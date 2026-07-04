@@ -2934,21 +2934,42 @@ class SQLiteStorage:
     async def delete_messages_by_dst(
         self, dst: str, own_call: str = "", read_key: str = ""
     ) -> int:
-        """Delete all messages (msg + ack) for a destination.
+        """Delete a whole conversation, mirroring the webapp's client-side
+        removal semantics.
 
-        Groups (numeric dst): delete by dst column.
+        Groups ('232', 'TEST') and broadcast ('*'): match via
+        conversation_key so via-routed rows (dst 'VIA,232' → key '232')
+        are included, like get_messages_page. 'Time' is the webapp's
+        virtual chat of {CET}-prefixed broadcasts — those rows live under
+        dst '*' in the DB and are split out of the '*' delete. New {CET}
+        messages are dropped by _should_filter_message, so the Time
+        branch only removes pre-filter legacy rows.
         Personal (callsign): delete bidirectional using conversation_key.
+        Matching only conversation_key is complete: type='ack' rows no
+        longer exist (the v4 migration removed them and store_message
+        never inserts them).
         Also cleans up the read_counts entry — keyed by read_key (the
         frontend sidebar key, e.g. pair 'A~B') when provided, else dst.
         Returns the count of deleted message rows.
         """
-        is_group = dst.isdigit() or dst in ("TEST", "*")
 
         def _run() -> int:
             with sqlite3.connect(self.db_path) as conn:
-                if is_group:
+                if dst == "Time":
                     cursor = conn.execute(
-                        "DELETE FROM messages WHERE dst = ?"
+                        "DELETE FROM messages WHERE conversation_key = '*'"
+                        " AND type IN ('msg', 'ack')"
+                        " AND msg LIKE '{CET}%'"
+                    )
+                elif dst == "*":
+                    cursor = conn.execute(
+                        "DELETE FROM messages WHERE conversation_key = '*'"
+                        " AND type IN ('msg', 'ack')"
+                        " AND (msg IS NULL OR msg NOT LIKE '{CET}%')"
+                    )
+                elif dst.isdigit() or dst == "TEST":
+                    cursor = conn.execute(
+                        "DELETE FROM messages WHERE conversation_key = ?"
                         " AND type IN ('msg', 'ack')",
                         (dst,),
                     )
