@@ -22,9 +22,6 @@ VERSION = "v0.50.0"
 
 logger = get_logger(__name__)
 
-# Schema version for migrations
-SCHEMA_VERSION = 17
-
 # Constants matching message_storage.py
 BUCKET_SECONDS = 5 * 60
 VALID_RSSI_RANGE = (-140, -30)
@@ -2015,7 +2012,31 @@ class SQLiteStorage:
         is_group = bool(dst) and (dst.isdigit() or dst == "TEST")
 
         params: tuple[Any, ...] = ()
-        if is_dm:
+        if dst == "Time":
+            # Webapp's virtual Time chat: {CET}-prefixed broadcasts, split
+            # out of '*' like in delete_messages_by_dst. New {CET} messages
+            # are dropped by _should_filter_message, so this only serves
+            # pre-filter legacy rows.
+            query = (
+                f"SELECT {_MSG_SELECT} FROM messages"
+                " WHERE type = 'msg' AND conversation_key = '*'"
+                " AND msg LIKE '{CET}%' AND timestamp < ?"
+                " ORDER BY timestamp DESC LIMIT ?"
+            )
+            params = (before_timestamp, limit + 1)
+        elif dst == "*":
+            # Broadcast: match via conversation_key so via-routed rows
+            # (dst 'DB0FHR-12,*' → key '*') are included; {CET} rows
+            # belong to the virtual Time chat
+            query = (
+                f"SELECT {_MSG_SELECT} FROM messages"
+                " WHERE type = 'msg' AND msg NOT LIKE '%:ack%'"
+                " AND conversation_key = '*' AND msg NOT LIKE '{CET}%'"
+                " AND timestamp < ?"
+                " ORDER BY timestamp DESC LIMIT ?"
+            )
+            params = (before_timestamp, limit + 1)
+        elif is_dm:
             # DM: compute conversation_key and use idx_messages_convkey_ts
             conv_key = compute_conversation_key(src or "", dst)
             query = (
