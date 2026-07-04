@@ -75,14 +75,22 @@ class SSEClient:
         self.client_id = client_id
         # Queue stores pre-formatted SSE event strings so broadcast payloads are
         # serialized once and shared across all clients instead of re-formatted N times.
-        self.queue: asyncio.Queue[str] = asyncio.Queue()
+        # Bounded so a slow/stalled consumer can't grow the queue without limit; on
+        # overflow the client is disconnected rather than backpressuring the broadcaster.
+        self.queue: asyncio.Queue[str] = asyncio.Queue(maxsize=256)
         self.connected = True
         self.connected_at = time.time()
 
     async def send(self, event: str) -> None:
-        """Queue a pre-formatted SSE event string for this client."""
-        if self.connected:
-            await self.queue.put(event)
+        """Queue a pre-formatted SSE event string; disconnect slow consumers."""
+        if not self.connected:
+            return
+        try:
+            self.queue.put_nowait(event)
+        except asyncio.QueueFull:
+            # Slow consumer: mark disconnected so its generator exits and cleans up.
+            self.disconnect()
+            raise
 
     def disconnect(self) -> None:
         """Mark client as disconnected."""
@@ -428,6 +436,7 @@ class SSEManager:
                         "get_messages_page",
                         websocket=None,
                         data=page_data,
+                        client_id=request.client_id,
                     )
                 elif request.type == "command":
                     # Route command through message router
@@ -436,6 +445,7 @@ class SSEManager:
                         websocket=None,
                         MAC=request.MAC,
                         BLE_Pin=request.BLE_Pin,
+                        client_id=request.client_id,
                     )
                 elif request.type == "BLE":
                     # Publish BLE message
@@ -706,7 +716,11 @@ class SSEManager:
             import zoneinfo
             from datetime import datetime
 
-            tz_name = _get_tz_finder().timezone_at(lat=lat, lng=lon)
+            def _lookup() -> str | None:
+                # First call constructs TimezoneFinder (slow) — keep that off the loop too.
+                return _get_tz_finder().timezone_at(lat=lat, lng=lon)
+
+            tz_name = await asyncio.to_thread(_lookup)
             if not tz_name:
                 raise HTTPException(
                     status_code=400, detail="No timezone found for coordinates"
@@ -1230,6 +1244,21 @@ class SSEManager:
         data = routed_message["data"]
         await self.broadcast_message({"type": "msg_status", **data})
 
+    async def send_to(self, client_id: str, message: dict[str, Any]) -> bool:
+        """Send one message to a single SSE client. Returns False if the client
+        is unknown/gone (caller decides fallback; we never broadcast here)."""
+        async with self.clients_lock:
+            client = self.clients.get(client_id)
+        if client is None or not client.connected:
+            return False
+        event = self._format_sse_event(message, self._get_event_type(message))
+        try:
+            await client.send(event)
+        except asyncio.QueueFull:
+            logger.warning("SSE send_to: client %s queue full, disconnected", client_id)
+            return False
+        return True
+
     async def broadcast_message(self, message: dict[str, Any]) -> None:
         """Broadcast message to all connected SSE clients."""
         async with self.clients_lock:
@@ -1247,7 +1276,8 @@ class SSEManager:
         for client, result in zip(clients, results):
             if isinstance(result, Exception):
                 logger.warning(
-                    "Failed to queue message for SSE client %s: %s",
+                    "Dropping SSE client %s: could not queue message "
+                    "(queue full / slow consumer): %s",
                     client.client_id, result,
                 )
 
@@ -1267,8 +1297,9 @@ class SSEManager:
         for client, result in zip(clients, results):
             if isinstance(result, Exception):
                 logger.warning(
-                    "Failed to queue %s for SSE client %s: %s",
-                    event_type, client.client_id, result,
+                    "Dropping SSE client %s: could not queue %s "
+                    "(queue full / slow consumer): %s",
+                    client.client_id, event_type, result,
                 )
 
     async def _disconnect_all_clients(self) -> None:

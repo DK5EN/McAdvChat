@@ -21,6 +21,7 @@ class SendMessageRequest(BaseModel):
     BLE_Pin: str | None = None
     before: int | None = None
     limit: int = 20
+    client_id: str | None = None  # SSE client to target for page/command responses
 
 
 class ReadCountRequest(BaseModel):

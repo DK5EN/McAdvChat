@@ -262,7 +262,8 @@ class MessageRouter:
 
     async def route_command(
         self, command: str, websocket: Any = None, MAC: str | None = None,
-        BLE_Pin: str | None = None, data: dict[str, Any] | None = None, **kwargs: Any
+        BLE_Pin: str | None = None, data: dict[str, Any] | None = None,
+        client_id: str | None = None, **kwargs: Any
     ) -> None:
       """Route commands to appropriate protocol handlers"""
       self._logger.debug("Routing command '%s'", command)
@@ -270,26 +271,26 @@ class MessageRouter:
       try:
         # Smart initial payload (paginated)
         if command == "smart_initial":
-            await self._handle_smart_initial_command(websocket)
+            await self._handle_smart_initial_command(websocket, client_id)
 
         elif command == "summary":
-            await self._handle_summary_command(websocket)
+            await self._handle_summary_command(websocket, client_id)
 
         elif command == "get_messages_page":
-            await self._handle_messages_page_command(websocket, data or {})
+            await self._handle_messages_page_command(websocket, data or {}, client_id)
 
         # Message dump commands (legacy clients redirect to smart_initial)
         elif command in ["send message dump", "send pos dump"]:
-            await self._handle_smart_initial_command(websocket)
+            await self._handle_smart_initial_command(websocket, client_id)
 
         elif command == "mheard dump":
-            await self._handle_mheard_dump_command(websocket)
+            await self._handle_mheard_dump_command(websocket, client_id)
 
         elif command == "mheard dump monthly":
-            await self._handle_mheard_dump_monthly_command(websocket)
+            await self._handle_mheard_dump_monthly_command(websocket, client_id)
 
         elif command == "mheard dump yearly":
-            await self._handle_mheard_dump_yearly_command(websocket)
+            await self._handle_mheard_dump_yearly_command(websocket, client_id)
 
         # BLE commands
         elif command == "scan BLE":
@@ -352,7 +353,28 @@ class MessageRouter:
             }
             await self.publish('router', 'websocket_message', error_msg)
 
-    async def _handle_smart_initial_command(self, websocket: Any) -> None:
+    async def _send_response(
+        self, websocket: Any, payload: dict[str, Any],
+        client_id: str | None = None,
+    ) -> None:
+        """Route a command response: websocket_direct > targeted SSE > broadcast."""
+        if websocket:
+            await self.publish('router', 'websocket_direct',
+                               {'websocket': websocket, 'data': payload})
+            return
+        if client_id:
+            sse = self.get_protocol('sse')
+            if sse is None or not await sse.send_to(client_id, payload):
+                # Client gone: drop, never broadcast (that would resurrect the bug).
+                self._logger.debug(
+                    "Dropped targeted response for gone SSE client %s", client_id
+                )
+            return
+        await self.publish('router', 'websocket_message', payload)
+
+    async def _handle_smart_initial_command(
+        self, websocket: Any, client_id: str | None = None
+    ) -> None:
         """Handle smart initial payload - sends only last N messages per dst + summary."""
         if hasattr(self.storage_handler, 'get_smart_initial_with_summary'):
             initial_data, summary = (
@@ -377,21 +399,21 @@ class MessageRouter:
                 "acks": acks_list,
             },
         }
-        await self.publish(
-            'router', 'websocket_direct', {'websocket': websocket, 'data': payload}
-        )
+        if client_id:
+            # Targeted SSE response for the requesting client.
+            await self._send_response(websocket, payload, client_id)
+        else:
+            # Legacy behaviour: unconditional websocket_direct — a no-op for SSE
+            # (SSE doesn't subscribe to websocket_direct) rather than a broadcast.
+            await self.publish(
+                'router', 'websocket_direct', {'websocket': websocket, 'data': payload}
+            )
         summary_payload = {
             "type": "response",
             "msg": "summary",
             "data": summary,
         }
-        if websocket:
-            await self.publish(
-                'router', 'websocket_direct',
-                {'websocket': websocket, 'data': summary_payload},
-            )
-        else:
-            await self.publish('router', 'websocket_message', summary_payload)
+        await self._send_response(websocket, summary_payload, client_id)
 
         # Send persisted read counts for unread badge sync
         if hasattr(self.storage_handler, 'get_read_counts'):
@@ -402,13 +424,7 @@ class MessageRouter:
                     "msg": "read_counts",
                     "data": read_counts,
                 }
-                if websocket:
-                    await self.publish(
-                        'router', 'websocket_direct',
-                        {'websocket': websocket, 'data': rc_payload},
-                    )
-                else:
-                    await self.publish('router', 'websocket_message', rc_payload)
+                await self._send_response(websocket, rc_payload, client_id)
 
         # Send persisted hidden destinations for group visibility sync
         if hasattr(self.storage_handler, 'get_hidden_destinations'):
@@ -419,13 +435,7 @@ class MessageRouter:
                     "msg": "hidden_destinations",
                     "data": hidden_dsts,
                 }
-                if websocket:
-                    await self.publish(
-                        'router', 'websocket_direct',
-                        {'websocket': websocket, 'data': hd_payload},
-                    )
-                else:
-                    await self.publish('router', 'websocket_message', hd_payload)
+                await self._send_response(websocket, hd_payload, client_id)
 
         # Send persisted blocked texts for message text filtering
         if hasattr(self.storage_handler, 'get_blocked_texts'):
@@ -436,13 +446,7 @@ class MessageRouter:
                     "msg": "blocked_texts",
                     "data": blocked_texts,
                 }
-                if websocket:
-                    await self.publish(
-                        'router', 'websocket_direct',
-                        {'websocket': websocket, 'data': bt_payload},
-                    )
-                else:
-                    await self.publish('router', 'websocket_message', bt_payload)
+                await self._send_response(websocket, bt_payload, client_id)
 
         # Send persisted spam filter preferences
         if hasattr(self.storage_handler, 'get_filter_prefs'):
@@ -452,15 +456,11 @@ class MessageRouter:
                 "msg": "filter_prefs",
                 "data": fp,
             }
-            if websocket:
-                await self.publish(
-                    'router', 'websocket_direct',
-                    {'websocket': websocket, 'data': fp_payload},
-                )
-            else:
-                await self.publish('router', 'websocket_message', fp_payload)
+            await self._send_response(websocket, fp_payload, client_id)
 
-    async def _handle_summary_command(self, websocket: Any) -> None:
+    async def _handle_summary_command(
+        self, websocket: Any, client_id: str | None = None
+    ) -> None:
         """Handle summary command - sends message counts per destination."""
         summary = await self.storage_handler.get_summary()
         payload: dict[str, Any] = {
@@ -468,14 +468,11 @@ class MessageRouter:
             "msg": "summary",
             "data": summary,
         }
-        if websocket:
-            await self.publish(
-                'router', 'websocket_direct', {'websocket': websocket, 'data': payload}
-            )
-        else:
-            await self.publish('router', 'websocket_message', payload)
+        await self._send_response(websocket, payload, client_id)
 
-    async def _handle_messages_page_command(self, websocket: Any, params: dict[str, Any]) -> None:
+    async def _handle_messages_page_command(
+        self, websocket: Any, params: dict[str, Any], client_id: str | None = None
+    ) -> None:
         """Handle paginated message fetch."""
         dst = params.get('dst', '*')
         before = params.get('before', int(time.time() * 1000))
@@ -490,14 +487,11 @@ class MessageRouter:
             "data": page_data["messages"],
             "has_more": page_data["has_more"],
         }
-        if websocket:
-            await self.publish(
-                'router', 'websocket_direct', {'websocket': websocket, 'data': payload}
-            )
-        else:
-            await self.publish('router', 'websocket_message', payload)
+        await self._send_response(websocket, payload, client_id)
 
-    async def _handle_mheard_dump_command(self, websocket: Any) -> None:
+    async def _handle_mheard_dump_command(
+        self, websocket: Any, client_id: str | None = None
+    ) -> None:
         """Handle mheard dump command"""
         # Create progress callback that sends updates to the requesting client
         async def progress_callback(stage: str, detail: str, callsign: str | None = None) -> None:
@@ -509,13 +503,7 @@ class MessageRouter:
             }
             if callsign:
                 progress_msg["callsign"] = callsign
-            if websocket:
-                await self.publish(
-                    'router', 'websocket_direct',
-                    {'websocket': websocket, 'data': progress_msg}
-                )
-            else:
-                await self.publish('router', 'websocket_message', progress_msg)
+            await self._send_response(websocket, progress_msg, client_id)
 
         # Use the parallel version
         mheard = await self.storage_handler.process_mheard_store_parallel(
@@ -526,16 +514,11 @@ class MessageRouter:
             "msg": "mheard stats",
             "data": mheard
         }
-        if websocket:
-            await self.publish(
-                'router', 'websocket_direct',
-                {'websocket': websocket, 'data': payload}
-            )
-        else:
-            # SSE client — broadcast to all connected clients
-            await self.publish('router', 'websocket_message', payload)
+        await self._send_response(websocket, payload, client_id)
 
-    async def _handle_mheard_dump_monthly_command(self, websocket: Any) -> None:
+    async def _handle_mheard_dump_monthly_command(
+        self, websocket: Any, client_id: str | None = None
+    ) -> None:
         """Handle mheard dump monthly command — queries buckets for 30 days."""
         async def progress_callback(stage: str, detail: str, callsign: str | None = None) -> None:
             progress_msg: dict[str, Any] = {
@@ -546,13 +529,7 @@ class MessageRouter:
             }
             if callsign:
                 progress_msg["callsign"] = callsign
-            if websocket:
-                await self.publish(
-                    'router', 'websocket_direct',
-                    {'websocket': websocket, 'data': progress_msg}
-                )
-            else:
-                await self.publish('router', 'websocket_message', progress_msg)
+            await self._send_response(websocket, progress_msg, client_id)
 
         mheard = await self.storage_handler.process_mheard_monthly(
             progress_callback=progress_callback
@@ -562,15 +539,11 @@ class MessageRouter:
             "msg": "mheard stats monthly",
             "data": mheard
         }
-        if websocket:
-            await self.publish(
-                'router', 'websocket_direct',
-                {'websocket': websocket, 'data': payload}
-            )
-        else:
-            await self.publish('router', 'websocket_message', payload)
+        await self._send_response(websocket, payload, client_id)
 
-    async def _handle_mheard_dump_yearly_command(self, websocket: Any) -> None:
+    async def _handle_mheard_dump_yearly_command(
+        self, websocket: Any, client_id: str | None = None
+    ) -> None:
         """Handle mheard dump yearly command — queries 1-hour buckets for 365 days."""
         async def progress_callback(stage: str, detail: str, callsign: str | None = None) -> None:
             progress_msg: dict[str, Any] = {
@@ -581,13 +554,7 @@ class MessageRouter:
             }
             if callsign:
                 progress_msg["callsign"] = callsign
-            if websocket:
-                await self.publish(
-                    'router', 'websocket_direct',
-                    {'websocket': websocket, 'data': progress_msg}
-                )
-            else:
-                await self.publish('router', 'websocket_message', progress_msg)
+            await self._send_response(websocket, progress_msg, client_id)
 
         mheard = await self.storage_handler.process_mheard_yearly(
             progress_callback=progress_callback
@@ -597,13 +564,7 @@ class MessageRouter:
             "msg": "mheard stats yearly",
             "data": mheard
         }
-        if websocket:
-            await self.publish(
-                'router', 'websocket_direct',
-                {'websocket': websocket, 'data': payload}
-            )
-        else:
-            await self.publish('router', 'websocket_message', payload)
+        await self._send_response(websocket, payload, client_id)
 
     # BLE command handlers - route through ble_client abstraction
     def _get_ble_client(self) -> Any:
