@@ -54,16 +54,21 @@ def compute_conversation_key(src: str, dst: str) -> str | None:
     """Compute conversation key for message grouping.
 
     Groups → dst, DMs → sorted base callsigns joined with '<>'.
+
+    Via-routed dst is 'VIA[,VIA2],TARGET' — the real target is the LAST
+    comma component (e.g. 'OE1KBC-12,232' → group 232). The src field
+    carries the relay path the other way round: FIRST component = sender.
     """
     if not dst:
         return None
-    if dst.isdigit() or dst == "TEST":
-        return dst
-    if dst == "*":
+    target = dst.split(",")[-1].strip()
+    if target.isdigit() or target == "TEST":
+        return target
+    if target == "*":
         return "*"
     # DM: strip SSIDs, sort alphabetically
-    base_src = src.split("-")[0]
-    base_dst = dst.split("-")[0]
+    base_src = src.split(",")[0].split("-")[0]
+    base_dst = target.split("-")[0]
     pair = sorted([base_src, base_dst])
     return f"{pair[0]}<>{pair[1]}"
 
@@ -480,6 +485,32 @@ class SQLiteStorage:
                         current_version,
                     )
                     _set_schema_version(conn, 17)
+
+                if current_version < 18:
+                    # Re-key messages whose src/dst carry a relay path: the
+                    # old compute_conversation_key used the VIA component of
+                    # 'VIA,TARGET' dst values instead of the real target
+                    rows = conn.execute(
+                        "SELECT id, src, dst, conversation_key FROM messages"
+                        " WHERE type = 'msg'"
+                        "   AND (dst LIKE '%,%' OR src LIKE '%,%')"
+                    ).fetchall()
+                    rekeyed = 0
+                    for row_id, src, dst, old_key in rows:
+                        new_key = compute_conversation_key(src or "", dst or "")
+                        if new_key != old_key:
+                            conn.execute(
+                                "UPDATE messages SET conversation_key = ?"
+                                " WHERE id = ?",
+                                (new_key, row_id),
+                            )
+                            rekeyed += 1
+                    logger.info(
+                        "Migration v%d → v18: re-keyed %d of %d via-routed "
+                        "messages (dst 'VIA,TARGET' → target)",
+                        current_version, rekeyed, len(rows),
+                    )
+                    _set_schema_version(conn, 18)
 
         await asyncio.to_thread(_init_db)
 
@@ -1981,6 +2012,7 @@ class SQLiteStorage:
             before_timestamp = int(time.time() * 1000)
 
         is_dm = dst and src and not dst.isdigit() and dst != '*'
+        is_group = bool(dst) and (dst.isdigit() or dst == "TEST")
 
         params: tuple[Any, ...] = ()
         if is_dm:
@@ -1992,6 +2024,16 @@ class SQLiteStorage:
                 " AND timestamp < ? ORDER BY timestamp DESC LIMIT ?"
             )
             params = (conv_key, before_timestamp, limit + 1)
+        elif is_group:
+            # Group: match via conversation_key so via-routed posts
+            # (dst 'VIA,232' → key '232') are included in the page
+            query = (
+                f"SELECT {_MSG_SELECT} FROM messages"
+                " WHERE type = 'msg' AND msg NOT LIKE '%:ack%'"
+                " AND conversation_key = ? AND timestamp < ?"
+                " ORDER BY timestamp DESC LIMIT ?"
+            )
+            params = (dst, before_timestamp, limit + 1)
         elif dst:
             query = (
                 f"SELECT {_MSG_SELECT} FROM messages"
