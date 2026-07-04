@@ -545,7 +545,9 @@ class SSEManager:
             )
             if not storage or not hasattr(storage, "delete_messages_by_dst"):
                 raise HTTPException(status_code=503, detail="Storage not available")
-            deleted = await storage.delete_messages_by_dst(body.dst, body.own_call)
+            deleted = await storage.delete_messages_by_dst(
+                body.dst, body.own_call, read_key=body.read_key
+            )
             return {"status": "ok", "deleted": deleted}
 
         # mHeard sidebar endpoints (persist station order + hidden)

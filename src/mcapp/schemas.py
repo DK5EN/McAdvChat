@@ -48,6 +48,11 @@ class DeleteMessagesRequest(BaseModel):
 
     dst: str = Field(min_length=1)
     own_call: str = ""
+    # Frontend sidebar key whose read_counts entry should be cleaned up
+    # (group number, partner callsign, or pair key 'A~B'). Falls back to
+    # dst when absent — which wrongly hits an own-DM read count for pair
+    # deletes, hence this explicit field.
+    read_key: str = ""
 
 
 class SidebarStateRequest(BaseModel):

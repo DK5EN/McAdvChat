@@ -2931,12 +2931,15 @@ class SQLiteStorage:
             fetch=False,
         )
 
-    async def delete_messages_by_dst(self, dst: str, own_call: str = "") -> int:
+    async def delete_messages_by_dst(
+        self, dst: str, own_call: str = "", read_key: str = ""
+    ) -> int:
         """Delete all messages (msg + ack) for a destination.
 
         Groups (numeric dst): delete by dst column.
         Personal (callsign): delete bidirectional using conversation_key.
-        Also cleans up the read_counts entry for that destination.
+        Also cleans up the read_counts entry — keyed by read_key (the
+        frontend sidebar key, e.g. pair 'A~B') when provided, else dst.
         Returns the count of deleted message rows.
         """
         is_group = dst.isdigit() or dst in ("TEST", "*")
@@ -2958,7 +2961,9 @@ class SQLiteStorage:
                     )
                 deleted = cursor.rowcount
                 # Clean up read_counts for this destination
-                conn.execute("DELETE FROM read_counts WHERE dst = ?", (dst,))
+                conn.execute(
+                    "DELETE FROM read_counts WHERE dst = ?", (read_key or dst,)
+                )
                 conn.commit()
                 return deleted
 
