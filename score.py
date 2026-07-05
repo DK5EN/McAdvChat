@@ -27,16 +27,11 @@ from __future__ import annotations
 
 import re
 
-# ── Emoji regex (deliberately a local copy, not imported from template.py) ──
-# Covers the same ranges as template.EMOJI_RE so the two are kept in sync:
-#   \U0001F300-\U0001FAFF  extended pictographs / emoticons / symbols
-#   \u2600-\u27BF          misc symbols, dingbats, etc.
-#   \u2300-\u23FF          misc technical (clocks, arrows, …)
-#   \ufe0f                 variation selector-16 (emoji presentation)
-#
-# The variation selector is included in the class so it adds to the count
-# alongside the base character — both are replaced when fingerprinting.
-EMOJI_RE: re.Pattern[str] = re.compile(r"[\U0001F300-\U0001FAFF\u2600-\u27BF\u2300-\u23FF\ufe0f]")
+from .types import EMOJI_RE
+
+# CLS-05: EMOJI_RE now imported from .types (single canonical definition,
+# shared with template.py -- previously this was a deliberately separate
+# local copy that had drifted into a subtly different regex).
 
 # ── Weights (tune here) ─────────────────────────────────────────────────────
 _W_LEN_FACTOR: float = 0.30
