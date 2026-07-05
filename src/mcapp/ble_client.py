@@ -28,22 +28,25 @@ from __future__ import annotations
 
 import logging
 from abc import ABC, abstractmethod
+from collections.abc import Callable
 from dataclasses import dataclass
 from enum import Enum
-from typing import Any, Callable
+from typing import Any
 
 logger = logging.getLogger(__name__)
 
 
 class BLEMode(Enum):
     """BLE operation modes"""
-    # LOCAL = "local"  # REMOVED: Use standalone BLE service instead
-    REMOTE = "remote"     # HTTP/SSE to remote service
-    DISABLED = "disabled" # No-op stub
+
+    # The former LOCAL mode was removed — use the standalone BLE service instead.
+    REMOTE = "remote"  # HTTP/SSE to remote service
+    DISABLED = "disabled"  # No-op stub
 
 
 class ConnectionState(Enum):
     """BLE connection states"""
+
     DISCONNECTED = "disconnected"
     CONNECTING = "connecting"
     CONNECTED = "connected"
@@ -54,6 +57,7 @@ class ConnectionState(Enum):
 @dataclass
 class BLEDevice:
     """Discovered BLE device information"""
+
     name: str
     address: str
     rssi: int = 0
@@ -65,6 +69,7 @@ class BLEDevice:
 @dataclass
 class BLEStatus:
     """Current BLE status"""
+
     state: ConnectionState = ConnectionState.DISCONNECTED
     device_address: str | None = None
     device_name: str | None = None
@@ -102,7 +107,7 @@ class BLEClientBase(ABC):
         return self._status.state == ConnectionState.CONNECTED
 
     @abstractmethod
-    async def scan(self, timeout: float = 5.0, prefix: str = "MC-") -> list[BLEDevice]:
+    async def scan(self, timeout: float = 5.0, prefix: str = "MC-") -> list[BLEDevice]:  # noqa: ASYNC109 - public API takes timeout
         """
         Scan for BLE devices.
 
@@ -113,7 +118,6 @@ class BLEClientBase(ABC):
         Returns:
             List of discovered devices
         """
-        pass
 
     @abstractmethod
     async def connect(self, mac: str) -> bool:
@@ -126,7 +130,6 @@ class BLEClientBase(ABC):
         Returns:
             True if connection successful
         """
-        pass
 
     @abstractmethod
     async def disconnect(self) -> bool:
@@ -136,7 +139,6 @@ class BLEClientBase(ABC):
         Returns:
             True if disconnection successful
         """
-        pass
 
     @abstractmethod
     async def pair(self, mac: str) -> bool:
@@ -149,7 +151,6 @@ class BLEClientBase(ABC):
         Returns:
             True if pairing successful
         """
-        pass
 
     @abstractmethod
     async def unpair(self, mac: str) -> bool:
@@ -162,7 +163,6 @@ class BLEClientBase(ABC):
         Returns:
             True if unpairing successful
         """
-        pass
 
     @abstractmethod
     async def send_message(self, msg: str, group: str) -> bool:
@@ -176,7 +176,6 @@ class BLEClientBase(ABC):
         Returns:
             True if send successful
         """
-        pass
 
     @abstractmethod
     async def send_command(self, cmd: str) -> bool:
@@ -189,7 +188,6 @@ class BLEClientBase(ABC):
         Returns:
             True if send successful
         """
-        pass
 
     @abstractmethod
     async def set_command(self, cmd: str) -> bool:
@@ -202,7 +200,6 @@ class BLEClientBase(ABC):
         Returns:
             True if send successful
         """
-        pass
 
     @abstractmethod
     async def save_settings(self) -> bool:
@@ -215,7 +212,6 @@ class BLEClientBase(ABC):
         Returns:
             True if save command sent successfully
         """
-        pass
 
     @abstractmethod
     async def reboot_device(self) -> bool:
@@ -227,7 +223,6 @@ class BLEClientBase(ABC):
         Returns:
             True if reboot command sent successfully
         """
-        pass
 
     @abstractmethod
     async def save_and_reboot(self) -> bool:
@@ -243,27 +238,24 @@ class BLEClientBase(ABC):
         Returns:
             True if save & reboot command sent successfully
         """
-        pass
 
     @abstractmethod
     async def start(self) -> None:
         """
         Start the BLE client (connect notification handlers, etc.)
         """
-        pass
 
     @abstractmethod
     async def stop(self) -> None:
         """
         Stop the BLE client and clean up resources.
         """
-        pass
 
 
-async def create_ble_client(
+async def create_ble_client(  # noqa: PLR0913 - signature fixed by call sites
     mode: BLEMode = BLEMode.DISABLED,
     notification_callback: Callable[[dict[str, Any]], None] | None = None,
-    device_mac: str | None = None,
+    device_mac: str | None = None,  # noqa: ARG001 - BLE-mode interface compatibility
     remote_url: str | None = None,
     api_key: str | None = None,
     message_router: Any | None = None,
@@ -286,7 +278,8 @@ async def create_ble_client(
     if mode == BLEMode.REMOTE:
         if not remote_url:
             raise ValueError("remote_url required for remote mode")
-        from .ble_client_remote import BLEClientRemote
+        from .ble_client_remote import BLEClientRemote  # noqa: PLC0415 - mode-dependent lazy import
+
         client = BLEClientRemote(
             remote_url=remote_url,
             api_key=api_key,
@@ -296,7 +289,8 @@ async def create_ble_client(
         logger.info("Created remote BLE client (HTTP/SSE) -> %s", remote_url)
 
     else:  # DISABLED
-        from .ble_client_disabled import BLEClientDisabled
+        from .ble_client_disabled import BLEClientDisabled  # noqa: PLC0415 - lazy import
+
         client = BLEClientDisabled(
             notification_callback=notification_callback,
             message_router=message_router,

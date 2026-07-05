@@ -24,19 +24,25 @@ export MCAPP_ENV=dev       # Enables verbose logging
 uv run mcapp               # Run locally
 uvx ruff check             # Lint (must pass before committing)
 uvx ruff check --fix       # Auto-fix
+uvx ruff format            # Format (must be clean before committing)
 ./scripts/release.sh       # Create release (interactive, run from development branch)
 ```
 
 ## Code Quality
 
 - `uvx ruff check` is mandatory — zero tolerance for errors and warnings
-- **Ruff config** in `pyproject.toml`: `line-length = 100`, `target-version = "py311"`, rules: `["E", "F", "I", "W"]`
+- `uvx ruff format` is the mandatory formatter — run it before committing (`uvx ruff format --check .` must be clean)
+- **Ruff config** in `pyproject.toml`: `line-length = 100`, `target-version = "py311"`, strict rule set (bugbear, security, pylint, pyupgrade, simplify, datetime-TZ, async, pathlib, naming, …) — see the `[tool.ruff.lint]` section for the full list and documented ignores
+- **Keep all `[tool.ruff*]` sections identical** across `pyproject.toml`, `ble_service/pyproject.toml` and mc-chat's `pyproject.toml` — the classifier subtree must lint clean under the same rules in both repos
+- New `# noqa` markers need a trailing reason comment and should stay rare — prefer a real fix
 - **Git branches**: `development` (default), `main` (production)
 - **Commit format**: `[type] description` — types: feat, fix, perf, refactor, chore, docs, test
 
 ## Testing
 
-No pytest — tests are built into the app and run at startup when `has_console()` is true:
+No pytest — tests are built into the app and run at startup when `has_console()` is true.
+Headless (no TTY, no `/etc/mcapp` needed): `uv run python scripts/run_startup_tests.py` — exit 0 = all passed (needs network for weather APIs).
+Suites:
 - `message_router.test_suppression_logic()`
 - `command_handler.run_all_tests()` (in `src/mcapp/commands/tests.py`)
 - `classifier.run_all_tests()` (in `src/mcapp/classifier/tests.py`) — uses an ephemeral tempfile SQLite so the live DB is untouched

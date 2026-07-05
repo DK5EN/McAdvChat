@@ -127,7 +127,7 @@ class CommandHandler(
     CTCPingMixin,
     TopicBeaconMixin,
 ):
-    def __init__(
+    def __init__(  # noqa: PLR0913 - signature fixed by call sites
         self,
         message_router: Any = None,
         storage_handler: Any = None,
@@ -142,7 +142,7 @@ class CommandHandler(
         self.message_router = message_router
         self.storage_handler = storage_handler
         self.my_callsign = my_callsign.upper()
-        self.admin_callsign_base = my_callsign.split("-")[0]
+        self.admin_callsign_base = my_callsign.split("-", maxsplit=1)[0]
         self.lat = lat
         self.lon = lon
         self.stat_name = stat_name
@@ -171,12 +171,12 @@ class CommandHandler(
 
     async def run_all_tests(self) -> bool:
         """Run complete test suite for CommandHandler"""
-        from .tests import run_all_tests
+        from .tests import run_all_tests  # noqa: PLC0415 - test suite loaded on demand
 
         return await run_all_tests(self)
 
 
-def create_command_handler(
+def create_command_handler(  # noqa: PLR0913 - signature fixed by call sites
     message_router: Any,
     storage_handler: Any,
     call_sign: str,

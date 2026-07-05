@@ -5,18 +5,24 @@ SQLite storage backend for McApp.
 Provides persistent message storage as an alternative to in-memory deque.
 Uses Python's built-in sqlite3 with asyncio.to_thread() for async operations.
 """
+
 import asyncio
+import contextlib
 import json
 import re
 import sqlite3
 import time
 from collections import defaultdict
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from statistics import mean
 from typing import Any, cast
 
 from .logging_setup import get_logger
+
+_MAX_FORENSIC_HOPS = 4  # log raw data for messages routed over more hops
+_MIN_PLAUSIBLE_HPA = 850  # pressure below this is a firmware mapping error
+_INITIAL_PER_KEY_LIMIT = 50  # initial-payload cap per dst/src
 
 VERSION = "v0.50.0"
 
@@ -58,16 +64,17 @@ def compute_conversation_key(src: str, dst: str) -> str | None:
     """
     if not dst:
         return None
-    target = dst.split(",")[-1].strip()
+    target = dst.rsplit(",", maxsplit=1)[-1].strip()
     if target.isdigit() or target == "TEST":
         return target
     if target == "*":
         return "*"
     # DM: strip SSIDs, sort alphabetically
-    base_src = src.split(",")[0].split("-")[0]
+    base_src = src.split(",", maxsplit=1)[0].split("-", maxsplit=1)[0]
     base_dst = target.split("-")[0]
     pair = sorted([base_src, base_dst])
     return f"{pair[0]}<>{pair[1]}"
+
 
 CREATE_SCHEMA_SQL = """
 -- Main messages table
@@ -210,7 +217,7 @@ class SQLiteStorage:
         """Wire the classifier so store_message() annotates new rows inline."""
         self._classifier = classifier
 
-    async def initialize(self) -> None:
+    async def initialize(self) -> None:  # noqa: PLR0915 - complex handler kept intact
         """Initialize database schema."""
         if self._initialized:
             return
@@ -218,12 +225,10 @@ class SQLiteStorage:
         def _set_schema_version(conn: sqlite3.Connection, version: int) -> None:
             """Persist schema version immediately so crashes don't re-run completed steps."""
             conn.execute("DELETE FROM schema_version")
-            conn.execute(
-                "INSERT INTO schema_version (version) VALUES (?)", (version,)
-            )
+            conn.execute("INSERT INTO schema_version (version) VALUES (?)", (version,))
             conn.commit()
 
-        def _init_db() -> None:
+        def _init_db() -> None:  # noqa: PLR0912, PLR0915 - complex handler kept intact
             with sqlite3.connect(self.db_path) as conn:
                 # Enable WAL mode for better concurrent read/write performance
                 conn.execute("PRAGMA journal_mode=WAL")
@@ -235,13 +240,13 @@ class SQLiteStorage:
                 row = cursor.fetchone()
                 current_version = row[0] if row else 0
 
-                if current_version < 2:
+                if current_version < 2:  # noqa: PLR2004 - schema migration step
                     logger.info("Migrating schema v%d → v2", current_version)
                     conn.executescript(CREATE_SCHEMA_V2_SQL)
                     self._backfill_new_tables(conn)
                     _set_schema_version(conn, 2)
 
-                if current_version < 3:
+                if current_version < 3:  # noqa: PLR2004 - schema migration step
                     logger.info(
                         "Migrating schema v%d → v3: removing msg_id UNIQUE constraint",
                         current_version,
@@ -249,7 +254,7 @@ class SQLiteStorage:
                     self._migrate_v2_to_v3(conn)
                     _set_schema_version(conn, 3)
 
-                if current_version < 4:
+                if current_version < 4:  # noqa: PLR2004 - schema migration step
                     logger.info(
                         "Migrating schema v%d → v4: new columns, telemetry, conversation_key",
                         current_version,
@@ -257,7 +262,7 @@ class SQLiteStorage:
                     self._migrate_v3_to_v4(conn)
                     _set_schema_version(conn, 4)
 
-                if current_version < 5:
+                if current_version < 5:  # noqa: PLR2004 - schema migration step
                     logger.info(
                         "Migrating schema v%d → v5: rename long→lon, long_dir→lon_dir",
                         current_version,
@@ -265,7 +270,7 @@ class SQLiteStorage:
                     self._migrate_v4_to_v5(conn)
                     _set_schema_version(conn, 5)
 
-                if current_version < 6:
+                if current_version < 6:  # noqa: PLR2004 - schema migration step
                     logger.info(
                         "Migrating schema v%d → v6: add alt column to telemetry",
                         current_version,
@@ -273,7 +278,7 @@ class SQLiteStorage:
                     self._migrate_v5_to_v6(conn)
                     _set_schema_version(conn, 6)
 
-                if current_version < 7:
+                if current_version < 7:  # noqa: PLR2004 - schema migration step
                     logger.info(
                         "Migrating schema v%d → v7: add read_counts table",
                         current_version,
@@ -287,29 +292,30 @@ class SQLiteStorage:
                     """)
                     _set_schema_version(conn, 7)
 
-                if current_version < 8:
+                if current_version < 8:  # noqa: PLR2004 - schema migration step
                     deleted = conn.execute(
-                        "DELETE FROM messages"
-                        " WHERE type = 'msg' AND src = '' AND msg = ''"
+                        "DELETE FROM messages WHERE type = 'msg' AND src = '' AND msg = ''"
                     ).rowcount
                     logger.info(
                         "Migration v%d → v8: purged %d empty BLE config messages",
-                        current_version, deleted,
+                        current_version,
+                        deleted,
                     )
                     _set_schema_version(conn, 8)
 
-                if current_version < 9:
+                if current_version < 9:  # noqa: PLR2004 - schema migration step
                     updated = conn.execute(
                         "UPDATE station_positions SET alt = NULL WHERE alt IS NOT NULL"
                     ).rowcount
                     logger.info(
                         "Migration v%d → v9: reset %d station altitudes "
                         "(fix double ft→m conversion)",
-                        current_version, updated,
+                        current_version,
+                        updated,
                     )
                     _set_schema_version(conn, 9)
 
-                if current_version < 10:
+                if current_version < 10:  # noqa: PLR2004 - schema migration step
                     conn.execute("""
                         CREATE TABLE IF NOT EXISTS hidden_destinations (
                             dst TEXT PRIMARY KEY,
@@ -322,7 +328,7 @@ class SQLiteStorage:
                     )
                     _set_schema_version(conn, 10)
 
-                if current_version < 11:
+                if current_version < 11:  # noqa: PLR2004 - schema migration step
                     conn.execute("""
                         CREATE TABLE IF NOT EXISTS blocked_texts (
                             text TEXT PRIMARY KEY,
@@ -335,7 +341,7 @@ class SQLiteStorage:
                     )
                     _set_schema_version(conn, 11)
 
-                if current_version < 12:
+                if current_version < 12:  # noqa: PLR2004 - schema migration step
                     conn.execute("""
                         CREATE TABLE IF NOT EXISTS mheard_sidebar (
                             id INTEGER PRIMARY KEY CHECK (id = 1),
@@ -350,7 +356,7 @@ class SQLiteStorage:
                     )
                     _set_schema_version(conn, 12)
 
-                if current_version < 13:
+                if current_version < 13:  # noqa: PLR2004 - schema migration step
                     conn.execute("""
                         CREATE TABLE IF NOT EXISTS wx_sidebar (
                             id INTEGER PRIMARY KEY CHECK (id = 1),
@@ -365,7 +371,7 @@ class SQLiteStorage:
                     )
                     _set_schema_version(conn, 13)
 
-                if current_version < 14:
+                if current_version < 14:  # noqa: PLR2004 - schema migration step
                     try:
                         conn.execute("ALTER TABLE telemetry ADD COLUMN batt INTEGER")
                     except sqlite3.OperationalError:
@@ -376,27 +382,23 @@ class SQLiteStorage:
                     )
                     _set_schema_version(conn, 14)
 
-                if current_version < 15:
+                if current_version < 15:  # noqa: PLR2004 - schema migration step
                     for tbl in ("telemetry", "station_positions"):
                         for col, typedef in [
                             ("hum2", "REAL"),
                             ("extras", "TEXT"),
                         ]:
                             try:
-                                conn.execute(
-                                    f"ALTER TABLE {tbl} ADD COLUMN {col} {typedef}"
-                                )
+                                conn.execute(f"ALTER TABLE {tbl} ADD COLUMN {col} {typedef}")
                             except sqlite3.OperationalError:
-                                logger.debug(
-                                    "Column %s already exists in %s, skipping", col, tbl
-                                )
+                                logger.debug("Column %s already exists in %s, skipping", col, tbl)
                     logger.info(
                         "Migration v%d → v15: added hum2, extras columns",
                         current_version,
                     )
                     _set_schema_version(conn, 15)
 
-                if current_version < 16:
+                if current_version < 16:  # noqa: PLR2004 - schema migration step
                     for col, typedef in [
                         ("category", "TEXT"),
                         ("tags", "TEXT"),
@@ -405,16 +407,11 @@ class SQLiteStorage:
                         ("classifier_ver", "INTEGER"),
                     ]:
                         try:
-                            conn.execute(
-                                f"ALTER TABLE messages ADD COLUMN {col} {typedef}"
-                            )
+                            conn.execute(f"ALTER TABLE messages ADD COLUMN {col} {typedef}")
                         except sqlite3.OperationalError:
-                            logger.debug(
-                                "Column %s already exists in messages, skipping", col
-                            )
+                            logger.debug("Column %s already exists in messages, skipping", col)
                     conn.execute(
-                        "CREATE INDEX IF NOT EXISTS idx_messages_category "
-                        "ON messages(category)"
+                        "CREATE INDEX IF NOT EXISTS idx_messages_category ON messages(category)"
                     )
                     conn.execute(
                         "CREATE INDEX IF NOT EXISTS idx_messages_template_hash "
@@ -469,7 +466,7 @@ class SQLiteStorage:
                     )
                     _set_schema_version(conn, 16)
 
-                if current_version < 17:
+                if current_version < 17:  # noqa: PLR2004 - schema migration step
                     conn.execute("""
                         CREATE TABLE IF NOT EXISTS filter_prefs (
                             id INTEGER PRIMARY KEY CHECK (id = 1),
@@ -483,7 +480,7 @@ class SQLiteStorage:
                     )
                     _set_schema_version(conn, 17)
 
-                if current_version < 18:
+                if current_version < 18:  # noqa: PLR2004 - schema migration step
                     # Re-key messages whose src/dst carry a relay path: the
                     # old compute_conversation_key used the VIA component of
                     # 'VIA,TARGET' dst values instead of the real target
@@ -497,15 +494,16 @@ class SQLiteStorage:
                         new_key = compute_conversation_key(src or "", dst or "")
                         if new_key != old_key:
                             conn.execute(
-                                "UPDATE messages SET conversation_key = ?"
-                                " WHERE id = ?",
+                                "UPDATE messages SET conversation_key = ? WHERE id = ?",
                                 (new_key, row_id),
                             )
                             rekeyed += 1
                     logger.info(
                         "Migration v%d → v18: re-keyed %d of %d via-routed "
                         "messages (dst 'VIA,TARGET' → target)",
-                        current_version, rekeyed, len(rows),
+                        current_version,
+                        rekeyed,
+                        len(rows),
                     )
                     _set_schema_version(conn, 18)
 
@@ -647,9 +645,13 @@ class SQLiteStorage:
             GROUP BY callsign, bucket_ts
             """,
             (
-                bucket_ms, bucket_ms, bucket_ms,
-                VALID_RSSI_RANGE[0], VALID_RSSI_RANGE[1],
-                VALID_SNR_RANGE[0], VALID_SNR_RANGE[1],
+                bucket_ms,
+                bucket_ms,
+                bucket_ms,
+                VALID_RSSI_RANGE[0],
+                VALID_RSSI_RANGE[1],
+                VALID_SNR_RANGE[0],
+                VALID_SNR_RANGE[1],
             ),
         )
         bucket_count = conn.execute("SELECT changes()").fetchone()[0]
@@ -743,9 +745,7 @@ class SQLiteStorage:
             ("extras", "TEXT"),
         ]:
             try:
-                conn.execute(
-                    f"ALTER TABLE station_positions ADD COLUMN {col} {typedef}"
-                )
+                conn.execute(f"ALTER TABLE station_positions ADD COLUMN {col} {typedef}")
             except sqlite3.OperationalError:
                 logger.debug("Column %s already exists in station_positions, skipping", col)
 
@@ -796,7 +796,7 @@ class SQLiteStorage:
             "SELECT id, msg FROM messages WHERE type = 'msg' AND msg LIKE '%{%'"
         ).fetchall()
         for row_id, msg in rows:
-            match = re.search(r'\{(\d+)$', msg or '')
+            match = re.search(r"\{(\d+)$", msg or "")
             if match:
                 conn.execute(
                     "UPDATE messages SET echo_id = ? WHERE id = ?",
@@ -827,7 +827,7 @@ class SQLiteStorage:
         """).fetchall()
         dm_count = 0
         for row_id, src, dst in dm_rows:
-            key = compute_conversation_key(src or '', dst or '')
+            key = compute_conversation_key(src or "", dst or "")
             if key:
                 conn.execute(
                     "UPDATE messages SET conversation_key = ? WHERE id = ?",
@@ -862,7 +862,9 @@ class SQLiteStorage:
         conn.execute("DELETE FROM messages WHERE type = 'ack'")
         logger.info(
             "ACK migration: matched %d of %d ACKs, deleted %d ACK rows",
-            matched, len(ack_rows), deleted,
+            matched,
+            len(ack_rows),
+            deleted,
         )
 
         logger.info("Schema v4 migration complete")
@@ -897,9 +899,13 @@ class SQLiteStorage:
             "SELECT callsign, timestamp, rssi, snr FROM signal_log"
             " WHERE timestamp >= ?"
             " AND rssi BETWEEN ? AND ? AND snr BETWEEN ? AND ?",
-            (current_bucket_start,
-             VALID_RSSI_RANGE[0], VALID_RSSI_RANGE[1],
-             VALID_SNR_RANGE[0], VALID_SNR_RANGE[1]),
+            (
+                current_bucket_start,
+                VALID_RSSI_RANGE[0],
+                VALID_RSSI_RANGE[1],
+                VALID_SNR_RANGE[0],
+                VALID_SNR_RANGE[1],
+            ),
         )
         rows = cast(list[dict[str, Any]], rows_result)
         for row in rows:
@@ -911,7 +917,8 @@ class SQLiteStorage:
         if rows:
             logger.info(
                 "Loaded %d signal_log entries into %d partial buckets",
-                len(rows), len(self._bucket_accumulators),
+                len(rows),
+                len(self._bucket_accumulators),
             )
 
     def _accumulate_signal(
@@ -941,12 +948,20 @@ class SQLiteStorage:
                 rssi_vals = v["rssi"]
                 snr_vals = v["snr"]
                 if rssi_vals and snr_vals:
-                    completed.append((
-                        callsign, k[1], bucket_ms,
-                        round(mean(rssi_vals), 2), min(rssi_vals), max(rssi_vals),
-                        round(mean(snr_vals), 2), round(min(snr_vals), 2),
-                        round(max(snr_vals), 2), len(rssi_vals),
-                    ))
+                    completed.append(
+                        (
+                            callsign,
+                            k[1],
+                            bucket_ms,
+                            round(mean(rssi_vals), 2),
+                            min(rssi_vals),
+                            max(rssi_vals),
+                            round(mean(snr_vals), 2),
+                            round(min(snr_vals), 2),
+                            round(max(snr_vals), 2),
+                            len(rssi_vals),
+                        )
+                    )
                 keys_to_remove.append(k)
 
         for k in keys_to_remove:
@@ -989,8 +1004,16 @@ class SQLiteStorage:
                        lora_mod = COALESCE(excluded.lora_mod, station_positions.lora_mod),
                        mesh = COALESCE(excluded.mesh, station_positions.mesh)
                 """,
-                (callsign, data.get("rssi"), data.get("snr"), timestamp, timestamp,
-                 data.get("hw_id"), data.get("lora_mod"), data.get("mesh")),
+                (
+                    callsign,
+                    data.get("rssi"),
+                    data.get("snr"),
+                    timestamp,
+                    timestamp,
+                    data.get("hw_id"),
+                    data.get("lora_mod"),
+                    data.get("mesh"),
+                ),
                 fetch=False,
             )
 
@@ -1048,13 +1071,25 @@ class SQLiteStorage:
                        position_ts = excluded.position_ts,
                        last_seen = MAX(station_positions.last_seen, excluded.last_seen)
                 """,
-                (callsign, data.get("lat"), data.get("lon"), data.get("alt"),
-                 data.get("lat_dir", ""), data.get("lon_dir", ""),
-                 data.get("hw_id"), data.get("firmware"), data.get("fw_sub"),
-                 data.get("aprs_symbol"), data.get("aprs_symbol_group"),
-                 data.get("batt"), data.get("gw"),
-                 via, via_paths_json,
-                 timestamp, timestamp),
+                (
+                    callsign,
+                    data.get("lat"),
+                    data.get("lon"),
+                    data.get("alt"),
+                    data.get("lat_dir", ""),
+                    data.get("lon_dir", ""),
+                    data.get("hw_id"),
+                    data.get("firmware"),
+                    data.get("fw_sub"),
+                    data.get("aprs_symbol"),
+                    data.get("aprs_symbol_group"),
+                    data.get("batt"),
+                    data.get("gw"),
+                    via,
+                    via_paths_json,
+                    timestamp,
+                    timestamp,
+                ),
                 fetch=False,
             )
 
@@ -1097,7 +1132,7 @@ class SQLiteStorage:
             self._read_conn = conn
         return self._read_conn
 
-    async def store_message(self, message: dict[str, Any], raw: str) -> None:
+    async def store_message(self, message: dict[str, Any], raw: str) -> None:  # noqa: PLR0912, PLR0915 - complex handler kept intact
         """Store a message with automatic filtering.
 
         Dual-writes to both the legacy messages table AND the new
@@ -1138,7 +1173,11 @@ class SQLiteStorage:
         if src_type in ("ble", "ble_remote"):
             logger.debug(
                 "BLE store: src=%s type=%s msg_id=%s transformer=%s msg=%.40s",
-                src, msg_type, msg_id, transformer, msg,
+                src,
+                msg_type,
+                msg_id,
+                transformer,
+                msg,
             )
 
         # Normalize callsign from relay path
@@ -1149,12 +1188,19 @@ class SQLiteStorage:
 
         # Forensic logging: capture raw data for messages with >4 hops
         hop_count = len(msg_via.split(",")) if msg_via else 0
-        if hop_count > 4:
+        if hop_count > _MAX_FORENSIC_HOPS:
             logger.warning(
                 "HIGH_HOP_FORENSIC hops=%d src=%s dst=%s type=%s via=%s "
                 "max_hop=%s mesh_info=%s src_type=%s raw=%s",
-                hop_count, callsign, dst, msg_type, msg_via,
-                max_hop, mesh_info, src_type, raw,
+                hop_count,
+                callsign,
+                dst,
+                msg_type,
+                msg_via,
+                max_hop,
+                mesh_info,
+                src_type,
+                raw,
             )
 
         # --- Early exit: Telemetry → dedicated table ---
@@ -1174,7 +1220,9 @@ class SQLiteStorage:
             if ack_for_msg_id:
                 logger.debug(
                     "ACK received: original_msg=%s ack_type=%s (%s)",
-                    ack_for_msg_id, ack_type, ack_type_text,
+                    ack_for_msg_id,
+                    ack_type,
+                    ack_type_text,
                 )
                 rows = await self._execute(
                     "UPDATE messages SET send_success = 1 WHERE id = ("
@@ -1193,39 +1241,38 @@ class SQLiteStorage:
                     )
                     recent = cast(list[dict[str, Any]], recent_result)
                     nearby = (
-                        ", ".join(
-                            f"{r['src']}:{r['msg_id']}" for r in recent
-                        )
-                        if recent else "none"
+                        ", ".join(f"{r['src']}:{r['msg_id']}" for r in recent) if recent else "none"
                     )
                     logger.debug(
-                        "ACK for unknown original_msg=%s — no matching message in DB"
-                        " (nearby: %s)",
-                        ack_for_msg_id, nearby,
+                        "ACK for unknown original_msg=%s — no matching message in DB (nearby: %s)",
+                        ack_for_msg_id,
+                        nearby,
                     )
                 # Notify frontend via SSE
                 if self._message_router:
-                    await self._message_router.publish("storage", "msg_status", {
-                        "msg_id": ack_for_msg_id,
-                        "acked": True,
-                    })
+                    await self._message_router.publish(
+                        "storage",
+                        "msg_status",
+                        {
+                            "msg_id": ack_for_msg_id,
+                            "acked": True,
+                        },
+                    )
             return  # Don't store ACK as a separate row
 
         # Compute echo_id (extract {NNN from end of message text)
         echo_id = None
         if msg_type == "msg" and msg:
-            echo_match = re.search(r'\{(\d+)$', msg)
+            echo_match = re.search(r"\{(\d+)$", msg)
             if echo_match:
                 echo_id = echo_match.group(1)
 
         # Compute conversation_key for fast DM queries
-        conversation_key = (
-            compute_conversation_key(callsign, dst) if msg_type == "msg" else None
-        )
+        conversation_key = compute_conversation_key(callsign, dst) if msg_type == "msg" else None
 
         # --- Inline ACK matching (:ackNNN → set acked on original) ---
-        if msg and ':ack' in msg:
-            ack_match = re.search(r':ack(\d+)', msg)
+        if msg and ":ack" in msg:
+            ack_match = re.search(r":ack(\d+)", msg)
             if ack_match:
                 ack_num = ack_match.group(1)
                 await self._execute(
@@ -1243,11 +1290,12 @@ class SQLiteStorage:
 
         if is_mheard and rssi is not None and snr is not None:
             # MHeard beacon → signal_log + station_positions (signal fields)
-            if (VALID_RSSI_RANGE[0] <= rssi <= VALID_RSSI_RANGE[1]
-                    and VALID_SNR_RANGE[0] <= snr <= VALID_SNR_RANGE[1]):
+            if (
+                VALID_RSSI_RANGE[0] <= rssi <= VALID_RSSI_RANGE[1]
+                and VALID_SNR_RANGE[0] <= snr <= VALID_SNR_RANGE[1]
+            ):
                 await self._execute(
-                    "INSERT INTO signal_log (callsign, timestamp, rssi, snr)"
-                    " VALUES (?, ?, ?, ?)",
+                    "INSERT INTO signal_log (callsign, timestamp, rssi, snr) VALUES (?, ?, ?, ?)",
                     (callsign, timestamp, rssi, snr),
                     fetch=False,
                 )
@@ -1268,9 +1316,20 @@ class SQLiteStorage:
 
             # Fallback keys for historical raw_json (used "long"/"long_dir")
             _raw_fallback = {"lon": "long", "lon_dir": "long_dir"}
-            for field in ("lat", "lon", "alt", "lat_dir", "lon_dir", "hw_id",
-                          "firmware", "fw_sub", "aprs_symbol", "aprs_symbol_group",
-                          "batt", "gw"):
+            for field in (
+                "lat",
+                "lon",
+                "alt",
+                "lat_dir",
+                "lon_dir",
+                "hw_id",
+                "firmware",
+                "fw_sub",
+                "aprs_symbol",
+                "aprs_symbol_group",
+                "batt",
+                "gw",
+            ):
                 if field not in pos_data or pos_data[field] is None:
                     val = raw_parsed.get(field)
                     if val is None and field in _raw_fallback:
@@ -1335,13 +1394,15 @@ class SQLiteStorage:
         # Classifier.classify() has its own fallback; NULL columns mean "no
         # classifier wired yet" and will be picked up by a later reclassify run.
         if self._classifier is not None:
-            cls = await self._classifier.classify({
-                "msg": msg,
-                "src": callsign,
-                "dst": dst,
-                "type": msg_type,
-                "timestamp": timestamp,
-            })
+            cls = await self._classifier.classify(
+                {
+                    "msg": msg,
+                    "src": callsign,
+                    "dst": dst,
+                    "type": msg_type,
+                    "timestamp": timestamp,
+                }
+            )
             cls_cols = (
                 cls.category,
                 json.dumps(list(cls.tags)),
@@ -1353,9 +1414,28 @@ class SQLiteStorage:
             cls_cols = (None, None, None, None, None)
 
         params = (
-            msg_id, src, dst, msg, msg_type, timestamp, rssi, snr, src_type, raw,
-            msg_via, hw_id, lora_mod, max_hop, mesh_info, firmware, fw_sub,
-            last_hw_id, last_sending, transformer, echo_id, conversation_key,
+            msg_id,
+            src,
+            dst,
+            msg,
+            msg_type,
+            timestamp,
+            rssi,
+            snr,
+            src_type,
+            raw,
+            msg_via,
+            hw_id,
+            lora_mod,
+            max_hop,
+            mesh_info,
+            firmware,
+            fw_sub,
+            last_hw_id,
+            last_sending,
+            transformer,
+            echo_id,
+            conversation_key,
             *cls_cols,
         )
         await self._execute(
@@ -1383,8 +1463,7 @@ class SQLiteStorage:
             "src_type": row.get("src_type", ""),
         }
         # Optional numeric fields
-        for field in ("rssi", "snr", "hw_id", "lora_mod", "max_hop", "mesh_info",
-                       "last_hw_id"):
+        for field in ("rssi", "snr", "hw_id", "lora_mod", "max_hop", "mesh_info", "last_hw_id"):
             val = row.get(field)
             if val is not None:
                 data[field] = val
@@ -1403,10 +1482,8 @@ class SQLiteStorage:
             data["category"] = row["category"]
         tags_raw = row.get("tags")
         if tags_raw:
-            try:
+            with contextlib.suppress(ValueError, TypeError):
                 data["tags"] = json.loads(tags_raw) if isinstance(tags_raw, str) else tags_raw
-            except (ValueError, TypeError):
-                pass
         if row.get("info_score") is not None:
             data["info_score"] = row["info_score"]
         if row.get("template_hash"):
@@ -1416,18 +1493,50 @@ class SQLiteStorage:
         return data
 
     # Keys in telemetry dicts that are NOT sensor readings (used for extras extraction)
-    _TELEMETRY_META_KEYS = frozenset({
-        "timestamp", "src", "src_type", "type", "msg", "dst", "via",
-        "transformer", "transformer2", "tele_seq", "lat", "lon", "lat_dir",
-        "lon_dir", "aprs_symbol", "aprs_symbol_group", "hw_id", "firmware",
-        "fw_sub", "gw", "lora_mod", "mesh", "rssi", "snr",
-    })
-    _TELEMETRY_KNOWN_KEYS = frozenset({
-        "temp1", "temp2", "hum", "hum2", "qfe", "qnh", "gas", "co2",
-        "alt", "batt",
-    })
+    _TELEMETRY_META_KEYS = frozenset(
+        {
+            "timestamp",
+            "src",
+            "src_type",
+            "type",
+            "msg",
+            "dst",
+            "via",
+            "transformer",
+            "transformer2",
+            "tele_seq",
+            "lat",
+            "lon",
+            "lat_dir",
+            "lon_dir",
+            "aprs_symbol",
+            "aprs_symbol_group",
+            "hw_id",
+            "firmware",
+            "fw_sub",
+            "gw",
+            "lora_mod",
+            "mesh",
+            "rssi",
+            "snr",
+        }
+    )
+    _TELEMETRY_KNOWN_KEYS = frozenset(
+        {
+            "temp1",
+            "temp2",
+            "hum",
+            "hum2",
+            "qfe",
+            "qnh",
+            "gas",
+            "co2",
+            "alt",
+            "batt",
+        }
+    )
 
-    async def store_telemetry(self, callsign: str, data: dict[str, Any]) -> None:
+    async def store_telemetry(self, callsign: str, data: dict[str, Any]) -> None:  # noqa: PLR0912, PLR0915 - complex handler kept intact
         """Store telemetry in dedicated table and update station_positions."""
         if not callsign:
             return
@@ -1449,21 +1558,21 @@ class SQLiteStorage:
         if isinstance(data.get("extras"), dict):
             extras_dict.update(data["extras"])
         all_known = self._TELEMETRY_META_KEYS | self._TELEMETRY_KNOWN_KEYS | {"extras"}
-        for k, v in data.items():
-            if k not in all_known and v is not None and v != 0:
-                extras_dict[k] = v
+        extras_dict.update(
+            {k: v for k, v in data.items() if k not in all_known and v is not None and v != 0}
+        )
         extras_json = json.dumps(extras_dict) if extras_dict else None
 
         # QFE < 850 hPa is unrealistic (firmware mapping error in UDP LoRa telemetry)
-        if qfe is not None and qfe < 850:
+        if qfe is not None and qfe < _MIN_PLAUSIBLE_HPA:
             qfe = None
 
         # If QFE missing but QNH + altitude available, calculate QFE
         # Barometric formula: QFE = QNH × (1 - 0.0065 × alt / 288.15)^5.255
         qnh = data.get("qnh")
-        if (qfe is None or qfe == 0) and qnh and alt:
-            if qnh > 850:  # Only use plausible QNH values
-                qfe = round(qnh * (1 - 0.0065 * alt / 288.15) ** 5.255, 1)
+        # Only use plausible QNH values
+        if (qfe is None or qfe == 0) and qnh and alt and qnh > _MIN_PLAUSIBLE_HPA:
+            qfe = round(qnh * (1 - 0.0065 * alt / 288.15) ** 5.255, 1)
 
         qnh = None  # Node QNH is unreliable; frontend calculates from QFE + alt
 
@@ -1499,9 +1608,9 @@ class SQLiteStorage:
                 if merge_sets:
                     merge_vals.append(existing["id"])
                     await self._execute(
-                        f"UPDATE telemetry SET {', '.join(merge_sets)}"
-                        " WHERE id = ?",
-                        tuple(merge_vals), fetch=False,
+                        f"UPDATE telemetry SET {', '.join(merge_sets)} WHERE id = ?",  # noqa: S608 - identifiers from fixed set; values parameterized
+                        tuple(merge_vals),
+                        fetch=False,
                     )
                 return  # keep existing record with real QFE
 
@@ -1519,7 +1628,8 @@ class SQLiteStorage:
                     extras_json = existing["extras"]
                 await self._execute(
                     "DELETE FROM telemetry WHERE callsign = ? AND timestamp > ?",
-                    (callsign, timestamp - 60_000), fetch=False,
+                    (callsign, timestamp - 60_000),
+                    fetch=False,
                 )
 
         # For T# telemetry packets (no altitude), look up from station_positions
@@ -1534,7 +1644,13 @@ class SQLiteStorage:
 
         logger.debug(
             "Telemetry from %s: temp1=%s temp2=%s hum=%s qfe=%s alt=%s batt=%s",
-            callsign, temp1, temp2, hum, qfe, alt, batt,
+            callsign,
+            temp1,
+            temp2,
+            hum,
+            qfe,
+            alt,
+            batt,
         )
 
         await self._execute(
@@ -1542,8 +1658,21 @@ class SQLiteStorage:
             " (callsign, timestamp, temp1, temp2, hum, hum2,"
             "  qfe, qnh, gas, co2, alt, batt, extras)"
             " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-            (callsign, timestamp, temp1, temp2, hum, hum2,
-             qfe, qnh, gas, co2, alt, batt, extras_json),
+            (
+                callsign,
+                timestamp,
+                temp1,
+                temp2,
+                hum,
+                hum2,
+                qfe,
+                qnh,
+                gas,
+                co2,
+                alt,
+                batt,
+                extras_json,
+            ),
             fetch=False,
         )
 
@@ -1568,12 +1697,25 @@ class SQLiteStorage:
                    last_seen = MAX(station_positions.last_seen, excluded.last_seen),
                    extras = COALESCE(excluded.extras, station_positions.extras)
             """,
-            (callsign, temp1, temp2, hum, hum2, qfe, qnh, gas, co2, batt,
-             timestamp, timestamp, extras_json),
+            (
+                callsign,
+                temp1,
+                temp2,
+                hum,
+                hum2,
+                qfe,
+                qnh,
+                gas,
+                co2,
+                batt,
+                timestamp,
+                timestamp,
+                extras_json,
+            ),
             fetch=False,
         )
 
-    def _should_filter_message(self, message: dict[str, Any]) -> bool:
+    def _should_filter_message(self, message: dict[str, Any]) -> bool:  # noqa: PLR0911 - complex handler kept intact
         """Check if message should be filtered out."""
         msg_content = message.get("msg", "")
         src_type = message.get("src_type", "")
@@ -1591,10 +1733,7 @@ class SQLiteStorage:
             return True
         if msg_content == "-- invalid character --":
             return True
-        if "No core dump" in msg_content:
-            return True
-
-        return False
+        return "No core dump" in msg_content
 
     async def get_message_count(self) -> int:
         """Get current message count."""
@@ -1631,7 +1770,7 @@ class SQLiteStorage:
         # naive datetime whose .timestamp() is interpreted as LOCAL time, shifting every
         # cutoff below by the local UTC offset (2h in CEST). That used to leave only a
         # ~2h/day sliver of 5-min buckets for the rollup. See doc/charts-wrong.md §13.
-        now = datetime.now(timezone.utc)
+        now = datetime.now(UTC)
         cutoff_msg_ms = int((now - timedelta(hours=prune_hours)).timestamp() * 1000)
         cutoff_pos_ms = int((now - timedelta(hours=prune_hours_pos)).timestamp() * 1000)
         cutoff_ack_ms = int((now - timedelta(hours=prune_hours_ack)).timestamp() * 1000)
@@ -1655,8 +1794,7 @@ class SQLiteStorage:
         # Catch-all for any other types: use the shortest retention
         min_cutoff_ms = max(cutoff_pos_ms, cutoff_ack_ms)
         await self._execute(
-            "DELETE FROM messages WHERE type NOT IN ('msg', 'pos', 'ack')"
-            " AND timestamp < ?",
+            "DELETE FROM messages WHERE type NOT IN ('msg', 'pos', 'ack') AND timestamp < ?",
             (min_cutoff_ms,),
             fetch=False,
         )
@@ -1665,7 +1803,7 @@ class SQLiteStorage:
         if block_list:
             placeholders = ",".join("?" * len(block_list))
             await self._execute(
-                f"DELETE FROM messages WHERE src IN ({placeholders})",
+                f"DELETE FROM messages WHERE src IN ({placeholders})",  # noqa: S608 - identifiers from fixed set; values parameterized
                 tuple(block_list),
                 fetch=False,
             )
@@ -1718,7 +1856,8 @@ class SQLiteStorage:
         if size_mb > self.MAX_DB_SIZE_MB:
             logger.warning(
                 "DB size %.0f MB exceeds %d MB limit — pruning oldest data",
-                size_mb, self.MAX_DB_SIZE_MB,
+                size_mb,
+                self.MAX_DB_SIZE_MB,
             )
             target_mb = self.MAX_DB_SIZE_MB * 0.9  # aim for 90% to avoid re-trigger
             excess_bytes = int((size_mb - target_mb) * 1024 * 1024)
@@ -1730,20 +1869,18 @@ class SQLiteStorage:
                 ("signal_buckets", "bucket_ts"),
                 ("messages", "timestamp"),
             ]:
-                result_raw = await self._execute(f"SELECT COUNT(*) as c FROM {table}")
+                result_raw = await self._execute(f"SELECT COUNT(*) as c FROM {table}")  # noqa: S608 - identifiers from fixed set; values parameterized
                 result = cast(list[dict[str, Any]], result_raw)
                 table_count = result[0]["c"] if result else 0
                 to_delete = min(table_count, rows_to_free)
                 if to_delete > 0:
                     await self._execute(
-                        f"DELETE FROM {table} WHERE rowid IN"
+                        f"DELETE FROM {table} WHERE rowid IN"  # noqa: S608 - identifiers from fixed set; values parameterized
                         f" (SELECT rowid FROM {table} ORDER BY {ts_col} ASC LIMIT ?)",
                         (to_delete,),
                         fetch=False,
                     )
-                    logger.info(
-                        "Size limit: deleted %d oldest rows from %s", to_delete, table
-                    )
+                    logger.info("Size limit: deleted %d oldest rows from %s", to_delete, table)
                     rows_to_free -= to_delete
                 if rows_to_free <= 0:
                     break
@@ -1751,9 +1888,7 @@ class SQLiteStorage:
             # VACUUM rebuilds the file to reclaim disk space
             await self._execute("VACUUM", fetch=False)
             new_size = await self.get_storage_size_mb()
-            logger.info(
-                "Size-based pruning complete: %.0f MB → %.0f MB", size_mb, new_size
-            )
+            logger.info("Size-based pruning complete: %.0f MB → %.0f MB", size_mb, new_size)
 
         # Update query planner statistics after bulk deletes
         await self._execute("ANALYZE", fetch=False)
@@ -1812,7 +1947,7 @@ class SQLiteStorage:
             WHERE type = 'msg' AND msg NOT LIKE '%:ack%'
             ORDER BY timestamp DESC
             LIMIT 1000
-        """
+        """  # noqa: S608 - identifiers from fixed set; values parameterized
         msg_rows_raw = await self._execute(msgs_query)
         msg_rows = cast(list[dict[str, Any]], msg_rows_raw)
 
@@ -1821,7 +1956,7 @@ class SQLiteStorage:
             WHERE type = 'pos'
             ORDER BY timestamp DESC
             LIMIT 500
-        """
+        """  # noqa: S608 - identifiers from fixed set; values parameterized
         pos_rows_raw = await self._execute(pos_query)
         pos_rows = cast(list[dict[str, Any]], pos_rows_raw)
 
@@ -1831,13 +1966,13 @@ class SQLiteStorage:
         for row in msg_rows:
             data = self._build_message_dict(row)
             dst = data.get("dst")
-            if dst and len(msgs_per_dst[dst]) < 50:
+            if dst and len(msgs_per_dst[dst]) < _INITIAL_PER_KEY_LIMIT:
                 msgs_per_dst[dst].append(json.dumps(data, ensure_ascii=False))
 
         for row in pos_rows:
             data = self._build_message_dict(row)
             src = data.get("src")
-            if src and len(pos_per_src[src]) < 50:
+            if src and len(pos_per_src[src]) < _INITIAL_PER_KEY_LIMIT:
                 pos_per_src[src].append(json.dumps(data, ensure_ascii=False))
 
         msg_msgs: list[str] = []
@@ -1851,7 +1986,7 @@ class SQLiteStorage:
         return msg_msgs + pos_msgs
 
     @staticmethod
-    def _build_position_dict(row: dict[str, Any]) -> dict[str, Any]:
+    def _build_position_dict(row: dict[str, Any]) -> dict[str, Any]:  # noqa: PLR0912 - complex handler kept intact
         """Build a position dict from station_positions row."""
         pos_data: dict[str, Any] = {
             "type": "pos",
@@ -1907,7 +2042,8 @@ class SQLiteStorage:
         return pos_data
 
     async def get_smart_initial_with_summary(
-        self, limit_per_dst: int = 20,
+        self,
+        limit_per_dst: int = 20,
     ) -> tuple[dict[str, Any], dict[str, Any]]:
         """Get smart initial payload + summary in a single thread call.
 
@@ -1927,7 +2063,7 @@ class SQLiteStorage:
             try:
                 # 1. Messages: window function, partition by conversation_key
                 msg_rows = conn.execute(
-                    f"SELECT {_MSG_SELECT} FROM ("
+                    f"SELECT {_MSG_SELECT} FROM ("  # noqa: S608 - identifiers from fixed set; values parameterized
                     f"  SELECT *, ROW_NUMBER() OVER ("
                     f"    PARTITION BY COALESCE(conversation_key, dst)"
                     f"    ORDER BY timestamp DESC"
@@ -1938,8 +2074,7 @@ class SQLiteStorage:
                     (limit_per_dst,),
                 ).fetchall()
                 messages = [
-                    json.dumps(build_msg(dict(row)), ensure_ascii=False)
-                    for row in msg_rows
+                    json.dumps(build_msg(dict(row)), ensure_ascii=False) for row in msg_rows
                 ]
 
                 # 2. Positions: station_positions table
@@ -1947,20 +2082,16 @@ class SQLiteStorage:
                     "SELECT * FROM station_positions",
                 ).fetchall()
                 positions = [
-                    json.dumps(build_pos(dict(row)), ensure_ascii=False)
-                    for row in pos_rows
+                    json.dumps(build_pos(dict(row)), ensure_ascii=False) for row in pos_rows
                 ]
 
                 # 3. ACK messages
                 ack_rows = conn.execute(
-                    f"SELECT {_MSG_SELECT} FROM messages"
+                    f"SELECT {_MSG_SELECT} FROM messages"  # noqa: S608 - identifiers from fixed set; values parameterized
                     " WHERE type = 'msg' AND msg LIKE '%:ack%'"
                     " ORDER BY timestamp DESC LIMIT 200",
                 ).fetchall()
-                acks = [
-                    json.dumps(build_msg(dict(row)), ensure_ascii=False)
-                    for row in ack_rows
-                ]
+                acks = [json.dumps(build_msg(dict(row)), ensure_ascii=False) for row in ack_rows]
 
                 # 4. Summary counts
                 summary_rows = conn.execute(
@@ -1969,9 +2100,7 @@ class SQLiteStorage:
                     " WHERE type = 'msg' AND msg NOT LIKE '%:ack%'"
                     " GROUP BY key",
                 ).fetchall()
-                summary = {
-                    row["key"]: row["cnt"] for row in summary_rows if row["key"]
-                }
+                summary = {row["key"]: row["cnt"] for row in summary_rows if row["key"]}
 
                 initial = {"messages": messages, "positions": positions, "acks": acks}
                 return initial, summary
@@ -1981,7 +2110,8 @@ class SQLiteStorage:
         initial, summary = await asyncio.to_thread(_run)
         logger.debug(
             "smart_initial: %d msgs, %d pos, %d acks",
-            len(initial["messages"]), len(initial["positions"]),
+            len(initial["messages"]),
+            len(initial["positions"]),
             len(initial["acks"]),
         )
         return initial, summary
@@ -1997,7 +2127,10 @@ class SQLiteStorage:
         return summary
 
     async def get_messages_page(
-        self, dst: str, before_timestamp: int | None = None, limit: int = 20,
+        self,
+        dst: str,
+        before_timestamp: int | None = None,
+        limit: int = 20,
         src: str | None = None,
     ) -> dict[str, Any]:
         """Get a page of messages for a destination, cursor-based.
@@ -2008,7 +2141,7 @@ class SQLiteStorage:
         if before_timestamp is None:
             before_timestamp = int(time.time() * 1000)
 
-        is_dm = dst and src and not dst.isdigit() and dst != '*'
+        is_dm = dst and src and not dst.isdigit() and dst != "*"
         is_group = bool(dst) and (dst.isdigit() or dst == "TEST")
 
         params: tuple[Any, ...] = ()
@@ -2018,7 +2151,7 @@ class SQLiteStorage:
             # are dropped by _should_filter_message, so this only serves
             # pre-filter legacy rows.
             query = (
-                f"SELECT {_MSG_SELECT} FROM messages"
+                f"SELECT {_MSG_SELECT} FROM messages"  # noqa: S608 - identifiers from fixed set; values parameterized
                 " WHERE type = 'msg' AND conversation_key = '*'"
                 " AND msg LIKE '{CET}%' AND timestamp < ?"
                 " ORDER BY timestamp DESC LIMIT ?"
@@ -2029,7 +2162,7 @@ class SQLiteStorage:
             # (dst 'DB0FHR-12,*' → key '*') are included; {CET} rows
             # belong to the virtual Time chat
             query = (
-                f"SELECT {_MSG_SELECT} FROM messages"
+                f"SELECT {_MSG_SELECT} FROM messages"  # noqa: S608 - identifiers from fixed set; values parameterized
                 " WHERE type = 'msg' AND msg NOT LIKE '%:ack%'"
                 " AND conversation_key = '*' AND msg NOT LIKE '{CET}%'"
                 " AND timestamp < ?"
@@ -2040,7 +2173,7 @@ class SQLiteStorage:
             # DM: compute conversation_key and use idx_messages_convkey_ts
             conv_key = compute_conversation_key(src or "", dst)
             query = (
-                f"SELECT {_MSG_SELECT} FROM messages"
+                f"SELECT {_MSG_SELECT} FROM messages"  # noqa: S608 - identifiers from fixed set; values parameterized
                 " WHERE type = 'msg' AND conversation_key = ?"
                 " AND timestamp < ? ORDER BY timestamp DESC LIMIT ?"
             )
@@ -2049,7 +2182,7 @@ class SQLiteStorage:
             # Group: match via conversation_key so via-routed posts
             # (dst 'VIA,232' → key '232') are included in the page
             query = (
-                f"SELECT {_MSG_SELECT} FROM messages"
+                f"SELECT {_MSG_SELECT} FROM messages"  # noqa: S608 - identifiers from fixed set; values parameterized
                 " WHERE type = 'msg' AND msg NOT LIKE '%:ack%'"
                 " AND conversation_key = ? AND timestamp < ?"
                 " ORDER BY timestamp DESC LIMIT ?"
@@ -2057,7 +2190,7 @@ class SQLiteStorage:
             params = (dst, before_timestamp, limit + 1)
         elif dst:
             query = (
-                f"SELECT {_MSG_SELECT} FROM messages"
+                f"SELECT {_MSG_SELECT} FROM messages"  # noqa: S608 - identifiers from fixed set; values parameterized
                 " WHERE type = 'msg' AND msg NOT LIKE '%:ack%'"
                 " AND dst = ? AND timestamp < ?"
                 " ORDER BY timestamp DESC LIMIT ?"
@@ -2065,7 +2198,7 @@ class SQLiteStorage:
             params = (dst, before_timestamp, limit + 1)
         else:
             query = (
-                f"SELECT {_MSG_SELECT} FROM messages"
+                f"SELECT {_MSG_SELECT} FROM messages"  # noqa: S608 - identifiers from fixed set; values parameterized
                 " WHERE type = 'msg' AND msg NOT LIKE '%:ack%'"
                 " AND timestamp < ?"
                 " ORDER BY timestamp DESC LIMIT ?"
@@ -2077,26 +2210,19 @@ class SQLiteStorage:
 
         has_more = len(rows) > limit
         result = [
-            json.dumps(self._build_message_dict(row), ensure_ascii=False)
-            for row in rows[:limit]
+            json.dumps(self._build_message_dict(row), ensure_ascii=False) for row in rows[:limit]
         ]
         result.reverse()
         return {"messages": result, "has_more": has_more}
 
     async def get_full_dump(self) -> list[str]:
         """Get full message dump."""
-        query = (
-            f"SELECT {_MSG_SELECT} FROM messages WHERE type = 'msg'"
-            " ORDER BY timestamp"
-        )
+        query = f"SELECT {_MSG_SELECT} FROM messages WHERE type = 'msg' ORDER BY timestamp"  # noqa: S608 - identifiers from fixed set; values parameterized
         rows_raw = await self._execute(query)
         rows = cast(list[dict[str, Any]], rows_raw)
-        return [
-            json.dumps(self._build_message_dict(row), ensure_ascii=False)
-            for row in rows
-        ]
+        return [json.dumps(self._build_message_dict(row), ensure_ascii=False) for row in rows]
 
-    async def process_mheard_store_parallel(
+    async def process_mheard_store_parallel(  # noqa: PLR0912, PLR0915 - complex handler kept intact
         self, progress_callback: Any = None
     ) -> list[dict[str, Any]]:
         """Process messages for MHeard statistics.
@@ -2136,15 +2262,15 @@ class SQLiteStorage:
             for row in bucket_rows:
                 callsign_data[row["callsign"]].append(row)
             qualified = {
-                cs: entries for cs, entries in callsign_data.items()
+                cs: entries
+                for cs, entries in callsign_data.items()
                 if len(entries) >= MIN_DATAPOINTS_FOR_STATS
             }
 
             if progress_callback:
                 await progress_callback(
                     "bucketing",
-                    f"Processing {len(bucket_rows)} buckets"
-                    f" for {len(qualified)} stations...",
+                    f"Processing {len(bucket_rows)} buckets for {len(qualified)} stations...",
                 )
 
             final_result = []
@@ -2152,8 +2278,7 @@ class SQLiteStorage:
                 if progress_callback:
                     await progress_callback(
                         "gaps",
-                        f"Building chart for {callsign}"
-                        f" ({idx}/{len(qualified)})...",
+                        f"Building chart for {callsign} ({idx}/{len(qualified)})...",
                         callsign,
                     )
 
@@ -2166,43 +2291,48 @@ class SQLiteStorage:
                     bucket_time = entry["bucket_ts"] // 1000
 
                     if prev_time and (bucket_time - prev_time) > gap_threshold:
-                        final_result.append({
-                            "src_type": "STATS",
-                            "timestamp": bucket_time - BUCKET_SECONDS,
-                            "callsign": callsign,
-                            "rssi": None, "snr": None,
-                            "rssi_min": None, "rssi_max": None,
-                            "snr_min": None, "snr_max": None,
-                            "count": None,
-                            "segment_id": f"{callsign}_gap_{segment_id}_to_{segment_id + 1}",
-                            "segment_size": 1,
-                            "is_gap_marker": True,
-                        })
+                        final_result.append(
+                            {
+                                "src_type": "STATS",
+                                "timestamp": bucket_time - BUCKET_SECONDS,
+                                "callsign": callsign,
+                                "rssi": None,
+                                "snr": None,
+                                "rssi_min": None,
+                                "rssi_max": None,
+                                "snr_min": None,
+                                "snr_max": None,
+                                "count": None,
+                                "segment_id": f"{callsign}_gap_{segment_id}_to_{segment_id + 1}",
+                                "segment_size": 1,
+                                "is_gap_marker": True,
+                            }
+                        )
                         segment_id += 1
 
-                    final_result.append({
-                        "src_type": "STATS",
-                        "timestamp": bucket_time,
-                        "callsign": callsign,
-                        "rssi": entry["rssi_avg"],
-                        "snr": entry["snr_avg"],
-                        "rssi_min": entry["rssi_min"],
-                        "rssi_max": entry["rssi_max"],
-                        "snr_min": entry["snr_min"],
-                        "snr_max": entry["snr_max"],
-                        "count": entry["count"],
-                        "segment_id": f"{callsign}_seg_{segment_id}",
-                        "segment_size": 1,
-                    })
+                    final_result.append(
+                        {
+                            "src_type": "STATS",
+                            "timestamp": bucket_time,
+                            "callsign": callsign,
+                            "rssi": entry["rssi_avg"],
+                            "snr": entry["snr_avg"],
+                            "rssi_min": entry["rssi_min"],
+                            "rssi_max": entry["rssi_max"],
+                            "snr_min": entry["snr_min"],
+                            "snr_max": entry["snr_max"],
+                            "count": entry["count"],
+                            "segment_id": f"{callsign}_seg_{segment_id}",
+                            "segment_size": 1,
+                        }
+                    )
                     prev_time = bucket_time
 
             result = sorted(final_result, key=lambda x: (x["callsign"], x["timestamp"]))
 
             if progress_callback:
                 stats_entries = [r for r in result if not r.get("is_gap_marker")]
-                callsign_count = (
-                    len(set(e["callsign"] for e in stats_entries)) if stats_entries else 0
-                )
+                callsign_count = len({e["callsign"] for e in stats_entries}) if stats_entries else 0
                 await progress_callback(
                     "done",
                     f"{len(stats_entries)} data points for {callsign_count} stations",
@@ -2222,8 +2352,10 @@ class SQLiteStorage:
         """
         params = (
             cutoff_ms,
-            VALID_RSSI_RANGE[0], VALID_RSSI_RANGE[1],
-            VALID_SNR_RANGE[0], VALID_SNR_RANGE[1],
+            VALID_RSSI_RANGE[0],
+            VALID_RSSI_RANGE[1],
+            VALID_SNR_RANGE[0],
+            VALID_SNR_RANGE[1],
         )
 
         rows_raw = await self._execute(query, params)
@@ -2256,9 +2388,7 @@ class SQLiteStorage:
 
         if progress_callback:
             stats_entries = [r for r in result if not r.get("is_gap_marker")]
-            callsign_count = (
-                len(set(e["callsign"] for e in stats_entries)) if stats_entries else 0
-            )
+            callsign_count = len({e["callsign"] for e in stats_entries}) if stats_entries else 0
             await progress_callback(
                 "done",
                 f"{len(stats_entries)} data points for {callsign_count} stations",
@@ -2306,15 +2436,15 @@ class SQLiteStorage:
         for row in bucket_rows:
             callsign_data[row["callsign"]].append(row)
         qualified = {
-            cs: entries for cs, entries in callsign_data.items()
+            cs: entries
+            for cs, entries in callsign_data.items()
             if len(entries) >= MIN_DATAPOINTS_FOR_STATS
         }
 
         if progress_callback:
             await progress_callback(
                 "bucketing",
-                f"Processing {len(bucket_rows)} hourly buckets"
-                f" for {len(qualified)} stations...",
+                f"Processing {len(bucket_rows)} hourly buckets for {len(qualified)} stations...",
             )
 
         final_result = []
@@ -2322,8 +2452,7 @@ class SQLiteStorage:
             if progress_callback:
                 await progress_callback(
                     "gaps",
-                    f"Building chart for {callsign}"
-                    f" ({idx}/{len(qualified)})...",
+                    f"Building chart for {callsign} ({idx}/{len(qualified)})...",
                     callsign,
                 )
 
@@ -2335,43 +2464,48 @@ class SQLiteStorage:
                 bucket_time = entry["bucket_ts"] // 1000
 
                 if prev_time and (bucket_time - prev_time) > HOURLY_GAP_THRESHOLD:
-                    final_result.append({
-                        "src_type": "STATS",
-                        "timestamp": bucket_time - 3600,
-                        "callsign": callsign,
-                        "rssi": None, "snr": None,
-                        "rssi_min": None, "rssi_max": None,
-                        "snr_min": None, "snr_max": None,
-                        "count": None,
-                        "segment_id": f"{callsign}_gap_{segment_id}_to_{segment_id + 1}",
-                        "segment_size": 1,
-                        "is_gap_marker": True,
-                    })
+                    final_result.append(
+                        {
+                            "src_type": "STATS",
+                            "timestamp": bucket_time - 3600,
+                            "callsign": callsign,
+                            "rssi": None,
+                            "snr": None,
+                            "rssi_min": None,
+                            "rssi_max": None,
+                            "snr_min": None,
+                            "snr_max": None,
+                            "count": None,
+                            "segment_id": f"{callsign}_gap_{segment_id}_to_{segment_id + 1}",
+                            "segment_size": 1,
+                            "is_gap_marker": True,
+                        }
+                    )
                     segment_id += 1
 
-                final_result.append({
-                    "src_type": "STATS",
-                    "timestamp": bucket_time,
-                    "callsign": callsign,
-                    "rssi": entry["rssi_avg"],
-                    "snr": entry["snr_avg"],
-                    "rssi_min": entry["rssi_min"],
-                    "rssi_max": entry["rssi_max"],
-                    "snr_min": entry["snr_min"],
-                    "snr_max": entry["snr_max"],
-                    "count": entry["count"],
-                    "segment_id": f"{callsign}_seg_{segment_id}",
-                    "segment_size": 1,
-                })
+                final_result.append(
+                    {
+                        "src_type": "STATS",
+                        "timestamp": bucket_time,
+                        "callsign": callsign,
+                        "rssi": entry["rssi_avg"],
+                        "snr": entry["snr_avg"],
+                        "rssi_min": entry["rssi_min"],
+                        "rssi_max": entry["rssi_max"],
+                        "snr_min": entry["snr_min"],
+                        "snr_max": entry["snr_max"],
+                        "count": entry["count"],
+                        "segment_id": f"{callsign}_seg_{segment_id}",
+                        "segment_size": 1,
+                    }
+                )
                 prev_time = bucket_time
 
         result = sorted(final_result, key=lambda x: (x["callsign"], x["timestamp"]))
 
         if progress_callback:
             stats_entries = [r for r in result if not r.get("is_gap_marker")]
-            callsign_count = (
-                len(set(e["callsign"] for e in stats_entries)) if stats_entries else 0
-            )
+            callsign_count = len({e["callsign"] for e in stats_entries}) if stats_entries else 0
             await progress_callback(
                 "done",
                 f"{len(stats_entries)} data points for {callsign_count} stations",
@@ -2418,15 +2552,15 @@ class SQLiteStorage:
         for row in bucket_rows:
             callsign_data[row["callsign"]].append(row)
         qualified = {
-            cs: entries for cs, entries in callsign_data.items()
+            cs: entries
+            for cs, entries in callsign_data.items()
             if len(entries) >= MIN_DATAPOINTS_FOR_STATS
         }
 
         if progress_callback:
             await progress_callback(
                 "bucketing",
-                f"Processing {len(bucket_rows)} buckets"
-                f" for {len(qualified)} stations...",
+                f"Processing {len(bucket_rows)} buckets for {len(qualified)} stations...",
             )
 
         final_result = []
@@ -2434,8 +2568,7 @@ class SQLiteStorage:
             if progress_callback:
                 await progress_callback(
                     "gaps",
-                    f"Building chart for {callsign}"
-                    f" ({idx}/{len(qualified)})...",
+                    f"Building chart for {callsign} ({idx}/{len(qualified)})...",
                     callsign,
                 )
 
@@ -2447,43 +2580,48 @@ class SQLiteStorage:
                 bucket_time = entry["bucket_ts"] // 1000
 
                 if prev_time and (bucket_time - prev_time) > HOURLY_GAP_THRESHOLD:
-                    final_result.append({
-                        "src_type": "STATS",
-                        "timestamp": bucket_time - 3600,
-                        "callsign": callsign,
-                        "rssi": None, "snr": None,
-                        "rssi_min": None, "rssi_max": None,
-                        "snr_min": None, "snr_max": None,
-                        "count": None,
-                        "segment_id": f"{callsign}_gap_{segment_id}_to_{segment_id + 1}",
-                        "segment_size": 1,
-                        "is_gap_marker": True,
-                    })
+                    final_result.append(
+                        {
+                            "src_type": "STATS",
+                            "timestamp": bucket_time - 3600,
+                            "callsign": callsign,
+                            "rssi": None,
+                            "snr": None,
+                            "rssi_min": None,
+                            "rssi_max": None,
+                            "snr_min": None,
+                            "snr_max": None,
+                            "count": None,
+                            "segment_id": f"{callsign}_gap_{segment_id}_to_{segment_id + 1}",
+                            "segment_size": 1,
+                            "is_gap_marker": True,
+                        }
+                    )
                     segment_id += 1
 
-                final_result.append({
-                    "src_type": "STATS",
-                    "timestamp": bucket_time,
-                    "callsign": callsign,
-                    "rssi": entry["rssi_avg"],
-                    "snr": entry["snr_avg"],
-                    "rssi_min": entry["rssi_min"],
-                    "rssi_max": entry["rssi_max"],
-                    "snr_min": entry["snr_min"],
-                    "snr_max": entry["snr_max"],
-                    "count": entry["count"],
-                    "segment_id": f"{callsign}_seg_{segment_id}",
-                    "segment_size": 1,
-                })
+                final_result.append(
+                    {
+                        "src_type": "STATS",
+                        "timestamp": bucket_time,
+                        "callsign": callsign,
+                        "rssi": entry["rssi_avg"],
+                        "snr": entry["snr_avg"],
+                        "rssi_min": entry["rssi_min"],
+                        "rssi_max": entry["rssi_max"],
+                        "snr_min": entry["snr_min"],
+                        "snr_max": entry["snr_max"],
+                        "count": entry["count"],
+                        "segment_id": f"{callsign}_seg_{segment_id}",
+                        "segment_size": 1,
+                    }
+                )
                 prev_time = bucket_time
 
         result = sorted(final_result, key=lambda x: (x["callsign"], x["timestamp"]))
 
         if progress_callback:
             stats_entries = [r for r in result if not r.get("is_gap_marker")]
-            callsign_count = (
-                len(set(e["callsign"] for e in stats_entries)) if stats_entries else 0
-            )
+            callsign_count = len({e["callsign"] for e in stats_entries}) if stats_entries else 0
             await progress_callback(
                 "done",
                 f"{len(stats_entries)} data points for {callsign_count} stations",
@@ -2500,12 +2638,20 @@ class SQLiteStorage:
             rssi_vals = values["rssi"]
             snr_vals = values["snr"]
             if rssi_vals and snr_vals:
-                flush_data.append((
-                    callsign, bucket_start, bucket_ms,
-                    round(mean(rssi_vals), 2), min(rssi_vals), max(rssi_vals),
-                    round(mean(snr_vals), 2), round(min(snr_vals), 2),
-                    round(max(snr_vals), 2), len(rssi_vals),
-                ))
+                flush_data.append(
+                    (
+                        callsign,
+                        bucket_start,
+                        bucket_ms,
+                        round(mean(rssi_vals), 2),
+                        min(rssi_vals),
+                        max(rssi_vals),
+                        round(mean(snr_vals), 2),
+                        round(min(snr_vals), 2),
+                        round(max(snr_vals), 2),
+                        len(rssi_vals),
+                    )
+                )
         if flush_data:
             await self._execute_many(
                 "INSERT OR REPLACE INTO signal_buckets"
@@ -2543,21 +2689,23 @@ class SQLiteStorage:
                 # Check for gap
                 if prev_time and (bucket_time - prev_time) > gap_threshold:
                     # Insert gap marker
-                    final_result.append({
-                        "src_type": "STATS",
-                        "timestamp": bucket_time - BUCKET_SECONDS,
-                        "callsign": callsign,
-                        "rssi": None,
-                        "snr": None,
-                        "rssi_min": None,
-                        "rssi_max": None,
-                        "snr_min": None,
-                        "snr_max": None,
-                        "count": None,
-                        "segment_id": f"{callsign}_gap_{segment_id}_to_{segment_id + 1}",
-                        "segment_size": 1,
-                        "is_gap_marker": True,
-                    })
+                    final_result.append(
+                        {
+                            "src_type": "STATS",
+                            "timestamp": bucket_time - BUCKET_SECONDS,
+                            "callsign": callsign,
+                            "rssi": None,
+                            "snr": None,
+                            "rssi_min": None,
+                            "rssi_max": None,
+                            "snr_min": None,
+                            "snr_max": None,
+                            "count": None,
+                            "segment_id": f"{callsign}_gap_{segment_id}_to_{segment_id + 1}",
+                            "segment_size": 1,
+                            "is_gap_marker": True,
+                        }
+                    )
                     segment_id += 1
 
                 rssi_values = values["rssi"]
@@ -2565,20 +2713,22 @@ class SQLiteStorage:
                 count = min(len(rssi_values), len(snr_values))
 
                 if count > 0:
-                    final_result.append({
-                        "src_type": "STATS",
-                        "timestamp": bucket_time,
-                        "callsign": callsign,
-                        "rssi": round(mean(rssi_values), 2),
-                        "snr": round(mean(snr_values), 2),
-                        "rssi_min": min(rssi_values),
-                        "rssi_max": max(rssi_values),
-                        "snr_min": round(min(snr_values), 2),
-                        "snr_max": round(max(snr_values), 2),
-                        "count": count,
-                        "segment_id": f"{callsign}_seg_{segment_id}",
-                        "segment_size": 1,
-                    })
+                    final_result.append(
+                        {
+                            "src_type": "STATS",
+                            "timestamp": bucket_time,
+                            "callsign": callsign,
+                            "rssi": round(mean(rssi_values), 2),
+                            "snr": round(mean(snr_values), 2),
+                            "rssi_min": min(rssi_values),
+                            "rssi_max": max(rssi_values),
+                            "snr_min": round(min(snr_values), 2),
+                            "snr_max": round(max(snr_values), 2),
+                            "count": count,
+                            "segment_id": f"{callsign}_seg_{segment_id}",
+                            "segment_size": 1,
+                        }
+                    )
 
                 prev_time = bucket_time
 
@@ -2600,7 +2750,8 @@ class SQLiteStorage:
         final_result = []
 
         qualified = {
-            cs: entries for cs, entries in callsign_data.items()
+            cs: entries
+            for cs, entries in callsign_data.items()
             if len(entries) >= MIN_DATAPOINTS_FOR_STATS
         }
 
@@ -2617,21 +2768,23 @@ class SQLiteStorage:
 
             for bucket_time, values in entries:
                 if prev_time and (bucket_time - prev_time) > gap_threshold:
-                    final_result.append({
-                        "src_type": "STATS",
-                        "timestamp": bucket_time - BUCKET_SECONDS,
-                        "callsign": callsign,
-                        "rssi": None,
-                        "snr": None,
-                        "rssi_min": None,
-                        "rssi_max": None,
-                        "snr_min": None,
-                        "snr_max": None,
-                        "count": None,
-                        "segment_id": f"{callsign}_gap_{segment_id}_to_{segment_id + 1}",
-                        "segment_size": 1,
-                        "is_gap_marker": True,
-                    })
+                    final_result.append(
+                        {
+                            "src_type": "STATS",
+                            "timestamp": bucket_time - BUCKET_SECONDS,
+                            "callsign": callsign,
+                            "rssi": None,
+                            "snr": None,
+                            "rssi_min": None,
+                            "rssi_max": None,
+                            "snr_min": None,
+                            "snr_max": None,
+                            "count": None,
+                            "segment_id": f"{callsign}_gap_{segment_id}_to_{segment_id + 1}",
+                            "segment_size": 1,
+                            "is_gap_marker": True,
+                        }
+                    )
                     segment_id += 1
 
                 rssi_values = values["rssi"]
@@ -2639,20 +2792,22 @@ class SQLiteStorage:
                 count = min(len(rssi_values), len(snr_values))
 
                 if count > 0:
-                    final_result.append({
-                        "src_type": "STATS",
-                        "timestamp": bucket_time,
-                        "callsign": callsign,
-                        "rssi": round(mean(rssi_values), 2),
-                        "snr": round(mean(snr_values), 2),
-                        "rssi_min": min(rssi_values),
-                        "rssi_max": max(rssi_values),
-                        "snr_min": round(min(snr_values), 2),
-                        "snr_max": round(max(snr_values), 2),
-                        "count": count,
-                        "segment_id": f"{callsign}_seg_{segment_id}",
-                        "segment_size": 1,
-                    })
+                    final_result.append(
+                        {
+                            "src_type": "STATS",
+                            "timestamp": bucket_time,
+                            "callsign": callsign,
+                            "rssi": round(mean(rssi_values), 2),
+                            "snr": round(mean(snr_values), 2),
+                            "rssi_min": min(rssi_values),
+                            "rssi_max": max(rssi_values),
+                            "snr_min": round(min(snr_values), 2),
+                            "snr_max": round(max(snr_values), 2),
+                            "count": count,
+                            "segment_id": f"{callsign}_seg_{segment_id}",
+                            "segment_size": 1,
+                        }
+                    )
 
                 prev_time = bucket_time
 
@@ -2689,7 +2844,7 @@ class SQLiteStorage:
             "users": users,
         }
 
-    async def get_mheard_stations(self, limit: int, msg_type: str) -> dict[str, Any]:
+    async def get_mheard_stations(self, _limit: int, _msg_type: str) -> dict[str, Any]:
         """Get recently heard stations aggregated by callsign."""
         rows_raw = await self._execute(
             "SELECT src, type, timestamp FROM messages"
@@ -2714,17 +2869,18 @@ class SQLiteStorage:
 
             if data_type == "msg":
                 stations[call]["msg_count"] += 1
-                if timestamp > stations[call]["last_msg"]:
-                    stations[call]["last_msg"] = timestamp
+                stations[call]["last_msg"] = max(stations[call]["last_msg"], timestamp)
             elif data_type == "pos":
                 stations[call]["pos_count"] += 1
-                if timestamp > stations[call]["last_pos"]:
-                    stations[call]["last_pos"] = timestamp
+                stations[call]["last_pos"] = max(stations[call]["last_pos"], timestamp)
 
         return dict(stations)
 
     async def get_search_summary(
-        self, callsign: str, days: int, search_type: str,
+        self,
+        callsign: str,
+        days: int,
+        search_type: str,
     ) -> dict[str, Any]:
         """Aggregate search: counts, last timestamps, destinations, SIDs."""
         cutoff_ms = int((time.time() - days * 86400) * 1000)
@@ -2733,7 +2889,7 @@ class SQLiteStorage:
         params: tuple[Any, ...] = ()
         if search_type == "prefix":
             src_filter = " AND UPPER(src) LIKE ?"
-            params = (cutoff_ms, f"%{callsign.upper()}-%" )
+            params = (cutoff_ms, f"%{callsign.upper()}-%")
         elif search_type == "exact":
             src_filter = " AND UPPER(src) LIKE ?"
             params = (cutoff_ms, f"%{callsign.upper()}%")
@@ -2743,16 +2899,19 @@ class SQLiteStorage:
 
         # Query 1: counts and last timestamps by type
         rows_raw = await self._execute(
-            "SELECT type, COUNT(*) as cnt, MAX(timestamp) as last_ts"
+            "SELECT type, COUNT(*) as cnt, MAX(timestamp) as last_ts"  # noqa: S608 - identifiers from fixed set; values parameterized
             f" FROM messages WHERE timestamp >= ?{src_filter}"
             " GROUP BY type",
             params,
         )
         rows = cast(list[dict[str, Any]], rows_raw)
         result: dict[str, Any] = {
-            "msg_count": 0, "pos_count": 0,
-            "last_msg": None, "last_pos": None,
-            "destinations": [], "sids": {},
+            "msg_count": 0,
+            "pos_count": 0,
+            "last_msg": None,
+            "last_pos": None,
+            "destinations": [],
+            "sids": {},
         }
         for row in rows:
             if row["type"] == "msg":
@@ -2764,7 +2923,7 @@ class SQLiteStorage:
 
         # Query 2: distinct numeric destinations
         dest_rows_raw = await self._execute(
-            "SELECT DISTINCT dst FROM messages"
+            "SELECT DISTINCT dst FROM messages"  # noqa: S608 - identifiers from fixed set; values parameterized
             f" WHERE timestamp >= ? AND type = 'msg'{src_filter}"
             " AND dst GLOB '[0-9]*'",
             params,
@@ -2775,7 +2934,7 @@ class SQLiteStorage:
         # Query 3: SID activity (prefix search only)
         if search_type == "prefix":
             sid_rows_raw = await self._execute(
-                "SELECT src, MAX(timestamp) as last_ts FROM messages"
+                "SELECT src, MAX(timestamp) as last_ts FROM messages"  # noqa: S608 - identifiers from fixed set; values parameterized
                 f" WHERE timestamp >= ?{src_filter}"
                 " GROUP BY src",
                 params,
@@ -2785,9 +2944,9 @@ class SQLiteStorage:
             pattern = callsign.upper() + "-"
             for row in sid_rows:
                 for part in row["src"].split(","):
-                    part = part.strip().upper()
-                    if part.startswith(pattern) and "-" in part:
-                        sid = part.split("-")[1]
+                    norm = part.strip().upper()
+                    if norm.startswith(pattern) and "-" in norm:
+                        sid = norm.split("-")[1]
                         if sid not in sids or row["last_ts"] > sids[sid]:
                             sids[sid] = row["last_ts"]
             result["sids"] = sids
@@ -2827,12 +2986,12 @@ class SQLiteStorage:
     async def load_dump(self, filename: str) -> int:
         """Load messages from JSON dump file."""
         path = Path(filename)
-        if not path.exists():
+        if not path.exists():  # noqa: ASYNC240 - rare admin op, cheap stat call
             logger.info("Dump file not found: %s", filename)
             return 0
 
         def _load() -> list[dict[str, Any]]:
-            with open(path, encoding="utf-8") as f:
+            with path.open(encoding="utf-8") as f:
                 return cast(list[dict[str, Any]], json.load(f))
 
         data = await asyncio.to_thread(_load)
@@ -2858,19 +3017,21 @@ class SQLiteStorage:
             if self._should_filter_message(parsed):
                 continue
 
-            params_list.append((
-                parsed.get("msg_id"),
-                parsed.get("src", ""),
-                parsed.get("dst", ""),
-                parsed.get("msg", ""),
-                parsed.get("type", "msg"),
-                parsed.get("timestamp", 0),
-                parsed.get("rssi"),
-                parsed.get("snr"),
-                parsed.get("src_type", ""),
-                raw,
-                timestamp_str,
-            ))
+            params_list.append(
+                (
+                    parsed.get("msg_id"),
+                    parsed.get("src", ""),
+                    parsed.get("dst", ""),
+                    parsed.get("msg", ""),
+                    parsed.get("type", "msg"),
+                    parsed.get("timestamp", 0),
+                    parsed.get("rssi"),
+                    parsed.get("snr"),
+                    parsed.get("src_type", ""),
+                    raw,
+                    timestamp_str,
+                )
+            )
 
         if params_list:
             await self._execute_many(insert_query, params_list)
@@ -2888,7 +3049,7 @@ class SQLiteStorage:
         data = [{"raw": row["raw_json"], "timestamp": row["created_at"]} for row in rows]
 
         def _save() -> None:
-            with open(filename, "w", encoding="utf-8") as f:
+            with Path(filename).open("w", encoding="utf-8") as f:
                 json.dump(data, f, ensure_ascii=False, indent=2)
 
         await asyncio.to_thread(_save)
@@ -2906,9 +3067,7 @@ class SQLiteStorage:
         )
         return cast(list[dict[str, Any]], result)
 
-    async def get_telemetry_chart_data_bucketed(
-        self, hours: int = 8760
-    ) -> list[dict[str, Any]]:
+    async def get_telemetry_chart_data_bucketed(self, hours: int = 8760) -> list[dict[str, Any]]:
         """Return telemetry aggregated into 4-hour buckets with min/max."""
         cutoff = int((time.time() - hours * 3600) * 1000)
         bucket_ms = 4 * 3600 * 1000  # 4 hours
@@ -2929,7 +3088,7 @@ class SQLiteStorage:
               AND (temp1 IS NOT NULL OR hum IS NOT NULL OR qfe IS NOT NULL)
             GROUP BY callsign, bucket_ts
             ORDER BY callsign, bucket_ts
-            """,
+            """,  # noqa: S608 - identifiers from fixed set; values parameterized
             (cutoff,),
         )
         return cast(list[dict[str, Any]], result)
@@ -2952,9 +3111,7 @@ class SQLiteStorage:
             fetch=False,
         )
 
-    async def delete_messages_by_dst(
-        self, dst: str, own_call: str = "", read_key: str = ""
-    ) -> int:
+    async def delete_messages_by_dst(self, dst: str, own_call: str = "", read_key: str = "") -> int:
         """Delete a whole conversation, mirroring the webapp's client-side
         removal semantics.
 
@@ -3003,9 +3160,7 @@ class SQLiteStorage:
                     )
                 deleted = cursor.rowcount
                 # Clean up read_counts for this destination
-                conn.execute(
-                    "DELETE FROM read_counts WHERE dst = ?", (read_key or dst,)
-                )
+                conn.execute("DELETE FROM read_counts WHERE dst = ?", (read_key or dst,))
                 conn.commit()
                 return deleted
 
@@ -3021,6 +3176,7 @@ class SQLiteStorage:
 
     async def set_hidden_destinations(self, destinations: list[str]) -> None:
         """Bulk replace all hidden destinations."""
+
         def _run() -> None:
             with sqlite3.connect(self.db_path) as conn:
                 conn.execute("DELETE FROM hidden_destinations")
@@ -3056,6 +3212,7 @@ class SQLiteStorage:
 
     async def set_blocked_texts(self, texts: list[str]) -> None:
         """Bulk replace all blocked text patterns."""
+
         def _run() -> None:
             with sqlite3.connect(self.db_path) as conn:
                 conn.execute("DELETE FROM blocked_texts")
@@ -3165,7 +3322,7 @@ class SQLiteStorage:
     async def get_classifier_rules(self, enabled_only: bool = False) -> list[dict[str, Any]]:
         where = "WHERE enabled = 1" if enabled_only else ""
         rows_raw = await self._execute(
-            f"SELECT * FROM classifier_rules {where} ORDER BY priority ASC, id ASC"  # noqa: S608
+            f"SELECT * FROM classifier_rules {where} ORDER BY priority ASC, id ASC"  # noqa: S608 - identifiers from fixed set; values parameterized
         )
         rows = cast(list[dict[str, Any]], rows_raw)
         for r in rows:
@@ -3177,7 +3334,7 @@ class SQLiteStorage:
             r["builtin"] = bool(r["builtin"])
         return rows
 
-    async def insert_classifier_rule(
+    async def insert_classifier_rule(  # noqa: PLR0913 - signature fixed by call sites
         self,
         *,
         name: str,
@@ -3189,7 +3346,7 @@ class SQLiteStorage:
         enabled: bool = True,
         builtin: bool = False,
     ) -> dict[str, Any]:
-        now_zulu = datetime.now().strftime("%Y-%m-%dT%H:%M:%SZ")
+        now_zulu = datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
         tags_json = json.dumps(extra_tags) if extra_tags else None
 
         def _run() -> int:
@@ -3199,16 +3356,24 @@ class SQLiteStorage:
                     "(name, pattern, scope, category, extra_tags, priority, "
                     " enabled, builtin, created_at, updated_at) "
                     "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                    (name, pattern, scope, category, tags_json, priority,
-                     int(enabled), int(builtin), now_zulu, now_zulu),
+                    (
+                        name,
+                        pattern,
+                        scope,
+                        category,
+                        tags_json,
+                        priority,
+                        int(enabled),
+                        int(builtin),
+                        now_zulu,
+                        now_zulu,
+                    ),
                 )
                 conn.commit()
                 return cursor.lastrowid  # type: ignore[return-value]
 
         rule_id = await asyncio.to_thread(_run)
-        rows_raw = await self._execute(
-            "SELECT * FROM classifier_rules WHERE id = ?", (rule_id,)
-        )
+        rows_raw = await self._execute("SELECT * FROM classifier_rules WHERE id = ?", (rule_id,))
         rows = cast(list[dict[str, Any]], rows_raw)
         row = rows[0]
         row["extra_tags"] = json.loads(row["extra_tags"]) if row.get("extra_tags") else []
@@ -3233,23 +3398,21 @@ class SQLiteStorage:
                 params.append(value)
             set_parts.append(f"{key} = ?")
         if not set_parts:
-            rows = await self._execute(
-                "SELECT * FROM classifier_rules WHERE id = ?", (rule_id,)
-            )
-            assert isinstance(rows, list)
+            rows = await self._execute("SELECT * FROM classifier_rules WHERE id = ?", (rule_id,))
+            if not isinstance(rows, list):
+                raise TypeError("expected list result")
             return rows[0] if rows else None
-        now_zulu = datetime.now().strftime("%Y-%m-%dT%H:%M:%SZ")
+        now_zulu = datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
         set_parts.append("updated_at = ?")
         params.extend([now_zulu, rule_id])
         await self._execute(
-            f"UPDATE classifier_rules SET {', '.join(set_parts)} WHERE id = ?",  # noqa: S608
+            f"UPDATE classifier_rules SET {', '.join(set_parts)} WHERE id = ?",  # noqa: S608 - identifiers from fixed set; values parameterized
             tuple(params),
             fetch=False,
         )
-        rows = await self._execute(
-            "SELECT * FROM classifier_rules WHERE id = ?", (rule_id,)
-        )
-        assert isinstance(rows, list)
+        rows = await self._execute("SELECT * FROM classifier_rules WHERE id = ?", (rule_id,))
+        if not isinstance(rows, list):
+            raise TypeError("expected list result")
         if not rows:
             return None
         row = rows[0]
@@ -3277,7 +3440,8 @@ class SQLiteStorage:
     async def upsert_beacon_template(
         self, hash_: str, msg: str, src: str, now_ms: int
     ) -> dict[str, Any]:
-        from .classifier.types import _ms_to_zulu  # avoid top-level circular
+        from .classifier.types import _ms_to_zulu  # noqa: PLC0415 - avoid top-level circular import
+
         now_zulu = _ms_to_zulu(now_ms)
 
         def _run() -> None:
@@ -3313,7 +3477,8 @@ class SQLiteStorage:
 
         await asyncio.to_thread(_run)
         result = await self.get_beacon_template(hash_)
-        assert result is not None
+        if result is None:
+            raise RuntimeError("result is unexpectedly None")
         return result
 
     async def set_template_auto_beacon(
@@ -3335,20 +3500,22 @@ class SQLiteStorage:
             "WHERE template_hash = ? AND src = ? AND timestamp >= ?",
             (hash_, src, since_ms),
         )
-        assert isinstance(rows, list)
+        if not isinstance(rows, list):
+            raise TypeError("expected list result")
         return int(rows[0]["n"]) if rows else 0
 
     async def clear_stale_auto_beacons(
         self, human_categories: frozenset[str], min_tokens: int
     ) -> int:
-        from .classifier.template import _tokenize_normalized
+        from .classifier.template import _tokenize_normalized  # noqa: PLC0415 - circular
+
         cleared = 0
         placeholders = ",".join("?" * len(human_categories))
 
         def _clear_by_category() -> int:
             with sqlite3.connect(self.db_path) as conn:
                 cur = conn.execute(
-                    f"UPDATE beacon_templates SET auto_beacon = 0 "  # noqa: S608
+                    f"UPDATE beacon_templates SET auto_beacon = 0 "  # noqa: S608 - identifiers from fixed set; values parameterized
                     f"WHERE user_action IS NULL AND auto_beacon = 1 "
                     f"AND EXISTS ("
                     f"  SELECT 1 FROM messages m "
@@ -3366,7 +3533,8 @@ class SQLiteStorage:
             "SELECT template_hash, example_msg FROM beacon_templates "
             "WHERE auto_beacon = 1 AND user_action IS NULL"
         )
-        assert isinstance(rows, list)
+        if not isinstance(rows, list):
+            raise TypeError("expected list result")
         for row in rows:
             tokens = _tokenize_normalized(row["example_msg"] or "")
             if len(tokens) <= min_tokens:
@@ -3385,9 +3553,7 @@ class SQLiteStorage:
         except (ValueError, TypeError):
             return 0
 
-    async def count_messages_to_classify(
-        self, *, classifier_ver_below: int | None = None
-    ) -> int:
+    async def count_messages_to_classify(self, *, classifier_ver_below: int | None = None) -> int:
         if classifier_ver_below is None:
             rows = await self._execute("SELECT COUNT(*) AS n FROM messages")
         else:
@@ -3396,7 +3562,8 @@ class SQLiteStorage:
                 "WHERE classifier_ver IS NULL OR classifier_ver < ?",
                 (classifier_ver_below,),
             )
-        assert isinstance(rows, list)
+        if not isinstance(rows, list):
+            raise TypeError("expected list result")
         return int(rows[0]["n"]) if rows else 0
 
     async def get_messages_to_classify(
@@ -3421,14 +3588,12 @@ class SQLiteStorage:
             params.append(since_ms)
         where = f"WHERE {' AND '.join(conditions)}" if conditions else ""
         rows_raw = await self._execute(
-            f"SELECT id, {_MSG_SELECT} FROM messages {where} "  # noqa: S608
-            f"ORDER BY id ASC LIMIT ? OFFSET ?",
+            f"SELECT id, {_MSG_SELECT} FROM messages {where} ORDER BY id ASC LIMIT ? OFFSET ?",  # noqa: S608 - identifiers from fixed set; values parameterized
             (*params, limit, offset),
         )
-        rows = cast(list[dict[str, Any]], rows_raw)
-        return rows
+        return cast(list[dict[str, Any]], rows_raw)
 
-    async def update_message_classification(
+    async def update_message_classification(  # noqa: PLR0913 - signature fixed by call sites
         self,
         row_id: Any,
         *,
@@ -3446,10 +3611,9 @@ class SQLiteStorage:
         )
 
     async def get_meta(self, key: str) -> str | None:
-        rows = await self._execute(
-            "SELECT value FROM classifier_meta WHERE key = ?", (key,)
-        )
-        assert isinstance(rows, list)
+        rows = await self._execute("SELECT value FROM classifier_meta WHERE key = ?", (key,))
+        if not isinstance(rows, list):
+            raise TypeError("expected list result")
         return rows[0]["value"] if rows else None
 
     async def set_meta(self, key: str, value: str) -> None:
@@ -3467,7 +3631,8 @@ class SQLiteStorage:
             "WHERE category IS NOT NULL AND timestamp >= ? GROUP BY category",
             (since_ms,),
         )
-        assert isinstance(rows, list)
+        if not isinstance(rows, list):
+            raise TypeError("expected list result")
         return {r["category"]: r["n"] for r in rows}
 
     async def count_blocked_text_hits_24h(self) -> dict[str, int]:
@@ -3484,9 +3649,10 @@ class SQLiteStorage:
             "SELECT msg FROM messages WHERE timestamp >= ? AND msg IS NOT NULL",
             (since_ms,),
         )
-        assert isinstance(rows, list)
+        if not isinstance(rows, list):
+            raise TypeError("expected list result")
         lowered = [(t, t.lower()) for t in texts]
-        counts = {t: 0 for t in texts}
+        counts = dict.fromkeys(texts, 0)
         for r in rows:
             m = (r["msg"] or "").lower()
             for orig, tl in lowered:
@@ -3497,7 +3663,8 @@ class SQLiteStorage:
     async def get_top_beacon_templates(
         self, since_ms: int, limit: int = 10
     ) -> list[dict[str, Any]]:
-        from .classifier.types import _ms_to_zulu
+        from .classifier.types import _ms_to_zulu  # noqa: PLC0415 - avoid top-level circular import
+
         cutoff = _ms_to_zulu(since_ms)
         rows_raw = await self._execute(
             "SELECT template_hash, example_msg, count, auto_beacon "
@@ -3514,7 +3681,8 @@ class SQLiteStorage:
         rows = await self._execute(
             "SELECT COUNT(*) AS n FROM beacon_templates WHERE auto_beacon = 1"
         )
-        assert isinstance(rows, list)
+        if not isinstance(rows, list):
+            raise TypeError("expected list result")
         return int(rows[0]["n"]) if rows else 0
 
     def get_heartbeat_window_size(self) -> int:
@@ -3528,6 +3696,7 @@ class SQLiteStorage:
 
     async def close(self) -> None:
         """Close the persistent read connection."""
+
         def _close() -> None:
             if self._read_conn is not None:
                 self._read_conn.close()

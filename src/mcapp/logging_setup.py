@@ -5,9 +5,11 @@ Centralized logging configuration for McApp.
 Replaces scattered `if has_console: print(...)` patterns with proper logging.
 Keeps emoji prefixes for visual scanning in logs.
 """
+
 import logging
 import sys
-from typing import Callable
+from collections.abc import Callable
+from typing import ClassVar
 
 VERSION = "v0.50.0"
 
@@ -20,9 +22,9 @@ DATE_FORMAT = "%Y-%m-%d %H:%M:%S"
 class EmojiFormatter(logging.Formatter):
     """Custom formatter that keeps emoji prefixes and adds level-based prefixes."""
 
-    LEVEL_EMOJIS = {
-        logging.DEBUG: "",       # No extra emoji for debug (message may have one)
-        logging.INFO: "",        # No extra emoji for info
+    LEVEL_EMOJIS: ClassVar[dict[int, str]] = {
+        logging.DEBUG: "",  # No extra emoji for debug (message may have one)
+        logging.INFO: "",  # No extra emoji for info
         logging.WARNING: "⚠️ ",
         logging.ERROR: "❌ ",
         logging.CRITICAL: "💥 ",

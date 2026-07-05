@@ -10,9 +10,7 @@ from .constants import has_console
 class AdminCommandsMixin(CommandHandlerBase):
     """Mixin providing admin command handlers."""
 
-    async def handle_group_control(
-        self, kwargs: dict[str, Any], requester: str
-    ) -> str:
+    async def handle_group_control(self, kwargs: dict[str, Any], requester: str) -> str:
         """Control group response mode (admin only)"""
         if has_console:
             print(f"🔍 handle_group_control called with kwargs={kwargs}, requester='{requester}'")
@@ -31,20 +29,17 @@ class AdminCommandsMixin(CommandHandlerBase):
             if has_console:
                 print("🔍 Set group_responses_enabled = True")
             return "✅ Group responses ENABLED"
-        elif state == "off":
+        if state == "off":
             self.group_responses_enabled = False
             if has_console:
                 print("🔍 Set group_responses_enabled = False")
             return "✅ Group responses DISABLED"
-        else:
-            current = "ON" if self.group_responses_enabled else "OFF"
-            if has_console:
-                print(f"🔍 No valid state, current setting: {current}")
-            return f"🔧 Group responses: {current}. Use !group on|off"
+        current = "ON" if self.group_responses_enabled else "OFF"
+        if has_console:
+            print(f"🔍 No valid state, current setting: {current}")
+        return f"🔧 Group responses: {current}. Use !group on|off"
 
-    async def handle_kickban(
-        self, kwargs: dict[str, Any], requester: str
-    ) -> str:
+    async def handle_kickban(self, kwargs: dict[str, Any], requester: str) -> str:  # noqa: PLR0911 - complex handler kept intact
         """Manage blocked callsigns"""
         if not self._is_admin(requester):
             return "❌ Admin access required"
@@ -78,8 +73,7 @@ class AdminCommandsMixin(CommandHandlerBase):
             if callsign in self.blocked_callsigns:
                 self.blocked_callsigns.remove(callsign)
                 return f"✅ {callsign} unblocked"
-            else:
-                return f"ℹ️ {callsign} was not blocked"
+            return f"ℹ️ {callsign} was not blocked"
 
         # !kb CALL (add to blocklist)
         if callsign in self.blocked_callsigns:

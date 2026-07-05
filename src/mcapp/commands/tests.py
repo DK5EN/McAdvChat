@@ -440,11 +440,7 @@ def test_reception_logic(handler: Any) -> bool:
                             f" {expected_exec}"
                         )
                     if not type_match:
-                        print(
-                            f"     ❌ Type mismatch:"
-                            f" got {actual_type},"
-                            f" expected {expected_type}"
-                        )
+                        print(f"     ❌ Type mismatch: got {actual_type}, expected {expected_type}")
                 print()
 
         finally:
@@ -464,7 +460,7 @@ def test_reception_logic(handler: Any) -> bool:
             if failed_tests:
                 print("\n❌ Failed Tests:")
                 for (
-                    status,
+                    _status,
                     description,
                     actual_exec,
                     expected_exec,
@@ -487,52 +483,191 @@ def test_intent_based_reception_logic(handler: Any) -> bool:
         print("=" * 55)
 
     test_cases = [
-        (handler.my_callsign, "20", "!WX", True, True, "group",
-         "Unsere Gruppe ohne Target → LOCAL intent → execute"),
-        (handler.my_callsign, "OE5HWN-12", "!TIME", True, True, "direct",
-         "Unsere persönlich ohne Target → LOCAL intent → execute"),
-        (handler.my_callsign, "20", f"!WX {handler.my_callsign}", True, True, "group",
-         "Unsere Gruppe mit unserem Target → LOCAL execution → execute"),
-        (handler.my_callsign, "20", "!WX OE5HWN-12", True, False, None,
-         "Unsere Gruppe mit fremdem Target → REMOTE intent → NO execution"),
-        (handler.my_callsign, "OE5HWN-12", "!TIME OE5HWN-12", True, False, None,
-         "Unsere persönlich mit fremdem Target → REMOTE intent → NO execution"),
-        ("OE5HWN-12", "20", f"!WX {handler.my_callsign}", True, True, "group",
-         "Eingehend Gruppe mit unserem Target → execute"),
-        ("OE5HWN-12", "20", f"!WX {handler.my_callsign}", False, False, None,
-         "Eingehend Gruppe, Groups OFF → no execute"),
-        ("OE5HWN-12", "20", "!WX OE1ABC-5", True, False, None,
-         "Eingehend Gruppe mit fremdem Target → no execute"),
-        ("OE5HWN-12", "20", "!WX", True, False, None,
-         "Eingehend Gruppe ohne Target → no execute"),
-        ("OE5HWN-12", handler.my_callsign, f"!TIME {handler.my_callsign}", True, True, "direct",
-         "Eingehend direkt mit unserem Target → execute"),
-        ("OE5HWN-12", handler.my_callsign, "!TIME", True, True, "direct",
-         "Eingehend direkt ohne Target → execute"),
-        (handler.admin_callsign_base, "20", f"!WX {handler.my_callsign}", False, True, "group",
-         "Admin override bei Groups OFF"),
-        ("OE5HWN-12", "*", f"!WX {handler.my_callsign}", True, False, None,
-         "Ungültiges Ziel → no execute"),
-        ("OE5HWN-12", "", f"!TIME {handler.my_callsign}", True, False, None,
-         "Leeres Ziel → no execute"),
+        (
+            handler.my_callsign,
+            "20",
+            "!WX",
+            True,
+            True,
+            "group",
+            "Unsere Gruppe ohne Target → LOCAL intent → execute",
+        ),
+        (
+            handler.my_callsign,
+            "OE5HWN-12",
+            "!TIME",
+            True,
+            True,
+            "direct",
+            "Unsere persönlich ohne Target → LOCAL intent → execute",
+        ),
+        (
+            handler.my_callsign,
+            "20",
+            f"!WX {handler.my_callsign}",
+            True,
+            True,
+            "group",
+            "Unsere Gruppe mit unserem Target → LOCAL execution → execute",
+        ),
+        (
+            handler.my_callsign,
+            "20",
+            "!WX OE5HWN-12",
+            True,
+            False,
+            None,
+            "Unsere Gruppe mit fremdem Target → REMOTE intent → NO execution",
+        ),
+        (
+            handler.my_callsign,
+            "OE5HWN-12",
+            "!TIME OE5HWN-12",
+            True,
+            False,
+            None,
+            "Unsere persönlich mit fremdem Target → REMOTE intent → NO execution",
+        ),
+        (
+            "OE5HWN-12",
+            "20",
+            f"!WX {handler.my_callsign}",
+            True,
+            True,
+            "group",
+            "Eingehend Gruppe mit unserem Target → execute",
+        ),
+        (
+            "OE5HWN-12",
+            "20",
+            f"!WX {handler.my_callsign}",
+            False,
+            False,
+            None,
+            "Eingehend Gruppe, Groups OFF → no execute",
+        ),
+        (
+            "OE5HWN-12",
+            "20",
+            "!WX OE1ABC-5",
+            True,
+            False,
+            None,
+            "Eingehend Gruppe mit fremdem Target → no execute",
+        ),
+        ("OE5HWN-12", "20", "!WX", True, False, None, "Eingehend Gruppe ohne Target → no execute"),
+        (
+            "OE5HWN-12",
+            handler.my_callsign,
+            f"!TIME {handler.my_callsign}",
+            True,
+            True,
+            "direct",
+            "Eingehend direkt mit unserem Target → execute",
+        ),
+        (
+            "OE5HWN-12",
+            handler.my_callsign,
+            "!TIME",
+            True,
+            True,
+            "direct",
+            "Eingehend direkt ohne Target → execute",
+        ),
+        (
+            handler.admin_callsign_base,
+            "20",
+            f"!WX {handler.my_callsign}",
+            False,
+            True,
+            "group",
+            "Admin override bei Groups OFF",
+        ),
+        (
+            "OE5HWN-12",
+            "*",
+            f"!WX {handler.my_callsign}",
+            True,
+            False,
+            None,
+            "Ungültiges Ziel → no execute",
+        ),
+        (
+            "OE5HWN-12",
+            "",
+            f"!TIME {handler.my_callsign}",
+            True,
+            False,
+            None,
+            "Leeres Ziel → no execute",
+        ),
         # target: parameter support (unified routing)
-        ("OE5HWN-12", "20", f"!MHEARD TARGET:{handler.my_callsign} TYPE:MSG", True, True, "group",
-         "Group mheard with target: param → execute"),
-        ("OE5HWN-12", "20", f"!POS TARGET:{handler.my_callsign} CALL:DB0ED", True, True, "group",
-         "Group pos with target: param → execute"),
-        ("OE5HWN-12", "20", f"!SEARCH TARGET:{handler.my_callsign} CALL:OE1ABC", True, True,
-         "group", "Group search with target: param → execute"),
+        (
+            "OE5HWN-12",
+            "20",
+            f"!MHEARD TARGET:{handler.my_callsign} TYPE:MSG",
+            True,
+            True,
+            "group",
+            "Group mheard with target: param → execute",
+        ),
+        (
+            "OE5HWN-12",
+            "20",
+            f"!POS TARGET:{handler.my_callsign} CALL:DB0ED",
+            True,
+            True,
+            "group",
+            "Group pos with target: param → execute",
+        ),
+        (
+            "OE5HWN-12",
+            "20",
+            f"!SEARCH TARGET:{handler.my_callsign} CALL:OE1ABC",
+            True,
+            True,
+            "group",
+            "Group search with target: param → execute",
+        ),
         # Positional fallback with key:value args (the bug fix)
-        ("OE5HWN-12", "20", f"!MHEARD {handler.my_callsign} TYPE:MSG", True, True, "group",
-         "Group mheard with positional target before key:value → execute"),
+        (
+            "OE5HWN-12",
+            "20",
+            f"!MHEARD {handler.my_callsign} TYPE:MSG",
+            True,
+            True,
+            "group",
+            "Group mheard with positional target before key:value → execute",
+        ),
         # Remote intent with target: and key:value
-        (handler.my_callsign, "20", "!MHEARD TARGET:OE5HWN-12 TYPE:MSG", True, False, None,
-         "Our mheard with remote target: → remote intent"),
-        (handler.my_callsign, "20", "!POS TARGET:OE5HWN-12 CALL:DK5EN", True, False, None,
-         "Our pos with remote target: → remote intent"),
+        (
+            handler.my_callsign,
+            "20",
+            "!MHEARD TARGET:OE5HWN-12 TYPE:MSG",
+            True,
+            False,
+            None,
+            "Our mheard with remote target: → remote intent",
+        ),
+        (
+            handler.my_callsign,
+            "20",
+            "!POS TARGET:OE5HWN-12 CALL:DK5EN",
+            True,
+            False,
+            None,
+            "Our pos with remote target: → remote intent",
+        ),
         # target:local explicit
-        (handler.my_callsign, handler.my_callsign, "!WX TARGET:LOCAL", True, True, "direct",
-         "Explicit target:local → local execution"),
+        (
+            handler.my_callsign,
+            handler.my_callsign,
+            "!WX TARGET:LOCAL",
+            True,
+            True,
+            "direct",
+            "Explicit target:local → local execution",
+        ),
     ]
 
     results = []
@@ -602,21 +737,69 @@ async def test_reception_edge_cases(handler: Any) -> bool:
         print("=" * 30)
 
     edge_cases = [
-        ("oe1abc-5", handler.my_callsign.lower(),
-         f"!time {handler.my_callsign.lower()}", True, True, "direct", "Lowercase handling"),
-        ("OE1ABC-5", "20",
-         f"!wx {handler.my_callsign.lower()}", True, True, "group", "Mixed case target"),
-        ("EA1ABC-15", "TEST",
-         f"!stats {handler.my_callsign}", True, True, "group", "Complex callsign (EA prefix)"),
-        ("W1A-1", "50",
-         f"!time {handler.my_callsign}", True, True, "group", "Short callsign (W1A)"),
-        (f"{handler.admin_callsign_base}-99", "20",
-         f"!wx {handler.my_callsign}", False, True, "group", "Admin with high SID"),
-        ("OE1ABC-5", "20",
-         f"!wx OE1ABC-5 {handler.my_callsign}", True, True, "group",
-         "Multiple targets (last one wins)"),
-        ("VK9ABCD-12", "TEST",
-         f"!time {handler.my_callsign}", True, True, "group", "Long callsign"),
+        (
+            "oe1abc-5",
+            handler.my_callsign.lower(),
+            f"!time {handler.my_callsign.lower()}",
+            True,
+            True,
+            "direct",
+            "Lowercase handling",
+        ),
+        (
+            "OE1ABC-5",
+            "20",
+            f"!wx {handler.my_callsign.lower()}",
+            True,
+            True,
+            "group",
+            "Mixed case target",
+        ),
+        (
+            "EA1ABC-15",
+            "TEST",
+            f"!stats {handler.my_callsign}",
+            True,
+            True,
+            "group",
+            "Complex callsign (EA prefix)",
+        ),
+        (
+            "W1A-1",
+            "50",
+            f"!time {handler.my_callsign}",
+            True,
+            True,
+            "group",
+            "Short callsign (W1A)",
+        ),
+        (
+            f"{handler.admin_callsign_base}-99",
+            "20",
+            f"!wx {handler.my_callsign}",
+            False,
+            True,
+            "group",
+            "Admin with high SID",
+        ),
+        (
+            "OE1ABC-5",
+            "20",
+            f"!wx OE1ABC-5 {handler.my_callsign}",
+            True,
+            True,
+            "group",
+            "Multiple targets (last one wins)",
+        ),
+        (
+            "VK9ABCD-12",
+            "TEST",
+            f"!time {handler.my_callsign}",
+            True,
+            True,
+            "group",
+            "Long callsign",
+        ),
     ]
 
     results = []
@@ -653,49 +836,138 @@ async def test_reception_edge_cases(handler: Any) -> bool:
     return passed == total
 
 
-async def test_kickban_logic(handler: Any) -> bool:
+async def test_kickban_logic(handler: Any) -> bool:  # noqa: PLR0912 - complex handler kept intact
     """Test kick-ban functionality"""
     if has_console:
         print("\n🧪 Testing Kick-Ban Logic:")
         print("=" * 40)
 
     test_cases = [
-        (handler.admin_callsign_base, {}, set(),
-         "Blocklist is empty", set(), "Empty list display"),
-        (handler.admin_callsign_base, {"callsign": "list"}, set(),
-         "Blocklist is empty", set(), "Explicit list command"),
-        (handler.admin_callsign_base, {"callsign": "OE1ABC-5"}, set(),
-         "🚫 OE1ABC-5 blocked", {"OE1ABC-5"}, "Add callsign to blocklist"),
-        (handler.admin_callsign_base, {"callsign": "OE1ABC-5"}, {"OE1ABC-5"},
-         "already blocked", {"OE1ABC-5"}, "Add already blocked callsign"),
-        (handler.admin_callsign_base, {"callsign": "OE1ABC-5", "action": "del"},
-         {"OE1ABC-5"}, "✅ OE1ABC-5 unblocked", set(), "Remove from blocklist"),
-        (handler.admin_callsign_base, {"callsign": "OE1ABC-5", "action": "del"},
-         set(), "was not blocked", set(), "Remove non-blocked callsign"),
-        (handler.admin_callsign_base, {}, {"OE1ABC-5", "W1XYZ-1"},
-         "🚫 Blocked: OE1ABC-5, W1XYZ-1", {"OE1ABC-5", "W1XYZ-1"}, "List multiple blocked"),
-        (handler.admin_callsign_base, {"callsign": "delall"},
-         {"OE1ABC-5", "W1XYZ-1"}, "✅ Cleared 2 blocked", set(), "Clear all blocked"),
-        (handler.admin_callsign_base, {"callsign": "delall"}, set(),
-         "✅ Cleared 0 blocked", set(), "Clear empty list"),
-        (handler.admin_callsign_base, {"callsign": handler.my_callsign}, set(),
-         "❌ Cannot block own callsign", set(), "Prevent self-blocking (exact)"),
-        (handler.admin_callsign_base, {"callsign": f"{handler.admin_callsign_base}-99"}, set(),
-         "❌ Cannot block own callsign", set(), "Prevent self-blocking (base)"),
-        (handler.admin_callsign_base, {"callsign": "INVALID"}, set(),
-         "❌ Invalid callsign format", set(), "Invalid callsign format"),
-        (handler.admin_callsign_base, {"callsign": "TOO-LONG-123"}, set(),
-         "❌ Invalid callsign format", set(), "Invalid callsign (too long)"),
+        (handler.admin_callsign_base, {}, set(), "Blocklist is empty", set(), "Empty list display"),
+        (
+            handler.admin_callsign_base,
+            {"callsign": "list"},
+            set(),
+            "Blocklist is empty",
+            set(),
+            "Explicit list command",
+        ),
+        (
+            handler.admin_callsign_base,
+            {"callsign": "OE1ABC-5"},
+            set(),
+            "🚫 OE1ABC-5 blocked",
+            {"OE1ABC-5"},
+            "Add callsign to blocklist",
+        ),
+        (
+            handler.admin_callsign_base,
+            {"callsign": "OE1ABC-5"},
+            {"OE1ABC-5"},
+            "already blocked",
+            {"OE1ABC-5"},
+            "Add already blocked callsign",
+        ),
+        (
+            handler.admin_callsign_base,
+            {"callsign": "OE1ABC-5", "action": "del"},
+            {"OE1ABC-5"},
+            "✅ OE1ABC-5 unblocked",
+            set(),
+            "Remove from blocklist",
+        ),
+        (
+            handler.admin_callsign_base,
+            {"callsign": "OE1ABC-5", "action": "del"},
+            set(),
+            "was not blocked",
+            set(),
+            "Remove non-blocked callsign",
+        ),
+        (
+            handler.admin_callsign_base,
+            {},
+            {"OE1ABC-5", "W1XYZ-1"},
+            "🚫 Blocked: OE1ABC-5, W1XYZ-1",
+            {"OE1ABC-5", "W1XYZ-1"},
+            "List multiple blocked",
+        ),
+        (
+            handler.admin_callsign_base,
+            {"callsign": "delall"},
+            {"OE1ABC-5", "W1XYZ-1"},
+            "✅ Cleared 2 blocked",
+            set(),
+            "Clear all blocked",
+        ),
+        (
+            handler.admin_callsign_base,
+            {"callsign": "delall"},
+            set(),
+            "✅ Cleared 0 blocked",
+            set(),
+            "Clear empty list",
+        ),
+        (
+            handler.admin_callsign_base,
+            {"callsign": handler.my_callsign},
+            set(),
+            "❌ Cannot block own callsign",
+            set(),
+            "Prevent self-blocking (exact)",
+        ),
+        (
+            handler.admin_callsign_base,
+            {"callsign": f"{handler.admin_callsign_base}-99"},
+            set(),
+            "❌ Cannot block own callsign",
+            set(),
+            "Prevent self-blocking (base)",
+        ),
+        (
+            handler.admin_callsign_base,
+            {"callsign": "INVALID"},
+            set(),
+            "❌ Invalid callsign format",
+            set(),
+            "Invalid callsign format",
+        ),
+        (
+            handler.admin_callsign_base,
+            {"callsign": "TOO-LONG-123"},
+            set(),
+            "❌ Invalid callsign format",
+            set(),
+            "Invalid callsign (too long)",
+        ),
         ("OE1ABC-5", {}, set(), "❌ Admin access required", set(), "Non-admin list attempt"),
-        ("OE1ABC-5", {"callsign": "W1XYZ-1"}, set(),
-         "❌ Admin access required", set(), "Non-admin block attempt"),
-        ("OE1ABC-5", {"callsign": "delall"}, {"OE1ABC-5"},
-         "❌ Admin access required", {"OE1ABC-5"}, "Non-admin clear attempt"),
+        (
+            "OE1ABC-5",
+            {"callsign": "W1XYZ-1"},
+            set(),
+            "❌ Admin access required",
+            set(),
+            "Non-admin block attempt",
+        ),
+        (
+            "OE1ABC-5",
+            {"callsign": "delall"},
+            {"OE1ABC-5"},
+            "❌ Admin access required",
+            {"OE1ABC-5"},
+            "Non-admin clear attempt",
+        ),
     ]
 
     results = []
-    for (requester, args, initial_blocked, expected_contains,
-         expected_blocked_after, description) in test_cases:
+    for (
+        requester,
+        args,
+        initial_blocked,
+        expected_contains,
+        expected_blocked_after,
+        description,
+    ) in test_cases:
         old_blocked = handler.blocked_callsigns.copy()
         handler.blocked_callsigns = initial_blocked.copy()
 
@@ -744,7 +1016,7 @@ async def test_kickban_logic(handler: Any) -> bool:
             failed_tests = [r for r in results if not r[2]]
             if failed_tests:
                 print("\n❌ Failed Tests:")
-                for status, description, _ in failed_tests:
+                for _status, description, _ in failed_tests:
                     print(f"   • {description}")
         print("=" * 40)
 
@@ -824,7 +1096,7 @@ def test_message_blocking_integration(handler: Any) -> bool:
     return passed == total
 
 
-async def test_topic_logic(handler: Any) -> bool:
+async def test_topic_logic(handler: Any) -> bool:  # noqa: PLR0912, PLR0915 - complex handler kept intact
     """Test topic/beacon functionality"""
     if has_console:
         print("\n🧪 Testing Topic Logic:")
@@ -833,32 +1105,84 @@ async def test_topic_logic(handler: Any) -> bool:
     test_cases = [
         ("OE1ABC-5", {}, "❌ Admin access required", "Non-admin access denied"),
         (handler.admin_callsign_base, {}, "📡 No active beacon topics", "Empty topic list"),
-        (handler.admin_callsign_base, {"group": "INVALID"},
-         "❌ Invalid group format", "Invalid group name"),
-        (handler.admin_callsign_base, {"group": "123456"},
-         "❌ Invalid group format", "Group number too long"),
-        (handler.admin_callsign_base, {"group": "20"},
-         "❌ Beacon text required", "Missing beacon text"),
-        (handler.admin_callsign_base, {"text": "Hello World"},
-         "❌ Group required", "Missing group"),
-        (handler.admin_callsign_base, {"group": "20", "text": "x" * 201},
-         "❌ Beacon text too long", "Text too long"),
-        (handler.admin_callsign_base, {"group": "20", "text": "Test", "interval": 0},
-         "❌ Interval must be between", "Interval too small"),
-        (handler.admin_callsign_base, {"group": "20", "text": "Test", "interval": 1441},
-         "❌ Interval must be between", "Interval too large"),
-        (handler.admin_callsign_base, {"group": "20", "text": "Test", "interval": "invalid"},
-         "❌ Invalid interval format", "Invalid interval format"),
-        (handler.admin_callsign_base, {"group": "20", "text": "Test beacon", "interval": 30},
-         "✅ Beacon started", "Valid beacon creation"),
-        (handler.admin_callsign_base, {"group": "TEST", "text": "Another beacon"},
-         "✅ Beacon started", "Valid beacon with default interval"),
-        (handler.admin_callsign_base, {"action": "delete", "group": "999"},
-         "ℹ️ No beacon active", "Delete non-existent beacon"),
-        (handler.admin_callsign_base, {"action": "delete", "group": "20"},
-         "✅ Beacon stopped", "Delete existing beacon"),
-        (handler.admin_callsign_base, {"action": "delete"},
-         "❌ Group required", "Delete without group"),
+        (
+            handler.admin_callsign_base,
+            {"group": "INVALID"},
+            "❌ Invalid group format",
+            "Invalid group name",
+        ),
+        (
+            handler.admin_callsign_base,
+            {"group": "123456"},
+            "❌ Invalid group format",
+            "Group number too long",
+        ),
+        (
+            handler.admin_callsign_base,
+            {"group": "20"},
+            "❌ Beacon text required",
+            "Missing beacon text",
+        ),
+        (
+            handler.admin_callsign_base,
+            {"text": "Hello World"},
+            "❌ Group required",
+            "Missing group",
+        ),
+        (
+            handler.admin_callsign_base,
+            {"group": "20", "text": "x" * 201},
+            "❌ Beacon text too long",
+            "Text too long",
+        ),
+        (
+            handler.admin_callsign_base,
+            {"group": "20", "text": "Test", "interval": 0},
+            "❌ Interval must be between",
+            "Interval too small",
+        ),
+        (
+            handler.admin_callsign_base,
+            {"group": "20", "text": "Test", "interval": 1441},
+            "❌ Interval must be between",
+            "Interval too large",
+        ),
+        (
+            handler.admin_callsign_base,
+            {"group": "20", "text": "Test", "interval": "invalid"},
+            "❌ Invalid interval format",
+            "Invalid interval format",
+        ),
+        (
+            handler.admin_callsign_base,
+            {"group": "20", "text": "Test beacon", "interval": 30},
+            "✅ Beacon started",
+            "Valid beacon creation",
+        ),
+        (
+            handler.admin_callsign_base,
+            {"group": "TEST", "text": "Another beacon"},
+            "✅ Beacon started",
+            "Valid beacon with default interval",
+        ),
+        (
+            handler.admin_callsign_base,
+            {"action": "delete", "group": "999"},
+            "ℹ️ No beacon active",
+            "Delete non-existent beacon",
+        ),
+        (
+            handler.admin_callsign_base,
+            {"action": "delete", "group": "20"},
+            "✅ Beacon stopped",
+            "Delete existing beacon",
+        ),
+        (
+            handler.admin_callsign_base,
+            {"action": "delete"},
+            "❌ Group required",
+            "Delete without group",
+        ),
     ]
 
     results = []
@@ -943,14 +1267,14 @@ async def test_topic_logic(handler: Any) -> bool:
             failed_tests = [r for r in results if not r[2]]
             if failed_tests:
                 print("\n❌ Failed Tests:")
-                for status, description, _ in failed_tests:
+                for _status, description, _ in failed_tests:
                     print(f"   • {description}")
         print("=" * 35)
 
     return passed == total
 
 
-async def test_ctcping_logic(handler: Any) -> bool:
+async def test_ctcping_logic(handler: Any) -> bool:  # noqa: PLR0912, PLR0915 - complex handler kept intact
     """Test CTC ping functionality with complex scenarios"""
     if has_console:
         print("\n🧪 Testing CTC Ping Logic:")
@@ -958,22 +1282,54 @@ async def test_ctcping_logic(handler: Any) -> bool:
 
     validation_tests = [
         ("OE1ABC-5", {}, "❌ Target callsign required", "Missing target"),
-        ("OE1ABC-5", {"call": "INVALID"}, "❌ Invalid target callsign format",
-         "Invalid callsign format"),
-        ("OE1ABC-5", {"call": handler.my_callsign}, "❌ Cannot ping yourself",
-         "Self-ping prevention"),
-        ("OE1ABC-5", {"call": "W1ABC-1", "payload": 0},
-         "❌ Payload size must be between", "Payload too small"),
-        ("OE1ABC-5", {"call": "W1ABC-1", "payload": 141},
-         "❌ Payload size must be between", "Payload too large"),
-        ("OE1ABC-5", {"call": "W1ABC-1", "payload": "invalid"},
-         "❌ Invalid payload size", "Invalid payload format"),
-        ("OE1ABC-5", {"call": "W1ABC-1", "repeat": 0},
-         "❌ Repeat count must be between", "Repeat too small"),
-        ("OE1ABC-5", {"call": "W1ABC-1", "repeat": 6},
-         "❌ Repeat count must be between", "Repeat too large"),
-        ("OE1ABC-5", {"call": "W1ABC-1", "repeat": "invalid"},
-         "❌ Invalid repeat count", "Invalid repeat format"),
+        (
+            "OE1ABC-5",
+            {"call": "INVALID"},
+            "❌ Invalid target callsign format",
+            "Invalid callsign format",
+        ),
+        (
+            "OE1ABC-5",
+            {"call": handler.my_callsign},
+            "❌ Cannot ping yourself",
+            "Self-ping prevention",
+        ),
+        (
+            "OE1ABC-5",
+            {"call": "W1ABC-1", "payload": 0},
+            "❌ Payload size must be between",
+            "Payload too small",
+        ),
+        (
+            "OE1ABC-5",
+            {"call": "W1ABC-1", "payload": 141},
+            "❌ Payload size must be between",
+            "Payload too large",
+        ),
+        (
+            "OE1ABC-5",
+            {"call": "W1ABC-1", "payload": "invalid"},
+            "❌ Invalid payload size",
+            "Invalid payload format",
+        ),
+        (
+            "OE1ABC-5",
+            {"call": "W1ABC-1", "repeat": 0},
+            "❌ Repeat count must be between",
+            "Repeat too small",
+        ),
+        (
+            "OE1ABC-5",
+            {"call": "W1ABC-1", "repeat": 6},
+            "❌ Repeat count must be between",
+            "Repeat too large",
+        ),
+        (
+            "OE1ABC-5",
+            {"call": "W1ABC-1", "repeat": "invalid"},
+            "❌ Invalid repeat count",
+            "Invalid repeat format",
+        ),
     ]
 
     results = []
@@ -1099,14 +1455,14 @@ async def test_ctcping_logic(handler: Any) -> bool:
             failed_tests = [r for r in results if not r[2]]
             if failed_tests:
                 print("\n❌ Failed Tests:")
-                for status, description, _ in failed_tests:
+                for _status, description, _ in failed_tests:
                     print(f"   • {description}")
         print("=" * 45)
 
     return passed == total
 
 
-async def _test_simulated_ping_flows(handler: Any, results: list[Any]) -> None:
+async def _test_simulated_ping_flows(handler: Any, results: list[Any]) -> None:  # noqa: PLR0915 - complex handler kept intact
     """Test simulated ping flows with mock echo/ACK responses"""
     if has_console:
         print("\n🔄 Testing Simulated Ping Flows:")
@@ -1176,12 +1532,29 @@ async def _test_simulated_ping_flows(handler: Any, results: list[Any]) -> None:
 
     # Test 3: Invalid ACK Scenarios
     invalid_ack_tests = [
-        ({"src": "WRONG-NODE", "dst": handler.my_callsign,
-          "msg": f"{handler.my_callsign} :ack456"}, True, "ACK from wrong sender"),
-        ({"src": "TIMEOUT-NODE", "dst": "WRONG-DST",
-          "msg": "WRONG-DST :ack456"}, True, "ACK to wrong destination"),
-        ({"src": "TIMEOUT-NODE", "dst": handler.my_callsign,
-          "msg": f"{handler.my_callsign} :ack999"}, True, "ACK with unknown ID"),
+        (
+            {
+                "src": "WRONG-NODE",
+                "dst": handler.my_callsign,
+                "msg": f"{handler.my_callsign} :ack456",
+            },
+            True,
+            "ACK from wrong sender",
+        ),
+        (
+            {"src": "TIMEOUT-NODE", "dst": "WRONG-DST", "msg": "WRONG-DST :ack456"},
+            True,
+            "ACK to wrong destination",
+        ),
+        (
+            {
+                "src": "TIMEOUT-NODE",
+                "dst": handler.my_callsign,
+                "msg": f"{handler.my_callsign} :ack999",
+            },
+            True,
+            "ACK with unknown ID",
+        ),
     ]
 
     for ack_data, should_ignore, description in invalid_ack_tests:
@@ -1206,7 +1579,7 @@ async def _test_simulated_ping_flows(handler: Any, results: list[Any]) -> None:
                 print(f"{status} | {description} - Exception: {e}")
 
 
-async def test_self_command_execution(handler: Any) -> bool:
+async def test_self_command_execution(handler: Any) -> bool:  # noqa: PLR0912, PLR0915 - complex handler kept intact
     """Test that all self-commands (src=dst=my_callsign) execute locally"""
     if has_console:
         print("\n🧪 Testing Self-Command Execution:")
@@ -1216,16 +1589,15 @@ async def test_self_command_execution(handler: Any) -> bool:
         ("!WX", ["🌤️", "weather", "°C", "hPa"], "Weather command should return weather data"),
         ("!TIME", ["🕐", "Uhr", "2025"], "Time command should return current time"),
         ("!DICE", ["🎲", "DK5EN-1:", "[", "]", "→"], "Dice command should return dice roll"),
-        ("!STATS", ["📊", "Stats", "Messages:", "Positions:"],
-         "Stats command should return message statistics"),
-        ("!MHEARD LIMIT:5", ["📻", "MH:"],
-         "MHeard command should return heard stations"),
-        ("!SEARCH CALL:DK5EN-1 DAYS:1", ["🔍"],
-         "Search command should return search results"),
-        ("!POS CALL:DK5EN-1", ["🔍"],
-         "Position search should return position data"),
-        ("!HELP", ["📋", "Available commands"],
-         "Help command should return command list"),
+        (
+            "!STATS",
+            ["📊", "Stats", "Messages:", "Positions:"],
+            "Stats command should return message statistics",
+        ),
+        ("!MHEARD LIMIT:5", ["📻", "MH:"], "MHeard command should return heard stations"),
+        ("!SEARCH CALL:DK5EN-1 DAYS:1", ["🔍"], "Search command should return search results"),
+        ("!POS CALL:DK5EN-1", ["🔍"], "Position search should return position data"),
+        ("!HELP", ["📋", "Available commands"], "Help command should return command list"),
         ("!USERINFO", ["Node"], "User info should return node information"),
     ]
 
@@ -1239,7 +1611,7 @@ async def test_self_command_execution(handler: Any) -> bool:
             src = handler.my_callsign
             dst = handler.my_callsign
 
-            should_execute, target_type = handler._should_execute_command(src, dst, command)
+            should_execute, _target_type = handler._should_execute_command(src, dst, command)
 
             if not should_execute:
                 status = "❌ FAIL"
@@ -1297,14 +1669,14 @@ async def test_self_command_execution(handler: Any) -> bool:
             failed_tests = [r for r in results if not r[2]]
             if failed_tests:
                 print("\n❌ Failed Tests:")
-                for status, description, _ in failed_tests:
+                for _status, description, _ in failed_tests:
                     print(f"   • {description}")
         print("=" * 50)
 
     return passed == total
 
 
-async def test_self_command_suppression_logic(handler: Any) -> bool:
+async def test_self_command_suppression_logic(handler: Any) -> bool:  # noqa: PLR0912, PLR0915 - complex handler kept intact
     """Test that self-commands are properly suppressed (not sent to mesh)"""
     if has_console:
         print("\n🧪 Testing Self-Command Suppression Logic:")
@@ -1411,37 +1783,85 @@ async def test_self_command_suppression_logic(handler: Any) -> bool:
     return passed == total
 
 
-async def test_remote_command_execution(handler: Any) -> bool:
+async def test_remote_command_execution(handler: Any) -> bool:  # noqa: PLR0912 - complex handler kept intact
     """Test that remote commands are properly forwarded to mesh"""
     if has_console:
         print("\n🧪 Testing Remote Command Execution:")
         print("=" * 50)
 
     test_cases = [
-        ("!TIME", "DK5EN-99", True, "local",
-         "Time command execute locally,forward result to mesh"),
-        ("!DICE", "DK5EN-99", True, "local",
-         "Dice command execute locally,forward result to mesh"),
-        ("!WX", "DK5EN-99", True, "local",
-         "Weather command execute locally,forward result to mesh"),
-        ("!TIME DK5EN-99", "DK5EN-99", False, "mesh",
-         "Time command with matching target should execute locally"),
-        ("!WX DK5EN-99", "DK5EN-99", False, "mesh",
-         "Weather command with matching target should execute locally"),
-        ("!TIME DK5EN-99", "DK5EN-99", False, "mesh",
-         "Time command with non-matching target should forward to mesh"),
-        ("!CTCPING TARGET:DK5EN-99 CALL:DK5EN-1", "DK5EN-99", False, "mesh",
-         "CTCPING delegation should forward to mesh"),
-        ("!CTCPING TARGET:LOCAL CALL:DK5EN-99", "DK5EN-99", True, "local",
-         "CTCPING local execution should run locally"),
-        ("!WX", "TEST", True, "local",
-         "Group command without target get executed locally and result is sent to group"),
-        ("!TIME", "99999", True, "local",
-         "Test group command without target get executed locally and result is sent to group"),
-        ("!WX DK5EN-1", "99999", False, "mesh",
-         "Group command with different SSID target should forward to mesh"),
-        ("!TIME OE1ABC-5", "TEST", False, "mesh",
-         "Group command with other target should forward to mesh"),
+        ("!TIME", "DK5EN-99", True, "local", "Time command execute locally,forward result to mesh"),
+        ("!DICE", "DK5EN-99", True, "local", "Dice command execute locally,forward result to mesh"),
+        (
+            "!WX",
+            "DK5EN-99",
+            True,
+            "local",
+            "Weather command execute locally,forward result to mesh",
+        ),
+        (
+            "!TIME DK5EN-99",
+            "DK5EN-99",
+            False,
+            "mesh",
+            "Time command with matching target should execute locally",
+        ),
+        (
+            "!WX DK5EN-99",
+            "DK5EN-99",
+            False,
+            "mesh",
+            "Weather command with matching target should execute locally",
+        ),
+        (
+            "!TIME DK5EN-99",
+            "DK5EN-99",
+            False,
+            "mesh",
+            "Time command with non-matching target should forward to mesh",
+        ),
+        (
+            "!CTCPING TARGET:DK5EN-99 CALL:DK5EN-1",
+            "DK5EN-99",
+            False,
+            "mesh",
+            "CTCPING delegation should forward to mesh",
+        ),
+        (
+            "!CTCPING TARGET:LOCAL CALL:DK5EN-99",
+            "DK5EN-99",
+            True,
+            "local",
+            "CTCPING local execution should run locally",
+        ),
+        (
+            "!WX",
+            "TEST",
+            True,
+            "local",
+            "Group command without target get executed locally and result is sent to group",
+        ),
+        (
+            "!TIME",
+            "99999",
+            True,
+            "local",
+            "Test group command without target get executed locally and result is sent to group",
+        ),
+        (
+            "!WX DK5EN-1",
+            "99999",
+            False,
+            "mesh",
+            "Group command with different SSID target should forward to mesh",
+        ),
+        (
+            "!TIME OE1ABC-5",
+            "TEST",
+            False,
+            "mesh",
+            "Group command with other target should forward to mesh",
+        ),
     ]
 
     results = []
@@ -1459,10 +1879,7 @@ async def test_remote_command_execution(handler: Any) -> bool:
 
             exec_match = should_execute == expected_execute
 
-            if expected_routing == "mesh":
-                routing_correct = not should_execute
-            else:
-                routing_correct = should_execute
+            routing_correct = not should_execute if expected_routing == "mesh" else should_execute
 
             overall_pass = exec_match and routing_correct
             status = "✅ PASS" if overall_pass else "❌ FAIL"
@@ -1509,14 +1926,14 @@ async def test_remote_command_execution(handler: Any) -> bool:
             failed_tests = [r for r in results if not r[2]]
             if failed_tests:
                 print("\n❌ Failed Tests:")
-                for status, description, _ in failed_tests:
+                for _status, description, _ in failed_tests:
                     print(f"   • {description}")
         print("=" * 50)
 
     return passed == total
 
 
-async def test_incoming_personal_commands(handler: Any) -> bool:
+async def test_incoming_personal_commands(handler: Any) -> bool:  # noqa: PLR0912, PLR0915 - complex handler kept intact
     """Test incoming personal commands from other
     stations and outgoing commands to chat partners"""
     if has_console:
@@ -1524,107 +1941,316 @@ async def test_incoming_personal_commands(handler: Any) -> bool:
         print("=" * 60)
 
     test_cases = [
-        ("DK5EN-99", handler.my_callsign, f"!WX {handler.my_callsign}",
-         True, "direct", "DK5EN-99", "Weather request with our target should execute"),
-        ("DK5EN-99", handler.my_callsign, f"!TIME {handler.my_callsign}",
-         True, "direct", "DK5EN-99", "Time request with our target should execute"),
-        ("DK5EN-99", handler.my_callsign, f"!DICE {handler.my_callsign}",
-         True, "direct", "DK5EN-99", "Dice request with our target should execute"),
-        ("DL2JA-1", handler.my_callsign, f"!STATS {handler.my_callsign}",
-         True, "direct", "DL2JA-1", "Stats request with our target should execute"),
-        ("DK5EN-99", handler.my_callsign, f"!SEARCH CALL:DK5EN-1 {handler.my_callsign}",
-         True, "direct", "DK5EN-99", "Search request with our target should execute"),
-        ("DK5EN-99", handler.my_callsign, f"!POS CALL:DB0ED-99 {handler.my_callsign}",
-         True, "direct", "DK5EN-99", "Position request with our target should execute"),
-        ("DK5EN-99", handler.my_callsign, f"!MHEARD LIMIT:5 {handler.my_callsign}",
-         True, "direct", "DK5EN-99", "MHeard request with our target should execute"),
-        ("DK5EN-99", handler.my_callsign, f"!USERINFO {handler.my_callsign}",
-         True, "direct", "DK5EN-99", "UserInfo request with our target should execute"),
-        ("OE5HWN-12", handler.my_callsign, "!WX",
-         True, "direct", "OE5HWN-12",
-         "Weather request without target should send out our WX report"),
-        ("OE5HWN-12", handler.my_callsign, "!TIME",
-         True, "direct", "OE5HWN-12",
-         "Time request without target should send out our time"),
-        ("OE5HWN-12", handler.my_callsign, "!DICE",
-         True, "direct", "OE5HWN-12",
-         "Dice request without target should send out our dice"),
-        ("OE5HWN-12", handler.my_callsign, "!STATS",
-         True, "direct", "OE5HWN-12",
-         "Stats request without target should not execute"),
-        ("DK5EN-99", handler.my_callsign, "!WX OE5HWN-12",
-         False, None, None, "Weather request with other target should not execute"),
-        ("DK5EN-99", handler.my_callsign, "!TIME OE5HWN-12",
-         False, None, None, "Time request with other target should not execute"),
-        ("DK5EN-99", handler.my_callsign, "!DICE OE5HWN-12",
-         False, None, None, "Dice request with other target should not execute"),
-        ("DK5EN-99", handler.my_callsign, f"!CTCPING TARGET:{handler.my_callsign} CALL:W1XYZ-1",
-         True, "direct", "DK5EN-99", "CTCPING with our target should execute"),
-        ("DK5EN-99", handler.my_callsign,
-         f"!CTCPING CALL:DK5EN-99 {handler.my_callsign}",
-         True, "direct", "DK5EN-99", "CTCPING with our target at end should execute"),
-        ("DK5EN-99", handler.my_callsign, "!CTCPING TARGET:OE5HWN-12 CALL:DK5EN-1",
-         False, None, None, "CTCPING with other target should not execute"),
-        (handler.my_callsign, "OE5HWN-12", "!WX",
-         True, "direct", "OE5HWN-12",
-         "Our weather command to chat partner should"
-         " execute locally and send result to partner"),
-        (handler.my_callsign, "OE5HWN-12", "!TIME",
-         True, "direct", "OE5HWN-12",
-         "Our time command to chat partner should"
-         " execute locally and send result to partner"),
-        (handler.my_callsign, "OE5HWN-12", "!DICE",
-         True, "direct", "OE5HWN-12",
-         "Our dice command to chat partner should"
-         " execute locally and send result to partner"),
-        (handler.my_callsign, "OE5HWN-12", "!STATS",
-         True, "direct", "OE5HWN-12",
-         "Our stats command to chat partner should"
-         " execute locally and send result to partner"),
-        (handler.my_callsign, "OE5HWN-12", "!USERINFO",
-         True, "direct", "OE5HWN-12",
-         "Our userinfo to chat partner should execute locally and send result to partner"),
-        (handler.my_callsign, "OE5HWN-12", "!SEARCH CALL:DK5EN-1",
-         True, "direct", "OE5HWN-12",
-         "Our search command to chat partner should"
-         " execute locally and send result to partner"),
-        (handler.my_callsign, "OE5HWN-12", "!MHEARD LIMIT:3",
-         True, "direct", "OE5HWN-12",
-         "Our mheard command to chat partner should"
-         " execute locally and send result to partner"),
-        (handler.my_callsign, "DK5EN-99", "!WX",
-         True, "direct", "DK5EN-99",
-         "Our weather command to DK5EN-99 should execute locally and send result to partner"),
-        (handler.my_callsign, "OE1ABC-5", "!DICE",
-         True, "direct", "OE1ABC-5",
-         "Our dice command to OE1ABC-5 should execute locally and send result to partner"),
-        (handler.my_callsign, "W1XYZ-1", "!STATS",
-         True, "direct", "W1XYZ-1",
-         "Our stats command to W1XYZ-1 should execute locally and send result to partner"),
-        (handler.my_callsign, "OE5HWN-12", f"!TIME {handler.my_callsign}",
-         True, "direct", "OE5HWN-12",
-         "Our time command with our target should"
-         " execute locally and send result to partner"),
-        (handler.my_callsign, "DK5EN-99", f"!WX {handler.my_callsign}",
-         True, "direct", "DK5EN-99",
-         "Our weather command with our target should"
-         " execute locally and send result to partner"),
-        (handler.my_callsign, "OE5HWN-12", "!TIME OE5HWN-12",
-         False, None, None,
-         "Our time command with partner's target should not execute locally (remote intent)"),
-        (handler.my_callsign, "DK5EN-99", "!WX DK5EN-99",
-         False, None, None,
-         "Our weather command with DK5EN-99 target"
-         " should not execute locally (remote intent)"),
-        (handler.my_callsign, "OE1ABC-5", "!DICE OE1ABC-5",
-         False, None, None,
-         "Our dice command with OE1ABC-5 target should not execute locally (remote intent)"),
+        (
+            "DK5EN-99",
+            handler.my_callsign,
+            f"!WX {handler.my_callsign}",
+            True,
+            "direct",
+            "DK5EN-99",
+            "Weather request with our target should execute",
+        ),
+        (
+            "DK5EN-99",
+            handler.my_callsign,
+            f"!TIME {handler.my_callsign}",
+            True,
+            "direct",
+            "DK5EN-99",
+            "Time request with our target should execute",
+        ),
+        (
+            "DK5EN-99",
+            handler.my_callsign,
+            f"!DICE {handler.my_callsign}",
+            True,
+            "direct",
+            "DK5EN-99",
+            "Dice request with our target should execute",
+        ),
+        (
+            "DL2JA-1",
+            handler.my_callsign,
+            f"!STATS {handler.my_callsign}",
+            True,
+            "direct",
+            "DL2JA-1",
+            "Stats request with our target should execute",
+        ),
+        (
+            "DK5EN-99",
+            handler.my_callsign,
+            f"!SEARCH CALL:DK5EN-1 {handler.my_callsign}",
+            True,
+            "direct",
+            "DK5EN-99",
+            "Search request with our target should execute",
+        ),
+        (
+            "DK5EN-99",
+            handler.my_callsign,
+            f"!POS CALL:DB0ED-99 {handler.my_callsign}",
+            True,
+            "direct",
+            "DK5EN-99",
+            "Position request with our target should execute",
+        ),
+        (
+            "DK5EN-99",
+            handler.my_callsign,
+            f"!MHEARD LIMIT:5 {handler.my_callsign}",
+            True,
+            "direct",
+            "DK5EN-99",
+            "MHeard request with our target should execute",
+        ),
+        (
+            "DK5EN-99",
+            handler.my_callsign,
+            f"!USERINFO {handler.my_callsign}",
+            True,
+            "direct",
+            "DK5EN-99",
+            "UserInfo request with our target should execute",
+        ),
+        (
+            "OE5HWN-12",
+            handler.my_callsign,
+            "!WX",
+            True,
+            "direct",
+            "OE5HWN-12",
+            "Weather request without target should send out our WX report",
+        ),
+        (
+            "OE5HWN-12",
+            handler.my_callsign,
+            "!TIME",
+            True,
+            "direct",
+            "OE5HWN-12",
+            "Time request without target should send out our time",
+        ),
+        (
+            "OE5HWN-12",
+            handler.my_callsign,
+            "!DICE",
+            True,
+            "direct",
+            "OE5HWN-12",
+            "Dice request without target should send out our dice",
+        ),
+        (
+            "OE5HWN-12",
+            handler.my_callsign,
+            "!STATS",
+            True,
+            "direct",
+            "OE5HWN-12",
+            "Stats request without target should not execute",
+        ),
+        (
+            "DK5EN-99",
+            handler.my_callsign,
+            "!WX OE5HWN-12",
+            False,
+            None,
+            None,
+            "Weather request with other target should not execute",
+        ),
+        (
+            "DK5EN-99",
+            handler.my_callsign,
+            "!TIME OE5HWN-12",
+            False,
+            None,
+            None,
+            "Time request with other target should not execute",
+        ),
+        (
+            "DK5EN-99",
+            handler.my_callsign,
+            "!DICE OE5HWN-12",
+            False,
+            None,
+            None,
+            "Dice request with other target should not execute",
+        ),
+        (
+            "DK5EN-99",
+            handler.my_callsign,
+            f"!CTCPING TARGET:{handler.my_callsign} CALL:W1XYZ-1",
+            True,
+            "direct",
+            "DK5EN-99",
+            "CTCPING with our target should execute",
+        ),
+        (
+            "DK5EN-99",
+            handler.my_callsign,
+            f"!CTCPING CALL:DK5EN-99 {handler.my_callsign}",
+            True,
+            "direct",
+            "DK5EN-99",
+            "CTCPING with our target at end should execute",
+        ),
+        (
+            "DK5EN-99",
+            handler.my_callsign,
+            "!CTCPING TARGET:OE5HWN-12 CALL:DK5EN-1",
+            False,
+            None,
+            None,
+            "CTCPING with other target should not execute",
+        ),
+        (
+            handler.my_callsign,
+            "OE5HWN-12",
+            "!WX",
+            True,
+            "direct",
+            "OE5HWN-12",
+            "Our weather command to chat partner should execute locally and send result to partner",
+        ),
+        (
+            handler.my_callsign,
+            "OE5HWN-12",
+            "!TIME",
+            True,
+            "direct",
+            "OE5HWN-12",
+            "Our time command to chat partner should execute locally and send result to partner",
+        ),
+        (
+            handler.my_callsign,
+            "OE5HWN-12",
+            "!DICE",
+            True,
+            "direct",
+            "OE5HWN-12",
+            "Our dice command to chat partner should execute locally and send result to partner",
+        ),
+        (
+            handler.my_callsign,
+            "OE5HWN-12",
+            "!STATS",
+            True,
+            "direct",
+            "OE5HWN-12",
+            "Our stats command to chat partner should execute locally and send result to partner",
+        ),
+        (
+            handler.my_callsign,
+            "OE5HWN-12",
+            "!USERINFO",
+            True,
+            "direct",
+            "OE5HWN-12",
+            "Our userinfo to chat partner should execute locally and send result to partner",
+        ),
+        (
+            handler.my_callsign,
+            "OE5HWN-12",
+            "!SEARCH CALL:DK5EN-1",
+            True,
+            "direct",
+            "OE5HWN-12",
+            "Our search command to chat partner should execute locally and send result to partner",
+        ),
+        (
+            handler.my_callsign,
+            "OE5HWN-12",
+            "!MHEARD LIMIT:3",
+            True,
+            "direct",
+            "OE5HWN-12",
+            "Our mheard command to chat partner should execute locally and send result to partner",
+        ),
+        (
+            handler.my_callsign,
+            "DK5EN-99",
+            "!WX",
+            True,
+            "direct",
+            "DK5EN-99",
+            "Our weather command to DK5EN-99 should execute locally and send result to partner",
+        ),
+        (
+            handler.my_callsign,
+            "OE1ABC-5",
+            "!DICE",
+            True,
+            "direct",
+            "OE1ABC-5",
+            "Our dice command to OE1ABC-5 should execute locally and send result to partner",
+        ),
+        (
+            handler.my_callsign,
+            "W1XYZ-1",
+            "!STATS",
+            True,
+            "direct",
+            "W1XYZ-1",
+            "Our stats command to W1XYZ-1 should execute locally and send result to partner",
+        ),
+        (
+            handler.my_callsign,
+            "OE5HWN-12",
+            f"!TIME {handler.my_callsign}",
+            True,
+            "direct",
+            "OE5HWN-12",
+            "Our time command with our target should execute locally and send result to partner",
+        ),
+        (
+            handler.my_callsign,
+            "DK5EN-99",
+            f"!WX {handler.my_callsign}",
+            True,
+            "direct",
+            "DK5EN-99",
+            "Our weather command with our target should execute locally and send result to partner",
+        ),
+        (
+            handler.my_callsign,
+            "OE5HWN-12",
+            "!TIME OE5HWN-12",
+            False,
+            None,
+            None,
+            "Our time command with partner's target should not execute locally (remote intent)",
+        ),
+        (
+            handler.my_callsign,
+            "DK5EN-99",
+            "!WX DK5EN-99",
+            False,
+            None,
+            None,
+            "Our weather command with DK5EN-99 target should not execute locally (remote intent)",
+        ),
+        (
+            handler.my_callsign,
+            "OE1ABC-5",
+            "!DICE OE1ABC-5",
+            False,
+            None,
+            None,
+            "Our dice command with OE1ABC-5 target should not execute locally (remote intent)",
+        ),
     ]
 
     results = []
 
-    for (src, dst, command, should_execute, expected_type,
-         expected_response_dst, description) in test_cases:
+    for (
+        src,
+        dst,
+        command,
+        should_execute,
+        expected_type,
+        expected_response_dst,
+        description,
+    ) in test_cases:
         try:
             if has_console:
                 print(f"\n🔄 Testing: {src} → {dst}: {command}")
@@ -1635,10 +2261,7 @@ async def test_incoming_personal_commands(handler: Any) -> bool:
             type_match = target_type == expected_type
 
             if should_execute and target_type == "direct":
-                if src == handler.my_callsign:
-                    actual_response_target = dst
-                else:
-                    actual_response_target = src
+                actual_response_target = dst if src == handler.my_callsign else src
             elif should_execute and target_type == "group":
                 actual_response_target = dst
             else:
@@ -1681,12 +2304,7 @@ async def test_incoming_personal_commands(handler: Any) -> bool:
                             f" {should_execute}"
                         )
                     if not type_match:
-                        print(
-                            f"     ❌ Type mismatch:"
-                            f" got {target_type},"
-                            f" expected"
-                            f" {expected_type}"
-                        )
+                        print(f"     ❌ Type mismatch: got {target_type}, expected {expected_type}")
                     if not response_match:
                         print(
                             f"     ❌ Response target"
@@ -1718,10 +2336,8 @@ async def test_incoming_personal_commands(handler: Any) -> bool:
             failed_tests = [r for r in results if not r[2]]
             if failed_tests:
                 print("\n❌ Failed Tests:")
-                for status, description, _ in failed_tests:
+                for _status, description, _ in failed_tests:
                     print(f"   • {description}")
         print("=" * 60)
 
     return passed == total
-
-

@@ -16,16 +16,19 @@ logger = get_logger(__name__)
 class RoutingMixin(CommandHandlerBase):
     """Mixin providing message routing, command parsing, and execution logic."""
 
-    async def _message_handler(self, routed_message: dict[str, Any]) -> None:
+    async def _message_handler(self, routed_message: dict[str, Any]) -> None:  # noqa: PLR0911 - complex handler kept intact
         """Handle incoming messages: dispatch echoes/ACKs, then parse and execute commands."""
         message_data = routed_message["data"]
         src_type = message_data.get("src_type")
 
         logger.debug(
             "_message_handler: source=%s type=%s src_type=%r src=%s dst=%s msg=%.30s",
-            routed_message.get('source'), routed_message.get('type'),
-            src_type, message_data.get('src'), message_data.get('dst'),
-            message_data.get('msg', ''),
+            routed_message.get("source"),
+            routed_message.get("type"),
+            src_type,
+            message_data.get("src"),
+            message_data.get("dst"),
+            message_data.get("msg", ""),
         )
 
         if "msg" not in message_data:
@@ -55,7 +58,7 @@ class RoutingMixin(CommandHandlerBase):
         msg_text = normalized["msg"]
 
         # Skip own messages echoed back from the mesh
-        if src == self.my_callsign and routed_message.get('source') == 'udp':
+        if src == self.my_callsign and routed_message.get("source") == "udp":
             logger.debug("Skipping own echo from mesh: %s", msg_text[:30])
             return
 
@@ -66,7 +69,10 @@ class RoutingMixin(CommandHandlerBase):
 
         logger.debug(
             "Executing %s command from %s (admin=%s, groups=%s)",
-            target_type, src, self._is_admin(src), self.group_responses_enabled,
+            target_type,
+            src,
+            self._is_admin(src),
+            self.group_responses_enabled,
         )
 
         response_target = self._resolve_response_target(src, dst, target_type)
@@ -78,7 +84,8 @@ class RoutingMixin(CommandHandlerBase):
                 self.block_notifications_sent.add(src)
                 await self.send_response(
                     "🚫 Temporarily in timeout due to repeated invalid commands",
-                    response_target, src_type,
+                    response_target,
+                    src_type,
                 )
             return
 
@@ -88,12 +95,18 @@ class RoutingMixin(CommandHandlerBase):
             logger.debug("Throttled: %s command '%s'", src, msg_text)
             await self.send_response(
                 "⏳ Command throttled. Same command allowed once per 5min",
-                response_target, src_type,
+                response_target,
+                src_type,
             )
             return
 
         await self._parse_and_execute(
-            msg_text, msg_id, content_hash, response_target, src, src_type,
+            msg_text,
+            msg_id,
+            content_hash,
+            response_target,
+            src,
+            src_type,
         )
 
     def _resolve_response_target(self, src: str, dst: str, target_type: str) -> str:
@@ -102,7 +115,7 @@ class RoutingMixin(CommandHandlerBase):
             return dst if src == self.my_callsign else src
         return dst  # group → reply to group
 
-    async def _parse_and_execute(
+    async def _parse_and_execute(  # noqa: PLR0913 - signature fixed by call sites
         self,
         msg_text: str,
         msg_id: Any,
@@ -126,7 +139,8 @@ class RoutingMixin(CommandHandlerBase):
                 timeout_min = COMMAND_THROTTLING.get(cmd, DEFAULT_THROTTLE_TIMEOUT // 60)
                 await self.send_response(
                     f"⏳ !{cmd} throttled. Try again in {timeout_min}min",
-                    response_target, src_type,
+                    response_target,
+                    src_type,
                 )
                 return
 
@@ -140,7 +154,9 @@ class RoutingMixin(CommandHandlerBase):
             self._track_failed_attempt(src)
             self._mark_msg_id_processed(msg_id)
             await self.send_response(
-                self._error_response_text(e), response_target, src_type,
+                self._error_response_text(e),
+                response_target,
+                src_type,
             )
 
     @staticmethod
@@ -157,7 +173,7 @@ class RoutingMixin(CommandHandlerBase):
         """Normalize command data with uppercase conversion."""
         return normalize_unified(message_data, context="command")
 
-    def _should_execute_command(self, src: str, dst: str, msg: str) -> tuple[bool, str | None]:
+    def _should_execute_command(self, src: str, dst: str, msg: str) -> tuple[bool, str | None]:  # noqa: PLR0911 - complex handler kept intact
         """Flat routing logic with early returns."""
         src = src.upper()
         dst = dst.upper()
@@ -217,7 +233,7 @@ class RoutingMixin(CommandHandlerBase):
 
     async def execute_command(self, cmd: str, kwargs: dict[str, Any], requester: str) -> Any:
         """Execute a command and return response"""
-        from .handler import COMMANDS
+        from .handler import COMMANDS  # noqa: PLC0415 - circular import avoidance
 
         if cmd not in COMMANDS:
             return "❌ Unknown command"

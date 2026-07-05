@@ -7,10 +7,13 @@ and Server-Sent Events for notifications.
 
 import asyncio
 import base64
+import contextlib
 import json
 import logging
 import time
-from typing import Any, Callable, cast
+from collections.abc import Callable
+from http import HTTPStatus
+from typing import Any, cast
 from urllib.parse import urljoin
 
 import httpx
@@ -38,7 +41,7 @@ class BLEClientRemote(BLEClientBase):
         timeout: float = 30.0,
     ) -> None:
         super().__init__(notification_callback)
-        self.remote_url = remote_url.rstrip('/')
+        self.remote_url = remote_url.rstrip("/")
         self.api_key = api_key
         self.message_router = message_router
         self.timeout = timeout
@@ -73,7 +76,7 @@ class BLEClientRemote(BLEClientBase):
         self._client = None
         await self._ensure_client()
 
-    async def _request(
+    async def _request(  # noqa: PLR0913 - signature fixed by call sites
         self,
         method: str,
         endpoint: str,
@@ -93,50 +96,54 @@ class BLEClientRemote(BLEClientBase):
 
         for attempt in range(1 + retries):
             try:
-                assert self._client is not None
+                if self._client is None:
+                    raise RuntimeError("self._client is unexpectedly None")
                 response = await self._client.request(
                     method,
                     url,
                     headers=self._headers(),
-                    json=data if data else None,
+                    json=data or None,
                     timeout=timeout,
                 )
                 response_data: dict[str, Any] = response.json()
 
-                if response.status_code == 409 and attempt < retries:
+                if response.status_code == HTTPStatus.CONFLICT and attempt < retries:
                     logger.info(
                         "BLE busy (409), retry %d/%d in %.1fs: %s",
-                        attempt + 1, retries, retry_delay, endpoint
+                        attempt + 1,
+                        retries,
+                        retry_delay,
+                        endpoint,
                     )
                     await asyncio.sleep(retry_delay)
                     continue
 
-                if response.status_code >= 400:
-                    detail = response_data.get('detail', 'Unknown error')
+                if response.status_code >= HTTPStatus.BAD_REQUEST:
+                    detail = response_data.get("detail", "Unknown error")
                     # Structured detail (dict) from enriched 409 responses
                     if isinstance(detail, dict):
-                        error_msg = detail.get('message', str(detail))
-                        reason = detail.get('reason', '')
-                        if reason == 'reconnecting':
-                            attempt = detail.get('attempt', '?')
-                            max_a = detail.get('max_attempts', '?')
-                            dev = detail.get('device_name', '')
+                        error_msg = detail.get("message", str(detail))
+                        reason = detail.get("reason", "")
+                        if reason == "reconnecting":
+                            attempt_no = detail.get("attempt", "?")
+                            max_a = detail.get("max_attempts", "?")
+                            dev = detail.get("device_name", "")
                             error_msg = (
-                                f"Cannot scan: reconnecting to {dev} "
-                                f"(attempt {attempt}/{max_a})"
+                                f"Cannot scan: reconnecting to {dev} (attempt {attempt_no}/{max_a})"
                             )
                     else:
                         error_msg = str(detail)
                     raise RuntimeError(f"API error ({response.status_code}): {error_msg}")
-
-                return response_data
 
             except httpx.HTTPError as e:
                 if attempt < retries:
                     log = logger.debug if quiet else logger.warning
                     log(
                         "HTTP request failed (%s), retry %d/%d: %s",
-                        e, attempt + 1, retries, endpoint
+                        e,
+                        attempt + 1,
+                        retries,
+                        endpoint,
                     )
                     await self._reset_client()
                     await asyncio.sleep(retry_delay)
@@ -145,63 +152,67 @@ class BLEClientRemote(BLEClientBase):
                 log_final("HTTP request failed after %d attempts: %s", retries + 1, e)
                 raise RuntimeError(f"Connection error: {e}") from e
 
+            else:
+                return response_data
         raise RuntimeError("BLE service busy after retries")
 
     async def _publish_status(self, command: str, result: str, msg: str) -> None:
         """Publish BLE status through message router"""
         if self.message_router:
-            await self.message_router.publish('ble', 'ble_status', {
-                'src_type': 'BLE',
-                'TYP': 'blueZ',
-                'command': command,
-                'result': result,
-                'msg': msg,
-                'timestamp': int(time.time() * 1000)
-            })
+            await self.message_router.publish(
+                "ble",
+                "ble_status",
+                {
+                    "src_type": "BLE",
+                    "TYP": "blueZ",
+                    "command": command,
+                    "result": result,
+                    "msg": msg,
+                    "timestamp": int(time.time() * 1000),
+                },
+            )
 
-    async def scan(self, timeout: float = 5.0, prefix: str = "MC-") -> list[BLEDevice]:
+    async def scan(self, timeout: float = 5.0, prefix: str = "MC-") -> list[BLEDevice]:  # noqa: ASYNC109 - public API takes timeout
         """Scan for devices via remote service"""
         try:
-            await self._publish_status('scan BLE', 'info', 'Starting remote scan...')
+            await self._publish_status("scan BLE", "info", "Starting remote scan...")
 
             response = await self._request(
-                'GET',
-                f'/api/ble/devices?timeout={timeout}&prefix={prefix}'
+                "GET", f"/api/ble/devices?timeout={timeout}&prefix={prefix}"
             )
 
             devices = [
                 BLEDevice(
-                    name=d['name'],
-                    address=d['address'],
-                    rssi=d['rssi'],
-                    paired=d['paired'],
-                    known=d.get('known', False)
+                    name=d["name"],
+                    address=d["address"],
+                    rssi=d["rssi"],
+                    paired=d["paired"],
+                    known=d.get("known", False),
                 )
-                for d in response.get('devices', [])
+                for d in response.get("devices", [])
             ]
 
-            await self._publish_status(
-                'scan BLE result',
-                'ok',
-                f'Found {len(devices)} devices'
-            )
-
-            return devices
+            await self._publish_status("scan BLE result", "ok", f"Found {len(devices)} devices")
 
         except RuntimeError as e:
             error_str = str(e)
-            logger.error("Scan error: %s", error_str)
+            logger.exception("Scan error: %s", error_str)
             # Produce a user-friendly message for reconnect-blocked scans
             msg = error_str
-            if 'reconnect' in error_str.lower() or '409' in error_str:
-                msg = ("Cannot scan: the backend is reconnecting to the device. "
-                       "Wait for reconnect to finish or cancel it first.")
-            await self._publish_status('scan BLE result', 'error', msg)
+            if "reconnect" in error_str.lower() or "409" in error_str:
+                msg = (
+                    "Cannot scan: the backend is reconnecting to the device. "
+                    "Wait for reconnect to finish or cancel it first."
+                )
+            await self._publish_status("scan BLE result", "error", msg)
             return []
         except Exception as e:
-            logger.error("Scan error: %s", e)
-            await self._publish_status('scan BLE result', 'error', str(e))
+            logger.exception("Scan error")
+            await self._publish_status("scan BLE result", "error", str(e))
             return []
+
+        else:
+            return devices
 
     async def connect(self, mac: str) -> bool:
         """Connect to device via remote service"""
@@ -220,130 +231,122 @@ class BLEClientRemote(BLEClientBase):
         try:
             self._status.state = ConnectionState.CONNECTING
             self._last_connect_attempt = time.time()
-            await self._publish_status('connect BLE', 'info', f'Connecting to {mac}...')
+            await self._publish_status("connect BLE", "info", f"Connecting to {mac}...")
 
             response = await self._request(
-                'POST',
-                '/api/ble/connect',
-                {'device_address': mac},
+                "POST",
+                "/api/ble/connect",
+                {"device_address": mac},
                 retries=0,  # BLE service has internal retries; don't retry 409 here
                 request_timeout=45.0,  # Allow for 3×10s BLE attempts + cleanup
             )
 
-            success = cast(bool, response.get('success', False))
+            success = cast(bool, response.get("success", False))
 
             if success:
                 self._status.state = ConnectionState.CONNECTED
                 self._status.device_address = mac
                 self._last_connect_attempt = 0  # Reset cooldown on success
-                await self._publish_status('connect BLE result', 'ok', f'Connected to {mac}')
+                await self._publish_status("connect BLE result", "ok", f"Connected to {mac}")
             else:
                 self._status.state = ConnectionState.ERROR
-                self._status.error = response.get('message', 'Connection failed')
-                await self._publish_status(
-                    'connect BLE result',
-                    'error',
-                    self._status.error
-                )
-
-            return success
+                self._status.error = response.get("message", "Connection failed")
+                await self._publish_status("connect BLE result", "error", self._status.error)
 
         except Exception as e:
-            logger.error("Connect error: %s", e)
+            logger.exception("Connect error")
             self._status.state = ConnectionState.ERROR
             self._status.error = str(e)
-            await self._publish_status('connect BLE result', 'error', str(e))
+            await self._publish_status("connect BLE result", "error", str(e))
             return False
+
+        else:
+            return success
 
     async def disconnect(self) -> bool:
         """Disconnect via remote service"""
         try:
             self._status.state = ConnectionState.DISCONNECTING
-            await self._publish_status('disconnect BLE', 'info', 'Disconnecting...')
+            await self._publish_status("disconnect BLE", "info", "Disconnecting...")
 
-            response = await self._request('POST', '/api/ble/disconnect')
-            success = cast(bool, response.get('success', False))
+            response = await self._request("POST", "/api/ble/disconnect")
+            success = cast(bool, response.get("success", False))
 
             self._status.state = ConnectionState.DISCONNECTED
             self._status.device_address = None
-            await self._publish_status('disconnect BLE result', 'ok', 'Disconnected')
-
-            return success
+            await self._publish_status("disconnect BLE result", "ok", "Disconnected")
 
         except Exception as e:
-            logger.error("Disconnect error: %s", e)
-            await self._publish_status('disconnect BLE result', 'error', str(e))
+            logger.exception("Disconnect error")
+            await self._publish_status("disconnect BLE result", "error", str(e))
             return False
+
+        else:
+            return success
 
     async def cancel_reconnect(self) -> bool:
         """Cancel any in-progress auto-reconnect on the BLE service."""
         try:
-            response = await self._request('POST', '/api/ble/cancel_reconnect')
-            success = cast(bool, response.get('success', False))
+            response = await self._request("POST", "/api/ble/cancel_reconnect")
+            success = cast(bool, response.get("success", False))
             self._status.state = ConnectionState.DISCONNECTED
             self._status.device_address = None
-            await self._publish_status(
-                'disconnect BLE', 'ok', 'Reconnect cancelled'
-            )
-            return success
-        except Exception as e:
-            logger.error("Cancel reconnect error: %s", e)
+            await self._publish_status("disconnect BLE", "ok", "Reconnect cancelled")
+        except Exception:
+            logger.exception("Cancel reconnect error")
             return False
+
+        else:
+            return success
 
     async def get_activity(self) -> list[dict[str, Any]]:
         """Fetch the activity log from the BLE service."""
         try:
-            response = await self._request('GET', '/api/ble/activity')
-            return cast(list[dict[str, Any]], response.get('events', []))
-        except Exception as e:
-            logger.error("Get activity error: %s", e)
+            response = await self._request("GET", "/api/ble/activity")
+            return cast(list[dict[str, Any]], response.get("events", []))
+        except Exception:
+            logger.exception("Get activity error")
             return []
 
     async def pair(self, mac: str) -> bool:
         """Pair with device via remote service"""
         try:
-            await self._publish_status('pair BLE', 'info', f'Pairing with {mac}...')
+            await self._publish_status("pair BLE", "info", f"Pairing with {mac}...")
 
-            response = await self._request(
-                'POST',
-                '/api/ble/pair',
-                {'device_address': mac}
-            )
+            response = await self._request("POST", "/api/ble/pair", {"device_address": mac})
 
-            success = cast(bool, response.get('success', False))
-            result = 'ok' if success else 'error'
-            msg = cast(str, response.get('message', ''))
-            await self._publish_status('pair BLE result', result, msg)
-
-            return success
+            success = cast(bool, response.get("success", False))
+            result = "ok" if success else "error"
+            msg = cast(str, response.get("message", ""))
+            await self._publish_status("pair BLE result", result, msg)
 
         except Exception as e:
-            logger.error("Pair error: %s", e)
-            await self._publish_status('pair BLE result', 'error', str(e))
+            logger.exception("Pair error")
+            await self._publish_status("pair BLE result", "error", str(e))
             return False
+
+        else:
+            return success
 
     async def unpair(self, mac: str) -> bool:
         """Unpair device via remote service"""
         try:
-            await self._publish_status('unpair BLE', 'info', f'Unpairing {mac}...')
+            await self._publish_status("unpair BLE", "info", f"Unpairing {mac}...")
 
-            response = await self._request(
-                'POST',
-                '/api/ble/unpair',
-                {'device_address': mac}
-            )
+            response = await self._request("POST", "/api/ble/unpair", {"device_address": mac})
 
-            success = cast(bool, response.get('success', False))
-            result = 'ok' if success else 'error'
-            msg = cast(str, response.get('message', ''))
-            await self._publish_status('unpair BLE result', result, msg)
-
-            return success
+            success = cast(bool, response.get("success", False))
+            result = "ok" if success else "error"
+            msg = cast(str, response.get("message", ""))
+            await self._publish_status("unpair BLE result", result, msg)
 
         except Exception as e:
-            logger.error("Unpair error: %s", e)
-            await self._publish_status('unpair BLE result', 'error', str(e))
+            logger.exception("Unpair error")
+            await self._publish_status("unpair BLE result", "error", str(e))
             return False
+
+        else:
+            return success
 
     async def send_message(self, msg: str, group: str) -> bool:
         """Send message via remote service"""
@@ -352,14 +355,12 @@ class BLEClientRemote(BLEClientBase):
 
         try:
             response = await self._request(
-                'POST',
-                '/api/ble/send',
-                {'message': msg, 'group': group}
+                "POST", "/api/ble/send", {"message": msg, "group": group}
             )
-            return cast(bool, response.get('success', False))
+            return cast(bool, response.get("success", False))
 
-        except Exception as e:
-            logger.error("Send message error: %s", e)
+        except Exception:
+            logger.exception("Send message error")
             return False
 
     async def send_command(self, cmd: str) -> bool:
@@ -368,25 +369,21 @@ class BLEClientRemote(BLEClientBase):
             return False
 
         try:
-            response = await self._request(
-                'POST',
-                '/api/ble/send',
-                {'command': cmd}
-            )
-            return cast(bool, response.get('success', False))
+            response = await self._request("POST", "/api/ble/send", {"command": cmd})
+            return cast(bool, response.get("success", False))
 
-        except Exception as e:
-            logger.error("Send command error: %s", e)
+        except Exception:
+            logger.exception("Send command error")
             return False
 
     async def set_command(self, cmd: str) -> bool:
         """Send set command via remote service"""
         if cmd == "--settime":
             try:
-                response = await self._request('POST', '/api/ble/settime')
-                return cast(bool, response.get('success', False))
-            except Exception as e:
-                logger.error("Set time error: %s", e)
+                response = await self._request("POST", "/api/ble/settime")
+                return cast(bool, response.get("success", False))
+            except Exception:
+                logger.exception("Set time error")
                 return False
         else:
             # For other set commands, send as regular command
@@ -413,8 +410,8 @@ class BLEClientRemote(BLEClientBase):
 
         Does NOT change the PIN on the device — use `--btcode <pin>` for that.
         """
-        response = await self._request('PATCH', '/api/ble/pin', data={'pin': pin})
-        return cast(bool, response.get('ok', False))
+        response = await self._request("PATCH", "/api/ble/pin", data={"pin": pin})
+        return cast(bool, response.get("ok", False))
 
     async def start(self) -> None:
         """Start the remote BLE client and SSE notification stream"""
@@ -424,22 +421,20 @@ class BLEClientRemote(BLEClientBase):
         # Check connection to remote service
         try:
             await self._ensure_client()
-            status = await self._request('GET', '/api/ble/status', retries=4, quiet=True)
-            logger.info("Remote service status: %s", status.get('state', 'unknown'))
+            status = await self._request("GET", "/api/ble/status", retries=4, quiet=True)
+            logger.info("Remote service status: %s", status.get("state", "unknown"))
 
             # Update local status based on remote
-            if status.get('connected'):
+            if status.get("connected"):
                 self._status.state = ConnectionState.CONNECTED
-                self._status.device_address = status.get('device_address')
+                self._status.device_address = status.get("device_address")
             else:
                 self._status.state = ConnectionState.DISCONNECTED
 
         except Exception as e:
             logger.warning("Remote BLE service not ready yet: %s (SSE loop will retry)", e)
             await self._publish_status(
-                'remote connect',
-                'error',
-                f'Cannot reach BLE service at {self.remote_url}: {e}'
+                "remote connect", "error", f"Cannot reach BLE service at {self.remote_url}: {e}"
             )
 
         # Always start SSE notification stream — it has its own reconnection logic
@@ -453,10 +448,8 @@ class BLEClientRemote(BLEClientBase):
         # Stop SSE task
         if self._sse_task and not self._sse_task.done():
             self._sse_task.cancel()
-            try:
+            with contextlib.suppress(asyncio.CancelledError):
                 await self._sse_task
-            except asyncio.CancelledError:
-                pass
             self._sse_task = None
 
         # Close HTTP client
@@ -464,46 +457,53 @@ class BLEClientRemote(BLEClientBase):
             await self._client.aclose()
             self._client = None
 
-    async def _sse_loop(self) -> None:
+    async def _sse_loop(self) -> None:  # noqa: PLR0912, PLR0915 - complex handler kept intact
         """SSE notification listener loop"""
-        url = urljoin(self.remote_url, '/api/ble/notifications')
+        url = urljoin(self.remote_url, "/api/ble/notifications")
         headers: dict[str, str] = {}
         if self.api_key:
-            headers['X-API-Key'] = self.api_key
+            headers["X-API-Key"] = self.api_key
 
         while self._running:
             try:
                 logger.info("Connecting to SSE stream: %s", url)
 
-                async with httpx.AsyncClient(timeout=httpx.Timeout(
-                    connect=30.0, read=90.0, write=30.0, pool=30.0,
-                )) as sse_client:
-                    async with sse_client.stream('GET', url, headers=headers) as response:
-                        response.raise_for_status()
-                        self._sse_backoff = 5  # Reset on successful connection
+                async with (
+                    httpx.AsyncClient(
+                        timeout=httpx.Timeout(
+                            connect=30.0,
+                            read=90.0,
+                            write=30.0,
+                            pool=30.0,
+                        )
+                    ) as sse_client,
+                    sse_client.stream("GET", url, headers=headers) as response,
+                ):
+                    response.raise_for_status()
+                    self._sse_backoff = 5  # Reset on successful connection
 
-                        event_type: str = ''
-                        event_data: str = ''
+                    event_type: str = ""
+                    event_data: str = ""
 
-                        async for line in response.aiter_lines():
-                            if not self._running:
-                                break
+                    async for line in response.aiter_lines():
+                        if not self._running:
+                            break
 
-                            if line.startswith('event:'):
-                                event_type = line[6:].strip()
-                            elif line.startswith('data:'):
-                                event_data = line[5:].strip()
-                            elif line == '':
-                                # Empty line = end of SSE event
-                                if event_type and event_data:
-                                    if event_type == 'notification':
-                                        await self._handle_notification(event_data)
-                                    elif event_type == 'status':
-                                        await self._handle_status(event_data)
-                                    elif event_type == 'ping':
-                                        logger.debug("SSE ping received")
-                                event_type = ''
-                                event_data = ''
+                        if line.startswith("event:"):
+                            event_type = line[6:].strip()
+                        elif line.startswith("data:"):
+                            event_data = line[5:].strip()
+                        elif line == "":
+                            # Empty line = end of SSE event
+                            if event_type and event_data:
+                                if event_type == "notification":
+                                    await self._handle_notification(event_data)
+                                elif event_type == "status":
+                                    await self._handle_status(event_data)
+                                elif event_type == "ping":
+                                    logger.debug("SSE ping received")
+                            event_type = ""
+                            event_data = ""
 
             except asyncio.CancelledError:
                 break
@@ -531,12 +531,13 @@ class BLEClientRemote(BLEClientBase):
                             self._status.state = ConnectionState.DISCONNECTED
                             self._status.device_address = None
                             await self._publish_status(
-                                'disconnect BLE', 'lost', 'BLE service connection lost'
+                                "disconnect BLE", "lost", "BLE service connection lost"
                             )
-                    if not hasattr(self, '_sse_backoff'):
+                    if not hasattr(self, "_sse_backoff"):
                         self._sse_backoff = 5
-                    logger.warning("SSE connection error: %s, reconnecting in %ds...",
-                                   e, self._sse_backoff)
+                    logger.warning(
+                        "SSE connection error: %s, reconnecting in %ds...", e, self._sse_backoff
+                    )
                     await asyncio.sleep(self._sse_backoff)
                     self._sse_backoff = min(self._sse_backoff * 2, 60)
                 else:
@@ -551,17 +552,21 @@ class BLEClientRemote(BLEClientBase):
             notification: dict[str, Any] = json.loads(data)
 
             # CONFFIN is a status message, not a mesh message
-            if notification.get('format') == 'json' and 'parsed' in notification:
-                typ = notification['parsed'].get('TYP')
-                if typ == 'CONFFIN' and self.message_router:
-                    await self.message_router.publish('ble', 'ble_status', {
-                        'src_type': 'BLE',
-                        'TYP': 'blueZ',
-                        'command': 'conffin',
-                        'result': 'ok',
-                        'msg': '✅ finished sending config',
-                        'timestamp': int(time.time() * 1000),
-                    })
+            if notification.get("format") == "json" and "parsed" in notification:
+                typ = notification["parsed"].get("TYP")
+                if typ == "CONFFIN" and self.message_router:
+                    await self.message_router.publish(
+                        "ble",
+                        "ble_status",
+                        {
+                            "src_type": "BLE",
+                            "TYP": "blueZ",
+                            "command": "conffin",
+                            "result": "ok",
+                            "msg": "✅ finished sending config",
+                            "timestamp": int(time.time() * 1000),
+                        },
+                    )
                     return
 
             # Publish through message router if available
@@ -569,7 +574,7 @@ class BLEClientRemote(BLEClientBase):
                 # Transform to match expected format
                 output = self._transform_notification(notification)
                 if output:
-                    await self.message_router.publish('ble', 'ble_notification', output)
+                    await self.message_router.publish("ble", "ble_notification", output)
 
             # Call direct callback if set
             if self.notification_callback:
@@ -577,23 +582,35 @@ class BLEClientRemote(BLEClientBase):
 
         except json.JSONDecodeError as e:
             logger.warning("Invalid SSE notification JSON: %s", e)
-        except Exception as e:
-            logger.error("Notification handling error: %s", e)
+        except Exception:
+            logger.exception("Notification handling error")
 
     def _get_own_callsign(self) -> str:
         """Get own callsign from message router if available."""
-        return getattr(self.message_router, 'my_callsign', '') if self.message_router else ''
+        return getattr(self.message_router, "my_callsign", "") if self.message_router else ""
 
-    def _transform_notification(self, notification: dict[str, Any]) -> dict[str, Any] | None:
+    def _transform_notification(self, notification: dict[str, Any]) -> dict[str, Any] | None:  # noqa: PLR0912 - complex handler kept intact
         """Transform SSE notification to match local BLE handler format"""
         own_call = self._get_own_callsign()
-        if notification.get('format') == 'json' and 'parsed' in notification:
+        if notification.get("format") == "json" and "parsed" in notification:
             # JSON notification - run through dispatcher like local mode
-            parsed = cast(dict[str, Any], notification['parsed'])
+            parsed = cast(dict[str, Any], notification["parsed"])
             typ = parsed.get("TYP", "?")
             _routine_typs = {
-                "MH", "G", "I", "SA", "SN", "W", "IO", "TM", "AN",
-                "SE", "SW", "S1", "S2", "CONFFIN",
+                "MH",
+                "G",
+                "I",
+                "SA",
+                "SN",
+                "W",
+                "IO",
+                "TM",
+                "AN",
+                "SE",
+                "SW",
+                "S1",
+                "S2",
+                "CONFFIN",
             }
             if typ in _routine_typs:
                 logger.debug("BLE JSON TYP=%s: %s", typ, parsed)
@@ -601,19 +618,19 @@ class BLEClientRemote(BLEClientBase):
                 logger.info("BLE JSON TYP=%s: %s", typ, parsed)
             output = dispatcher(parsed, own_call)
             if output:
-                output['timestamp'] = notification.get('timestamp', int(time.time() * 1000))
-                if output.get('transformer') not in ('generic_ble', 'mh'):
-                    output['src_type'] = 'ble_remote'
+                output["timestamp"] = notification.get("timestamp", int(time.time() * 1000))
+                if output.get("transformer") not in ("generic_ble", "mh"):
+                    output["src_type"] = "ble_remote"
                 return output
             return None  # Unknown TYP — don't publish
 
-        elif notification.get('format') == 'binary':
+        if notification.get("format") == "binary":
             # Decode binary the same way local BLE handler does
-            raw_b64 = notification.get('raw_base64')
+            raw_b64 = notification.get("raw_base64")
             if raw_b64:
                 try:
                     raw_bytes = base64.b64decode(raw_b64)
-                    if raw_bytes.startswith(b'@'):
+                    if raw_bytes.startswith(b"@"):
                         decoded = decode_binary_message(raw_bytes)
                         if isinstance(decoded, dict):
                             pt = decoded.get("payload_type", 0)
@@ -633,92 +650,99 @@ class BLEClientRemote(BLEClientBase):
                             )
                         output = dispatcher(cast(dict[str, Any], decoded), own_call)
                         if output:
-                            if output.get('transformer') not in ('generic_ble', 'mh'):
-                                output['src_type'] = 'ble_remote'
-                            output['timestamp'] = notification.get(
-                                'timestamp', int(time.time() * 1000)
+                            if output.get("transformer") not in ("generic_ble", "mh"):
+                                output["src_type"] = "ble_remote"
+                            output["timestamp"] = notification.get(
+                                "timestamp", int(time.time() * 1000)
                             )
                             return output
-                    elif raw_bytes.startswith(b'D{'):
+                    elif raw_bytes.startswith(b"D{"):
                         decoded_maybe = decode_json_message(raw_bytes)
                         if isinstance(decoded_maybe, dict):
                             output = dispatcher(decoded_maybe, own_call)
                         else:
                             output = None
                         if output:
-                            if output.get('transformer') not in ('generic_ble', 'mh'):
-                                output['src_type'] = 'ble_remote'
-                            output['timestamp'] = notification.get(
-                                'timestamp', int(time.time() * 1000)
+                            if output.get("transformer") not in ("generic_ble", "mh"):
+                                output["src_type"] = "ble_remote"
+                            output["timestamp"] = notification.get(
+                                "timestamp", int(time.time() * 1000)
                             )
                             return output
                 except Exception as e:
                     logger.warning("Failed to decode binary notification: %s", e)
             # Fallback: return raw if decoding failed
             return {
-                'src_type': 'ble_remote',
-                'format': 'binary',
-                'raw_base64': raw_b64,
-                'raw_hex': notification.get('raw_hex'),
-                'timestamp': notification.get('timestamp', int(time.time() * 1000))
+                "src_type": "ble_remote",
+                "format": "binary",
+                "raw_base64": raw_b64,
+                "raw_hex": notification.get("raw_hex"),
+                "timestamp": notification.get("timestamp", int(time.time() * 1000)),
             }
 
-        else:
-            # Unknown format - pass through
-            notification['src_type'] = 'ble_remote'
-            return notification
+        # Unknown format - pass through
+        notification["src_type"] = "ble_remote"
+        return notification
 
-    async def _handle_status(self, data: str) -> None:
+    async def _handle_status(self, data: str) -> None:  # noqa: PLR0912 - complex handler kept intact
         """Handle SSE status update"""
         try:
             status: dict[str, Any] = json.loads(data)
             old_state = self._status.state
-            state_str = status.get('state', 'disconnected')
+            state_str = status.get("state", "disconnected")
 
             # --- Reconnecting: BLE service is retrying connection ---
-            if state_str == 'reconnecting':
+            if state_str == "reconnecting":
                 self._status.state = ConnectionState.CONNECTING
-                attempt = status.get('attempt', 0)
-                max_attempts = status.get('max_attempts', 4)
-                device_name = status.get('device_name', '')
-                logger.info("BLE reconnecting: attempt %d/%d to %s",
-                            attempt, max_attempts, device_name)
+                attempt = status.get("attempt", 0)
+                max_attempts = status.get("max_attempts", 4)
+                device_name = status.get("device_name", "")
+                logger.info(
+                    "BLE reconnecting: attempt %d/%d to %s", attempt, max_attempts, device_name
+                )
                 if self.message_router:
-                    await self.message_router.publish('ble', 'ble_status', {
-                        'src_type': 'BLE',
-                        'TYP': 'blueZ',
-                        'command': 'reconnecting BLE',
-                        'result': 'info',
-                        'msg': f'Reconnecting to {device_name} ({attempt}/{max_attempts})',
-                        'attempt': attempt,
-                        'max_attempts': max_attempts,
-                        'device_name': device_name,
-                        'device_address': status.get('device_address', ''),
-                        'next_retry_in': status.get('next_retry_in', 0),
-                        'timestamp': int(time.time() * 1000),
-                    })
+                    await self.message_router.publish(
+                        "ble",
+                        "ble_status",
+                        {
+                            "src_type": "BLE",
+                            "TYP": "blueZ",
+                            "command": "reconnecting BLE",
+                            "result": "info",
+                            "msg": f"Reconnecting to {device_name} ({attempt}/{max_attempts})",
+                            "attempt": attempt,
+                            "max_attempts": max_attempts,
+                            "device_name": device_name,
+                            "device_address": status.get("device_address", ""),
+                            "next_retry_in": status.get("next_retry_in", 0),
+                            "timestamp": int(time.time() * 1000),
+                        },
+                    )
                 return
 
             # --- Reconnect exhausted: all retry attempts failed ---
-            if state_str == 'reconnect_exhausted':
+            if state_str == "reconnect_exhausted":
                 self._status.state = ConnectionState.ERROR
-                device_name = status.get('device_name', '')
-                attempts = status.get('attempts', 4)
+                device_name = status.get("device_name", "")
+                attempts = status.get("attempts", 4)
                 self._status.error = f"Reconnect failed after {attempts} attempts"
-                logger.warning("BLE reconnect exhausted: %d attempts to %s",
-                               attempts, device_name)
+                logger.warning("BLE reconnect exhausted: %d attempts to %s", attempts, device_name)
                 if self.message_router:
-                    await self.message_router.publish('ble', 'ble_status', {
-                        'src_type': 'BLE',
-                        'TYP': 'blueZ',
-                        'command': 'reconnect_exhausted BLE',
-                        'result': 'error',
-                        'msg': f'Reconnect to {device_name} failed after {attempts} attempts',
-                        'attempts': attempts,
-                        'device_name': device_name,
-                        'device_address': status.get('device_address', ''),
-                        'timestamp': int(time.time() * 1000),
-                    })
+                    await self.message_router.publish(
+                        "ble",
+                        "ble_status",
+                        {
+                            "src_type": "BLE",
+                            "TYP": "blueZ",
+                            "command": "reconnect_exhausted BLE",
+                            "result": "error",
+                            "msg": f"Reconnect to {device_name} failed after {attempts} attempts",
+                            "attempts": attempts,
+                            "device_name": device_name,
+                            "device_address": status.get("device_address", ""),
+                            "timestamp": int(time.time() * 1000),
+                        },
+                    )
                 return
 
             # --- Standard state transitions ---
@@ -731,29 +755,29 @@ class BLEClientRemote(BLEClientBase):
 
             if old_state != new_state:
                 if new_state == ConnectionState.DISCONNECTED:
-                    reason = status.get('reason', 'unknown')
-                    logger.info("BLE remote disconnected (was %s, reason: %s)",
-                                old_state.value, reason)
+                    reason = status.get("reason", "unknown")
+                    logger.info(
+                        "BLE remote disconnected (was %s, reason: %s)", old_state.value, reason
+                    )
                     # Don't publish "lost" if this is a user-initiated cancel
-                    if reason == 'reconnect_cancelled':
-                        await self._publish_status(
-                            'disconnect BLE', 'ok', 'Reconnect cancelled'
-                        )
+                    if reason == "reconnect_cancelled":
+                        await self._publish_status("disconnect BLE", "ok", "Reconnect cancelled")
                     else:
                         await self._publish_status(
-                            'disconnect BLE', 'lost', 'BLE connection lost (device reboot)'
+                            "disconnect BLE", "lost", "BLE connection lost (device reboot)"
                         )
-                elif (old_state == ConnectionState.DISCONNECTED
-                        and new_state == ConnectionState.CONNECTED):
+                elif (
+                    old_state == ConnectionState.DISCONNECTED
+                    and new_state == ConnectionState.CONNECTED
+                ):
                     logger.info("BLE auto-reconnected (remote service restored connection)")
-                    self._status.device_address = status.get('device_address')
-                    self._status.device_name = status.get('device_name')
-                    await self._publish_status(
-                        'connect BLE result', 'ok', 'BLE auto-reconnected'
-                    )
+                    self._status.device_address = status.get("device_address")
+                    self._status.device_name = status.get("device_name")
+                    await self._publish_status("connect BLE result", "ok", "BLE auto-reconnected")
                 else:
-                    logger.info("BLE remote state changed: %s -> %s",
-                                old_state.value, new_state.value)
+                    logger.info(
+                        "BLE remote state changed: %s -> %s", old_state.value, new_state.value
+                    )
             else:
                 logger.debug("Remote status update: %s (unchanged)", state_str)
 
@@ -768,28 +792,29 @@ class BLEClientRemote(BLEClientBase):
     async def refresh_status(self) -> BLEStatus:
         """Refresh status from remote service"""
         try:
-            response = await self._request('GET', '/api/ble/status')
+            response = await self._request("GET", "/api/ble/status")
 
-            if response.get('connected'):
+            if response.get("connected"):
                 self._status.state = ConnectionState.CONNECTED
-                self._status.device_address = response.get('device_address')
-                self._status.device_name = response.get('device_name')
-            elif response.get('reconnecting'):
+                self._status.device_address = response.get("device_address")
+                self._status.device_name = response.get("device_name")
+            elif response.get("reconnecting"):
                 self._status.state = ConnectionState.CONNECTING
-                self._status.device_address = response.get('device_address')
-                self._status.device_name = response.get('device_name')
+                self._status.device_address = response.get("device_address")
+                self._status.device_name = response.get("device_name")
             else:
-                state_str = response.get('state', 'disconnected')
+                state_str = response.get("state", "disconnected")
                 try:
                     self._status.state = ConnectionState(state_str)
                 except ValueError:
                     self._status.state = ConnectionState.DISCONNECTED
                 self._status.device_address = None
 
-            self._status.error = response.get('error')
-            return self._status
+            self._status.error = response.get("error")
 
         except Exception as e:
             logger.warning("Status refresh error: %s", e)
             self._status.error = str(e)
+            return self._status
+        else:
             return self._status

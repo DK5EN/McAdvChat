@@ -9,6 +9,9 @@ from typing import Any, Literal
 
 from pydantic import BaseModel, Field, field_validator
 
+_BLE_PIN_MIN = 100_000
+_BLE_PIN_MAX = 999_999
+
 
 class SendMessageRequest(BaseModel):
     """Request model for sending messages via SSE API."""
@@ -71,7 +74,7 @@ class BlePinRequest(BaseModel):
     @field_validator("pin")
     @classmethod
     def _check_range(cls, v: int) -> int:
-        if v != 0 and not (100000 <= v <= 999999):
+        if v != 0 and not (_BLE_PIN_MIN <= v <= _BLE_PIN_MAX):
             raise ValueError("pin must be 0 or 100000–999999")
         return v
 

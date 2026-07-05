@@ -5,10 +5,14 @@ making them directly testable without constructing a MessageRouter.
 
 The MessageValidator class in main.py delegates to these functions.
 """
+
 from __future__ import annotations
 
 import re
-from typing import Any, Callable
+from collections.abc import Callable
+from typing import Any
+
+from .commands.parsing import extract_target_callsign
 
 
 def is_command(msg: str) -> bool:
@@ -52,7 +56,6 @@ def should_suppress_outbound(
         my_callsign: Own callsign in uppercase.
         is_group_func: Callable that returns True for group destinations.
     """
-    from .commands.parsing import extract_target_callsign
 
     src = message_data.get("src", "")
     dst = message_data.get("dst", "")
@@ -69,10 +72,7 @@ def should_suppress_outbound(
 
     target = extract_target_callsign(msg)
 
-    if not target or target == my_callsign:
-        return True
-
-    return False
+    return bool(not target or target == my_callsign)
 
 
 def get_suppression_reason(
@@ -87,7 +87,6 @@ def get_suppression_reason(
         my_callsign: Own callsign in uppercase.
         is_group_func: Callable that returns True for group destinations.
     """
-    from .commands.parsing import extract_target_callsign
 
     src = message_data.get("src", "")
     dst = message_data.get("dst", "")

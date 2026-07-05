@@ -16,6 +16,7 @@ Port: 2985 (hardcoded, LAN-only)
 """
 
 import argparse
+import contextlib
 import http.server
 import json
 import os
@@ -25,9 +26,13 @@ import shutil
 import sqlite3
 import subprocess
 import sys
+import tempfile
 import threading
 import time
-from datetime import datetime, timezone
+import traceback
+import urllib.error
+import urllib.request
+from datetime import UTC, datetime
 from http import HTTPStatus
 from pathlib import Path
 
@@ -47,26 +52,27 @@ META_DIR = None  # ~/mcapp-slots/meta
 home = None  # User home directory (inferred from script location)
 DB_PATH = Path("/var/lib/mcapp/messages.db")
 WEBAPP_SLOTS_DIR = Path("/var/www/html/webapp-slots")
-_ANSI_RE = re.compile(r'\x1b\[[0-9;]*[a-zA-Z]')  # all ANSI escape sequences
-_DECORATIVE_LINE_RE = re.compile(r'^[\s╔╗╚╝═─┌┐└┘│┤├]+$')  # pure box-drawing decoration
-_BANNER_LINE_RE = re.compile(r'^\s*║\s*(.*?)\s*║?\s*$')      # ║ content ║ banner lines
+_ANSI_RE = re.compile(r"\x1b\[[0-9;]*[a-zA-Z]")  # all ANSI escape sequences
+_DECORATIVE_LINE_RE = re.compile(r"^[\s╔╗╚╝═─┌┐└┘│┤├]+$")  # pure box-drawing decoration
+_BANNER_LINE_RE = re.compile(r"^\s*║\s*(.*?)\s*║?\s*$")  # ║ content ║ banner lines
 
 
 def _clean_line(line: str) -> str | None:
     """Strip ANSI codes and bootstrap decorations. Returns None to skip."""
-    line = _ANSI_RE.sub('', line)
+    line = _ANSI_RE.sub("", line)
     if _DECORATIVE_LINE_RE.match(line):
         return None
     m = _BANNER_LINE_RE.match(line)
     if m:
         content = m.group(1).strip()
-        return content if content else None
+        return content or None
     return line
 
 
 # ──────────────────────────────────────────────────────────────
 # SSE Event Broadcasting
 # ──────────────────────────────────────────────────────────────
+
 
 class EventBus:
     """Thread-safe SSE event broadcaster to multiple clients."""
@@ -94,15 +100,15 @@ class EventBus:
         with self._lock:
             self._history.append(payload)
             for q in self._clients:
-                try:
+                # Drop for slow clients
+                with contextlib.suppress(queue.Full):
                     q.put_nowait(payload)
-                except queue.Full:
-                    pass  # Drop for slow clients
 
 
 # ──────────────────────────────────────────────────────────────
 # Slot Management
 # ──────────────────────────────────────────────────────────────
+
 
 def get_slot_meta(slot_id: int) -> dict:
     """Read metadata for a slot."""
@@ -167,21 +173,20 @@ def get_oldest_slot() -> int:
 def snapshot_etc(slot_id: int) -> None:
     """Snapshot /etc config files into meta/slot-N.etc.tar.gz."""
     archive = META_DIR / f"slot-{slot_id}.etc.tar.gz"
-    files_to_backup = []
-    for path in [
+    candidates = [
         "/etc/mcapp/config.json",
         "/etc/systemd/system/mcapp.service",
         "/etc/systemd/system/mcapp-ble.service",
         "/etc/lighttpd/conf-available/99-mcapp.conf",
         "/etc/lighttpd/lighttpd.conf",
-    ]:
-        if os.path.exists(path):
-            files_to_backup.append(path)
+    ]
+    files_to_backup = [path for path in candidates if Path(path).exists()]
 
     if files_to_backup:
-        subprocess.run(
-            ["tar", "czf", str(archive)] + files_to_backup,
-            check=True, capture_output=True,
+        subprocess.run(  # noqa: S603 - fixed internal command
+            ["tar", "czf", str(archive), *files_to_backup],  # noqa: S607 - fixed internal command
+            check=True,
+            capture_output=True,
         )
 
 
@@ -202,9 +207,10 @@ def restore_etc(slot_id: int) -> bool:
     archive = META_DIR / f"slot-{slot_id}.etc.tar.gz"
     if not archive.exists():
         return False
-    subprocess.run(
-        ["tar", "xzf", str(archive), "-C", "/"],
-        check=True, capture_output=True,
+    subprocess.run(  # noqa: S603 - fixed internal command
+        ["tar", "xzf", str(archive), "-C", "/"],  # noqa: S607 - fixed internal command
+        check=True,
+        capture_output=True,
     )
     return True
 
@@ -252,6 +258,7 @@ def get_all_slots_info() -> list[dict]:
 # Health Checks
 # ──────────────────────────────────────────────────────────────
 
+
 def run_health_checks(bus: EventBus) -> bool:
     """Run post-deployment health checks. Returns True if all pass."""
 
@@ -266,13 +273,11 @@ def run_health_checks(bus: EventBus) -> bool:
     all_passed = True
     for name, check_fn in checks:
         passed = False
-        for attempt in range(HEALTH_CHECK_RETRIES):
-            try:
+        for _attempt in range(HEALTH_CHECK_RETRIES):
+            with contextlib.suppress(Exception):
                 if check_fn():
                     passed = True
                     break
-            except Exception:
-                pass
             time.sleep(HEALTH_CHECK_INTERVAL_S)
 
         bus.publish("health", {"check": name, "passed": passed})
@@ -283,20 +288,20 @@ def run_health_checks(bus: EventBus) -> bool:
 
 
 def _check_systemd(service: str) -> bool:
-    result = subprocess.run(
-        ["systemctl", "is-active", "--quiet", service],
+    result = subprocess.run(  # noqa: S603 - fixed internal command
+        ["systemctl", "is-active", "--quiet", service],  # noqa: S607 - fixed internal command
         capture_output=True,
+        check=False,
     )
     return result.returncode == 0
 
 
 def _check_http(url: str) -> bool:
-    import urllib.error
-    import urllib.request
+
     try:
-        req = urllib.request.Request(url, method="GET")
-        with urllib.request.urlopen(req, timeout=5) as resp:
-            return resp.status == 200
+        req = urllib.request.Request(url, method="GET")  # noqa: S310 - fixed https URL
+        with urllib.request.urlopen(req, timeout=5) as resp:  # noqa: S310 - fixed https URL
+            return resp.status == HTTPStatus.OK
     except (urllib.error.URLError, OSError):
         return False
 
@@ -305,7 +310,8 @@ def _check_http(url: str) -> bool:
 # Update Execution
 # ──────────────────────────────────────────────────────────────
 
-def run_update(bus: EventBus, dev_mode: bool = False) -> dict:
+
+def run_update(bus: EventBus, dev_mode: bool = False) -> dict:  # noqa: PLR0912, PLR0915 - complex handler kept intact
     """Execute the full update cycle. Returns result dict."""
     start_time = time.time()
 
@@ -314,19 +320,25 @@ def run_update(bus: EventBus, dev_mode: bool = False) -> dict:
         active_slot = get_active_slot()
         target_slot = get_oldest_slot()
         msg = f"Target: slot-{target_slot} (active: slot-{active_slot})"
-        bus.publish("phase", {"phase": "prepare", "progress": 5,
-                              "message": msg})
+        bus.publish("phase", {"phase": "prepare", "progress": 5, "message": msg})
 
         # Phase 2: Snapshot current config and database
         if active_slot is not None:
-            bus.publish("phase", {"phase": "snapshot", "progress": 10,
-                                  "message": "Snapshotting config and database..."})
+            bus.publish(
+                "phase",
+                {
+                    "phase": "snapshot",
+                    "progress": 10,
+                    "message": "Snapshotting config and database...",
+                },
+            )
             snapshot_etc(active_slot)
             snapshot_database(active_slot)
 
         # Phase 3: Run bootstrap into target slot
-        bus.publish("phase", {"phase": "bootstrap", "progress": 15,
-                              "message": "Running bootstrap..."})
+        bus.publish(
+            "phase", {"phase": "bootstrap", "progress": 15, "message": "Running bootstrap..."}
+        )
 
         slot_dir = SLOTS_DIR / f"slot-{target_slot}"
         slot_dir.mkdir(parents=True, exist_ok=True)
@@ -341,8 +353,13 @@ def run_update(bus: EventBus, dev_mode: bool = False) -> dict:
 
         if bootstrap_path is None:
             # Fallback: download bootstrap from GitHub
-            bus.publish("log", {"line": "No local bootstrap found, downloading from GitHub...",
-                                "phase": "bootstrap"})
+            bus.publish(
+                "log",
+                {
+                    "line": "No local bootstrap found, downloading from GitHub...",
+                    "phase": "bootstrap",
+                },
+            )
             bootstrap_path = _download_bootstrap(dev_mode)
 
         cmd = ["bash", bootstrap_path, "--skip"]
@@ -369,13 +386,22 @@ def run_update(bus: EventBus, dev_mode: bool = False) -> dict:
             # Check if the target slot is now active
             current_active = get_active_slot()
             if current_active == target_slot:
-                bus.publish("log", {"line": "Bootstrap exited non-zero but slot was activated",
-                                    "phase": "bootstrap"})
-                print("[UPDATE-RUNNER] Bootstrap failed but slot activated, proceeding to "
-                      "health checks", flush=True)
+                bus.publish(
+                    "log",
+                    {
+                        "line": "Bootstrap exited non-zero but slot was activated",
+                        "phase": "bootstrap",
+                    },
+                )
+                print(
+                    "[UPDATE-RUNNER] Bootstrap failed but slot activated, proceeding to "
+                    "health checks",
+                    flush=True,
+                )
             else:
-                bus.publish("phase", {"phase": "failed", "progress": 100,
-                                      "message": "Bootstrap failed"})
+                bus.publish(
+                    "phase", {"phase": "failed", "progress": 100, "message": "Bootstrap failed"}
+                )
                 return {
                     "status": "failed",
                     "reason": "bootstrap_error",
@@ -383,29 +409,37 @@ def run_update(bus: EventBus, dev_mode: bool = False) -> dict:
                 }
 
         # Phase 4: Activate slot
-        bus.publish("phase", {"phase": "activate", "progress": 80,
-                              "message": f"Activating slot-{target_slot}..."})
+        bus.publish(
+            "phase",
+            {"phase": "activate", "progress": 80, "message": f"Activating slot-{target_slot}..."},
+        )
 
         version = _read_version(target_slot)
 
         if success:
             # Bootstrap succeeded — swap symlink ourselves
-            set_slot_meta(target_slot, {
-                "slot": target_slot,
-                "version": version,
-                "status": "active",
-                "deployed_at": datetime.now(timezone.utc).isoformat(),
-            })
+            set_slot_meta(
+                target_slot,
+                {
+                    "slot": target_slot,
+                    "version": version,
+                    "status": "active",
+                    "deployed_at": datetime.now(UTC).isoformat(),
+                },
+            )
 
             swap_symlink(target_slot, SLOTS_DIR)
 
         # Phase 5: Health checks
-        bus.publish("phase", {"phase": "health_check", "progress": 85,
-                              "message": "Running health checks..."})
+        bus.publish(
+            "phase",
+            {"phase": "health_check", "progress": 85, "message": "Running health checks..."},
+        )
 
         if run_health_checks(bus):
-            bus.publish("phase", {"phase": "complete", "progress": 100,
-                                  "message": "Update successful"})
+            bus.publish(
+                "phase", {"phase": "complete", "progress": 100, "message": "Update successful"}
+            )
             return {
                 "status": "success",
                 "version": version,
@@ -414,8 +448,14 @@ def run_update(bus: EventBus, dev_mode: bool = False) -> dict:
             }
 
         # Phase 6: Auto-rollback
-        bus.publish("phase", {"phase": "rollback", "progress": 90,
-                              "message": "Health checks failed, rolling back..."})
+        bus.publish(
+            "phase",
+            {
+                "phase": "rollback",
+                "progress": 90,
+                "message": "Health checks failed, rolling back...",
+            },
+        )
 
         if active_slot is not None:
             _do_rollback(active_slot, bus)
@@ -433,7 +473,6 @@ def run_update(bus: EventBus, dev_mode: bool = False) -> dict:
         }
 
     except Exception as e:
-        import traceback
         print(f"[UPDATE-RUNNER] ERROR in run_update: {e}", flush=True)
         traceback.print_exc()
         bus.publish("log", {"line": f"ERROR: {e}", "phase": "error"})
@@ -459,8 +498,7 @@ def run_rollback(bus: EventBus) -> dict:
         }
 
     msg = f"Rolling back slot-{active_slot} → slot-{rollback_target}..."
-    bus.publish("phase", {"phase": "rollback", "progress": 10,
-                          "message": msg})
+    bus.publish("phase", {"phase": "rollback", "progress": 10, "message": msg})
 
     # Snapshot current state first
     if active_slot is not None:
@@ -470,8 +508,9 @@ def run_rollback(bus: EventBus) -> dict:
     _do_rollback(rollback_target, bus)
 
     # Health check after rollback
-    bus.publish("phase", {"phase": "health_check", "progress": 80,
-                          "message": "Verifying rollback..."})
+    bus.publish(
+        "phase", {"phase": "health_check", "progress": 80, "message": "Verifying rollback..."}
+    )
 
     health_ok = run_health_checks(bus)
 
@@ -488,7 +527,11 @@ def run_rollback(bus: EventBus) -> dict:
 def _do_rollback(target_slot: int, bus: EventBus) -> None:
     """Swap symlink to target slot, restore etc + database, restart services."""
     # Stop mcapp to release database before restore
-    subprocess.run(["systemctl", "stop", "mcapp"], capture_output=True)
+    subprocess.run(
+        ["systemctl", "stop", "mcapp"],  # noqa: S607 - fixed internal command
+        capture_output=True,
+        check=False,
+    )
 
     bus.publish("log", {"line": f"Swapping to slot-{target_slot}", "phase": "rollback"})
     swap_symlink(target_slot, SLOTS_DIR)
@@ -502,18 +545,30 @@ def _do_rollback(target_slot: int, bus: EventBus) -> None:
 
     # Restart services
     bus.publish("log", {"line": "Restarting services...", "phase": "rollback"})
-    subprocess.run(["systemctl", "daemon-reload"], capture_output=True)
+    subprocess.run(
+        ["systemctl", "daemon-reload"],  # noqa: S607 - fixed internal command
+        capture_output=True,
+        check=False,
+    )
     for svc in ["lighttpd", "mcapp"]:
-        subprocess.run(["systemctl", "restart", svc], capture_output=True)
+        subprocess.run(  # noqa: S603 - fixed internal command
+            ["systemctl", "restart", svc],  # noqa: S607 - fixed internal command
+            capture_output=True,
+            check=False,
+        )
         bus.publish("log", {"line": f"Restarted {svc}", "phase": "rollback"})
 
 
 def _run_bootstrap_streaming(cmd: list[str], env: dict, bus: EventBus) -> bool:
     """Run bootstrap subprocess, streaming output as SSE log events."""
     try:
-        process = subprocess.Popen(
-            cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-            env=env, text=True, bufsize=1,
+        process = subprocess.Popen(  # noqa: S603 - fixed internal command
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            env=env,
+            text=True,
+            bufsize=1,
         )
 
         deadline = time.time() + BOOTSTRAP_TIMEOUT_S
@@ -527,32 +582,33 @@ def _run_bootstrap_streaming(cmd: list[str], env: dict, bus: EventBus) -> bool:
 
             if time.time() > deadline:
                 process.kill()
-                bus.publish("log", {"line": "TIMEOUT: Bootstrap exceeded 15 minutes",
-                                    "phase": "bootstrap"})
+                bus.publish(
+                    "log", {"line": "TIMEOUT: Bootstrap exceeded 15 minutes", "phase": "bootstrap"}
+                )
                 return False
 
         process.wait()
         if process.returncode != 0:
-            print(f"[UPDATE-RUNNER] Bootstrap exited with code {process.returncode}",
-                  flush=True)
-        return process.returncode == 0
+            print(f"[UPDATE-RUNNER] Bootstrap exited with code {process.returncode}", flush=True)
 
     except Exception as e:
         bus.publish("log", {"line": f"Bootstrap execution error: {e}", "phase": "bootstrap"})
         return False
 
+    else:
+        return process.returncode == 0
+
 
 def _download_bootstrap(dev_mode: bool) -> str:
     """Download bootstrap script to a temp location. Returns path."""
-    import tempfile
-    import urllib.request
 
     branch = "development" if dev_mode else "main"
     url = f"https://raw.githubusercontent.com/DK5EN/McApp/{branch}/bootstrap/mcapp.sh"
 
-    tmp = tempfile.NamedTemporaryFile(suffix=".sh", delete=False)
-    urllib.request.urlretrieve(url, tmp.name)
-    return tmp.name
+    with tempfile.NamedTemporaryFile(suffix=".sh", delete=False) as tmp:
+        script_path = tmp.name
+    urllib.request.urlretrieve(url, script_path)  # noqa: S310 - fixed https URL
+    return script_path
 
 
 def _read_version(slot_id: int) -> str:
@@ -571,6 +627,7 @@ def _read_version(slot_id: int) -> str:
 # HTTP Server
 # ──────────────────────────────────────────────────────────────
 
+
 class UpdateHandler(http.server.BaseHTTPRequestHandler):
     """HTTP request handler for update runner SSE server."""
 
@@ -578,9 +635,8 @@ class UpdateHandler(http.server.BaseHTTPRequestHandler):
     result: dict | None = None
     mode: str = "idle"
 
-    def log_message(self, format, *args):
+    def log_message(self, fmt, *args):
         """Suppress default HTTP logging."""
-        pass
 
     def _send_cors_headers(self):
         self.send_header("Access-Control-Allow-Origin", "*")
@@ -666,12 +722,16 @@ class UpdateHandler(http.server.BaseHTTPRequestHandler):
 # Main
 # ──────────────────────────────────────────────────────────────
 
-def main():
+
+def main():  # noqa: PLR0915 - complex handler kept intact
     global SLOTS_DIR, META_DIR, home
 
     parser = argparse.ArgumentParser(description="McApp Update Runner")
-    parser.add_argument("--mode", choices=["update", "rollback"],
-                        help="Operation mode (required unless --args-file given)")
+    parser.add_argument(
+        "--mode",
+        choices=["update", "rollback"],
+        help="Operation mode (required unless --args-file given)",
+    )
     parser.add_argument("--dev", action="store_true", help="Use development pre-release")
     parser.add_argument("--home", help="User home directory (for slot paths)")
     parser.add_argument("--args-file", help="JSON file with mode/dev args (systemd .path trigger)")
@@ -722,7 +782,7 @@ def main():
     bus = EventBus()
 
     # Start HTTP server in background thread
-    server = http.server.HTTPServer(("0.0.0.0", PORT), UpdateHandler)
+    server = http.server.HTTPServer(("0.0.0.0", PORT), UpdateHandler)  # noqa: S104 - LAN service binds all interfaces by design
     UpdateHandler.bus = bus
     UpdateHandler.mode = args.mode
 
@@ -730,14 +790,17 @@ def main():
     server_thread.start()
     print(f"[UPDATE-RUNNER] HTTP server listening on port {PORT}", flush=True)
 
-    bus.publish("phase", {"phase": "started", "progress": 0,
-                          "message": f"Update runner started (mode: {args.mode})"})
+    bus.publish(
+        "phase",
+        {
+            "phase": "started",
+            "progress": 0,
+            "message": f"Update runner started (mode: {args.mode})",
+        },
+    )
 
     # Run the operation
-    if args.mode == "update":
-        result = run_update(bus, dev_mode=args.dev)
-    else:
-        result = run_rollback(bus)
+    result = run_update(bus, dev_mode=args.dev) if args.mode == "update" else run_rollback(bus)
 
     print(f"[UPDATE-RUNNER] Finished: {json.dumps(result)}", flush=True)
 
@@ -756,5 +819,6 @@ if __name__ == "__main__":
     except Exception as e:
         print(f"[UPDATE-RUNNER] FATAL: {e}", flush=True)
         import traceback
+
         traceback.print_exc()
         sys.exit(1)

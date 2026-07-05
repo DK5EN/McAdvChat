@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import time
 
 from ..logging_setup import get_logger
@@ -15,7 +16,7 @@ logger = get_logger(__name__)
 class ResponseMixin(CommandHandlerBase):
     """Mixin providing response sending and chunking methods."""
 
-    async def send_response(self, response: str, recipient: str, src_type: str = "udp") -> None:
+    async def send_response(self, response: str, recipient: str, src_type: str = "udp") -> None:  # noqa: PLR0912 - complex handler kept intact
         """Send response back to requester, chunking if necessary"""
         if not response:
             return
@@ -32,10 +33,11 @@ class ResponseMixin(CommandHandlerBase):
         # Split response into chunks if too long
         chunks = self._chunk_response(response)
 
-        for i, chunk in enumerate(chunks[:MAX_CHUNKS]):
+        for i, raw_chunk in enumerate(chunks[:MAX_CHUNKS]):
+            chunk = raw_chunk
             if len(chunks) > 1:
                 chunk_header = f"({i + 1}/{min(len(chunks), MAX_CHUNKS)}) "
-                chunk = chunk_header + chunk
+                chunk = chunk_header + raw_chunk
 
             if recipient.upper() == self.my_callsign:
                 if has_console:
@@ -59,54 +61,47 @@ class ResponseMixin(CommandHandlerBase):
 
                     # Persist self-response to DB so it survives page reload
                     if self.storage_handler:
-                        import json
                         raw_json = json.dumps(websocket_message)
                         await self.storage_handler.store_message(websocket_message, raw_json)
 
-            else:
-                # Send via message router
-                if self.message_router:
-                    message_data = {
-                        "dst": recipient,
-                        "msg": chunk,
-                        "src_type": "command_response",
-                        "type": "msg",
-                    }
+            # Send via message router
+            elif self.message_router:
+                message_data = {
+                    "dst": recipient,
+                    "msg": chunk,
+                    "src_type": "command_response",
+                    "type": "msg",
+                }
 
-                    # Route to appropriate protocol (BLE or UDP)
-                    if has_console:
-                        print("command handler: src_type", src_type)
+                # Route to appropriate protocol (BLE or UDP)
+                if has_console:
+                    print("command handler: src_type", src_type)
 
-                    try:
-                        if src_type in ("ble", "ble_remote"):
-                            await self.message_router.publish(
-                                "command", "ble_message", message_data
-                            )
-                            if has_console:
-                                print(
-                                    f"📋 CommandHandler: Sent chunk {i + 1} via BLE to {recipient}"
-                                )
-                        elif src_type in ["udp", "node", "lora"]:
-                            # Update message data for UDP transport
-                            message_data["src_type"] = "command_response_udp"
-                            await self.message_router.publish(
-                                "command", "udp_message", message_data
-                            )
-                            if has_console:
-                                print(
-                                    f"📋 CommandHandler: Sent chunk {i + 1} via UDP to {recipient}"
-                                )
-                        else:
-                            logger.warning(
-                                "RESPONSE LOST: No transport for src_type=%r, "
-                                "recipient=%s, msg=%s",
-                                src_type, recipient, chunk[:40],
-                            )
-                    except Exception as ble_error:
+                try:
+                    if src_type in ("ble", "ble_remote"):
+                        await self.message_router.publish("command", "ble_message", message_data)
+                        if has_console:
+                            print(f"📋 CommandHandler: Sent chunk {i + 1} via BLE to {recipient}")
+                    elif src_type in ["udp", "node", "lora"]:
+                        # Update message data for UDP transport
+                        message_data["src_type"] = "command_response_udp"
+                        await self.message_router.publish("command", "udp_message", message_data)
+                        if has_console:
+                            print(f"📋 CommandHandler: Sent chunk {i + 1} via UDP to {recipient}")
+                    else:
                         logger.warning(
-                            "CommandHandler: send failed to %s: %s", recipient, ble_error,
+                            "RESPONSE LOST: No transport for src_type=%r, recipient=%s, msg=%s",
+                            src_type,
+                            recipient,
+                            chunk[:40],
                         )
-                        continue
+                except Exception as ble_error:
+                    logger.warning(
+                        "CommandHandler: send failed to %s: %s",
+                        recipient,
+                        ble_error,
+                    )
+                    continue
 
             # Small delay between chunks
             if i < len(chunks) - 1:
@@ -126,28 +121,27 @@ class ResponseMixin(CommandHandlerBase):
         chunks = []
 
         # Split on padding separator first (for our two-line responses)
-        if ", " in response and len(response.split(", ")) == 2:
+        if ", " in response and len(response.split(", ")) == 2:  # noqa: PLR2004 - two-part response format
             chunks = response.split(", ")
+        # Split long single responses on station boundaries
+        elif " | " in response:
+            parts = response.split(" | ")
+            current = ""
+
+            for part in parts:
+                test = current + (" | " if current else "") + part
+                if len(test.encode("utf-8")) <= max_bytes:
+                    current = test
+                else:
+                    if current:
+                        chunks.append(current)
+                    current = part
+
+            if current:
+                chunks.append(current)
         else:
-            # Split long single responses on station boundaries
-            if " | " in response:
-                parts = response.split(" | ")
-                current = ""
-
-                for part in parts:
-                    test = current + (" | " if current else "") + part
-                    if len(test.encode("utf-8")) <= max_bytes:
-                        current = test
-                    else:
-                        if current:
-                            chunks.append(current)
-                        current = part
-
-                if current:
-                    chunks.append(current)
-            else:
-                # Fallback: character-wise split
-                chunks = [response[i : i + max_bytes] for i in range(0, len(response), max_bytes)]
+            # Fallback: character-wise split
+            chunks = [response[i : i + max_bytes] for i in range(0, len(response), max_bytes)]
 
         return chunks[:MAX_CHUNKS]
 

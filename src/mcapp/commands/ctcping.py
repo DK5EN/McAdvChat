@@ -1,12 +1,17 @@
 """CTCPingMixin: all ping/ack/echo methods."""
 
 import asyncio
+import contextlib
 import re
 import time
 from typing import Any
 
 from ..logging_setup import get_logger
 from ._base import CommandHandlerBase
+
+_MIN_PING_PAYLOAD = 25
+_MAX_PING_PAYLOAD = 140
+_MAX_PING_REPEAT = 5
 
 logger = get_logger(__name__)
 
@@ -20,14 +25,14 @@ class CTCPingMixin(CommandHandlerBase):
         self.ping_tests = {}
         self.ping_timeout = 30.0  # 30 seconds per ping
         self._completion_events = {}
+        self._ping_bg_tasks: set[asyncio.Task[Any]] = set()
 
     def _is_ack_message(self, msg: str) -> bool:
         """Check if message is an ACK with :ackXXX pattern"""
         if not msg:
             return False
         pattern = r"\s*:ack\d{3}$"
-        result = bool(re.search(pattern, msg))
-        return result
+        return bool(re.search(pattern, msg))
 
     def _is_echo_message(self, msg: str) -> bool:
         """Check if message is a CTC ping echo with [CTC] signature and {xxx} suffix"""
@@ -147,14 +152,14 @@ class CTCPingMixin(CommandHandlerBase):
 
             self.active_pings[message_id] = ping_info
 
-            logger.debug(
-                "Echo tracked: ID=%s, target=%s, test_id=%s", message_id, dst, test_id
-            )
+            logger.debug("Echo tracked: ID=%s, target=%s, test_id=%s", message_id, dst, test_id)
 
-            asyncio.create_task(self._ping_timeout_task(message_id))
+            timeout_task = asyncio.create_task(self._ping_timeout_task(message_id))
+            self._ping_bg_tasks.add(timeout_task)
+            timeout_task.add_done_callback(self._ping_bg_tasks.discard)
 
-        except Exception as e:
-            logger.error("Error handling echo message: %s", e)
+        except Exception:
+            logger.exception("Error handling echo message")
 
     async def _handle_ack_message(self, message_data: dict[str, Any]) -> None:
         """Handle ACK message and calculate RTT with idempotent processing"""
@@ -187,7 +192,9 @@ class CTCPingMixin(CommandHandlerBase):
             if src != ping_info["target"] or dst != self.my_callsign:
                 logger.debug(
                     "ACK %s verification failed: src=%s, expected=%s",
-                    ack_id, src, ping_info["target"],
+                    ack_id,
+                    src,
+                    ping_info["target"],
                 )
                 return
 
@@ -208,8 +215,8 @@ class CTCPingMixin(CommandHandlerBase):
                 await self._record_ack_result(ack_id, test_id, ping_info, result, rtt)
             del self.active_pings[ack_id]
 
-        except Exception as e:
-            logger.error("Error handling ACK message: %s", e)
+        except Exception:
+            logger.exception("Error handling ACK message")
 
     async def _record_ack_result(
         self,
@@ -225,7 +232,9 @@ class CTCPingMixin(CommandHandlerBase):
         if test_summary["status"] != "running":
             logger.debug(
                 "ACK %s received but test %s no longer running (status: %s)",
-                ack_id, test_id, test_summary["status"],
+                ack_id,
+                test_id,
+                test_summary["status"],
             )
             return
 
@@ -261,7 +270,11 @@ class CTCPingMixin(CommandHandlerBase):
         self._completion_events[completion_event_key] = asyncio.Event()
         self._completion_events[completion_event_key].set()
 
-        asyncio.create_task(self._complete_test_with_cleanup(test_id, completion_event_key))
+        cleanup_task = asyncio.create_task(
+            self._complete_test_with_cleanup(test_id, completion_event_key)
+        )
+        self._ping_bg_tasks.add(cleanup_task)
+        cleanup_task.add_done_callback(self._ping_bg_tasks.discard)
         return True
 
     async def _complete_test(self, test_id: str) -> None:
@@ -284,18 +297,16 @@ class CTCPingMixin(CommandHandlerBase):
             if monitor_task and not monitor_task.done():
                 logger.debug("Cancelling monitor task for %s", test_id)
                 monitor_task.cancel()
-                try:
+                with contextlib.suppress(asyncio.CancelledError):
                     await monitor_task
-                except asyncio.CancelledError:
-                    pass
 
             test_summary["status"] = "completed"
             test_summary["end_time"] = time.time()
 
             await self._send_test_summary(test_id)
 
-        except Exception as e:
-            logger.error("Error completing test %s: %s", test_id, e)
+        except Exception:
+            logger.exception("Error completing test %s", test_id)
 
     async def _complete_test_with_cleanup(self, test_id: str, completion_event_key: str) -> None:
         """Complete test and cleanup completion event"""
@@ -317,12 +328,15 @@ class CTCPingMixin(CommandHandlerBase):
 
         test_summary["results"].append(result)
 
-        if result["status"] == "success":
-            if test_summary["completed"] < test_summary["total_pings"]:
-                test_summary["completed"] += 1
-        elif result["status"] == "timeout":
-            if test_summary["timeouts"] < test_summary["total_pings"]:
-                test_summary["timeouts"] += 1
+        if (
+            result["status"] == "success"
+            and test_summary["completed"] < test_summary["total_pings"]
+        ):
+            test_summary["completed"] += 1
+        elif (
+            result["status"] == "timeout" and test_summary["timeouts"] < test_summary["total_pings"]
+        ):
+            test_summary["timeouts"] += 1
 
         if self._trigger_completion_if_done(test_id):
             logger.debug("Test %s completed via %s", test_id, result["status"])
@@ -346,7 +360,9 @@ class CTCPingMixin(CommandHandlerBase):
         if total_completed > expected_total:
             logger.warning(
                 "Test %s over-completion detected: %d/%d",
-                test_id, total_completed, expected_total,
+                test_id,
+                total_completed,
+                expected_total,
             )
             excess = total_completed - expected_total
             if test_summary["completed"] >= excess:
@@ -360,8 +376,11 @@ class CTCPingMixin(CommandHandlerBase):
         if is_complete:
             logger.debug(
                 "Test %s completion detected: %d success + %d timeouts = %d/%d",
-                test_id, test_summary["completed"], test_summary["timeouts"],
-                total_completed, expected_total,
+                test_id,
+                test_summary["completed"],
+                test_summary["timeouts"],
+                total_completed,
+                expected_total,
             )
 
         return is_complete
@@ -405,16 +424,14 @@ class CTCPingMixin(CommandHandlerBase):
                     ping_info["requester"], timeout_msg, ping_info["target"]
                 )
 
-            logger.debug(
-                "Timeout processed: ID=%s, Test complete: %s", message_id, test_completed
-            )
+            logger.debug("Timeout processed: ID=%s, Test complete: %s", message_id, test_completed)
 
         except asyncio.CancelledError:
             pass
-        except Exception as e:
-            logger.error("Error in ping timeout task: %s", e)
+        except Exception:
+            logger.exception("Error in ping timeout task")
 
-    async def handle_ctcping(self, kwargs: dict[str, Any], requester: str) -> str:
+    async def handle_ctcping(self, kwargs: dict[str, Any], requester: str) -> str:  # noqa: PLR0911 - complex handler kept intact
         """Handle CTC ping test with roundtrip time measurement"""
         ping_target = kwargs.get("call", "").upper()
         payload_size = kwargs.get("payload", 25)
@@ -434,21 +451,23 @@ class CTCPingMixin(CommandHandlerBase):
 
         try:
             payload_size = int(payload_size)
-            if payload_size < 25 or payload_size > 140:
+            if payload_size < _MIN_PING_PAYLOAD or payload_size > _MAX_PING_PAYLOAD:
                 return "❌ Payload size must be between 25 and 140 bytes"
         except (ValueError, TypeError):
             return "❌ Invalid payload size"
 
         try:
             repeat_count = int(repeat_count)
-            if repeat_count < 1 or repeat_count > 5:
+            if repeat_count < 1 or repeat_count > _MAX_PING_REPEAT:
                 return "❌ Repeat count must be between 1 and 5"
         except (ValueError, TypeError):
             return "❌ Invalid repeat count"
 
-        asyncio.create_task(
+        test_task = asyncio.create_task(
             self._start_ping_test(ping_target, payload_size, repeat_count, requester)
         )
+        self._ping_bg_tasks.add(test_task)
+        test_task.add_done_callback(self._ping_bg_tasks.discard)
 
         return (
             f"🏓 Ping test to {ping_target}"
@@ -505,12 +524,12 @@ class CTCPingMixin(CommandHandlerBase):
             test_summary["monitor_task"] = monitor_task
 
         except Exception as e:
-            logger.error("Ping test error: %s", e)
+            logger.exception("Ping test error")
             test_summary["status"] = "error"
             await self._send_ping_result(requester, f"🏓 Ping test error: {str(e)[:50]}", target)
 
     async def _send_ping_message(
-        self, target: str, message: str, sequence: int, total: int, requester: str, test_id: str
+        self, target: str, message: str, sequence: int, total: int, _requester: str, test_id: str
     ) -> None:
         """Send a single ping message and track it"""
         try:
@@ -526,11 +545,14 @@ class CTCPingMixin(CommandHandlerBase):
 
                 logger.debug(
                     "Sent ping %d/%d to %s: '%s...'",
-                    sequence, total, target, message[:30],
+                    sequence,
+                    total,
+                    target,
+                    message[:30],
                 )
 
-        except Exception as e:
-            logger.error("Failed to send ping to %s: %s", target, e)
+        except Exception:
+            logger.exception("Failed to send ping to %s", target)
 
     async def _monitor_test_completion(self, test_id: str) -> None:
         """Monitor test completion and send summary when done"""
@@ -560,8 +582,8 @@ class CTCPingMixin(CommandHandlerBase):
                 test_summary["end_time"] = time.time()
                 await self._send_test_summary(test_id, "Test timeout after 5 minutes")
 
-        except Exception as e:
-            logger.error("Error monitoring test completion: %s", e)
+        except Exception:
+            logger.exception("Error monitoring test completion")
 
     async def _send_test_summary(self, test_id: str, error_msg: str | None = None) -> None:
         """Send complete test summary to requester"""
@@ -589,7 +611,10 @@ class CTCPingMixin(CommandHandlerBase):
                     logger.warning(
                         "Ping summary inconsistency: results=%d success/%d timeouts,"
                         " tracked=%d success/%d timeouts",
-                        successful_from_results, timeouts_from_results, successful, timeouts,
+                        successful_from_results,
+                        timeouts_from_results,
+                        successful,
+                        timeouts,
                     )
 
                 loss_percent = int((timeouts / total_pings) * 100)
@@ -636,8 +661,8 @@ class CTCPingMixin(CommandHandlerBase):
 
             logger.debug("Test summary sent for %s", test_id)
 
-        except Exception as e:
-            logger.error("Error sending test summary: %s", e, exc_info=True)
+        except Exception:
+            logger.exception("Error sending test summary")
 
     async def _send_ping_result(
         self, requester: str, result_message: str, target: str = ""
@@ -666,8 +691,8 @@ class CTCPingMixin(CommandHandlerBase):
                     }
                     await self.message_router.publish("ctcping", "udp_message", result_data)
 
-        except Exception as e:
-            logger.error("Failed to send ping result: %s", e)
+        except Exception:
+            logger.exception("Failed to send ping result")
 
     async def cleanup_ping_tests(self) -> None:
         """Clean up all active ping tests"""

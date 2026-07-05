@@ -11,9 +11,7 @@ from ._base import CommandHandlerBase
 class DataCommandsMixin(CommandHandlerBase):
     """Mixin providing data query command handlers."""
 
-    async def handle_search(
-        self, kwargs: dict[str, Any], requester: str
-    ) -> str:
+    async def handle_search(self, kwargs: dict[str, Any], _requester: str) -> str:
         """Search messages by user and timeframe - show
         summary with counts, last seen, and destinations"""
         user = kwargs.get("call", "*")
@@ -66,9 +64,7 @@ class DataCommandsMixin(CommandHandlerBase):
 
         return response
 
-    async def handle_stats(
-        self, kwargs: dict[str, Any], requester: str
-    ) -> str:
+    async def handle_stats(self, kwargs: dict[str, Any], _requester: str) -> str:
         """Show message statistics"""
         hours = int(kwargs.get("hours", 24))
 
@@ -92,9 +88,7 @@ class DataCommandsMixin(CommandHandlerBase):
 
         return response
 
-    async def handle_mheard(
-        self, kwargs: dict[str, Any], requester: str
-    ) -> str:
+    async def handle_mheard(self, kwargs: dict[str, Any], _requester: str) -> str:
         """Show recently heard stations with optional type filtering"""
         limit = int(kwargs.get("limit", 5))
         msg_type = kwargs.get("type", "all").lower()
@@ -139,7 +133,6 @@ class DataCommandsMixin(CommandHandlerBase):
 
         if len(lines) == 1:
             return lines[0]
-        else:
-            line1 = lines[0]
-            padding_needed = max(0, 138 - len(line1.encode("utf-8")))
-            return line1 + " " * padding_needed + ", " + lines[1]
+        line1 = lines[0]
+        padding_needed = max(0, 138 - len(line1.encode("utf-8")))
+        return line1 + " " * padding_needed + ", " + lines[1]

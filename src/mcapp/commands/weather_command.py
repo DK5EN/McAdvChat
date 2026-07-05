@@ -2,6 +2,7 @@
 
 from typing import Any
 
+from ..meteo import WeatherService
 from ._base import CommandHandlerBase
 from .constants import has_console
 
@@ -11,13 +12,10 @@ class WeatherCommandMixin(CommandHandlerBase):
 
     def _init_weather(self) -> None:
         """Initialize weather service. Called from CommandHandler.__init__."""
-        from ..meteo import WeatherService
 
         weather_service: WeatherService | None
         try:
-            weather_service = WeatherService(
-                self.lat, self.lon, self.stat_name, max_age_minutes=30
-            )
+            weather_service = WeatherService(self.lat, self.lon, self.stat_name, max_age_minutes=30)
             if has_console:
                 print("🌤️  CommandHandler: Weather service initialized (location from GPS)")
         except ImportError as e:
@@ -26,9 +24,7 @@ class WeatherCommandMixin(CommandHandlerBase):
                 print(f"❌ CommandHandler: Weather service unavailable: {e}")
         self.weather_service = weather_service
 
-    async def handle_weather(
-        self, kwargs: dict[str, Any], requester: str
-    ) -> str:
+    async def handle_weather(self, kwargs: dict[str, Any], requester: str) -> str:
         try:
             if self.weather_service is None:
                 return "❌ Weather service unavailable"
@@ -54,17 +50,14 @@ class WeatherCommandMixin(CommandHandlerBase):
                 age = weather_data.get("data_age_minutes", 0)
                 print(f"✅ Weather delivered: {source}, Quality: {quality}, Age: {age:.1f}min")
 
-                if (
-                    "supplemented_parameters" in weather_data
-                    and weather_data["supplemented_parameters"]
-                ):
+                if weather_data.get("supplemented_parameters"):
                     supplemented = ", ".join(weather_data["supplemented_parameters"])
                     print(f"🔗 Fusion used: {supplemented} from OpenMeteo")
-
-            return weather_msg
 
         except Exception as e:
             error_msg = f"Weather service error: {str(e)[:40]}"
             if has_console:
                 print(f"❌ Weather handler error: {e}")
             return f"❌ {error_msg}"
+        else:
+            return weather_msg

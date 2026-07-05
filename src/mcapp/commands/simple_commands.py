@@ -12,10 +12,10 @@ from ._base import CommandHandlerBase
 class SimpleCommandsMixin(CommandHandlerBase):
     """Mixin providing simple command handlers."""
 
-    async def handle_dice(self, kwargs: dict[str, Any], requester: str) -> str:
+    async def handle_dice(self, _kwargs: dict[str, Any], requester: str) -> str:
         """Roll two dice with Mäxchen rules"""
-        die1 = random.randint(1, 6)
-        die2 = random.randint(1, 6)
+        die1 = random.randint(1, 6)  # noqa: S311 - non-crypto randomness
+        die2 = random.randint(1, 6)  # noqa: S311 - non-crypto randomness
 
         sorted_value, description = self._calculate_maexchen_value(die1, die2)
 
@@ -26,7 +26,7 @@ class SimpleCommandsMixin(CommandHandlerBase):
         dice = sorted([die1, die2], reverse=True)
         higher, lower = dice[0], dice[1]
 
-        if set([die1, die2]) == {2, 1}:
+        if {die1, die2} == {2, 1}:
             return "21", "(Mäxchen! 🏆)"
 
         if die1 == die2:
@@ -43,9 +43,9 @@ class SimpleCommandsMixin(CommandHandlerBase):
         value = f"{higher}{lower}"
         return value, ""
 
-    async def handle_time(self, kwargs: dict[str, Any], requester: str) -> str:
+    async def handle_time(self, _kwargs: dict[str, Any], _requester: str) -> str:
         """Show current time and date"""
-        now = datetime.now()
+        now = datetime.now().astimezone()
 
         date_str = now.strftime("%d.%m.%Y")
         time_str = now.strftime("%H:%M:%S")
@@ -65,7 +65,7 @@ class SimpleCommandsMixin(CommandHandlerBase):
 
         return f"🕐 {time_str} Uhr, {weekday_de}, {date_str}"
 
-    async def handle_help(self, kwargs: dict[str, Any], requester: str) -> str:
+    async def handle_help(self, _kwargs: dict[str, Any], _requester: str) -> str:
         """Show available commands"""
         response = "📋 Available commands: "
 
@@ -81,7 +81,7 @@ class SimpleCommandsMixin(CommandHandlerBase):
 
         return response
 
-    async def handle_userinfo(self, kwargs: dict[str, Any], requester: str) -> str:
+    async def handle_userinfo(self, _kwargs: dict[str, Any], _requester: str) -> str:
         """Show user information from config"""
         try:
             user_info = getattr(self, "user_info_text", None)
@@ -89,12 +89,13 @@ class SimpleCommandsMixin(CommandHandlerBase):
             if not user_info:
                 return "❌ User info not configured"
 
-            return f"{user_info}"
-
         except Exception as e:
             return f"❌ Error retrieving user info: {str(e)[:30]}"
 
-    async def handle_position(self, kwargs: dict[str, Any], requester: str) -> str:
+        else:
+            return f"{user_info}"
+
+    async def handle_position(self, kwargs: dict[str, Any], _requester: str) -> str:
         """Show position data for callsign"""
         callsign = kwargs.get("call", "").upper()
         days = int(kwargs.get("days", 7))

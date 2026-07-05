@@ -13,12 +13,18 @@ This module provides:
 
 from __future__ import annotations
 
+import contextlib
 import json
 import logging
+import re
 import time
 from datetime import datetime
 from struct import unpack
 from typing import Any
+
+PAYLOAD_TYPE_MSG = 58  # ":" text message frame
+PAYLOAD_TYPE_POS = 33  # "!" position/telemetry frame
+PAYLOAD_TYPE_ACK = 65  # acknowledgement frame
 
 logger = logging.getLogger(__name__)
 
@@ -26,13 +32,11 @@ logger = logging.getLogger(__name__)
 def calc_fcs(msg: bytes) -> int:
     """Calculate frame checksum"""
     fcs = 0
-    for x in range(0, len(msg)):
+    for x in range(len(msg)):
         fcs = fcs + msg[x]
 
     # SWAP MSB/LSB
-    fcs = ((fcs & 0xFF00) >> 8) | ((fcs & 0xFF) << 8)
-
-    return fcs
+    return ((fcs & 0xFF00) >> 8) | ((fcs & 0xFF) << 8)
 
 
 def hex_msg_id(msg_id: int) -> str:
@@ -53,20 +57,22 @@ def strip_prefix(msg: str, prefix: str = ":") -> str:
 def decode_json_message(byte_msg: bytes) -> dict[str, Any] | None:
     """Decode JSON message from BLE notification"""
     try:
-        json_str = byte_msg.rstrip(b'\x00').decode("utf-8")[1:]
+        json_str = byte_msg.rstrip(b"\x00").decode("utf-8")[1:]
         result: dict[str, Any] = json.loads(json_str)
-        return result
 
-    except (json.JSONDecodeError, UnicodeDecodeError) as e:
-        logger.error("Error decoding JSON message: %s", e)
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        logger.exception("Error decoding JSON message")
         return None
+
+    else:
+        return result
 
 
 def decode_binary_message(byte_msg: bytes) -> dict[str, Any] | str:
     """Decode binary BLE message (@ prefix format)"""
     # little-endian unpack
     raw_header = byte_msg[1:7]
-    [payload_type, msg_id, max_hop_raw] = unpack('<BIB', raw_header)
+    [payload_type, msg_id, max_hop_raw] = unpack("<BIB", raw_header)
 
     # Bit shift operations
     max_hop = max_hop_raw & 0x0F
@@ -75,9 +81,9 @@ def decode_binary_message(byte_msg: bytes) -> dict[str, Any] | str:
     # Calculate frame checksum
     calced_fcs = calc_fcs(byte_msg[1:-11])
 
-    remaining_msg = byte_msg[7:].rstrip(b'\x00')  # Extract data after hop count byte
+    remaining_msg = byte_msg[7:].rstrip(b"\x00")  # Extract data after hop count byte
 
-    if byte_msg[:2] == b'@A':  # Check if this is an ACK frame
+    if byte_msg[:2] == b"@A":  # Check if this is an ACK frame
         logger.debug("ACK raw hex: %s (len=%d)", byte_msg.hex(), len(byte_msg))
 
         # Firmware sends 7-byte ACKs to BLE (never 12-byte):
@@ -99,29 +105,26 @@ def decode_binary_message(byte_msg: bytes) -> dict[str, Any] | str:
         else:
             ack_type_text = f"Unknown ({ack_type})"
 
-        json_obj = {
+        return {
             "payload_type": payload_type,
             "msg_id": msg_id,
             "ack_type": ack_type,
             "ack_type_text": ack_type_text,
         }
 
-        return json_obj
-
-    elif bytes(byte_msg[:2]) in {b'@:', b'@!'}:
-
-        split_idx = remaining_msg.find(b'>')
+    if bytes(byte_msg[:2]) in {b"@:", b"@!"}:
+        split_idx = remaining_msg.find(b">")
         if split_idx == -1:
             return "Invalid routing format"
 
-        path = remaining_msg[:split_idx+1].decode("utf-8", errors="ignore")
-        remaining_msg = remaining_msg[split_idx + 1:]
+        path = remaining_msg[: split_idx + 1].decode("utf-8", errors="ignore")
+        remaining_msg = remaining_msg[split_idx + 1 :]
 
         # Extrahiere Dest-Type (`dt`)
-        if payload_type == 58:
-            split_idx = remaining_msg.find(b':')
-        elif payload_type == 33:
-            split_idx = remaining_msg.find(b'*')+1
+        if payload_type == PAYLOAD_TYPE_MSG:
+            split_idx = remaining_msg.find(b":")
+        elif payload_type == PAYLOAD_TYPE_POS:
+            split_idx = remaining_msg.find(b"*") + 1
         else:
             logger.warning("Payload type not matched! %d", payload_type)
 
@@ -130,69 +133,74 @@ def decode_binary_message(byte_msg: bytes) -> dict[str, Any] | str:
 
         dest = remaining_msg[:split_idx].decode("utf-8", errors="ignore")
 
-        raw = remaining_msg[split_idx:remaining_msg.find(b'\00')]
+        raw = remaining_msg[split_idx : remaining_msg.find(b"\00")]
         message = raw.decode("utf-8", errors="ignore").strip()
 
         # Extract binary footer (fixed structure at end of message)
         [zero, hardware_id, lora_mod, fcs, fw, lasthw, fw_sub, ending, time_ms] = unpack(
-            '<BBBHBBBBI', byte_msg[-14:-1]
+            "<BBBHBBBBI", byte_msg[-14:-1]
         )
 
         # Split lasthw byte into hardware ID and last sending flag
-        last_hw_id = lasthw & 0x7F        # Bits 0-6: Hardware-Typ (0-127)
-        last_sending = bool(lasthw & 0x80) # Bit 7: Last Sending Flag (True/False)
+        last_hw_id = lasthw & 0x7F  # Bits 0-6: Hardware-Typ (0-127)
+        last_sending = bool(lasthw & 0x80)  # Bit 7: Last Sending Flag (True/False)
 
         # Verify frame checksum
-        fcs_ok = (calced_fcs == fcs)
+        fcs_ok = calced_fcs == fcs
 
         # FCS validation (permissive mode - log at debug level, continue processing)
         if not fcs_ok:
             logger.debug(
                 "Frame checksum mismatch: calculated=0x%04X, received=0x%04X, msg_id=%s",
-                calced_fcs, fcs, format(msg_id, '08X')
+                calced_fcs,
+                fcs,
+                format(msg_id, "08X"),
             )
             # Permissive mode: log at debug level but continue processing
 
-        json_obj = {k: v for k, v in locals().items() if k in [
-            "payload_type",
-            "msg_id",
-            "max_hop",
-            "mesh_info",
-            "path",
-            "dest",
-            "message",
-            "hardware_id",
-            "lora_mod",
-            "fw",
-            "fw_sub",
-            "last_hw_id",
-            "last_sending"
-        ]}
+        return {
+            k: v
+            for k, v in locals().items()
+            if k
+            in [
+                "payload_type",
+                "msg_id",
+                "max_hop",
+                "mesh_info",
+                "path",
+                "dest",
+                "message",
+                "hardware_id",
+                "lora_mod",
+                "fw",
+                "fw_sub",
+                "last_hw_id",
+                "last_sending",
+            ]
+        }
 
-        return json_obj
-
-    else:
-        return "Invalid mesh format"
+    return "Invalid mesh format"
 
 
 def timestamp_from_date_time(date: str, time_str: str) -> int:
     """Convert date and time strings to timestamp"""
     dt_str = f"{date} {time_str}"
     try:
-        dt = datetime.strptime(dt_str, "%Y-%m-%d %H:%M:%S")
+        dt = datetime.strptime(dt_str, "%Y-%m-%d %H:%M:%S")  # noqa: DTZ007 - node-local wall clock
     except Exception:
-        dt = datetime.strptime("1970-01-01 00:00:00", "%Y-%m-%d %H:%M:%S")
+        dt = datetime.strptime(  # noqa: DTZ007 - node-local wall clock
+            "1970-01-01 00:00:00", "%Y-%m-%d %H:%M:%S"
+        )
 
     return int(dt.timestamp() * 1000)
 
 
-def parse_aprs_position(message: str) -> dict[str, Any] | None:
+def parse_aprs_position(message: str) -> dict[str, Any] | None:  # noqa: PLR0912 - complex handler kept intact
     """Parse APRS position format"""
-    import re
+
     # Extended APRS position format with optional symbol and symbol group
     match = re.match(
-        r"!(\d{2})(\d{2}\.\d{2})([NS])([/\\])(\d{3})(\d{2}\.\d{2})([EW])([ -~]?)",
-        message
+        r"!(\d{2})(\d{2}\.\d{2})([NS])([/\\])(\d{3})(\d{2}\.\d{2})([EW])([ -~]?)", message
     )
     if not match:
         return None
@@ -202,9 +210,9 @@ def parse_aprs_position(message: str) -> dict[str, Any] | None:
     lat = int(lat_deg) + float(lat_min) / 60
     lon = int(lon_deg) + float(lon_min) / 60
 
-    if lat_dir == 'S':
+    if lat_dir == "S":
         lat = -lat
-    if lon_dir == 'W':
+    if lon_dir == "W":
         lon = -lon
 
     result = {
@@ -263,10 +271,8 @@ def parse_aprs_position(message: str) -> dict[str, Any] | None:
         key = m.group(1)
         if key in ("A", "B", "R"):
             continue  # already handled: altitude, battery, groups
-        try:
+        with contextlib.suppress(ValueError):
             extras[key] = float(m.group(2))
-        except ValueError:
-            pass
     if extras:
         result["extras"] = extras
 
@@ -279,9 +285,9 @@ def parse_aprs_telemetry(message: str) -> dict[str, Any] | None:
     Format: T#seq,v1,v2,v3,v4,v5,bits
     MeshCom convention: v1=qfe, v2=temp1, v3=hum, v4=qnh, v5=co2
     """
-    import re
+
     match = re.match(
-        r'T#(\d+),([\d.]+),(-?[\d.]+),([\d.]+),([\d.]+),([\d.]+),(\d+)',
+        r"T#(\d+),([\d.]+),(-?[\d.]+),([\d.]+),([\d.]+),([\d.]+),(\d+)",
         message,
     )
     if not match:
@@ -311,10 +317,7 @@ def split_path(path: str, own_callsign: str = "") -> tuple[str, str]:
     Returns: ("DL8DD-7", "") or ("DO7TW-1", "DO7TW-1,DB0FHR-12")
     """
     parts = path.rstrip(">").strip().split(",")
-    if own_callsign:
-        filtered = [p for p in parts if p.upper() != own_callsign.upper()]
-    else:
-        filtered = parts
+    filtered = [p for p in parts if p.upper() != own_callsign.upper()] if own_callsign else parts
     src = filtered[0] if filtered else parts[0]
     via = ",".join(filtered)
     return src, via
@@ -352,7 +355,7 @@ def transform_msg(input_dict: dict[str, Any], own_callsign: str = "") -> dict[st
         "msg": strip_prefix(input_dict["message"]),
         "msg_id": hex_msg_id(input_dict["msg_id"]),
         "hw_id": input_dict["hardware_id"],
-        **transform_common_fields(input_dict, own_callsign)
+        **transform_common_fields(input_dict, own_callsign),
     }
 
 
@@ -363,8 +366,8 @@ def transform_ack(input_dict: dict[str, Any]) -> dict[str, Any]:
         "src_type": "ble",
         "type": "ack",
         **input_dict,
-        "msg_id": format(input_dict.get("msg_id"), '08X'),
-        "timestamp": int(time.time() * 1000)
+        "msg_id": format(input_dict.get("msg_id"), "08X"),
+        "timestamp": int(time.time() * 1000),
     }
 
 
@@ -380,7 +383,7 @@ def transform_pos(input_dict: dict[str, Any], own_callsign: str = "") -> dict[st
         "msg": input_dict["message"],
         "hw_id": input_dict.get("hardware_id"),
         **aprs,
-        **transform_common_fields(input_dict, own_callsign)
+        **transform_common_fields(input_dict, own_callsign),
     }
 
 
@@ -398,7 +401,7 @@ def transform_mh(input_dict: dict[str, Any]) -> dict[str, Any]:
         "lora_mod": input_dict.get("MOD"),
         "mesh": input_dict.get("MESH"),
         "node_timestamp": node_timestamp,
-        "timestamp": node_timestamp
+        "timestamp": node_timestamp,
     }
 
 
@@ -426,7 +429,7 @@ def transform_ble(input_dict: dict[str, Any]) -> dict[str, Any]:
         "transformer": "generic_ble",
         "src_type": "BLE",
         **input_dict,
-        "timestamp": int(time.time() * 1000)
+        "timestamp": int(time.time() * 1000),
     }
 
 
@@ -451,24 +454,36 @@ def dispatcher(input_dict: dict[str, Any], own_callsign: str = "") -> dict[str, 
     if "TYP" in input_dict:
         if input_dict["TYP"] == "MH":
             return transform_mh(input_dict)
-        elif input_dict["TYP"] in [
-            "I", "SN", "G", "SA", "W", "IO", "TM", "AN", "SE", "SW", "S1", "S2",
+        if input_dict["TYP"] in [
+            "I",
+            "SN",
+            "G",
+            "SA",
+            "W",
+            "IO",
+            "TM",
+            "AN",
+            "SE",
+            "SW",
+            "S1",
+            "S2",
         ]:
             logger.debug("BLE JSON TYP=%s", input_dict["TYP"])
             return transform_ble(input_dict)
-        else:
-            logger.warning("Type not found! %s", input_dict)
+        logger.warning("Type not found! %s", input_dict)
 
-    elif input_dict.get("payload_type") == 58:
+    elif input_dict.get("payload_type") == PAYLOAD_TYPE_MSG:
         result = transform_msg(input_dict, own_callsign)
         if result:
             logger.debug(
                 "BLE dispatch: type=msg src=%s msg_id=%s dst=%s",
-                result.get("src"), result.get("msg_id"), result.get("dst"),
+                result.get("src"),
+                result.get("msg_id"),
+                result.get("dst"),
             )
         return result
 
-    elif input_dict.get("payload_type") == 33:
+    elif input_dict.get("payload_type") == PAYLOAD_TYPE_POS:
         msg = input_dict.get("message", "")
         if msg.startswith("T#"):
             result = transform_tele(input_dict, own_callsign)
@@ -477,11 +492,13 @@ def dispatcher(input_dict: dict[str, Any], own_callsign: str = "") -> dict[str, 
         if result:
             logger.debug(
                 "BLE dispatch: type=%s src=%s msg_id=%s",
-                result.get("type"), result.get("src"), result.get("msg_id"),
+                result.get("type"),
+                result.get("src"),
+                result.get("msg_id"),
             )
         return result
 
-    elif input_dict.get("payload_type") == 65:
+    elif input_dict.get("payload_type") == PAYLOAD_TYPE_ACK:
         return transform_ack(input_dict)
 
     return None

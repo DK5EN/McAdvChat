@@ -5,6 +5,7 @@ Centralized configuration for McApp.
 Provides dataclass-based configuration with defaults and validation.
 Supports environment variable overrides for deployment flexibility.
 """
+
 import json
 import os
 from dataclasses import dataclass, field
@@ -19,9 +20,9 @@ logger = get_logger(__name__)
 
 # ── Protocol constants (fixed by hardware / architecture) ─────────────
 
-MESHCOM_UDP_PORT = 1799                # MeshCom IoT — not configurable
-SSE_HOST = "127.0.0.1"                 # Behind lighttpd reverse proxy
-SSE_PORT = 2981                        # Tied to lighttpd proxy rule
+MESHCOM_UDP_PORT = 1799  # MeshCom IoT — not configurable
+SSE_HOST = "127.0.0.1"  # Behind lighttpd reverse proxy
+SSE_PORT = 2981  # Tied to lighttpd proxy rule
 
 BLE_SERVICE_URL = "http://127.0.0.1:8081"  # Remote BLE service on same Pi
 BLE_NUS_RX_UUID = "6e400003-b5a3-f393-e0a9-e50e24dcca9e"  # Nordic UART RX
@@ -40,8 +41,8 @@ class UDPConfig:
 class BLEConfig:
     """Bluetooth Low Energy configuration."""
 
-    mode: str = "remote"   # "local" | "remote" | "disabled"
-    api_key: str = ""      # per-deployment auth key
+    mode: str = "remote"  # "local" | "remote" | "disabled"
+    api_key: str = ""  # per-deployment auth key
 
 
 @dataclass
@@ -108,7 +109,7 @@ class Config:
             logger.warning("Config file not found: %s, using defaults", path)
             return cls()
 
-        with open(path, encoding="utf-8") as f:
+        with path.open(encoding="utf-8") as f:
             data = json.load(f)
 
         logger.info("Loaded config from %s", path)
@@ -184,7 +185,7 @@ class Config:
     def save(self, path: str | Path) -> None:
         """Save config to file."""
         path = Path(path)
-        with open(path, "w", encoding="utf-8") as f:
+        with path.open("w", encoding="utf-8") as f:
             json.dump(self.to_dict(), f, indent=2, ensure_ascii=False)
         logger.info("Saved config to %s", path)
 

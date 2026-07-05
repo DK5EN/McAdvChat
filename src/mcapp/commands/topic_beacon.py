@@ -3,11 +3,17 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 from datetime import datetime
 from typing import Any
 
 from ._base import CommandHandlerBase
 from .constants import has_console
+
+_TEXT_PREVIEW_CHARS = 30
+_STATUS_PREVIEW_CHARS = 50
+_MAX_BEACON_TEXT_CHARS = 120
+_MAX_INTERVAL_MINUTES = 1440
 
 
 class TopicBeaconMixin(CommandHandlerBase):
@@ -18,7 +24,7 @@ class TopicBeaconMixin(CommandHandlerBase):
         self.active_topics: dict[str, dict[str, Any]] = {}
         self.topic_tasks: set[asyncio.Task[Any]] = set()
 
-    async def handle_topic(self, kwargs: dict[str, Any], requester: str) -> str:
+    async def handle_topic(self, kwargs: dict[str, Any], requester: str) -> str:  # noqa: PLR0911, PLR0912 - complex handler kept intact
         """Manage group beacon messages"""
         if not self._is_admin(requester):
             return "❌ Admin access required"
@@ -31,7 +37,8 @@ class TopicBeaconMixin(CommandHandlerBase):
             topics_info = []
             for group, info in self.active_topics.items():
                 interval = info["interval"]
-                text_preview = info["text"][:30] + ("..." if len(info["text"]) > 30 else "")
+                truncated = len(info["text"]) > _TEXT_PREVIEW_CHARS
+                text_preview = info["text"][:_TEXT_PREVIEW_CHARS] + ("..." if truncated else "")
                 topics_info.append(f"Group {group}: '{text_preview}' every {interval}min")
 
             return f"📡 Active beacons: {' | '.join(topics_info)}"
@@ -65,12 +72,12 @@ class TopicBeaconMixin(CommandHandlerBase):
         if not text:
             return "❌ Beacon text required"
 
-        if len(str(text)) > 120:
+        if len(str(text)) > _MAX_BEACON_TEXT_CHARS:
             return "❌ Beacon text too long (max 120 chars)"
 
         try:
             interval_int = int(interval)
-            if interval_int < 1 or interval_int > 1440:
+            if interval_int < 1 or interval_int > _MAX_INTERVAL_MINUTES:
                 return "❌ Interval must be between 1 and 1440 minutes"
         except (ValueError, TypeError):
             return "❌ Invalid interval format"
@@ -85,18 +92,16 @@ class TopicBeaconMixin(CommandHandlerBase):
                 f"✅ Beacon started for group"
                 f" {group}:"
                 f" '{text[:50]}"
-                f"{'...' if len(text) > 50 else ''}'"
+                f"{'...' if len(text) > _STATUS_PREVIEW_CHARS else ''}'"
                 f" every {interval}min"
             )
-        else:
-            return "❌ Failed to start beacon"
+        return "❌ Failed to start beacon"
 
     async def _start_topic_beacon(self, group: str, text: str, interval_minutes: int) -> bool:
         """Start a beacon task for a group"""
         try:
             interval_seconds = (interval_minutes * 60) - 10
-            if interval_seconds < 10:
-                interval_seconds = 10
+            interval_seconds = max(interval_seconds, 10)
 
             task = asyncio.create_task(self._beacon_loop(group, text, interval_seconds))
 
@@ -104,7 +109,7 @@ class TopicBeaconMixin(CommandHandlerBase):
                 "text": text,
                 "interval": interval_minutes,
                 "task": task,
-                "started": datetime.now(),
+                "started": datetime.now().astimezone(),
             }
 
             self.topic_tasks.add(task)
@@ -114,12 +119,13 @@ class TopicBeaconMixin(CommandHandlerBase):
             if has_console:
                 print(f"📡 Started beacon for group {group}: interval {interval_seconds}s")
 
-            return True
-
         except Exception as e:
             if has_console:
                 print(f"❌ Failed to start beacon for group {group}: {e}")
             return False
+
+        else:
+            return True
 
     async def _stop_topic_beacon(self, group: str) -> bool:
         """Stop a beacon task for a group"""
@@ -132,22 +138,21 @@ class TopicBeaconMixin(CommandHandlerBase):
 
             if not task.done():
                 task.cancel()
-                try:
+                with contextlib.suppress(asyncio.CancelledError):
                     await task
-                except asyncio.CancelledError:
-                    pass
 
             del self.active_topics[group]
 
             if has_console:
                 print(f"📡 Stopped beacon for group {group}")
 
-            return True
-
         except Exception as e:
             if has_console:
                 print(f"❌ Failed to stop beacon for group {group}: {e}")
             return False
+
+        else:
+            return True
 
     async def _beacon_loop(self, group: str, text: str, interval_seconds: int) -> None:
         """Beacon loop - sends periodic messages to a group"""
@@ -206,10 +211,8 @@ class TopicBeaconMixin(CommandHandlerBase):
             for task in remaining_tasks:
                 task.cancel()
 
-            try:
+            with contextlib.suppress(Exception):
                 await asyncio.gather(*remaining_tasks, return_exceptions=True)
-            except Exception:
-                pass
 
         self.topic_tasks.clear()
 

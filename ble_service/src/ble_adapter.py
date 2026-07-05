@@ -35,18 +35,26 @@ Extended Register Queries:
 """
 
 import asyncio
+import contextlib
 import hashlib
 import logging
+import struct
 import time
+from collections.abc import Callable
 from dataclasses import dataclass, field
+from datetime import UTC, datetime
 from enum import Enum
-from typing import Callable
 
 from dbus_next import Variant
 from dbus_next.aio import MessageBus
 from dbus_next.constants import BusType
 from dbus_next.errors import DBusError, InterfaceNotFoundError
 from dbus_next.service import ServiceInterface, method
+
+_MAX_CALLSIGN_LEN = 15
+_BLE_MTU_LIMIT = 247
+_MAX_SSID_LEN = 32
+_MAX_WIFI_PASSWORD_LEN = 63
 
 logger = logging.getLogger(__name__)
 
@@ -75,11 +83,12 @@ def build_hello_bytes(pin: int) -> bytes:
     if pin > 0:
         digest = hashlib.sha256(f"{pin:06d}".encode()).digest()
         return bytes([0x24, 0x10, 0x20, 0x30]) + digest
-    return b'\x04\x10\x20\x30'
+    return b"\x04\x10\x20\x30"
 
 
 class ConnectionState(Enum):
     """BLE connection states"""
+
     DISCONNECTED = "disconnected"
     CONNECTING = "connecting"
     CONNECTED = "connected"
@@ -90,6 +99,7 @@ class ConnectionState(Enum):
 @dataclass
 class BLEDevice:
     """Discovered BLE device information"""
+
     name: str
     address: str
     rssi: int = 0
@@ -102,6 +112,7 @@ class BLEDevice:
 @dataclass
 class BLEStatus:
     """Current BLE adapter status"""
+
     state: ConnectionState = ConnectionState.DISCONNECTED
     device: BLEDevice | None = None
     error: str | None = None
@@ -119,52 +130,52 @@ class MeshComPairingAgent(ServiceInterface):
     """
 
     def __init__(self, pin_getter: Callable[[], int]):
-        super().__init__('org.bluez.Agent1')
+        super().__init__("org.bluez.Agent1")
         self._pin_getter = pin_getter
 
     @method()
-    def Release(self):
+    def Release(self):  # noqa: N802 - D-Bus Agent1 interface method
         logger.info("Agent released")
 
     @method()
-    def RequestPasskey(self, device: 'o') -> 'u':  # noqa: F821
+    def RequestPasskey(self, device: "o") -> "u":  # noqa: F821, N802 - D-Bus Agent1 interface
         pin = self._pin_getter()
         logger.info(
             "Passkey requested for %s: returning %s",
-            device, "<configured>" if pin > 0 else "0",
+            device,
+            "<configured>" if pin > 0 else "0",
         )
         return pin
 
     @method()
-    def RequestPinCode(self, device: 'o') -> 's':  # noqa: F821
+    def RequestPinCode(self, device: "o") -> "s":  # noqa: F821, N802 - D-Bus Agent1 interface
         pin = self._pin_getter()
         result = f"{pin:06d}" if pin > 0 else "000000"
         logger.info(
             "PIN requested for %s: returning %s",
-            device, "<configured>" if pin > 0 else "000000",
+            device,
+            "<configured>" if pin > 0 else "000000",
         )
         return result
 
     @method()
-    def DisplayPinCode(self, device: 'o', pincode: 's'):  # noqa: F821
+    def DisplayPinCode(self, device: "o", pincode: "s"):  # noqa: F821, N802 - D-Bus Agent1 interface
         logger.info("DisplayPinCode for %s: %s", device, pincode)
 
     @method()
-    def DisplayPasskey(self, device: 'o', passkey: 'u', entered: 'q'):  # noqa: F821
+    def DisplayPasskey(self, device: "o", passkey: "u", entered: "q"):  # noqa: F821, N802 - D-Bus Agent1 interface
         logger.info("DisplayPasskey for %s: %s (%s entered)", device, passkey, entered)
 
     @method()
-    def RequestConfirmation(self, device: 'o', passkey: 'u'):  # noqa: F821
+    def RequestConfirmation(self, device: "o", passkey: "u"):  # noqa: F821, N802 - D-Bus Agent1 interface
         logger.info("Confirm passkey %s for %s", passkey, device)
-        return
 
     @method()
-    def AuthorizeService(self, device: 'o', uuid: 's'):  # noqa: F821
+    def AuthorizeService(self, device: "o", uuid: "s"):  # noqa: F821, N802 - D-Bus Agent1 interface
         logger.info("Authorize service %s for %s", uuid, device)
-        return
 
     @method()
-    def Cancel(self):
+    def Cancel(self):  # noqa: N802 - D-Bus Agent1 interface method
         logger.info("Request cancelled")
 
 
@@ -180,8 +191,8 @@ class BLEAdapter:
         self,
         read_uuid: str = NUS_TX_UUID,
         write_uuid: str = NUS_RX_UUID,
-        hello_bytes: bytes = b'\x04\x10\x20\x30',
-        notification_callback: Callable[[bytes], None] | None = None
+        hello_bytes: bytes = b"\x04\x10\x20\x30",
+        notification_callback: Callable[[bytes], None] | None = None,
     ):
         self.read_uuid = read_uuid
         self.write_uuid = write_uuid
@@ -234,7 +245,7 @@ class BLEAdapter:
         if self.bus is None:
             self.bus = await MessageBus(bus_type=BusType.SYSTEM).connect()
 
-    async def scan(self, timeout: float = 5.0, prefix: str = "MC-") -> list[BLEDevice]:
+    async def scan(self, timeout: float = 5.0, prefix: str = "MC-") -> list[BLEDevice]:  # noqa: ASYNC109 - public API takes timeout
         """
         Scan for BLE devices with optional name prefix filter.
 
@@ -259,8 +270,7 @@ class BLEAdapter:
 
             # Get object manager for existing devices
             obj_mgr = self.bus.get_proxy_object(
-                BLUEZ_SERVICE_NAME, "/",
-                await self.bus.introspect(BLUEZ_SERVICE_NAME, "/")
+                BLUEZ_SERVICE_NAME, "/", await self.bus.introspect(BLUEZ_SERVICE_NAME, "/")
             )
             obj_mgr_iface = obj_mgr.get_interface(OBJECT_MANAGER_INTERFACE)
 
@@ -281,7 +291,7 @@ class BLEAdapter:
                             rssi=rssi,
                             paired=paired,
                             known=True,
-                            path=obj_path
+                            path=obj_path,
                         )
                         known_devices.append(device)
 
@@ -294,15 +304,15 @@ class BLEAdapter:
                         addr = props.get("Address", Variant("s", "")).value
                         rssi = props.get("RSSI", Variant("n", 0)).value
                         found_devices[path] = BLEDevice(
-                            name=name,
-                            address=addr,
-                            rssi=rssi,
-                            paired=False,
-                            path=path
+                            name=name, address=addr, rssi=rssi, paired=False, path=path
                         )
 
+            pending_tasks: set[asyncio.Task] = set()
+
             def on_interfaces_added_sync(path, interfaces):
-                asyncio.create_task(on_interfaces_added(path, interfaces))
+                task = asyncio.create_task(on_interfaces_added(path, interfaces))
+                pending_tasks.add(task)
+                task.add_done_callback(pending_tasks.discard)
 
             obj_mgr_iface.on_interfaces_added(on_interfaces_added_sync)
 
@@ -317,8 +327,9 @@ class BLEAdapter:
 
             # Combine results
             all_devices = known_devices + list(found_devices.values())
-            logger.info("Scan complete: %d known, %d discovered",
-                       len(known_devices), len(found_devices))
+            logger.info(
+                "Scan complete: %d known, %d discovered", len(known_devices), len(found_devices)
+            )
 
             return all_devices
 
@@ -340,9 +351,8 @@ class BLEAdapter:
                 if self._connected_mac == mac:
                     logger.info("Already connected to %s", mac)
                     return True
-                else:
-                    logger.warning("Connected to different device, disconnecting first")
-                    await self._disconnect_internal()
+                logger.warning("Connected to different device, disconnecting first")
+                await self._disconnect_internal()
 
             self._status.state = ConnectionState.CONNECTING
             self._status.error = None
@@ -359,9 +369,7 @@ class BLEAdapter:
                     self._status.state = ConnectionState.CONNECTED
                     # Read device name from BlueZ D-Bus
                     try:
-                        name = (await self.props_iface.call_get(
-                            DEVICE_INTERFACE, "Name"
-                        )).value
+                        name = (await self.props_iface.call_get(DEVICE_INTERFACE, "Name")).value
                     except Exception:
                         name = ""
                     self._status.device = BLEDevice(name=name, address=mac)
@@ -375,15 +383,17 @@ class BLEAdapter:
                     self._start_dst_check()
 
                     logger.info("Connected to %s", mac)
-                    return True
 
                 except Exception as e:
-                    logger.warning("Connection attempt %d/%d failed: %s",
-                                 attempt + 1, max_retries, e)
+                    logger.warning(
+                        "Connection attempt %d/%d failed: %s", attempt + 1, max_retries, e
+                    )
                     if attempt < max_retries - 1:
                         await self._cleanup_failed_connection()
                         await asyncio.sleep(1)
 
+                else:
+                    return True
             await self._cleanup_failed_connection()
 
             if self._cancel_connect:
@@ -394,7 +404,7 @@ class BLEAdapter:
                 self._status.error = f"Connection failed after {max_retries} attempts"
             return False
 
-    async def _attempt_connection(self, mac: str, path: str):
+    async def _attempt_connection(self, _mac: str, path: str):
         """Single connection attempt with stale BlueZ state handling"""
         await self._ensure_bus()
 
@@ -410,32 +420,26 @@ class BLEAdapter:
 
         # Check if BlueZ has stale connection (e.g. after device hard reboot)
         try:
-            connected = (await self.props_iface.call_get(
-                DEVICE_INTERFACE, "Connected"
-            )).value
+            connected = (await self.props_iface.call_get(DEVICE_INTERFACE, "Connected")).value
             if connected:
                 logger.warning("BlueZ reports connected (possibly stale), forcing disconnect")
-                try:
+                with contextlib.suppress(Exception):
                     await asyncio.wait_for(self.dev_iface.call_disconnect(), timeout=5.0)
-                except Exception:
-                    pass
                 await asyncio.sleep(0.5)
-        except Exception:
-            pass
+        except Exception as e:
+            logger.debug("Pre-connect state check failed: %s", e)
 
         # Attempt connection
         try:
             await asyncio.wait_for(self.dev_iface.call_connect(), timeout=10.0)
-        except asyncio.TimeoutError:
-            raise ConnectionError("Connection timeout after 10 seconds")
+        except TimeoutError as e:
+            raise ConnectionError("Connection timeout after 10 seconds") from e
         except DBusError as e:
             if "In Progress" in str(e):
                 # BlueZ has a pending connection from a previous attempt
                 logger.warning("Stale 'In Progress' in BlueZ, clearing before retry")
-                try:
+                with contextlib.suppress(Exception):
                     await asyncio.wait_for(self.dev_iface.call_disconnect(), timeout=3.0)
-                except Exception:
-                    pass
                 raise ConnectionError("Cleared stale BlueZ state, will retry") from e
             raise ConnectionError(f"Connect failed: {e}") from e
 
@@ -446,8 +450,8 @@ class BLEAdapter:
         # Find GATT characteristics (with timeout to prevent hangs)
         try:
             await asyncio.wait_for(self._find_characteristics(path), timeout=10.0)
-        except asyncio.TimeoutError:
-            raise ConnectionError("GATT characteristic discovery timeout")
+        except TimeoutError as e:
+            raise ConnectionError("GATT characteristic discovery timeout") from e
 
         if not self.read_char_iface or not self.write_char_iface:
             raise ConnectionError("Required GATT characteristics not found")
@@ -459,11 +463,14 @@ class BLEAdapter:
         if not self.props_iface:
             return
 
-        async def _on_device_props_changed(iface: str, changed: dict, invalidated: list):
-            if iface == DEVICE_INTERFACE and "Connected" in changed:
-                if not changed["Connected"].value:
-                    logger.warning("D-Bus: device disconnected (PropertiesChanged)")
-                    self._on_disconnect_detected()
+        async def _on_device_props_changed(iface: str, changed: dict, _invalidated: list):
+            if (
+                iface == DEVICE_INTERFACE
+                and "Connected" in changed
+                and not changed["Connected"].value
+            ):
+                logger.warning("D-Bus: device disconnected (PropertiesChanged)")
+                self._on_disconnect_detected()
 
         self._device_props_handler = _on_device_props_changed
         self.props_iface.on_properties_changed(_on_device_props_changed)
@@ -471,21 +478,19 @@ class BLEAdapter:
     def _unsubscribe_device_properties(self):
         """Unsubscribe from device PropertiesChanged signal"""
         if self._device_props_handler and self.props_iface:
-            try:
+            with contextlib.suppress(Exception):
                 self.props_iface.off_properties_changed(self._device_props_handler)
-            except Exception:
-                pass
         self._device_props_handler = None
 
-    async def _wait_for_services_resolved(self, timeout: float = 10.0) -> bool:
+    async def _wait_for_services_resolved(self, timeout: float = 10.0) -> bool:  # noqa: ASYNC109 - public API takes timeout
         """Wait for BLE services to be discovered"""
         start = time.time()
 
         while (time.time() - start) < timeout:
             try:
-                resolved = (await self.props_iface.call_get(
-                    DEVICE_INTERFACE, "ServicesResolved"
-                )).value
+                resolved = (
+                    await self.props_iface.call_get(DEVICE_INTERFACE, "ServicesResolved")
+                ).value
                 if resolved:
                     return True
                 await asyncio.sleep(0.5)
@@ -538,18 +543,14 @@ class BLEAdapter:
         """Clean up after failed connection — guaranteed to reset state"""
         try:
             if self.dev_iface:
-                try:
+                with contextlib.suppress(Exception):
                     await asyncio.wait_for(self.dev_iface.call_disconnect(), timeout=3.0)
-                except Exception:
-                    pass
         except Exception as e:
             logger.warning("Cleanup error: %s", e)
         finally:
             if self.bus:
-                try:
+                with contextlib.suppress(Exception):
                     self.bus.disconnect()
-                except Exception:
-                    pass
             self._reset_state()
 
     def _reset_state(self):
@@ -579,14 +580,12 @@ class BLEAdapter:
         self._status.state = ConnectionState.DISCONNECTING
 
         # Stop keepalive and DST check
-        for task_attr in ('_keepalive_task', '_dst_check_task'):
+        for task_attr in ("_keepalive_task", "_dst_check_task"):
             task = getattr(self, task_attr)
             if task and not task.done():
                 task.cancel()
-                try:
+                with contextlib.suppress(asyncio.CancelledError):
                     await task
-                except asyncio.CancelledError:
-                    pass
             setattr(self, task_attr, None)
 
         # Unsubscribe device property listener
@@ -607,10 +606,8 @@ class BLEAdapter:
 
         # Clean up
         if self.bus:
-            try:
+            with contextlib.suppress(Exception):
                 self.bus.disconnect()
-            except Exception:
-                pass
 
         self._reset_state()
         self._status.state = ConnectionState.DISCONNECTED
@@ -625,9 +622,9 @@ class BLEAdapter:
             raise RuntimeError("Not connected")
 
         # Check if already notifying
-        is_notifying = (await self.read_props_iface.call_get(
-            GATT_CHARACTERISTIC_INTERFACE, "Notifying"
-        )).value
+        is_notifying = (
+            await self.read_props_iface.call_get(GATT_CHARACTERISTIC_INTERFACE, "Notifying")
+        ).value
 
         if is_notifying:
             logger.info("Already notifying")
@@ -647,8 +644,8 @@ class BLEAdapter:
         try:
             if self.read_props_iface:
                 self.read_props_iface.off_properties_changed(self._on_props_changed)
-        except Exception:
-            pass
+        except Exception as e:
+            logger.debug("Detaching properties handler failed: %s", e)
 
         try:
             await self.read_char_iface.call_stop_notify()
@@ -656,7 +653,7 @@ class BLEAdapter:
             if "No notify session started" not in str(e):
                 raise
 
-    async def _on_props_changed(self, iface: str, changed: dict, invalidated: list):
+    async def _on_props_changed(self, iface: str, changed: dict, _invalidated: list):
         """Handle property changes (notifications)"""
         if iface != GATT_CHARACTERISTIC_INTERFACE:
             return
@@ -668,8 +665,8 @@ class BLEAdapter:
             if self.notification_callback:
                 try:
                     self.notification_callback(value)
-                except Exception as e:
-                    logger.error("Notification callback error: %s", e)
+                except Exception:
+                    logger.exception("Notification callback error")
 
     async def write(self, data: bytes) -> bool:
         """
@@ -688,20 +685,21 @@ class BLEAdapter:
         async with self._write_lock:
             try:
                 await asyncio.wait_for(
-                    self.write_char_iface.call_write_value(data, {}),
-                    timeout=5.0
+                    self.write_char_iface.call_write_value(data, {}), timeout=5.0
                 )
                 self._status.last_activity = time.time()
-                return True
-            except asyncio.TimeoutError:
-                logger.error("Write timeout")
+            except TimeoutError:
+                logger.exception("Write timeout")
                 return False
             except Exception as e:
                 error_str = str(e)
-                logger.error("Write error: %s", error_str)
+                logger.exception("Write error: %s", error_str)
                 if "Not connected" in error_str:
                     self._on_disconnect_detected()
                 return False
+
+            else:
+                return True
 
     def _on_disconnect_detected(self):
         """Handle unexpected disconnect (write failure or D-Bus signal)"""
@@ -714,7 +712,7 @@ class BLEAdapter:
         self._connected_mac = None
 
         # Cancel keepalive and DST check
-        for task_attr in ('_keepalive_task', '_dst_check_task'):
+        for task_attr in ("_keepalive_task", "_dst_check_task"):
             task = getattr(self, task_attr)
             if task and not task.done():
                 task.cancel()
@@ -735,8 +733,8 @@ class BLEAdapter:
         if self._disconnect_callback:
             try:
                 self._disconnect_callback()
-            except Exception as e:
-                logger.error("Disconnect callback error: %s", e)
+            except Exception:
+                logger.exception("Disconnect callback error")
 
     async def send_message(self, msg: str, group: str) -> bool:
         """
@@ -750,9 +748,9 @@ class BLEAdapter:
             True if send successful
         """
         message = "{" + group + "}" + msg
-        byte_array = bytearray(message.encode('utf-8'))
+        byte_array = bytearray(message.encode("utf-8"))
         length = len(byte_array) + 2
-        byte_array = length.to_bytes(1, 'big') + bytes([0xA0]) + byte_array
+        byte_array = length.to_bytes(1, "big") + bytes([0xA0]) + byte_array
 
         return await self.write(bytes(byte_array))
 
@@ -772,9 +770,9 @@ class BLEAdapter:
         Returns:
             True if send successful
         """
-        byte_array = bytearray(cmd.encode('utf-8'))
+        byte_array = bytearray(cmd.encode("utf-8"))
         length = len(byte_array) + 2
-        byte_array = length.to_bytes(1, 'big') + bytes([0xA0]) + byte_array
+        byte_array = length.to_bytes(1, "big") + bytes([0xA0]) + byte_array
 
         return await self.write(bytes(byte_array))
 
@@ -786,10 +784,9 @@ class BLEAdapter:
         uses the correct offset when converting UTC → local time, even
         after DST transitions.
         """
-        from datetime import datetime, timezone
 
         # Calculate current UTC offset of the system timezone (handles DST)
-        local_now = datetime.now(timezone.utc).astimezone()
+        local_now = datetime.now(UTC).astimezone()
         utc_offset_hours = local_now.utcoffset().total_seconds() / 3600
 
         # Send UTC offset first so the firmware applies it to the timestamp
@@ -804,7 +801,7 @@ class BLEAdapter:
 
         # Send Unix timestamp
         now = int(time.time())
-        data = 6 .to_bytes(1, 'big') + bytes([0x20]) + now.to_bytes(4, byteorder='little')
+        data = (6).to_bytes(1, "big") + bytes([0x20]) + now.to_bytes(4, byteorder="little")
         return await self.write(data)
 
     async def set_callsign(self, callsign: str) -> bool:
@@ -821,16 +818,16 @@ class BLEAdapter:
             raise RuntimeError("Not connected")
 
         # Validate callsign format
-        if not callsign or len(callsign) > 15:
+        if not callsign or len(callsign) > _MAX_CALLSIGN_LEN:
             raise ValueError("Callsign must be 1-15 characters")
 
-        callsign_bytes = callsign.encode('utf-8')
+        callsign_bytes = callsign.encode("utf-8")
         length = len(callsign_bytes) + 2
 
-        if length > 247:  # MTU limit
+        if length > _BLE_MTU_LIMIT:
             raise ValueError(f"Callsign too long: {length} bytes (max 247)")
 
-        byte_array = length.to_bytes(1, 'big') + bytes([0x50]) + callsign_bytes
+        byte_array = length.to_bytes(1, "big") + bytes([0x50]) + callsign_bytes
         return await self.write(bytes(byte_array))
 
     async def set_wifi(self, ssid: str, password: str) -> bool:
@@ -848,25 +845,22 @@ class BLEAdapter:
             raise RuntimeError("Not connected")
 
         # Validate lengths
-        if not ssid or len(ssid) > 32:
+        if not ssid or len(ssid) > _MAX_SSID_LEN:
             raise ValueError("SSID must be 1-32 characters")
-        if len(password) > 63:
+        if len(password) > _MAX_WIFI_PASSWORD_LEN:
             raise ValueError("Password must be 0-63 characters")
 
-        ssid_bytes = ssid.encode('utf-8')
-        pwd_bytes = password.encode('utf-8')
+        ssid_bytes = ssid.encode("utf-8")
+        pwd_bytes = password.encode("utf-8")
 
-        # Format: [SSID_len][SSID][PWD_len][PWD]
-        byte_array = (
-            bytes([len(ssid_bytes)]) + ssid_bytes +
-            bytes([len(pwd_bytes)]) + pwd_bytes
-        )
+        # Wire format: SSID_len byte, SSID bytes, PWD_len byte, PWD bytes
+        byte_array = bytes([len(ssid_bytes)]) + ssid_bytes + bytes([len(pwd_bytes)]) + pwd_bytes
         length = len(byte_array) + 2
 
-        if length > 247:  # MTU limit
+        if length > _BLE_MTU_LIMIT:
             raise ValueError(f"WiFi config too long: {length} bytes (max 247)")
 
-        byte_array = length.to_bytes(1, 'big') + bytes([0x55]) + byte_array
+        byte_array = length.to_bytes(1, "big") + bytes([0x55]) + byte_array
         return await self.write(bytes(byte_array))
 
     async def set_latitude(self, lat: float, save: bool = False) -> bool:
@@ -883,15 +877,14 @@ class BLEAdapter:
         if not self.is_connected:
             raise RuntimeError("Not connected")
 
-        if not -90.0 <= lat <= 90.0:
+        if not -90.0 <= lat <= 90.0:  # noqa: PLR2004 - geographic bound
             raise ValueError("Latitude must be between -90.0 and 90.0")
 
-        import struct
         save_flag = 0x0A if save else 0x0B
-        byte_array = struct.pack('<f', lat) + bytes([save_flag])
+        byte_array = struct.pack("<f", lat) + bytes([save_flag])
         length = len(byte_array) + 2
 
-        byte_array = length.to_bytes(1, 'big') + bytes([0x70]) + byte_array
+        byte_array = length.to_bytes(1, "big") + bytes([0x70]) + byte_array
         return await self.write(bytes(byte_array))
 
     async def set_longitude(self, lon: float, save: bool = False) -> bool:
@@ -908,15 +901,14 @@ class BLEAdapter:
         if not self.is_connected:
             raise RuntimeError("Not connected")
 
-        if not -180.0 <= lon <= 180.0:
+        if not -180.0 <= lon <= 180.0:  # noqa: PLR2004 - geographic bound
             raise ValueError("Longitude must be between -180.0 and 180.0")
 
-        import struct
         save_flag = 0x0A if save else 0x0B
-        byte_array = struct.pack('<f', lon) + bytes([save_flag])
+        byte_array = struct.pack("<f", lon) + bytes([save_flag])
         length = len(byte_array) + 2
 
-        byte_array = length.to_bytes(1, 'big') + bytes([0x80]) + byte_array
+        byte_array = length.to_bytes(1, "big") + bytes([0x80]) + byte_array
         return await self.write(bytes(byte_array))
 
     async def set_altitude(self, alt: int, save: bool = False) -> bool:
@@ -933,14 +925,14 @@ class BLEAdapter:
         if not self.is_connected:
             raise RuntimeError("Not connected")
 
-        if not -1000 <= alt <= 10000:
+        if not -1000 <= alt <= 10000:  # noqa: PLR2004 - altitude bound
             raise ValueError("Altitude must be between -1000 and 10000 meters")
 
         save_flag = 0x0A if save else 0x0B
-        byte_array = alt.to_bytes(4, byteorder='little', signed=True) + bytes([save_flag])
+        byte_array = alt.to_bytes(4, byteorder="little", signed=True) + bytes([save_flag])
         length = len(byte_array) + 2
 
-        byte_array = length.to_bytes(1, 'big') + bytes([0x90]) + byte_array
+        byte_array = length.to_bytes(1, "big") + bytes([0x90]) + byte_array
         return await self.write(bytes(byte_array))
 
     async def set_aprs_symbols(self, primary: str, secondary: str) -> bool:
@@ -966,7 +958,7 @@ class BLEAdapter:
         byte_array = bytes([primary_byte, secondary_byte])
         length = len(byte_array) + 2
 
-        byte_array = length.to_bytes(1, 'big') + bytes([0x95]) + byte_array
+        byte_array = length.to_bytes(1, "big") + bytes([0x95]) + byte_array
         return await self.write(bytes(byte_array))
 
     async def save_and_reboot(self) -> bool:
@@ -997,8 +989,8 @@ class BLEAdapter:
             return
 
         commands = [
-            ("--io", 0.8),    # TYP: IO (GPIO status)
-            ("--tel", 0.8),   # TYP: TM (telemetry config)
+            ("--io", 0.8),  # TYP: IO (GPIO status)
+            ("--tel", 0.8),  # TYP: TM (telemetry config)
         ]
 
         for cmd, delay in commands:
@@ -1033,7 +1025,6 @@ class BLEAdapter:
 
     async def _dst_check_loop(self):
         """Check hourly for DST transitions and update device UTC offset."""
-        from datetime import datetime, timezone
 
         try:
             while self.is_connected:
@@ -1041,16 +1032,14 @@ class BLEAdapter:
                 if not self.is_connected:
                     break
 
-                local_now = datetime.now(timezone.utc).astimezone()
+                local_now = datetime.now(UTC).astimezone()
                 current_offset = local_now.utcoffset().total_seconds() / 3600
 
-                if (
-                    self._last_utc_offset is not None
-                    and current_offset != self._last_utc_offset
-                ):
+                if self._last_utc_offset is not None and current_offset != self._last_utc_offset:
                     logger.info(
                         "DST transition detected: UTC%+.1f -> UTC%+.1f",
-                        self._last_utc_offset, current_offset,
+                        self._last_utc_offset,
+                        current_offset,
                     )
                     await self.set_time()
         except asyncio.CancelledError:
@@ -1080,8 +1069,9 @@ class BLEAdapter:
                 self.bus.export(AGENT_PATH, agent)
 
                 manager_obj = self.bus.get_proxy_object(
-                    BLUEZ_SERVICE_NAME, "/org/bluez",
-                    await self.bus.introspect(BLUEZ_SERVICE_NAME, "/org/bluez")
+                    BLUEZ_SERVICE_NAME,
+                    "/org/bluez",
+                    await self.bus.introspect(BLUEZ_SERVICE_NAME, "/org/bluez"),
                 )
                 agent_manager = manager_obj.get_interface("org.bluez.AgentManager1")
                 await agent_manager.call_register_agent(AGENT_PATH, "KeyboardDisplay")
@@ -1090,14 +1080,13 @@ class BLEAdapter:
 
             # Pair
             dev_obj = self.bus.get_proxy_object(
-                BLUEZ_SERVICE_NAME, path,
-                await self.bus.introspect(BLUEZ_SERVICE_NAME, path)
+                BLUEZ_SERVICE_NAME, path, await self.bus.introspect(BLUEZ_SERVICE_NAME, path)
             )
 
             try:
                 dev_iface = dev_obj.get_interface(DEVICE_INTERFACE)
             except InterfaceNotFoundError:
-                logger.error("Device not found: %s", mac)
+                logger.exception("Device not found: %s", mac)
                 return False
 
             try:
@@ -1109,16 +1098,15 @@ class BLEAdapter:
 
                 # Disconnect after pairing
                 await asyncio.sleep(2)
-                try:
+                with contextlib.suppress(Exception):
                     await dev_iface.call_disconnect()
-                except Exception:
-                    pass
 
-                return is_paired
-
-            except Exception as e:
-                logger.error("Pairing failed: %s", e)
+            except Exception:
+                logger.exception("Pairing failed")
                 return False
+
+            else:
+                return is_paired
 
     async def unpair(self, mac: str) -> bool:
         """
@@ -1137,15 +1125,17 @@ class BLEAdapter:
             adapter_path = "/org/bluez/hci0"
 
             adapter_obj = self.bus.get_proxy_object(
-                BLUEZ_SERVICE_NAME, adapter_path,
-                await self.bus.introspect(BLUEZ_SERVICE_NAME, adapter_path)
+                BLUEZ_SERVICE_NAME,
+                adapter_path,
+                await self.bus.introspect(BLUEZ_SERVICE_NAME, adapter_path),
             )
             adapter_iface = adapter_obj.get_interface(ADAPTER_INTERFACE)
 
             try:
                 await adapter_iface.call_remove_device(device_path)
                 logger.info("Unpaired device: %s", mac)
-                return True
-            except DBusError as e:
-                logger.error("Unpair failed: %s", e)
+            except DBusError:
+                logger.exception("Unpair failed")
                 return False
+            else:
+                return True

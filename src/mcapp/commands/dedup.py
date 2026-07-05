@@ -1,6 +1,7 @@
 """DedupMixin: deduplication, throttling, and abuse protection."""
 
 import asyncio
+import contextlib
 import hashlib
 import time
 from typing import Any
@@ -50,10 +51,8 @@ class DedupMixin(CommandHandlerBase):
         if task is None:
             return
         task.cancel()
-        try:
+        with contextlib.suppress(asyncio.CancelledError):
             await task
-        except asyncio.CancelledError:
-            pass
         self._dedup_cleanup_task = None
 
     async def _dedup_cleanup_loop(self) -> None:
@@ -93,21 +92,17 @@ class DedupMixin(CommandHandlerBase):
                 command = parts[0].lower()
                 # For commands with specific throttling, use command-only hash
                 if command in COMMAND_THROTTLING:
-                    if dst:
-                        content = f"{src}:{dst}:!{command}"
-                    else:
-                        content = f"{src}:!{command}"
+                    content = f"{src}:{dst}:!{command}" if dst else f"{src}:!{command}"
+                elif dst:
+                    content = f"{src}:{dst}:{msg_text}"
                 else:
-                    if dst:
-                        content = f"{src}:{dst}:{msg_text}"
-                    else:
-                        content = f"{src}:{msg_text}"  # Full command + args for others
+                    content = f"{src}:{msg_text}"  # Full command + args for others
             else:
                 content = f"{src}:{msg_text}"
         else:
             content = f"{src}:{msg_text}"
 
-        hash_value = hashlib.md5(content.encode()).hexdigest()[:8]
+        hash_value = hashlib.md5(content.encode(), usedforsecurity=False).hexdigest()[:8]
         logger.debug("Hash generation: %r -> %s", content, hash_value)
 
         return hash_value
@@ -118,7 +113,7 @@ class DedupMixin(CommandHandlerBase):
         self._cleanup_msg_id_cache(current_time)
         return msg_id in self.processed_msg_ids
 
-    def _is_throttled(self, content_hash: str, command: str | None = None) -> bool:
+    def _is_throttled(self, content_hash: str, _command: str | None = None) -> bool:
         """Check throttle cache and cleanup expired entries"""
         current_time = time.time()
         self._cleanup_throttle_cache(current_time)
@@ -160,7 +155,9 @@ class DedupMixin(CommandHandlerBase):
             self.blocked_users[src] = current_time
             logger.info(
                 "BLOCKED user %s for %.1f minutes after %d failed attempts",
-                src, self.block_duration / 60, len(self.failed_attempts[src]),
+                src,
+                self.block_duration / 60,
+                len(self.failed_attempts[src]),
             )
 
     def _cleanup_msg_id_cache(self, current_time: float) -> None:
@@ -179,7 +176,7 @@ class DedupMixin(CommandHandlerBase):
             self.block_notifications_sent.discard(src)
             logger.info("UNBLOCKED user %s", src)
 
-    def _cleanup_throttle_cache(self, current_time: float, timeout: float | None = None) -> None:
+    def _cleanup_throttle_cache(self, current_time: float, _timeout: float | None = None) -> None:
         """Remove old entries from throttle cache with specific timeout"""
         expired = []
 
