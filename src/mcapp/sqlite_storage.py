@@ -11,6 +11,7 @@ import contextlib
 import json
 import re
 import sqlite3
+import tempfile
 import time
 from collections import defaultdict
 from datetime import UTC, datetime, timedelta
@@ -507,6 +508,19 @@ class SQLiteStorage:
                         len(rows),
                     )
                     _set_schema_version(conn, 18)
+
+                if current_version < 19:  # noqa: PLR2004 - schema migration step
+                    # UDP 2.0 Track U (Wave U2): tag each signal_log row with its
+                    # transport ('mheard' = BLE MHeard, 'lora' = UDP Extern-UDP) so
+                    # overlapping BLE+UDP signal sources on one node are distinguishable.
+                    conn.execute("ALTER TABLE signal_log ADD COLUMN source TEXT")
+                    conn.execute("UPDATE signal_log SET source = 'mheard' WHERE source IS NULL")
+                    logger.info(
+                        "Migration v%d → v19: added signal_log.source column"
+                        " (backfilled existing rows as 'mheard')",
+                        current_version,
+                    )
+                    _set_schema_version(conn, 19)
 
         await asyncio.to_thread(_init_db)
 
@@ -1094,6 +1108,53 @@ class SQLiteStorage:
                 fetch=False,
             )
 
+    async def _ingest_signal(  # noqa: PLR0913 - keyword-only args mirror store_message's locals
+        self,
+        callsign: str,
+        message: dict[str, Any],
+        *,
+        src_type: str,
+        msg_type: str,
+        msg_id: Any,
+        rssi: int | None,
+        snr: int | None,
+        timestamp: int,
+    ) -> bool:
+        """Route a signal-bearing packet into signal_log/signal_buckets/station_positions.
+
+        Two sources feed the same signal architecture (UDP-2.0 Track U, design principle 1):
+        BLE MHeard beacons (no msg_id, src_type "ble", msg_type "pos") and UDP Extern-UDP
+        packets received over RF (src_type "lora", msg_type "pos" or "msg" — "node"/"udp"
+        src_types are the local node's own traffic and carry a 0/0 signal sentinel, so they
+        are excluded by src_type rather than relying solely on the range check).
+
+        Returns `is_mheard` (the BLE-MHeard sub-condition) since the caller's legacy
+        messages-table throttle branch keys off it too.
+        """
+        is_mheard = not msg_id and src_type == "ble" and msg_type == "pos"
+        is_lora_observation = src_type == "lora" and msg_type in ("pos", "msg")
+        has_signal = (is_mheard or is_lora_observation) and rssi is not None and snr is not None
+
+        if has_signal:
+            if (
+                VALID_RSSI_RANGE[0] <= rssi <= VALID_RSSI_RANGE[1]
+                and VALID_SNR_RANGE[0] <= snr <= VALID_SNR_RANGE[1]
+            ):
+                source = "mheard" if is_mheard else "lora"
+                await self._execute(
+                    "INSERT INTO signal_log (callsign, timestamp, rssi, snr, source)"
+                    " VALUES (?, ?, ?, ?, ?)",
+                    (callsign, timestamp, rssi, snr, source),
+                    fetch=False,
+                )
+                # Accumulate into bucket and flush completed ones
+                completed = self._accumulate_signal(callsign, timestamp, rssi, snr)
+                await self._flush_completed_buckets(completed)
+
+            await self._upsert_station_position(callsign, message, "signal")
+
+        return is_mheard
+
     async def _execute(
         self,
         query: str,
@@ -1285,28 +1346,36 @@ class SQLiteStorage:
                     fetch=False,
                 )
 
+        # Time-windowed dedup: reject only if same msg_id was seen within DEDUP_WINDOW_MS.
+        # MHeard beacons (msg_id=None) skip this check — they have their own throttle below.
+        # Checked here (before signal ingestion, not just before the final INSERT) so a
+        # duplicate-delivered datagram (firmware is known to double-deliver) can't double-count
+        # into signal_log/signal_buckets (UDP 2.0 Track U, Wave U2).
+        if msg_id is not None:
+            existing = await self._execute(
+                "SELECT 1 FROM messages WHERE msg_id = ? AND timestamp > ? LIMIT 1",
+                (msg_id, timestamp - DEDUP_WINDOW_MS),
+            )
+            if existing:
+                return
+
         # --- Dual-write to new tables ---
-        is_mheard = not msg_id and src_type == "ble" and msg_type == "pos"
+        # A lora `pos` packet updates both field groups (signal + position) in this
+        # same call — they are independent column groups on station_positions, so
+        # both branches below run rather than being mutually exclusive (UDP 2.0 Track U).
+        is_mheard = await self._ingest_signal(
+            callsign,
+            message,
+            src_type=src_type,
+            msg_type=msg_type,
+            msg_id=msg_id,
+            rssi=rssi,
+            snr=snr,
+            timestamp=timestamp,
+        )
         is_position = msg_type == "pos" and not is_mheard
 
-        if is_mheard and rssi is not None and snr is not None:
-            # MHeard beacon → signal_log + station_positions (signal fields)
-            if (
-                VALID_RSSI_RANGE[0] <= rssi <= VALID_RSSI_RANGE[1]
-                and VALID_SNR_RANGE[0] <= snr <= VALID_SNR_RANGE[1]
-            ):
-                await self._execute(
-                    "INSERT INTO signal_log (callsign, timestamp, rssi, snr) VALUES (?, ?, ?, ?)",
-                    (callsign, timestamp, rssi, snr),
-                    fetch=False,
-                )
-                # Accumulate into bucket and flush completed ones
-                completed = self._accumulate_signal(callsign, timestamp, rssi, snr)
-                await self._flush_completed_buckets(completed)
-
-            await self._upsert_station_position(callsign, message, "signal")
-
-        elif is_position:
+        if is_position:
             # Position beacon → station_positions (location fields)
             pos_data = {**message, "via": relay_via}
             # Extract fields from raw_json if not in message dict
@@ -1379,16 +1448,6 @@ class SQLiteStorage:
                     (rssi, snr, timestamp, raw, existing_list[0]["id"]),
                     fetch=False,
                 )
-                return
-
-        # Time-windowed dedup: reject only if same msg_id was seen within DEDUP_WINDOW_MS.
-        # MHeard beacons (msg_id=None) skip this check — they have their own throttle.
-        if msg_id is not None:
-            existing = await self._execute(
-                "SELECT 1 FROM messages WHERE msg_id = ? AND timestamp > ? LIMIT 1",
-                (msg_id, timestamp - DEDUP_WINDOW_MS),
-            )
-            if existing:
                 return
 
         # Inline classification (before INSERT so columns land in the same row).
@@ -3722,3 +3781,339 @@ async def create_sqlite_storage(db_path: str | Path) -> SQLiteStorage:
     storage = SQLiteStorage(db_path)
     await storage.initialize()
     return storage
+
+
+async def run_startup_tests() -> bool:  # noqa: PLR0915 - test suite lists one case per assertion
+    """UDP 2.0 Track U (U1+U2) regression suite: signal ingestion via `_ingest_signal`.
+
+    Ephemeral tempfile SQLite DB, mirroring the classifier test-suite pattern
+    (never touches the live DB). Covers: lora pos/msg with valid signal, the
+    node/udp 0/0 sentinel, out-of-range rejection, a BLE-MHeard regression,
+    duplicate-datagram dedup, signal_log.source tagging, station_positions
+    field-group independence, and the v18→v19 migration.
+    """
+    results: list[tuple[str, bool]] = []
+    base_ts = 1_770_000_000_000  # fixed ms timestamp so the suite is deterministic
+
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        db_path = Path(tmp_dir) / "udp2_test.db"
+        storage = await create_sqlite_storage(db_path)
+        try:
+
+            async def _signal_row_count(callsign: str) -> int:
+                rows = await storage._execute(  # noqa: SLF001 - white-box startup test
+                    "SELECT COUNT(*) as c FROM signal_log WHERE callsign = ?", (callsign,)
+                )
+                return cast(list[dict[str, Any]], rows)[0]["c"]
+
+            async def _signal_sources(callsign: str) -> list[str]:
+                rows = await storage._execute(  # noqa: SLF001 - white-box startup test
+                    "SELECT source FROM signal_log WHERE callsign = ? ORDER BY timestamp",
+                    (callsign,),
+                )
+                return [row["source"] for row in cast(list[dict[str, Any]], rows)]
+
+            async def _station_row(callsign: str) -> dict[str, Any] | None:
+                rows = await storage._execute(  # noqa: SLF001 - white-box startup test
+                    "SELECT * FROM station_positions WHERE callsign = ?", (callsign,)
+                )
+                rows = cast(list[dict[str, Any]], rows)
+                return rows[0] if rows else None
+
+            # 1. lora `pos` with valid signal → signal_log + both ts fields on station_positions.
+            cs1 = "OE1XYZ-1"
+            msg1 = {
+                "msg_id": "AAAA0001",
+                "src": cs1,
+                "dst": "*",
+                "msg": "",
+                "type": "pos",
+                "src_type": "lora",
+                "timestamp": base_ts + 1,
+                "rssi": -95,
+                "snr": 9,
+                "lat": 48.2,
+                "lon": 16.3,
+            }
+            await storage.store_message(msg1, json.dumps(msg1))
+            row1 = await _station_row(cs1)
+            results.append(
+                (
+                    "lora pos: signal_log row written",
+                    await _signal_row_count(cs1) == 1,
+                )
+            )
+            results.append(
+                (
+                    "lora pos: station_positions has both position_ts and signal_ts",
+                    row1 is not None
+                    and row1.get("position_ts") is not None
+                    and row1.get("signal_ts") is not None,
+                )
+            )
+            results.append(
+                (
+                    "lora pos: signal_log.source tagged 'lora'",
+                    await _signal_sources(cs1) == ["lora"],
+                )
+            )
+
+            # 2. lora `msg` with valid signal → signal_log, no coordinates written.
+            cs2 = "OE1XYZ-2"
+            msg2 = {
+                "msg_id": "AAAA0002",
+                "src": cs2,
+                "dst": "*",
+                "msg": "Hello mesh",
+                "type": "msg",
+                "src_type": "lora",
+                "timestamp": base_ts + 2,
+                "rssi": -88,
+                "snr": 5,
+            }
+            await storage.store_message(msg2, json.dumps(msg2))
+            row2 = await _station_row(cs2)
+            results.append(("lora msg: signal_log row written", await _signal_row_count(cs2) == 1))
+            results.append(
+                (
+                    "lora msg: no position written (no coordinates in a msg packet)",
+                    row2 is not None and row2.get("position_ts") is None,
+                )
+            )
+
+            # 3. node/udp 0/0 sentinel → excluded by src_type, never reaches signal_log.
+            cs3 = "OE1XYZ-3"
+            msg3 = {
+                "msg_id": "AAAA0003",
+                "src": cs3,
+                "dst": "*",
+                "msg": "",
+                "type": "pos",
+                "src_type": "node",
+                "timestamp": base_ts + 3,
+                "rssi": 0,
+                "snr": 0,
+                "lat": 48.1,
+                "lon": 16.1,
+            }
+            await storage.store_message(msg3, json.dumps(msg3))
+            results.append(
+                (
+                    "node src_type (0/0 sentinel): no signal_log row",
+                    await _signal_row_count(cs3) == 0,
+                )
+            )
+
+            # 4. lora pos, out-of-range rssi → rejected from signal_log; messages row still stored.
+            cs4 = "OE1XYZ-4"
+            msg4 = {
+                "msg_id": "AAAA0004",
+                "src": cs4,
+                "dst": "*",
+                "msg": "",
+                "type": "pos",
+                "src_type": "lora",
+                "timestamp": base_ts + 4,
+                "rssi": 5,  # outside VALID_RSSI_RANGE
+                "snr": 9,
+                "lat": 48.3,
+                "lon": 16.4,
+            }
+            await storage.store_message(msg4, json.dumps(msg4))
+            msg_rows = await storage._execute(  # noqa: SLF001 - white-box startup test
+                "SELECT COUNT(*) as c FROM messages WHERE src = ?", (cs4,)
+            )
+            results.append(
+                (
+                    "lora pos out-of-range rssi: no signal_log row",
+                    await _signal_row_count(cs4) == 0,
+                )
+            )
+            results.append(
+                (
+                    "lora pos out-of-range rssi: messages row still stored",
+                    cast(list[dict[str, Any]], msg_rows)[0]["c"] == 1,
+                )
+            )
+
+            # 5. BLE MHeard regression: unchanged behavior (no msg_id, src_type "ble", pos).
+            cs5 = "OE1XYZ-5"
+            msg5 = {
+                "msg_id": None,
+                "src": cs5,
+                "dst": "*",
+                "msg": "",
+                "type": "pos",
+                "src_type": "ble",
+                "timestamp": base_ts + 5,
+                "rssi": -90,
+                "snr": 3,
+            }
+            await storage.store_message(msg5, json.dumps(msg5))
+            results.append(
+                (
+                    "BLE MHeard regression: signal_log row still written",
+                    await _signal_row_count(cs5) == 1,
+                )
+            )
+            results.append(
+                (
+                    "BLE MHeard: signal_log.source tagged 'mheard'",
+                    await _signal_sources(cs5) == ["mheard"],
+                )
+            )
+
+            # 6. Duplicate-delivered datagram (same msg_id twice) → one signal_log row, not two.
+            cs6 = "OE1XYZ-6"
+            msg6 = {
+                "msg_id": "AAAA0006",
+                "src": cs6,
+                "dst": "*",
+                "msg": "duplicate test",
+                "type": "msg",
+                "src_type": "lora",
+                "timestamp": base_ts + 6,
+                "rssi": -80,
+                "snr": 4,
+            }
+            await storage.store_message(msg6, json.dumps(msg6))
+            await storage.store_message(dict(msg6), json.dumps(msg6))  # firmware re-delivery
+            results.append(
+                (
+                    "duplicate datagram: exactly one signal_log row",
+                    await _signal_row_count(cs6) == 1,
+                )
+            )
+
+            # 7. station_positions field-group independence under interleaved pos/signal updates.
+            cs7 = "OE1XYZ-7"
+            pos_a = {
+                "msg_id": "AAAA0007",
+                "src": cs7,
+                "dst": "*",
+                "msg": "",
+                "type": "pos",
+                "src_type": "lora",
+                "timestamp": base_ts + 10,
+                "lat": 48.5,
+                "lon": 16.5,
+            }
+            await storage.store_message(pos_a, json.dumps(pos_a))
+            row_a = await _station_row(cs7)
+
+            signal_b = {
+                "msg_id": "AAAA0008",
+                "src": cs7,
+                "dst": "*",
+                "msg": "signal only",
+                "type": "msg",
+                "src_type": "lora",
+                "timestamp": base_ts + 11,
+                "rssi": -100,
+                "snr": 2,
+            }
+            await storage.store_message(signal_b, json.dumps(signal_b))
+            row_b = await _station_row(cs7)
+
+            pos_c = {
+                "msg_id": "AAAA0009",
+                "src": cs7,
+                "dst": "*",
+                "msg": "",
+                "type": "pos",
+                "src_type": "lora",
+                "timestamp": base_ts + 12,
+                "lat": 48.6,
+                "lon": 16.6,
+            }
+            await storage.store_message(pos_c, json.dumps(pos_c))
+            row_c = await _station_row(cs7)
+
+            results.append(
+                (
+                    "field-group independence: position-only write leaves signal fields unset",
+                    row_a is not None
+                    and row_a.get("rssi") is None
+                    and row_a.get("signal_ts") is None,
+                )
+            )
+            results.append(
+                (
+                    "field-group independence: signal write doesn't clobber earlier position",
+                    row_b is not None
+                    and row_b.get("lat") == pos_a["lat"]
+                    and row_b.get("rssi") == signal_b["rssi"],
+                )
+            )
+            results.append(
+                (
+                    "field-group independence: later position write doesn't clobber earlier signal",
+                    row_c is not None
+                    and row_c.get("lat") == pos_c["lat"]
+                    and row_c.get("rssi") == signal_b["rssi"]
+                    and row_c.get("signal_ts") == base_ts + 11,
+                )
+            )
+        finally:
+            await storage.close()
+
+    # 8. Migration v18 → v19: an existing v18 DB (signal_log without `source`) must migrate
+    # cleanly and idempotently — startup on an old DB succeeds (UDP 2.0 Track U, Wave U2).
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        v18_db_path = Path(tmp_dir) / "udp2_v18_test.db"
+
+        def _create_v18_db() -> None:
+            with sqlite3.connect(v18_db_path) as conn:
+                # v2 introduced signal_log/station_positions; a real v18 DB already has them.
+                conn.executescript(CREATE_SCHEMA_SQL)
+                conn.executescript(CREATE_SCHEMA_V2_SQL)
+                conn.execute("DELETE FROM schema_version")
+                conn.execute("INSERT INTO schema_version (version) VALUES (18)")
+                conn.execute(
+                    "INSERT INTO signal_log (callsign, timestamp, rssi, snr)"
+                    " VALUES ('OE1OLD-1', ?, -100, 5)",
+                    (base_ts,),
+                )
+                conn.commit()
+
+        await asyncio.to_thread(_create_v18_db)
+
+        migration_ok = True
+        try:
+            migrated_storage = await create_sqlite_storage(v18_db_path)
+            try:
+                rows = await migrated_storage._execute(  # noqa: SLF001 - white-box startup test
+                    "SELECT source FROM signal_log WHERE callsign = 'OE1OLD-1'"
+                )
+                pre_existing_source = cast(list[dict[str, Any]], rows)[0]["source"]
+                version_rows = await migrated_storage._execute(  # noqa: SLF001 - white-box startup test
+                    "SELECT version FROM schema_version LIMIT 1"
+                )
+                schema_version = cast(list[dict[str, Any]], version_rows)[0]["version"]
+                results.append(
+                    (
+                        "v18→v19 migration: pre-existing signal_log row backfilled as 'mheard'",
+                        pre_existing_source == "mheard",
+                    )
+                )
+                results.append(
+                    (
+                        "v18→v19 migration: schema at v19",
+                        schema_version == 19,  # noqa: PLR2004 - expected schema version
+                    )
+                )
+            finally:
+                await migrated_storage.close()
+
+            # Re-open (simulates a restart) — must be idempotent, no duplicate-column error.
+            reopened_storage = await create_sqlite_storage(v18_db_path)
+            await reopened_storage.close()
+        except Exception:
+            logger.exception("v18→v19 migration test raised")
+            migration_ok = False
+        results.append(("v18→v19 migration: idempotent re-open succeeds", migration_ok))
+
+    for label, ok in results:
+        print(f"    {'✅ PASS' if ok else '❌ FAIL'} | {label}")
+
+    return all(ok for _, ok in results)

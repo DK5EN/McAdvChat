@@ -312,7 +312,7 @@ regression case. **Risks:** double upsert on same callsign; ensure `last_seen`/`
 
 | Wave | Status | Commit | Advisor notes |
 |---|---|---|---|
-| 1 — core routing | not started | — | — |
-| 2 — robustness | not started | — | — |
+| 1 — core routing | done | `[feat] Track U waves U1+U2: ...` (development) | Approved. `_ingest_signal` extracted per ST-05 coupling; both signal+position branches now run for lora `pos` (no longer if/elif); node/udp excluded by explicit `src_type` check, not just the range check; no SNR/RSSI re-scaling; BLE MHeard path byte-identical (regression test green). |
+| 2 — robustness | done | `[feat] Track U waves U1+U2: ...` (development) | Approved. Time-windowed dedup relocated to run *before* signal ingestion (was: only before the final INSERT) — a duplicate-delivered datagram (same msg_id) no longer double-counts into signal_log. `signal_log.source` ('mheard'/'lora') added via a new `current_version < 19` migration block (older blocks untouched); backfills existing rows as 'mheard'; idempotent (verified against a synthetic v18 DB). Field-group independence verified: `_upsert_station_position`'s "signal" and "position" `ON CONFLICT` clauses touch disjoint column sets (not MAX/COALESCE on the `_ts` fields themselves, as this doc's wording suggested — the actual guarantee is the disjoint columns; the two genuinely shared columns, `last_seen`/`hw_id`, do use MAX/COALESCE) — proven with an interleaved pos→signal→pos test. Non-blocking nitpick noted: an out-of-range lora rssi/snr is still written into `station_positions.rssi/snr/signal_ts` (only `signal_log` is gated by the range check) — this is inherited byte-for-byte from the pre-existing BLE code path, not a regression, and no acceptance criterion requires gating it; left as-is (see fable-verdict.md "Discovered during waves"). |
 | 3 — realtime + backfill | not started | — | — |
 | 4 — docs | not started | — | — |

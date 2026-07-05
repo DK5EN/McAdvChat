@@ -947,3 +947,16 @@ Review checklist:
   concurrent multi-chunk responses can now interleave their chunks on the LoRa air
   interface (per-response order is still preserved) — inherent to the fix the verdict
   requested, not a defect.
+
+- [2026-07-05] Track U waves U1+U2 complete (`doc/UDP-2.0-impl.md` §6 Wave 1/Wave 2 —
+  UDP-lora signal routing, dedup, `signal_log.source`, v18→v19 migration). Implemented
+  together since U2's dedup-reorder fix directly touches code U1 introduced. Gates green;
+  17 new storage regression cases in `sqlite_storage.run_startup_tests()`. Opus review:
+  **approved**. One item deliberately left as-is rather than fixed: `_ingest_signal`
+  (`sqlite_storage.py`) writes an out-of-range lora rssi/snr into
+  `station_positions.rssi/snr/signal_ts` even though it correctly excludes that
+  measurement from `signal_log`/`signal_buckets` — this is byte-for-byte the same
+  structure as the pre-existing BLE code it generalizes, no Track U acceptance criterion
+  requires gating `station_positions` on validity, and "fixing" it would make the lora
+  path diverge from the BLE path's established behavior. Deferred, not fixed — flag if a
+  future wave wants `station_positions` signal fields validated too.
