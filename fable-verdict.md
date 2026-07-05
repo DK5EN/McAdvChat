@@ -1125,3 +1125,34 @@ Review checklist:
   full `src` relay path instead of the normalized `callsign` the old inline code used — error-path-
   only (fires only on a DB-locked INSERT failure), arguably more informative, but flagging in case
   a future pass wants the log argument changed back to the normalized callsign.
+
+- [2026-07-06] Wave 6 sub-commit 2/5 complete (sse_handler decomposition: SSE-01, CO-07's
+  sse_handler half). `_create_app` (~900 lines, ~30 nested endpoint closures + a ~230-line
+  triple-nested `event_generator`) split into a new `src/mcapp/sse_routes/` package —
+  `stream.py` (`/events`, `/api/send`, `/api/status`, `/health`, `/api/time`), `prefs.py`
+  (read_counts/hidden_destinations/blocked_texts/delete_messages/mheard+wx sidebar/filter_prefs),
+  `classifier.py` (`/api/classifier/*`), `weather.py` (`/api/weather*`, `/api/telemetry*`,
+  `/api/timezone`), `deploy.py` (`/api/update/*`, `/api/ble/pin`) — each a
+  `build_<x>_router(manager, ...) -> APIRouter` closing over the `SSEManager` instance.
+  `_create_app` is now ~35 lines: FastAPI + CORS + five `include_router()` calls. The
+  ~180-line initial-snapshot section of `event_generator` extracted into
+  `SSEManager.initial_events()` (stays on the class, needs full instance state; consumed via
+  `async for` from `stream.py`). CO-07: every `hasattr(storage, "...")` guard removed —
+  `manager.require_storage()` now raises 503 only when storage itself isn't wired (storage is
+  typed as the concrete `SQLiteStorage`, no more `Any`); BLE-side `hasattr(ble, ...)` checks
+  deliberately left untouched (BLE-09, a different sub-commit). Several `SSEManager`
+  methods/attributes needed for the cross-module router contract were renamed to drop their
+  leading underscore (ruff's SLF001 flagged the alternative): `_storage`→`require_storage`,
+  `_classifier`→`require_classifier` (kept distinct from the `self.classifier` attribute to avoid
+  a name collision), `_after_rule_mutation`→`after_rule_mutation`, `_register_client`→
+  `register_client`, `_initial_events`→`initial_events`, `_format_sse_event`→`format_sse_event`,
+  `_launch_update_runner`→`launch_update_runner`, `_read_slot_info`→`read_slot_info`,
+  `_shutdown_event`→`shutdown_event`. Opus review independently re-extracted and diffed the full
+  REST-path set (37 routes) and SSE event-name literal set (20 names) between old and new —
+  **byte-identical, zero diff** — plus spot-checked JSON response shapes (sidebar fallback
+  values, rule-test response shape, update/slots body) and drove the rebuilt app with a
+  TestClient to confirm 200s on health/status/time/slots and 503s from `require_*` when deps
+  aren't wired. **Verdict: approve, zero defects.** Gates green (ruff check, ruff format
+  --check — 55 files, startup tests — 5 suites including the UDP-lora→SSE regression check),
+  noqa count unchanged (6), classifier subtree untouched, scope discipline confirmed (only
+  `sse_handler.py` + new `sse_routes/` touched).
