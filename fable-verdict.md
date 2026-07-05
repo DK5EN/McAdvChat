@@ -1199,3 +1199,45 @@ Review checklist:
   `hasattr(sse_manager, "set_classifier")` and `hasattr(command_handler, "blocked_callsigns")`
   (the latter is CO-06's blocklist-unification finding) remain; both defensible to leave for a
   future pass.
+
+- [2026-07-06] Wave 6 sub-commit 4/5 complete (ctcping.py dataclasses + single completion:
+  CMD-03, CMD-04, CMD-09). CMD-04: `active_pings`/`ping_tests` (untyped dicts with ad-hoc keys
+  added later via bare assignment or `.setdefault`) converted to `dict[str, ActivePing]`/
+  `dict[str, PingTest]` — two new dataclasses plus a `PingStatus(StrEnum)`
+  (`WAITING_ACK/RUNNING/COMPLETING/COMPLETED/ERROR/TIMEOUT`); the dynamically-added `end_time`/
+  `send_times` keys promoted to real fields with defaults. `commands/_base.py`'s
+  `CommandHandlerBase` Protocol updated to match, importing `ActivePing`/`PingTest` under
+  `TYPE_CHECKING` (no runtime circular import — confirmed). CMD-03: the two overlapping
+  completion mechanisms (ACK/timeout-driven event path vs. a 1s-polling `_monitor_test_completion`
+  that also independently detected completion) consolidated — the event path
+  (`_record_ping_result` → `_trigger_completion_if_done` → `_check_test_completion`) is now
+  authoritative; `_monitor_test_completion` is a single `asyncio.sleep(PING_TEST_MAX_WAIT_SECONDS)`
+  deadline fallback that only acts if the test is still `RUNNING` when it wakes (i.e. the event
+  path never fired), and gets cancelled by `_complete_test` the moment the event path completes
+  a test. The "over-completion detected" reconciliation logic in `_check_test_completion` was
+  deleted as genuinely dead now that the monitor no longer increments any counters. The
+  `_completion_events: dict[str, asyncio.Event]` idempotence guard (an Event created and `.set()`
+  but never awaited — pure membership-testing) replaced with a plain `_completing_test_ids:
+  set[str]` doing the identical job. CMD-09: all 19 Protocol method stubs in `_base.py` changed
+  from bare `...` bodies (silently returning `None` if a mixin failed to override one) to
+  `raise NotImplementedError`. Opus review traced the concurrency properties end-to-end: proved
+  double-increment of `completed`/`timeouts` is now structurally impossible (only one increment
+  site, guarded by per-sequence idempotence on both the ACK and timeout paths, which are mutually
+  exclusive), proved the `_completing_test_ids` guard closes the same async gap the old
+  `asyncio.Event` dict did (no `await` between the check and the add — single-threaded asyncio
+  gives no interleaving point), proved `monitor_task` is cancelled before its deadline on both the
+  ACK-driven and timeout-driven completion paths, and proved the `_start_ping_test` error path
+  (sets `status=ERROR`, sends an error result) is byte-identical to before so no new stuck-RUNNING
+  case was introduced. Constructed a real `CommandHandler` and drove a live echo→ACK→completion
+  flow plus verified no path raises the new `NotImplementedError` (nothing was silently relying on
+  the old no-op behavior). **Verdict: approve, zero defects.** Gates green (ruff check, ruff
+  format --check, startup tests — 5 suites, `commands` suite meaningfully exercises the reviewed
+  ping-completion code), noqa counts unchanged (1 and 1), classifier subtree untouched, scope
+  discipline confirmed (only `ctcping.py` + `_base.py` touched; `commands/tests.py`'s
+  `active_pings`/`ping_tests` references are container-level ops — `.clear()`/`in`/`len()` — that
+  needed no changes). Flagged (pre-existing, NOT introduced by this sub-commit, byte-identical
+  control flow before and after — confirmed by the reviewer, out of scope to fix here): a latent
+  double-`del self.active_pings[ack_id]` on a genuine duplicate-sequence ACK — `_record_ack_result`
+  deletes the key and returns, then `_handle_ack_message` deletes it again, raising `KeyError`
+  that's silently swallowed by the outer `try/except Exception`. Worth a dedicated correctness
+  pass in a future wave.
