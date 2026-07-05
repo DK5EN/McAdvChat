@@ -68,18 +68,20 @@ class SimpleCommandsMixin(CommandHandlerBase):
         return f"🕐 {time_str} Uhr, {weekday_de}, {date_str}"
 
     async def handle_help(self, _kwargs: dict[str, Any], _requester: str) -> str:
-        """Show available commands"""
+        """Show available commands. Format strings are sourced from the COMMANDS
+        registry (handler.py) so this list can't drift out of sync with the
+        actual command syntax.
+        """
+        from .handler import COMMANDS  # noqa: PLC0415 - circular import avoidance
+
+        def fmt(cmd: str) -> str:
+            return COMMANDS[cmd]["format"]
+
         response = "📋 Available commands: "
-
-        search_cmds = ["!search user:CALL days:7", "!pos call:CALL"]
-        stats_cmds = ["!stats 24", "!mheard 5"]
-        weather_cmds = ["!wx"]
-        fun_cmds = ["!dice", "!time"]
-
-        response += "Search: " + ", ".join(search_cmds) + " | "
-        response += "Stats: " + ", ".join(stats_cmds) + " | "
-        response += "Weather: " + ", ".join(weather_cmds) + " | "
-        response += "Fun: " + ", ".join(fun_cmds)
+        response += "Search: " + ", ".join([fmt("search"), fmt("pos")]) + " | "
+        response += "Stats: " + ", ".join([fmt("stats"), fmt("mheard")]) + " | "
+        response += "Weather: " + fmt("wx") + " | "
+        response += "Fun: " + ", ".join([fmt("dice"), fmt("time"), fmt("userinfo"), fmt("ctcping")])
 
         return response
 

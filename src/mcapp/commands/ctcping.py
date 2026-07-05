@@ -10,6 +10,7 @@ from ..logging_setup import get_logger
 from ..util import now_ms
 from ._base import CommandHandlerBase
 from .constants import CALLSIGN_STRICT_RE
+from .parsing import strip_relay_path
 
 _MIN_PING_PAYLOAD = 25
 _MAX_PING_PAYLOAD = 140
@@ -156,7 +157,7 @@ class CTCPingMixin(CommandHandlerBase):
             dst = message_data.get("dst", "").upper()
             msg = message_data.get("msg", "")
 
-            src = src_raw.split(",")[0].strip() if "," in src_raw else src_raw.strip()
+            src = strip_relay_path(src_raw)
 
             if "," in src_raw:
                 logger.debug("ACK path processing: '%s' → originator: '%s'", src_raw, src)

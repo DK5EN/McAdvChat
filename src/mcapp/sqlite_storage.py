@@ -17,7 +17,7 @@ from collections import defaultdict
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from statistics import mean
-from typing import Any, cast
+from typing import Any, NamedTuple, cast
 
 from .logging_setup import get_logger
 from .util import FEET_TO_METERS, now_ms
@@ -70,6 +70,11 @@ SECONDS_PER_DAY = 86400
 TELEMETRY_BUCKET_MS = 4 * 3600 * 1000
 HOURS_PER_YEAR = 8760
 
+# Shared between _should_filter_message (rejects new rows) and prune_messages
+# (sweeps out any that slipped in before the filter existed).
+INVALID_CHARACTER_MSG = "-- invalid character --"
+CORE_DUMP_FILTER_TEXT = "No core dump"
+
 # Columns to SELECT when building message JSON (avoids fetching raw_json)
 _MSG_SELECT = (
     "msg_id, src, dst, msg, type, timestamp, rssi, snr, src_type,"
@@ -78,8 +83,20 @@ _MSG_SELECT = (
     " category, tags, info_score, template_hash, classifier_ver"
 )
 
-# Type alias for signal bucket tuples
-BucketTuple = tuple[str, int, int, float, float | int, float | int, float, float, float, int]
+
+class BucketTuple(NamedTuple):
+    """A completed signal_buckets row, ready for INSERT OR REPLACE."""
+
+    callsign: str
+    bucket_ts: int
+    bucket_size: int
+    rssi_avg: float
+    rssi_min: float | int
+    rssi_max: float | int
+    snr_avg: float
+    snr_min: float
+    snr_max: float
+    count: int
 
 
 def compute_conversation_key(src: str, dst: str) -> str | None:
@@ -940,14 +957,34 @@ class SQLiteStorage:
                 len(self._bucket_accumulators),
             )
 
+    @staticmethod
+    def _build_bucket_tuple(
+        callsign: str,
+        bucket_ts: int,
+        bucket_size: int,
+        rssi_vals: list[float | int],
+        snr_vals: list[float | int],
+    ) -> BucketTuple:
+        """Aggregate raw rssi/snr value lists into one completed-bucket row."""
+        return BucketTuple(
+            callsign=callsign,
+            bucket_ts=bucket_ts,
+            bucket_size=bucket_size,
+            rssi_avg=round(mean(rssi_vals), 2),
+            rssi_min=min(rssi_vals),
+            rssi_max=max(rssi_vals),
+            snr_avg=round(mean(snr_vals), 2),
+            snr_min=round(min(snr_vals), 2),
+            snr_max=round(max(snr_vals), 2),
+            count=len(rssi_vals),
+        )
+
     def _accumulate_signal(
         self, callsign: str, timestamp_ms: int, rssi: int, snr: float
     ) -> list[BucketTuple]:
         """Accumulate a signal measurement into the in-memory bucket.
 
-        Returns a list of (callsign, bucket_ts, bucket_size, rssi_avg, rssi_min,
-        rssi_max, snr_avg, snr_min, snr_max, count) tuples for completed buckets
-        that should be flushed to the database.
+        Returns a list of completed-bucket tuples that should be flushed to the database.
         """
         bucket_ms = BUCKET_SECONDS * 1000
         bucket_start = (timestamp_ms // bucket_ms) * bucket_ms
@@ -968,18 +1005,7 @@ class SQLiteStorage:
                 snr_vals = v["snr"]
                 if rssi_vals and snr_vals:
                     completed.append(
-                        (
-                            callsign,
-                            k[1],
-                            bucket_ms,
-                            round(mean(rssi_vals), 2),
-                            min(rssi_vals),
-                            max(rssi_vals),
-                            round(mean(snr_vals), 2),
-                            round(min(snr_vals), 2),
-                            round(max(snr_vals), 2),
-                            len(rssi_vals),
-                        )
+                        self._build_bucket_tuple(callsign, k[1], bucket_ms, rssi_vals, snr_vals)
                     )
                 keys_to_remove.append(k)
 
@@ -1916,9 +1942,9 @@ class SQLiteStorage:
             return True
         if src_type == "TEST":
             return True
-        if msg_content == "-- invalid character --":
+        if msg_content == INVALID_CHARACTER_MSG:
             return True
-        return "No core dump" in msg_content
+        return CORE_DUMP_FILTER_TEXT in msg_content
 
     async def get_message_count(self) -> int:
         """Get current message count."""
@@ -1995,8 +2021,8 @@ class SQLiteStorage:
 
         # Delete invalid messages
         await self._execute(
-            "DELETE FROM messages WHERE msg = '-- invalid character --'"
-            " OR msg LIKE '%No core dump%'",
+            "DELETE FROM messages WHERE msg = ? OR msg LIKE ?",
+            (INVALID_CHARACTER_MSG, f"%{CORE_DUMP_FILTER_TEXT}%"),
             fetch=False,
         )
 
@@ -2360,7 +2386,7 @@ class SQLiteStorage:
         rows = cast(list[dict[str, Any]], rows_raw)
         return [json.dumps(self._build_message_dict(row), ensure_ascii=False) for row in rows]
 
-    async def process_mheard_store_parallel(  # noqa: PLR0912, PLR0915 - complex handler kept intact
+    async def process_mheard_store_parallel(
         self, progress_callback: Any = None
     ) -> list[dict[str, Any]]:
         """Process messages for MHeard statistics.
@@ -2368,8 +2394,7 @@ class SQLiteStorage:
         Reads from pre-aggregated signal_buckets table instead of scanning
         all messages. Falls back to legacy scan if signal_buckets is empty.
         """
-        now_ts_ms = now_ms()
-        cutoff_ms = now_ts_ms - SEVEN_DAYS_MS
+        cutoff_ms = now_ms() - SEVEN_DAYS_MS
         bucket_5min_ms = BUCKET_SECONDS * 1000
 
         if progress_callback:
@@ -2388,94 +2413,14 @@ class SQLiteStorage:
         if bucket_rows:
             # Use pre-aggregated data — much faster
             logger.debug("Using %d pre-aggregated signal_buckets", len(bucket_rows))
-
             # Also flush any in-memory partial buckets before building result
             await self._flush_all_accumulators()
-
-            # Build result with gap markers from pre-aggregated buckets
-            gap_threshold = GAP_THRESHOLD_MULTIPLIER * BUCKET_SECONDS
-
-            # Group by callsign and filter to qualified stations
-            callsign_data: dict[str, list[dict[str, Any]]] = defaultdict(list)
-            for row in bucket_rows:
-                callsign_data[row["callsign"]].append(row)
-            qualified = {
-                cs: entries
-                for cs, entries in callsign_data.items()
-                if len(entries) >= MIN_DATAPOINTS_FOR_STATS
-            }
-
-            if progress_callback:
-                await progress_callback(
-                    "bucketing",
-                    f"Processing {len(bucket_rows)} buckets for {len(qualified)} stations...",
-                )
-
-            final_result = []
-            for idx, (callsign, entries) in enumerate(sorted(qualified.items()), 1):
-                if progress_callback:
-                    await progress_callback(
-                        "gaps",
-                        f"Building chart for {callsign} ({idx}/{len(qualified)})...",
-                        callsign,
-                    )
-
-                entries.sort(key=lambda x: x["bucket_ts"])
-                segment_id = 0
-                prev_time = None
-
-                for entry in entries:
-                    # bucket_ts is in ms, convert to seconds for gap check
-                    bucket_time = entry["bucket_ts"] // 1000
-
-                    if prev_time and (bucket_time - prev_time) > gap_threshold:
-                        final_result.append(
-                            {
-                                "src_type": "STATS",
-                                "timestamp": bucket_time - BUCKET_SECONDS,
-                                "callsign": callsign,
-                                "rssi": None,
-                                "snr": None,
-                                "rssi_min": None,
-                                "rssi_max": None,
-                                "snr_min": None,
-                                "snr_max": None,
-                                "count": None,
-                                "segment_id": f"{callsign}_gap_{segment_id}_to_{segment_id + 1}",
-                                "segment_size": 1,
-                                "is_gap_marker": True,
-                            }
-                        )
-                        segment_id += 1
-
-                    final_result.append(
-                        {
-                            "src_type": "STATS",
-                            "timestamp": bucket_time,
-                            "callsign": callsign,
-                            "rssi": entry["rssi_avg"],
-                            "snr": entry["snr_avg"],
-                            "rssi_min": entry["rssi_min"],
-                            "rssi_max": entry["rssi_max"],
-                            "snr_min": entry["snr_min"],
-                            "snr_max": entry["snr_max"],
-                            "count": entry["count"],
-                            "segment_id": f"{callsign}_seg_{segment_id}",
-                            "segment_size": 1,
-                        }
-                    )
-                    prev_time = bucket_time
-
-            result = sorted(final_result, key=lambda x: (x["callsign"], x["timestamp"]))
-
-            if progress_callback:
-                stats_entries = [r for r in result if not r.get("is_gap_marker")]
-                callsign_count = len({e["callsign"] for e in stats_entries}) if stats_entries else 0
-                await progress_callback(
-                    "done",
-                    f"{len(stats_entries)} data points for {callsign_count} stations",
-                )
-            return result
+            return await self._build_chart_series(
+                bucket_rows,
+                gap_threshold_s=GAP_THRESHOLD_MULTIPLIER * BUCKET_SECONDS,
+                gap_offset_s=BUCKET_SECONDS,
+                progress_callback=progress_callback,
+            )
 
         # --- Fallback: legacy scan from messages table ---
         logger.info("signal_buckets empty, falling back to legacy messages scan")
@@ -2519,147 +2464,56 @@ class SQLiteStorage:
                 buckets[key]["rssi"].append(row["rssi"])
                 buckets[key]["snr"].append(row["snr"])
 
-        if progress_callback:
-            result = await self._build_stats_with_gaps_async(buckets, progress_callback)
-        else:
-            result = self._build_stats_with_gaps(buckets)
-
-        if progress_callback:
-            stats_entries = [r for r in result if not r.get("is_gap_marker")]
-            callsign_count = len({e["callsign"] for e in stats_entries}) if stats_entries else 0
-            await progress_callback(
-                "done",
-                f"{len(stats_entries)} data points for {callsign_count} stations",
-            )
-
-        return result
+        bucket_rows = self._legacy_buckets_to_rows(buckets)
+        return await self._build_chart_series(
+            bucket_rows,
+            gap_threshold_s=GAP_THRESHOLD_MULTIPLIER * BUCKET_SECONDS,
+            gap_offset_s=BUCKET_SECONDS,
+            progress_callback=progress_callback,
+        )
 
     async def process_mheard_yearly(self, progress_callback: Any = None) -> list[dict[str, Any]]:
         """Process 1-hour signal buckets for yearly mHeard statistics."""
-        now_ts_ms = now_ms()
-        cutoff_ms = now_ts_ms - ONE_YEAR_MS
-
+        cutoff_ms = now_ms() - ONE_YEAR_MS
         if progress_callback:
             await progress_callback("start", "Querying yearly data...")
-
-        bucket_5min_ms = BUCKET_SECONDS * 1000
-        bucket_rows_raw = await self._execute(
-            "SELECT callsign, bucket_ts, rssi_avg, rssi_min, rssi_max,"  # noqa: S608 - identifiers from fixed set; values parameterized
-            "       snr_avg, snr_min, snr_max, count"
-            " FROM signal_buckets"
-            " WHERE bucket_size = ? AND bucket_ts >= ?"
-            " UNION ALL"
-            " SELECT callsign,"
-            f"       (bucket_ts / {HOURLY_BUCKET_MS}) * {HOURLY_BUCKET_MS} AS bucket_ts,"
-            "       SUM(rssi_avg * count) / SUM(count),"
-            "       MIN(rssi_min), MAX(rssi_max),"
-            "       SUM(snr_avg * count) / SUM(count),"
-            "       MIN(snr_min), MAX(snr_max),"
-            "       SUM(count)"
-            " FROM signal_buckets"
-            " WHERE bucket_size = ? AND bucket_ts >= ?"
-            f" GROUP BY callsign, (bucket_ts / {HOURLY_BUCKET_MS}) * {HOURLY_BUCKET_MS}",
-            (HOURLY_BUCKET_MS, cutoff_ms, bucket_5min_ms, cutoff_ms),
-        )
-        bucket_rows = cast(list[dict[str, Any]], bucket_rows_raw)
-
+        bucket_rows = await self._query_rolled_up_buckets(cutoff_ms)
         if not bucket_rows:
             if progress_callback:
                 await progress_callback("done", "No yearly data available")
             return []
-
         logger.debug("Using %d hourly signal_buckets for yearly report", len(bucket_rows))
-
-        callsign_data: dict[str, list[dict[str, Any]]] = defaultdict(list)
-        for row in bucket_rows:
-            callsign_data[row["callsign"]].append(row)
-        qualified = {
-            cs: entries
-            for cs, entries in callsign_data.items()
-            if len(entries) >= MIN_DATAPOINTS_FOR_STATS
-        }
-
-        if progress_callback:
-            await progress_callback(
-                "bucketing",
-                f"Processing {len(bucket_rows)} hourly buckets for {len(qualified)} stations...",
-            )
-
-        final_result = []
-        for idx, (callsign, entries) in enumerate(sorted(qualified.items()), 1):
-            if progress_callback:
-                await progress_callback(
-                    "gaps",
-                    f"Building chart for {callsign} ({idx}/{len(qualified)})...",
-                    callsign,
-                )
-
-            entries.sort(key=lambda x: x["bucket_ts"])
-            segment_id = 0
-            prev_time = None
-
-            for entry in entries:
-                bucket_time = entry["bucket_ts"] // 1000
-
-                if prev_time and (bucket_time - prev_time) > HOURLY_GAP_THRESHOLD:
-                    final_result.append(
-                        {
-                            "src_type": "STATS",
-                            "timestamp": bucket_time - HOURLY_BUCKET_S,
-                            "callsign": callsign,
-                            "rssi": None,
-                            "snr": None,
-                            "rssi_min": None,
-                            "rssi_max": None,
-                            "snr_min": None,
-                            "snr_max": None,
-                            "count": None,
-                            "segment_id": f"{callsign}_gap_{segment_id}_to_{segment_id + 1}",
-                            "segment_size": 1,
-                            "is_gap_marker": True,
-                        }
-                    )
-                    segment_id += 1
-
-                final_result.append(
-                    {
-                        "src_type": "STATS",
-                        "timestamp": bucket_time,
-                        "callsign": callsign,
-                        "rssi": entry["rssi_avg"],
-                        "snr": entry["snr_avg"],
-                        "rssi_min": entry["rssi_min"],
-                        "rssi_max": entry["rssi_max"],
-                        "snr_min": entry["snr_min"],
-                        "snr_max": entry["snr_max"],
-                        "count": entry["count"],
-                        "segment_id": f"{callsign}_seg_{segment_id}",
-                        "segment_size": 1,
-                    }
-                )
-                prev_time = bucket_time
-
-        result = sorted(final_result, key=lambda x: (x["callsign"], x["timestamp"]))
-
-        if progress_callback:
-            stats_entries = [r for r in result if not r.get("is_gap_marker")]
-            callsign_count = len({e["callsign"] for e in stats_entries}) if stats_entries else 0
-            await progress_callback(
-                "done",
-                f"{len(stats_entries)} data points for {callsign_count} stations",
-            )
-        return result
+        return await self._build_chart_series(
+            bucket_rows,
+            gap_threshold_s=HOURLY_GAP_THRESHOLD,
+            gap_offset_s=HOURLY_BUCKET_S,
+            progress_callback=progress_callback,
+        )
 
     async def process_mheard_monthly(self, progress_callback: Any = None) -> list[dict[str, Any]]:
         """Process signal buckets for 30-day mHeard statistics."""
-        now_ts_ms = now_ms()
-        cutoff_ms = now_ts_ms - ONE_MONTH_MS
-
+        cutoff_ms = now_ms() - ONE_MONTH_MS
         if progress_callback:
             await progress_callback("start", "Querying monthly data...")
+        bucket_rows = await self._query_rolled_up_buckets(cutoff_ms)
+        if not bucket_rows:
+            if progress_callback:
+                await progress_callback("done", "No monthly data available")
+            return []
+        logger.debug("Using %d signal_buckets for monthly report", len(bucket_rows))
+        return await self._build_chart_series(
+            bucket_rows,
+            gap_threshold_s=HOURLY_GAP_THRESHOLD,
+            gap_offset_s=HOURLY_BUCKET_S,
+            progress_callback=progress_callback,
+        )
 
+    async def _query_rolled_up_buckets(self, cutoff_ms: int) -> list[dict[str, Any]]:
+        """Shared query for yearly/monthly mheard stats: 5-min buckets UNION ALL'd with
+        5-min buckets rolled up on the fly into hourly buckets, both filtered by cutoff.
+        """
         bucket_5min_ms = BUCKET_SECONDS * 1000
-        bucket_rows_raw = await self._execute(
+        rows_raw = await self._execute(
             "SELECT callsign, bucket_ts, rssi_avg, rssi_min, rssi_max,"  # noqa: S608 - identifiers from fixed set; values parameterized
             "       snr_avg, snr_min, snr_max, count"
             " FROM signal_buckets"
@@ -2677,15 +2531,53 @@ class SQLiteStorage:
             f" GROUP BY callsign, (bucket_ts / {HOURLY_BUCKET_MS}) * {HOURLY_BUCKET_MS}",
             (HOURLY_BUCKET_MS, cutoff_ms, bucket_5min_ms, cutoff_ms),
         )
-        bucket_rows = cast(list[dict[str, Any]], bucket_rows_raw)
+        return cast(list[dict[str, Any]], rows_raw)
 
-        if not bucket_rows:
-            if progress_callback:
-                await progress_callback("done", "No monthly data available")
-            return []
+    @staticmethod
+    def _legacy_buckets_to_rows(
+        buckets: dict[tuple[int, str], dict[str, list[float | int]]],
+    ) -> list[dict[str, Any]]:
+        """Aggregate the legacy per-value-list buckets into rows shaped like a
+        signal_buckets query result, so the legacy scan path can share
+        _build_chart_series with the pre-aggregated-bucket paths.
+        """
+        rows = []
+        for (bucket_time, callsign), values in buckets.items():
+            rssi_values = values["rssi"]
+            snr_values = values["snr"]
+            count = min(len(rssi_values), len(snr_values))
+            if count == 0:
+                continue
+            rows.append(
+                {
+                    "callsign": callsign,
+                    "bucket_ts": bucket_time * 1000,
+                    "rssi_avg": round(mean(rssi_values), 2),
+                    "rssi_min": min(rssi_values),
+                    "rssi_max": max(rssi_values),
+                    "snr_avg": round(mean(snr_values), 2),
+                    "snr_min": round(min(snr_values), 2),
+                    "snr_max": round(max(snr_values), 2),
+                    "count": count,
+                }
+            )
+        return rows
 
-        logger.debug("Using %d signal_buckets for monthly report", len(bucket_rows))
+    async def _build_chart_series(
+        self,
+        bucket_rows: list[dict[str, Any]],
+        *,
+        gap_threshold_s: int,
+        gap_offset_s: int,
+        progress_callback: Any = None,
+    ) -> list[dict[str, Any]]:
+        """Group bucket rows by callsign, insert gap markers, and sort for Chart.js.
 
+        Shared by process_mheard_store_parallel (5-min buckets, both the pre-aggregated
+        and legacy-scan paths), process_mheard_yearly, and process_mheard_monthly (both
+        hourly-rolled-up) — the only differences between callers are the query that
+        produces bucket_rows and the two window-specific gap parameters.
+        """
         callsign_data: dict[str, list[dict[str, Any]]] = defaultdict(list)
         for row in bucket_rows:
             callsign_data[row["callsign"]].append(row)
@@ -2715,13 +2607,14 @@ class SQLiteStorage:
             prev_time = None
 
             for entry in entries:
+                # bucket_ts is in ms, convert to seconds for gap check
                 bucket_time = entry["bucket_ts"] // 1000
 
-                if prev_time and (bucket_time - prev_time) > HOURLY_GAP_THRESHOLD:
+                if prev_time and (bucket_time - prev_time) > gap_threshold_s:
                     final_result.append(
                         {
                             "src_type": "STATS",
-                            "timestamp": bucket_time - HOURLY_BUCKET_S,
+                            "timestamp": bucket_time - gap_offset_s,
                             "callsign": callsign,
                             "rssi": None,
                             "snr": None,
@@ -2777,18 +2670,7 @@ class SQLiteStorage:
             snr_vals = values["snr"]
             if rssi_vals and snr_vals:
                 flush_data.append(
-                    (
-                        callsign,
-                        bucket_start,
-                        bucket_ms,
-                        round(mean(rssi_vals), 2),
-                        min(rssi_vals),
-                        max(rssi_vals),
-                        round(mean(snr_vals), 2),
-                        round(min(snr_vals), 2),
-                        round(max(snr_vals), 2),
-                        len(rssi_vals),
-                    )
+                    self._build_bucket_tuple(callsign, bucket_start, bucket_ms, rssi_vals, snr_vals)
                 )
         if flush_data:
             await self._execute_many(
@@ -2798,159 +2680,6 @@ class SQLiteStorage:
                 " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 flush_data,
             )
-
-    def _build_stats_with_gaps(
-        self,
-        buckets: dict[tuple[int, str], dict[str, list[float | int]]],
-    ) -> list[dict[str, Any]]:
-        """Build statistics with gap markers for Chart.js."""
-        gap_threshold = GAP_THRESHOLD_MULTIPLIER * BUCKET_SECONDS
-
-        # Group by callsign
-        callsign_data: dict[str, list[tuple[int, dict[str, list[float | int]]]]] = defaultdict(list)
-        for (bucket_time, callsign), values in buckets.items():
-            callsign_data[callsign].append((bucket_time, values))
-
-        final_result = []
-
-        for callsign, entries in callsign_data.items():
-            if len(entries) < MIN_DATAPOINTS_FOR_STATS:
-                continue
-
-            # Sort by time
-            entries.sort(key=lambda x: x[0])
-
-            segment_id = 0
-            prev_time = None
-
-            for bucket_time, values in entries:
-                # Check for gap
-                if prev_time and (bucket_time - prev_time) > gap_threshold:
-                    # Insert gap marker
-                    final_result.append(
-                        {
-                            "src_type": "STATS",
-                            "timestamp": bucket_time - BUCKET_SECONDS,
-                            "callsign": callsign,
-                            "rssi": None,
-                            "snr": None,
-                            "rssi_min": None,
-                            "rssi_max": None,
-                            "snr_min": None,
-                            "snr_max": None,
-                            "count": None,
-                            "segment_id": f"{callsign}_gap_{segment_id}_to_{segment_id + 1}",
-                            "segment_size": 1,
-                            "is_gap_marker": True,
-                        }
-                    )
-                    segment_id += 1
-
-                rssi_values = values["rssi"]
-                snr_values = values["snr"]
-                count = min(len(rssi_values), len(snr_values))
-
-                if count > 0:
-                    final_result.append(
-                        {
-                            "src_type": "STATS",
-                            "timestamp": bucket_time,
-                            "callsign": callsign,
-                            "rssi": round(mean(rssi_values), 2),
-                            "snr": round(mean(snr_values), 2),
-                            "rssi_min": min(rssi_values),
-                            "rssi_max": max(rssi_values),
-                            "snr_min": round(min(snr_values), 2),
-                            "snr_max": round(max(snr_values), 2),
-                            "count": count,
-                            "segment_id": f"{callsign}_seg_{segment_id}",
-                            "segment_size": 1,
-                        }
-                    )
-
-                prev_time = bucket_time
-
-        logger.info("Generated %d statistics entries", len(final_result))
-        return sorted(final_result, key=lambda x: (x["callsign"], x["timestamp"]))
-
-    async def _build_stats_with_gaps_async(
-        self,
-        buckets: dict[tuple[int, str], dict[str, list[float | int]]],
-        progress_callback: Any,
-    ) -> list[dict[str, Any]]:
-        """Async version with per-callsign progress."""
-        gap_threshold = GAP_THRESHOLD_MULTIPLIER * BUCKET_SECONDS
-
-        callsign_data: dict[str, list[tuple[int, dict[str, list[float | int]]]]] = defaultdict(list)
-        for (bucket_time, callsign), values in buckets.items():
-            callsign_data[callsign].append((bucket_time, values))
-
-        final_result = []
-
-        qualified = {
-            cs: entries
-            for cs, entries in callsign_data.items()
-            if len(entries) >= MIN_DATAPOINTS_FOR_STATS
-        }
-
-        for idx, (callsign, entries) in enumerate(sorted(qualified.items()), 1):
-            await progress_callback(
-                "gaps",
-                f"Building chart for {callsign} ({idx}/{len(qualified)})...",
-                callsign,
-            )
-
-            entries.sort(key=lambda x: x[0])
-            segment_id = 0
-            prev_time = None
-
-            for bucket_time, values in entries:
-                if prev_time and (bucket_time - prev_time) > gap_threshold:
-                    final_result.append(
-                        {
-                            "src_type": "STATS",
-                            "timestamp": bucket_time - BUCKET_SECONDS,
-                            "callsign": callsign,
-                            "rssi": None,
-                            "snr": None,
-                            "rssi_min": None,
-                            "rssi_max": None,
-                            "snr_min": None,
-                            "snr_max": None,
-                            "count": None,
-                            "segment_id": f"{callsign}_gap_{segment_id}_to_{segment_id + 1}",
-                            "segment_size": 1,
-                            "is_gap_marker": True,
-                        }
-                    )
-                    segment_id += 1
-
-                rssi_values = values["rssi"]
-                snr_values = values["snr"]
-                count = min(len(rssi_values), len(snr_values))
-
-                if count > 0:
-                    final_result.append(
-                        {
-                            "src_type": "STATS",
-                            "timestamp": bucket_time,
-                            "callsign": callsign,
-                            "rssi": round(mean(rssi_values), 2),
-                            "snr": round(mean(snr_values), 2),
-                            "rssi_min": min(rssi_values),
-                            "rssi_max": max(rssi_values),
-                            "snr_min": round(min(snr_values), 2),
-                            "snr_max": round(max(snr_values), 2),
-                            "count": count,
-                            "segment_id": f"{callsign}_seg_{segment_id}",
-                            "segment_size": 1,
-                        }
-                    )
-
-                prev_time = bucket_time
-
-        logger.info("Generated %d statistics entries", len(final_result))
-        return sorted(final_result, key=lambda x: (x["callsign"], x["timestamp"]))
 
     async def get_stats(self, hours: int) -> dict[str, Any]:
         """Get message statistics for the given time window."""
@@ -3311,131 +3040,113 @@ class SQLiteStorage:
         logger.info("Deleted %d messages for dst=%s", count, dst)
         return count
 
+    async def _get_identifier_list(self, table: str, column: str) -> list[str]:
+        """Shared getter for a flat identifier-list table (hidden_destinations.dst,
+        blocked_texts.text). `table`/`column` are always literals from call sites in
+        this file, never user input.
+        """
+        rows_raw = await self._execute(f"SELECT {column} FROM {table}")  # noqa: S608 - table/column from fixed whitelist, not user input
+        rows = cast(list[dict[str, Any]], rows_raw)
+        return [row[column] for row in rows]
+
+    async def _set_identifier_list(self, table: str, column: str, values: list[str]) -> None:
+        """Bulk replace all rows in a flat identifier-list table."""
+
+        def _run() -> None:
+            with sqlite3.connect(self.db_path) as conn:
+                conn.execute(f"DELETE FROM {table}")  # noqa: S608 - table from fixed whitelist
+                if values:
+                    conn.executemany(
+                        f"INSERT INTO {table} ({column}) VALUES (?)",  # noqa: S608 - table/column from fixed whitelist
+                        [(v,) for v in values],
+                    )
+                conn.commit()
+
+        await asyncio.to_thread(_run)
+
+    async def _update_identifier(self, table: str, column: str, value: str, present: bool) -> None:
+        """Add or remove a single row in a flat identifier-list table."""
+        if present:
+            await self._execute(
+                f"INSERT OR IGNORE INTO {table} ({column}) VALUES (?)",  # noqa: S608 - table/column from fixed whitelist
+                (value,),
+                fetch=False,
+            )
+        else:
+            await self._execute(
+                f"DELETE FROM {table} WHERE {column} = ?",  # noqa: S608 - table/column from fixed whitelist
+                (value,),
+                fetch=False,
+            )
+
     async def get_hidden_destinations(self) -> list[str]:
         """Get all hidden destination identifiers."""
-        rows_raw = await self._execute("SELECT dst FROM hidden_destinations")
-        rows = cast(list[dict[str, Any]], rows_raw)
-        return [row["dst"] for row in rows]
+        return await self._get_identifier_list("hidden_destinations", "dst")
 
     async def set_hidden_destinations(self, destinations: list[str]) -> None:
         """Bulk replace all hidden destinations."""
-
-        def _run() -> None:
-            with sqlite3.connect(self.db_path) as conn:
-                conn.execute("DELETE FROM hidden_destinations")
-                if destinations:
-                    conn.executemany(
-                        "INSERT INTO hidden_destinations (dst) VALUES (?)",
-                        [(d,) for d in destinations],
-                    )
-                conn.commit()
-
-        await asyncio.to_thread(_run)
+        await self._set_identifier_list("hidden_destinations", "dst", destinations)
 
     async def update_hidden_destination(self, dst: str, hidden: bool) -> None:
         """Show or hide a single destination."""
-        if hidden:
-            await self._execute(
-                "INSERT OR IGNORE INTO hidden_destinations (dst) VALUES (?)",
-                (dst,),
-                fetch=False,
-            )
-        else:
-            await self._execute(
-                "DELETE FROM hidden_destinations WHERE dst = ?",
-                (dst,),
-                fetch=False,
-            )
+        await self._update_identifier("hidden_destinations", "dst", dst, hidden)
 
     async def get_blocked_texts(self) -> list[str]:
         """Get all blocked text patterns."""
-        rows_raw = await self._execute("SELECT text FROM blocked_texts")
-        rows = cast(list[dict[str, Any]], rows_raw)
-        return [row["text"] for row in rows]
+        return await self._get_identifier_list("blocked_texts", "text")
 
     async def set_blocked_texts(self, texts: list[str]) -> None:
         """Bulk replace all blocked text patterns."""
-
-        def _run() -> None:
-            with sqlite3.connect(self.db_path) as conn:
-                conn.execute("DELETE FROM blocked_texts")
-                if texts:
-                    conn.executemany(
-                        "INSERT INTO blocked_texts (text) VALUES (?)",
-                        [(t,) for t in texts],
-                    )
-                conn.commit()
-
-        await asyncio.to_thread(_run)
+        await self._set_identifier_list("blocked_texts", "text", texts)
 
     async def update_blocked_text(self, text: str, blocked: bool) -> None:
         """Add or remove a single blocked text pattern."""
-        if blocked:
-            await self._execute(
-                "INSERT OR IGNORE INTO blocked_texts (text) VALUES (?)",
-                (text,),
-                fetch=False,
-            )
-        else:
-            await self._execute(
-                "DELETE FROM blocked_texts WHERE text = ?",
-                (text,),
-                fetch=False,
-            )
+        await self._update_identifier("blocked_texts", "text", text, blocked)
+
+    async def _get_sidebar(self, table: str) -> dict[str, Any] | None:
+        """Shared getter for mheard_sidebar/wx_sidebar (station order + hidden stations).
+        `table` is always a literal from call sites in this file, never user input.
+        """
+        rows_raw = await self._execute(
+            f"SELECT station_order, hidden_stations FROM {table} WHERE id = 1"  # noqa: S608 - table from fixed whitelist, not user input
+        )
+        rows = cast(list[dict[str, Any]], rows_raw)
+        if not rows:
+            return None
+        row = rows[0]
+        return {
+            "order": json.loads(row["station_order"]),
+            "hidden": json.loads(row["hidden_stations"]),
+        }
+
+    async def _set_sidebar(self, table: str, order: list[str], hidden: list[str]) -> None:
+        """Shared upsert for mheard_sidebar/wx_sidebar."""
+        await self._execute(
+            f"""INSERT INTO {table} (id, station_order, hidden_stations, updated_at)
+               VALUES (1, ?, ?, CURRENT_TIMESTAMP)
+               ON CONFLICT(id) DO UPDATE SET
+                 station_order = excluded.station_order,
+                 hidden_stations = excluded.hidden_stations,
+                 updated_at = CURRENT_TIMESTAMP""",  # noqa: S608 - table from fixed whitelist, not user input
+            (json.dumps(order), json.dumps(hidden)),
+            fetch=False,
+        )
 
     async def get_mheard_sidebar(self) -> dict[str, Any] | None:
         """Get mheard sidebar state (station order + hidden stations)."""
-        rows_raw = await self._execute(
-            "SELECT station_order, hidden_stations FROM mheard_sidebar WHERE id = 1"
-        )
-        rows = cast(list[dict[str, Any]], rows_raw)
-        if not rows:
-            return None
-        row = rows[0]
-        return {
-            "order": json.loads(row["station_order"]),
-            "hidden": json.loads(row["hidden_stations"]),
-        }
+        return await self._get_sidebar("mheard_sidebar")
 
     async def set_mheard_sidebar(self, order: list[str], hidden: list[str]) -> None:
         """Upsert mheard sidebar state."""
-        await self._execute(
-            """INSERT INTO mheard_sidebar (id, station_order, hidden_stations, updated_at)
-               VALUES (1, ?, ?, CURRENT_TIMESTAMP)
-               ON CONFLICT(id) DO UPDATE SET
-                 station_order = excluded.station_order,
-                 hidden_stations = excluded.hidden_stations,
-                 updated_at = CURRENT_TIMESTAMP""",
-            (json.dumps(order), json.dumps(hidden)),
-            fetch=False,
-        )
+        await self._set_sidebar("mheard_sidebar", order, hidden)
 
     async def get_wx_sidebar(self) -> dict[str, Any] | None:
         """Get WX sidebar state (station order + hidden stations)."""
-        rows_raw = await self._execute(
-            "SELECT station_order, hidden_stations FROM wx_sidebar WHERE id = 1"
-        )
-        rows = cast(list[dict[str, Any]], rows_raw)
-        if not rows:
-            return None
-        row = rows[0]
-        return {
-            "order": json.loads(row["station_order"]),
-            "hidden": json.loads(row["hidden_stations"]),
-        }
+        return await self._get_sidebar("wx_sidebar")
 
     async def set_wx_sidebar(self, order: list[str], hidden: list[str]) -> None:
         """Upsert WX sidebar state."""
-        await self._execute(
-            """INSERT INTO wx_sidebar (id, station_order, hidden_stations, updated_at)
-               VALUES (1, ?, ?, CURRENT_TIMESTAMP)
-               ON CONFLICT(id) DO UPDATE SET
-                 station_order = excluded.station_order,
-                 hidden_stations = excluded.hidden_stations,
-                 updated_at = CURRENT_TIMESTAMP""",
-            (json.dumps(order), json.dumps(hidden)),
-            fetch=False,
-        )
+        await self._set_sidebar("wx_sidebar", order, hidden)
 
     async def get_filter_prefs(self) -> dict[str, Any]:
         """Get persisted spam filter preferences."""
@@ -3462,20 +3173,26 @@ class SQLiteStorage:
     # classifier/types.py, allowing the shared classifier subtree to run
     # in MCProxy without any meshcom_mock imports.
 
+    @staticmethod
+    def _normalize_rule_row(row: dict[str, Any]) -> dict[str, Any]:
+        """Normalize a classifier_rules row: JSON-decode extra_tags, coerce enabled/builtin
+        to bool. Mutates and returns the same dict.
+        """
+        try:
+            row["extra_tags"] = json.loads(row["extra_tags"]) if row.get("extra_tags") else []
+        except (json.JSONDecodeError, TypeError):
+            row["extra_tags"] = []
+        row["enabled"] = bool(row["enabled"])
+        row["builtin"] = bool(row["builtin"])
+        return row
+
     async def get_classifier_rules(self, enabled_only: bool = False) -> list[dict[str, Any]]:
         where = "WHERE enabled = 1" if enabled_only else ""
         rows_raw = await self._execute(
             f"SELECT * FROM classifier_rules {where} ORDER BY priority ASC, id ASC"  # noqa: S608 - identifiers from fixed set; values parameterized
         )
         rows = cast(list[dict[str, Any]], rows_raw)
-        for r in rows:
-            try:
-                r["extra_tags"] = json.loads(r["extra_tags"]) if r.get("extra_tags") else []
-            except (json.JSONDecodeError, TypeError):
-                r["extra_tags"] = []
-            r["enabled"] = bool(r["enabled"])
-            r["builtin"] = bool(r["builtin"])
-        return rows
+        return [self._normalize_rule_row(r) for r in rows]
 
     async def insert_classifier_rule(  # noqa: PLR0913 - signature fixed by call sites
         self,
@@ -3518,11 +3235,7 @@ class SQLiteStorage:
         rule_id = await asyncio.to_thread(_run)
         rows_raw = await self._execute("SELECT * FROM classifier_rules WHERE id = ?", (rule_id,))
         rows = cast(list[dict[str, Any]], rows_raw)
-        row = rows[0]
-        row["extra_tags"] = json.loads(row["extra_tags"]) if row.get("extra_tags") else []
-        row["enabled"] = bool(row["enabled"])
-        row["builtin"] = bool(row["builtin"])
-        return row
+        return self._normalize_rule_row(rows[0])
 
     async def update_classifier_rule(
         self, rule_id: int, **updates: object
@@ -3558,11 +3271,96 @@ class SQLiteStorage:
             raise TypeError("expected list result")
         if not rows:
             return None
-        row = rows[0]
-        row["extra_tags"] = json.loads(row["extra_tags"]) if row.get("extra_tags") else []
-        row["enabled"] = bool(row["enabled"])
-        row["builtin"] = bool(row["builtin"])
-        return row
+        return self._normalize_rule_row(rows[0])
+
+    async def get_classifier_rules_raw(self) -> list[dict[str, Any]]:
+        """All classifier rules, unnormalized (extra_tags as raw JSON string,
+        enabled/builtin as raw 0/1 ints) — the wire shape the SSE/REST classifier-rules
+        endpoints have always emitted (SSE-02). Prefer get_classifier_rules() for
+        internal Python consumers that want decoded/coerced values.
+        """
+        rows_raw = await self._execute(
+            "SELECT id, name, pattern, scope, category, extra_tags, priority, "
+            "enabled, builtin, created_at, updated_at "
+            "FROM classifier_rules ORDER BY priority ASC, id ASC"
+        )
+        return cast(list[dict[str, Any]], rows_raw)
+
+    async def classifier_rule_exists(self, rule_id: int) -> bool:
+        """Check whether a classifier_rules row with this id exists."""
+        rows = await self._execute("SELECT id FROM classifier_rules WHERE id = ?", (rule_id,))
+        return bool(rows)
+
+    async def get_classifier_rule_builtin_flag(self, rule_id: int) -> bool | None:
+        """Return the `builtin` flag for a rule, or None if the rule doesn't exist."""
+        rows_raw = await self._execute(
+            "SELECT builtin FROM classifier_rules WHERE id = ?", (rule_id,)
+        )
+        rows = cast(list[dict[str, Any]], rows_raw)
+        return bool(rows[0]["builtin"]) if rows else None
+
+    async def delete_classifier_rule(self, rule_id: int) -> None:
+        """Delete a classifier rule by id (caller is responsible for the builtin check)."""
+        await self._execute("DELETE FROM classifier_rules WHERE id = ?", (rule_id,), fetch=False)
+
+    async def list_beacon_templates(
+        self, min_count: int = 0, auto_only: bool = False, limit: int = 100
+    ) -> list[dict[str, Any]]:
+        """List beacon templates, optionally filtered by min count / auto-beacon flag."""
+        where: list[str] = []
+        params: list[Any] = []
+        if min_count > 0:
+            where.append("count >= ?")
+            params.append(min_count)
+        if auto_only:
+            where.append("auto_beacon = 1")
+        where_sql = f" WHERE {' AND '.join(where)}" if where else ""
+        params.append(limit)
+        rows_raw = await self._execute(
+            "SELECT template_hash, example_msg, example_src, srcs, count, "  # noqa: S608 - identifiers from fixed set; values parameterized
+            "first_seen, last_seen, auto_beacon, user_action "
+            f"FROM beacon_templates{where_sql} "
+            "ORDER BY count DESC LIMIT ?",
+            tuple(params),
+        )
+        return cast(list[dict[str, Any]], rows_raw)
+
+    async def beacon_template_exists(self, template_hash: str) -> bool:
+        """Check whether a beacon_templates row with this hash exists."""
+        rows = await self._execute(
+            "SELECT template_hash FROM beacon_templates WHERE template_hash = ?",
+            (template_hash,),
+        )
+        return bool(rows)
+
+    async def set_beacon_template_user_action(self, template_hash: str, action: str | None) -> None:
+        """Set (or clear, if action is None) the user override on a beacon template."""
+        await self._execute(
+            "UPDATE beacon_templates SET user_action = ? WHERE template_hash = ?",
+            (action, template_hash),
+            fetch=False,
+        )
+
+    async def get_recent_messages_for_rule_test(self, limit: int) -> list[dict[str, Any]]:
+        """Recent messages for classifier rule dry-run testing (SSE-02)."""
+        rows_raw = await self._execute(
+            "SELECT id, msg_id, src, dst, msg, type, timestamp FROM messages "
+            "ORDER BY id DESC LIMIT ?",
+            (limit,),
+        )
+        return cast(list[dict[str, Any]], rows_raw)
+
+    async def get_messages_by_template_hash(
+        self, template_hash: str, limit: int
+    ) -> list[dict[str, Any]]:
+        """Recent messages matching a beacon template hash (classifier template preview)."""
+        rows_raw = await self._execute(
+            "SELECT id, msg_id, src, dst, msg, type, timestamp, category, tags, "
+            "info_score FROM messages WHERE template_hash = ? "
+            "ORDER BY timestamp DESC LIMIT ?",
+            (template_hash, limit),
+        )
+        return cast(list[dict[str, Any]], rows_raw)
 
     async def get_beacon_template(self, template_hash: str) -> dict[str, Any] | None:
         rows_raw = await self._execute(

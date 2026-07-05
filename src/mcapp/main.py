@@ -8,6 +8,7 @@ import socket
 import sys
 import time
 from collections import defaultdict
+from collections.abc import Awaitable, Callable
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
@@ -48,6 +49,14 @@ from .util import now_ms
 
 _MSG_PREVIEW_CHARS = 20
 _FORCE_EXIT_WINDOW_S = 5.0  # second Ctrl-C within this window forces exit
+
+# mheard-dump command variants: variant -> (progress "msg" text, storage method name,
+# response "msg" text). The three dump commands differ only in these three strings.
+_MHEARD_DUMP_VARIANTS: dict[str, tuple[str, str, str]] = {
+    "7day": ("mheard progress", "process_mheard_store_parallel", "mheard stats"),
+    "monthly": ("mheard progress monthly", "process_mheard_monthly", "mheard stats monthly"),
+    "yearly": ("mheard progress yearly", "process_mheard_yearly", "mheard stats yearly"),
+}
 
 DEFAULT_PAGE_LIMIT = 20
 MAX_PAGE_LIMIT = 100
@@ -531,16 +540,20 @@ class MessageRouter:
         }
         await self._send_response(websocket, payload, client_id)
 
-    async def _handle_mheard_dump_command(
-        self, websocket: Any, client_id: str | None = None
+    async def _handle_mheard_dump(
+        self, websocket: Any, client_id: str | None, variant: str
     ) -> None:
-        """Handle mheard dump command"""
+        """Shared handler for the three mheard-dump commands (7-day/monthly/yearly),
+        which differ only in the progress/response message text and which storage
+        method computes the chart series.
+        """
+        progress_msg_text, method_name, response_msg_text = _MHEARD_DUMP_VARIANTS[variant]
 
         # Create progress callback that sends updates to the requesting client
         async def progress_callback(stage: str, detail: str, callsign: str | None = None) -> None:
             progress_msg: dict[str, Any] = {
                 "type": "progress",
-                "msg": "mheard progress",
+                "msg": progress_msg_text,
                 "stage": stage,
                 "detail": detail,
             }
@@ -548,60 +561,28 @@ class MessageRouter:
                 progress_msg["callsign"] = callsign
             await self._send_response(websocket, progress_msg, client_id)
 
-        # Use the parallel version
-        mheard = await self.storage_handler.process_mheard_store_parallel(
-            progress_callback=progress_callback
-        )
-        payload: dict[str, Any] = {"type": "response", "msg": "mheard stats", "data": mheard}
+        storage_method = getattr(self.storage_handler, method_name)
+        mheard = await storage_method(progress_callback=progress_callback)
+        payload: dict[str, Any] = {"type": "response", "msg": response_msg_text, "data": mheard}
         await self._send_response(websocket, payload, client_id)
+
+    async def _handle_mheard_dump_command(
+        self, websocket: Any, client_id: str | None = None
+    ) -> None:
+        """Handle mheard dump command"""
+        await self._handle_mheard_dump(websocket, client_id, "7day")
 
     async def _handle_mheard_dump_monthly_command(
         self, websocket: Any, client_id: str | None = None
     ) -> None:
         """Handle mheard dump monthly command — queries buckets for 30 days."""
-
-        async def progress_callback(stage: str, detail: str, callsign: str | None = None) -> None:
-            progress_msg: dict[str, Any] = {
-                "type": "progress",
-                "msg": "mheard progress monthly",
-                "stage": stage,
-                "detail": detail,
-            }
-            if callsign:
-                progress_msg["callsign"] = callsign
-            await self._send_response(websocket, progress_msg, client_id)
-
-        mheard = await self.storage_handler.process_mheard_monthly(
-            progress_callback=progress_callback
-        )
-        payload: dict[str, Any] = {
-            "type": "response",
-            "msg": "mheard stats monthly",
-            "data": mheard,
-        }
-        await self._send_response(websocket, payload, client_id)
+        await self._handle_mheard_dump(websocket, client_id, "monthly")
 
     async def _handle_mheard_dump_yearly_command(
         self, websocket: Any, client_id: str | None = None
     ) -> None:
         """Handle mheard dump yearly command — queries 1-hour buckets for 365 days."""
-
-        async def progress_callback(stage: str, detail: str, callsign: str | None = None) -> None:
-            progress_msg: dict[str, Any] = {
-                "type": "progress",
-                "msg": "mheard progress yearly",
-                "stage": stage,
-                "detail": detail,
-            }
-            if callsign:
-                progress_msg["callsign"] = callsign
-            await self._send_response(websocket, progress_msg, client_id)
-
-        mheard = await self.storage_handler.process_mheard_yearly(
-            progress_callback=progress_callback
-        )
-        payload: dict[str, Any] = {"type": "response", "msg": "mheard stats yearly", "data": mheard}
-        await self._send_response(websocket, payload, client_id)
+        await self._handle_mheard_dump(websocket, client_id, "yearly")
 
     # BLE command handlers - route through ble_client abstraction
     def _get_ble_client(self) -> Any:
@@ -956,10 +937,59 @@ class MessageRouter:
 
         return suppress, reason
 
+    async def _handle_outbound(
+        self,
+        routed_message: dict[str, Any],
+        protocol: str,
+        send: Callable[[dict[str, Any]], Awaitable[None]],
+    ) -> None:
+        """Shared outbound-message handling for UDP/BLE.
+
+        Normalizes the message, checks self-suppression and self-messaging, then
+        delegates the actual transport send to `send` — everything protocol-specific
+        (payload shaping, the send call itself, failure handling) lives in the
+        caller's `send` callable.
+        """
+        message_data = routed_message["data"]
+
+        if self.validator is None:
+            raise RuntimeError("self.validator is unexpectedly None")
+        normalized_data = self.validator.normalize_message_data(message_data)
+
+        if not normalized_data.get("src") and self.my_callsign:
+            normalized_data["src"] = self.my_callsign
+
+        self._logger.debug(
+            "%s Handler: Processing '%s' from %s to %s",
+            protocol.upper(),
+            normalized_data.get("msg"),
+            normalized_data.get("src"),
+            normalized_data.get("dst"),
+        )
+
+        suppress_result, reason = self._should_suppress_outbound(normalized_data)
+        self._logger.debug("%s_DIAG suppress=%s", protocol.upper(), suppress_result)
+
+        if suppress_result:
+            self.log_message_routing_decision(
+                normalized_data, f"{protocol.upper()}_SUPPRESSION", "SUPPRESS", reason
+            )
+            synthetic_message = self._create_synthetic_message(normalized_data, protocol)
+            await self._route_to_command_handler(synthetic_message)
+            return
+
+        is_self_message = await self._handle_outgoing_message(normalized_data, protocol)
+        self._logger.debug("%s_DIAG self_message=%s", protocol.upper(), is_self_message)
+
+        if is_self_message:
+            self._logger.debug("%s Handler: Self-message handled, not sending", protocol.upper())
+            return
+
+        await send(normalized_data)
+
     async def _udp_message_handler(self, routed_message: dict[str, Any]) -> None:
         """Handle UDP messages from WebSocket and route to UDP handler"""
         message_data = routed_message["data"]
-
         self._logger.info(
             "_udp_message_handler: src_type=%r src=%s dst=%s msg=%.40s",
             message_data.get("src_type"),
@@ -967,52 +997,10 @@ class MessageRouter:
             message_data.get("dst"),
             message_data.get("msg", ""),
         )
+        await self._handle_outbound(routed_message, "udp", self._send_via_udp)
 
-        # EARLY NORMALIZATION - ab hier alles uppercase
-        if self.validator is None:
-            raise RuntimeError("self.validator is unexpectedly None")
-        normalized_data = self.validator.normalize_message_data(message_data)
-
-        # Add our callsign if missing
-        if not normalized_data.get("src") and self.my_callsign:
-            normalized_data["src"] = self.my_callsign
-
-        self._logger.debug(
-            "UDP_DIAG normalize: src=%s dst=%s msg=%.40s keys=%s",
-            normalized_data.get("src"),
-            normalized_data.get("dst"),
-            normalized_data.get("msg", ""),
-            list(normalized_data.keys()),
-        )
-
-        self._logger.debug(
-            "UDP Handler: Processing '%s' from %s to %s",
-            normalized_data.get("msg"),
-            normalized_data.get("src"),
-            normalized_data.get("dst"),
-        )
-
-        suppress_result, reason = self._should_suppress_outbound(normalized_data)
-        self._logger.debug("UDP_DIAG suppress=%s", suppress_result)
-
-        if suppress_result:
-            self.log_message_routing_decision(
-                normalized_data, "UDP_SUPPRESSION", "SUPPRESS", reason
-            )
-
-            synthetic_message = self._create_synthetic_message(normalized_data, "udp")
-            await self._route_to_command_handler(synthetic_message)
-            return
-
-        # Check if this is a self-message first
-        is_self_message = await self._handle_outgoing_message(normalized_data, "udp")
-        self._logger.debug("UDP_DIAG self_message=%s", is_self_message)
-
-        if is_self_message:
-            self._logger.debug("UDP Handler: Self-message handled, not sending to mesh")
-            return
-
-        # External message - send to mesh network
+    async def _send_via_udp(self, normalized_data: dict[str, Any]) -> None:
+        """Transmit a normalized outbound message over UDP to the mesh network."""
         self._logger.debug("UDP Handler: Sending external message to mesh network")
 
         udp_handler = self.get_protocol("udp")
@@ -1020,17 +1008,10 @@ class MessageRouter:
         # Strip internal routing fields before sending to firmware
         # Firmware only accepts: type, dst, msg, src
         normalized_data.pop("src_type", None)
-        send_data = normalized_data
-
-        self._logger.debug(
-            "UDP_DIAG sending: target=%s payload_keys=%s",
-            getattr(udp_handler, "target_address", "?"),
-            list(send_data.keys()),
-        )
 
         if udp_handler:
             try:
-                await udp_handler.send_message(send_data)
+                await udp_handler.send_message(normalized_data)
                 self._logger.debug("UDP message sent successfully to mesh network")
             except Exception as e:
                 self._logger.warning("UDP message send failed: %s", e)
@@ -1059,53 +1040,14 @@ class MessageRouter:
 
     async def _ble_message_handler(self, routed_message: dict[str, Any]) -> None:
         """Handle BLE messages from WebSocket and route to BLE client"""
+        await self._handle_outbound(routed_message, "ble", self._send_via_ble)
 
-        message_data = routed_message["data"]
-
-        # EARLY NORMALIZATION - ab hier alles uppercase
-        if self.validator is None:
-            raise RuntimeError("self.validator is unexpectedly None")
-        normalized_data = self.validator.normalize_message_data(message_data)
-
-        # Add our callsign if missing
-        if not normalized_data.get("src") and self.my_callsign:
-            normalized_data["src"] = self.my_callsign
-
-        msg = normalized_data.get("msg")
-        dst = normalized_data.get("dst")
-
-        self._logger.debug(
-            "BLE Handler: msg='%s' src='%s' dst='%s'", msg, normalized_data.get("src"), dst
-        )
-
-        self._logger.debug(
-            "BLE Handler: Processing '%s' from %s to '%s'", msg, normalized_data.get("src"), dst
-        )
-
-        suppress, reason = self._should_suppress_outbound(normalized_data)
-        self._logger.debug("BLE Handler: suppress=%s", suppress)
-
-        if suppress:
-            self.log_message_routing_decision(
-                normalized_data, "BLE_SUPPRESSION", "SUPPRESS", reason
-            )
-
-            synthetic_message = self._create_synthetic_message(normalized_data, "ble")
-            await self._route_to_command_handler(synthetic_message)
-            return
-
-        # Check if this is a self-message first
-        is_self_message = await self._handle_outgoing_message(normalized_data, "ble")
-
-        if is_self_message:
-            self._logger.debug("BLE Handler: Self-message handled, not sending to device")
-            return
-
-        # External message - send to BLE device
+    async def _send_via_ble(self, normalized_data: dict[str, Any]) -> None:
+        """Transmit a normalized outbound message over BLE to the paired device."""
         self._logger.debug("BLE Handler: Sending external message to BLE device")
         client = self._get_ble_client()
         if client:
-            await client.send_message(msg, dst)
+            await client.send_message(normalized_data.get("msg"), normalized_data.get("dst"))
         else:
             logger.warning("BLE client not available, cannot send message")
 

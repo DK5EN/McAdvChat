@@ -12,6 +12,17 @@ from .constants import CALLSIGN_TARGET_RE
 _MAX_GROUP_NUM = 99999
 
 
+def strip_relay_path(src_raw: str) -> str:
+    """Strip a MeshCom relay-path suffix (comma-separated hops) from a raw src
+    field, returning just the originating callsign, upper-cased and stripped.
+    """
+    return (
+        src_raw.split(",", maxsplit=1)[0].strip().upper()
+        if "," in src_raw
+        else src_raw.strip().upper()
+    )
+
+
 def extract_target_callsign(msg: str) -> str | None:  # noqa: PLR0911 - complex handler kept intact
     """Extract target callsign from command message.
 
@@ -247,7 +258,7 @@ def normalize_unified(message_data: dict[str, Any], context: str = "command") ->
     """
     src_default = "UNKNOWN" if context == "command" else ""
     src_raw = message_data.get("src", src_default)
-    src = src_raw.split(",")[0].strip().upper() if "," in src_raw else src_raw.strip().upper()
+    src = strip_relay_path(src_raw)
     dst = message_data.get("dst", "").strip().upper()
     msg = message_data.get("msg", "").strip()
     # Strip MeshCom message ID suffix ({NNN) before any routing decisions
