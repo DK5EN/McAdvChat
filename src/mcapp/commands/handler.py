@@ -4,8 +4,8 @@ from __future__ import annotations
 
 from typing import Any
 
+from ..logging_setup import get_logger
 from .admin_commands import AdminCommandsMixin
-from .constants import has_console
 from .ctcping import CTCPingMixin
 from .data_commands import DataCommandsMixin
 from .dedup import DedupMixin
@@ -115,6 +115,8 @@ COMMANDS = {
     },
 }
 
+logger = get_logger(__name__)
+
 
 class CommandHandler(
     RoutingMixin,
@@ -165,10 +167,9 @@ class CommandHandler(
             message_router.subscribe("mesh_message", self._message_handler)
             message_router.subscribe("ble_notification", self._message_handler)
 
-        if has_console:
-            print(f"CommandHandler: Initialized with {len(COMMANDS)} commands")
-            print(f"🐛 CommandHandler: Listening for commands to '{self.my_callsign}'")
-            print(f"🐛 CommandHandler: Weather service initialized for {self.lat}/{self.lon}")
+        logger.debug("CommandHandler: Initialized with %d commands", len(COMMANDS))
+        logger.debug("CommandHandler: Listening for commands to '%s'", self.my_callsign)
+        logger.debug("CommandHandler: Weather service initialized for %s/%s", self.lat, self.lon)
 
     async def run_all_tests(self) -> bool:
         """Run complete test suite for CommandHandler"""

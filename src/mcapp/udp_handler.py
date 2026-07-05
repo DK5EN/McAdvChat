@@ -65,7 +65,8 @@ def is_allowed_char(ch: str) -> bool:  # noqa: PLR0911 - complex handler kept in
     if category.startswith(("S", "P")) or "EMOJI" in unicodedata.name(ch, ""):
         return True
 
-    logger.error("Invalid character: %r (U+%04X, %s)", ch, ord(ch), unicodedata.name(ch, "UNKNOWN"))
+    # Routine noise from a lossy RF link, not a real error — DEBUG only.
+    logger.debug("Invalid character: %r (U+%04X, %s)", ch, ord(ch), unicodedata.name(ch, "UNKNOWN"))
     return False
 
 
@@ -73,15 +74,8 @@ def strip_invalid_utf8(data: bytes) -> str:
     """Strip invalid UTF-8 characters from byte data"""
     # Step 1: decode as much as possible in one go
     text = data.decode("utf-8", errors="ignore")
-    valid_text = ""
-    for ch in text:
-        if is_allowed_char(ch):
-            valid_text += ch
-        else:
-            cp = ord(ch)
-            name = unicodedata.name(ch, "<unknown>")
-            print(f"[ERROR] Invalid character: '{ch}' (U+{cp:04X}, {name})")
-    return valid_text
+    # is_allowed_char() already logs each rejected character at DEBUG — don't double-report.
+    return "".join(ch for ch in text if is_allowed_char(ch))
 
 
 def try_repair_json(text: str) -> dict[str, Any]:
@@ -119,7 +113,7 @@ class UDPHandler:
 
     async def start_listening(self) -> None:
         if self._running:
-            print("UDP listener already running")
+            logger.warning("UDP listener already running")
             return
 
         self.listen_socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -143,7 +137,7 @@ class UDPHandler:
             self.listen_socket.close()
             self.listen_socket = None
 
-        print("UDP listener stopped")
+        logger.info("UDP listener stopped")
 
     async def _listen_loop(self) -> None:
         loop = asyncio.get_running_loop()

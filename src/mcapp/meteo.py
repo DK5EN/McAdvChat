@@ -5,7 +5,6 @@ DWD BrightSky als Primärquelle + OpenMeteo für fehlende Parameter
 Intelligente Daten-Fusion für optimale Genauigkeit
 """
 
-import logging
 import math
 import sys
 import time
@@ -14,6 +13,8 @@ from typing import Any
 from zoneinfo import ZoneInfo
 
 import httpx
+
+from .logging_setup import get_logger
 
 _DAY_START_HOUR = 6
 _DAY_END_HOUR = 20
@@ -57,15 +58,7 @@ def _messzeitpunkt_to_utc(timestamp_str: str) -> datetime:
     return parsed.replace(tzinfo=_BERLIN_TZ).astimezone(UTC)
 
 
-# Logging Setup
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
-    handlers=[logging.StreamHandler(sys.stdout)],
-)
-logger = logging.getLogger("weather_service")
-
-has_console = sys.stdout.isatty()
+logger = get_logger(__name__)
 
 
 class WeatherServiceError(Exception):
@@ -505,8 +498,7 @@ class WeatherService:
         response = self._make_request(url, params)
         data = response.json()
 
-        if has_console:
-            print("openmeteo debug:", data)
+        logger.debug("openmeteo response: %s", data)
 
         if "current" not in data:
             raise WeatherServiceError("Keine aktuellen Open-Meteo-Daten verfügbar")
@@ -800,4 +792,7 @@ def main() -> None:
 
 
 if __name__ == "__main__":
+    from .logging_setup import setup_logging
+
+    setup_logging()
     main()

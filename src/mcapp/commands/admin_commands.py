@@ -2,8 +2,11 @@
 
 from typing import Any
 
+from ..logging_setup import get_logger
 from ._base import CommandHandlerBase
-from .constants import CALLSIGN_STRICT_RE, has_console
+from .constants import CALLSIGN_STRICT_RE
+
+logger = get_logger(__name__)
 
 
 class AdminCommandsMixin(CommandHandlerBase):
@@ -11,31 +14,27 @@ class AdminCommandsMixin(CommandHandlerBase):
 
     async def handle_group_control(self, kwargs: dict[str, Any], requester: str) -> str:
         """Control group response mode (admin only)"""
-        if has_console:
-            print(f"🔍 handle_group_control called with kwargs={kwargs}, requester='{requester}'")
+        logger.debug(
+            "handle_group_control called with kwargs=%s, requester='%s'", kwargs, requester
+        )
 
         if not self._is_admin(requester):
-            if has_console:
-                print(f"🔍 Admin check failed for '{requester}'")
+            logger.debug("Admin check failed for '%s'", requester)
             return "❌ Admin access required"
 
         state = kwargs.get("state", "").lower()
-        if has_console:
-            print(f"🔍 Extracted state: '{state}'")
+        logger.debug("Extracted state: '%s'", state)
 
         if state == "on":
             self.group_responses_enabled = True
-            if has_console:
-                print("🔍 Set group_responses_enabled = True")
+            logger.debug("Set group_responses_enabled = True")
             return "✅ Group responses ENABLED"
         if state == "off":
             self.group_responses_enabled = False
-            if has_console:
-                print("🔍 Set group_responses_enabled = False")
+            logger.debug("Set group_responses_enabled = False")
             return "✅ Group responses DISABLED"
         current = "ON" if self.group_responses_enabled else "OFF"
-        if has_console:
-            print(f"🔍 No valid state, current setting: {current}")
+        logger.debug("No valid state, current setting: %s", current)
         return f"🔧 Group responses: {current}. Use !group on|off"
 
     async def handle_kickban(self, kwargs: dict[str, Any], requester: str) -> str:  # noqa: PLR0911 - complex handler kept intact

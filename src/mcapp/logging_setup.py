@@ -28,11 +28,21 @@ class EmojiFormatter(logging.Formatter):
     }
 
     def format(self, record: logging.LogRecord) -> str:
-        # Add emoji prefix for warnings/errors if not already present
+        # Add emoji prefix for warnings/errors if not already present. Mutating the
+        # shared record would stack the prefix if multiple handlers format it, so
+        # format the message text ourselves and restore record.msg afterward.
         emoji = self.LEVEL_EMOJIS.get(record.levelno, "")
-        if emoji and not record.getMessage().strip().startswith(tuple("⚠️❌💥🔧📡🔍🔄")):
-            record.msg = f"{emoji}{record.msg}"
-        return super().format(record)
+        message = record.getMessage()
+        original_msg = record.msg
+        original_args = record.args
+        if emoji and not message.strip().startswith(tuple("⚠️❌💥🔧📡🔍🔄")):
+            record.msg = f"{emoji}{message}"
+            record.args = None
+        try:
+            return super().format(record)
+        finally:
+            record.msg = original_msg
+            record.args = original_args
 
 
 def setup_logging(

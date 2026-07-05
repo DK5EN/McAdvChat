@@ -11,7 +11,7 @@ from typing import Any
 from ..logging_setup import get_logger
 from ..util import now_ms
 from ._base import CommandHandlerBase
-from .constants import CHUNK_SEND_DELAY_SECONDS, MAX_CHUNKS, MAX_RESPONSE_LENGTH, has_console
+from .constants import CHUNK_SEND_DELAY_SECONDS, MAX_CHUNKS, MAX_RESPONSE_LENGTH
 
 logger = get_logger(__name__)
 
@@ -48,18 +48,14 @@ class ResponseMixin(CommandHandlerBase):
         self._response_bg_tasks.add(task)
         task.add_done_callback(self._response_bg_tasks.discard)
 
-    async def _send_chunks(  # noqa: PLR0912 - complex handler kept intact
-        self, chunks: list[str], recipient: str, src_type: str
-    ) -> None:
+    async def _send_chunks(self, chunks: list[str], recipient: str, src_type: str) -> None:
         """Send response chunks in order, preserving the 12 s LoRa airtime spacing."""
-        if has_console:
-            print(
-                f"🐛 send_response:"
-                f" recipient='{recipient}',"
-                f" my_callsign='{self.my_callsign}',"
-                f" equal="
-                f"{recipient.upper() == self.my_callsign}"
-            )
+        logger.debug(
+            "send_response: recipient='%s', my_callsign='%s', equal=%s",
+            recipient,
+            self.my_callsign,
+            recipient.upper() == self.my_callsign,
+        )
 
         for i, raw_chunk in enumerate(chunks[:MAX_CHUNKS]):
             chunk = raw_chunk
@@ -68,8 +64,7 @@ class ResponseMixin(CommandHandlerBase):
                 chunk = chunk_header + raw_chunk
 
             if recipient.upper() == self.my_callsign:
-                if has_console:
-                    print("🔄 CommandHandler: Self-response, sending directly to WebSocket")
+                logger.debug("Self-response, sending directly to WebSocket")
 
                 # Send directly via WebSocket, bypass BLE routing
                 if self.message_router:
@@ -102,20 +97,17 @@ class ResponseMixin(CommandHandlerBase):
                 }
 
                 # Route to appropriate protocol (BLE or UDP)
-                if has_console:
-                    print("command handler: src_type", src_type)
+                logger.debug("command handler: src_type=%s", src_type)
 
                 try:
                     if src_type in ("ble", "ble_remote"):
                         await self.message_router.publish("command", "ble_message", message_data)
-                        if has_console:
-                            print(f"📋 CommandHandler: Sent chunk {i + 1} via BLE to {recipient}")
+                        logger.debug("Sent chunk %d via BLE to %s", i + 1, recipient)
                     elif src_type in ["udp", "node", "lora"]:
                         # Update message data for UDP transport
                         message_data["src_type"] = "command_response_udp"
                         await self.message_router.publish("command", "udp_message", message_data)
-                        if has_console:
-                            print(f"📋 CommandHandler: Sent chunk {i + 1} via UDP to {recipient}")
+                        logger.debug("Sent chunk %d via UDP to %s", i + 1, recipient)
                     else:
                         logger.warning(
                             "RESPONSE LOST: No transport for src_type=%r, recipient=%s, msg=%s",
@@ -135,8 +127,7 @@ class ResponseMixin(CommandHandlerBase):
             if i < len(chunks) - 1:
                 await asyncio.sleep(CHUNK_SEND_DELAY_SECONDS)
 
-            if has_console:
-                print(f"📋 CommandHandler: Sent response chunk {i + 1} to {recipient}")
+            logger.debug("Sent response chunk %d to %s", i + 1, recipient)
 
     def _chunk_response(self, response: str) -> list[str]:
         """Split response into chunks - simple and robust"""

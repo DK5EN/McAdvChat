@@ -1004,3 +1004,31 @@ Review checklist:
   Opus review: **approved, zero defects** — every deletion's caller-grep independently
   re-derived, migration blocks confirmed byte-identical, CMD-02 reachability re-traced from
   scratch. Gates green (ruff check, ruff format --check, startup tests — 5 suites, 0 failures).
+
+- [2026-07-05] Wave 4 complete (CO-09, CMD-06, MET-02, MET-03, X-03, CO-16). `udp_handler.py`'s
+  RF-noise character rejection demoted ERROR→DEBUG (log-spam fix) and its duplicate report in
+  `strip_invalid_utf8` removed outright (the per-character log already fires once in
+  `is_allowed_char`). The four CMD-06 files (`topic_beacon.py`, `admin_commands.py`,
+  `response.py`, `weather_command.py`) had every `if has_console: print(...)` converted to
+  `logger.debug/warning/exception`, decorative-only emoji dropped, message content preserved.
+  `meteo.py` no longer calls `logging.basicConfig()` at import (MET-02 — was hijacking root
+  logging for the whole app); its openmeteo debug dump moved to `logger.debug` (MET-03). X-03:
+  `commands/constants.py`'s independent `has_console` computation now sources from
+  `logging_setup.has_console()` (Wave 3 had already removed the other two independent
+  computations). CO-16: `EmojiFormatter.format()` no longer mutates the shared `record.msg` —
+  saves/restores via a `finally` block instead. Caught and fixed one gap after the
+  implementation pass: `commands/handler.py:168` had the same invisible-under-systemd startup
+  banner as CMD-06's four named files (not itself one of them, but the wave's own acceptance
+  grep — `if has_console` across all of `src/mcapp/commands` — expects it gone too), converted
+  for consistency. Opus review caught nothing further, but I'd independently found and fixed
+  one content-preservation regression before sending it for review:
+  `weather_command.py`'s `except ImportError as e:` had been converted in a way that silently
+  dropped the exception detail (`logger.warning("Weather service unavailable")` instead of
+  including `{e}`) — fixed to `logger.warning("Weather service unavailable: %s", e)`. Review
+  independently re-checked every conversion for the same class of bug (info silently dropped,
+  or a needed `as e` binding dropped causing a latent `NameError`) and found none. Intentionally
+  left untouched: `commands/tests.py`'s ~70 `if has_console:` sites (the built-in test suite's
+  own console-reporting mechanism — a CLAUDE.md-documented, different, and still-correct
+  pattern, not the systemd-invisible-logging problem this wave targets) and all of
+  `ble_service/` (separate process, own already-intentional `logging.basicConfig` setup, outside
+  this wave's `src/mcapp/` scope). Opus review: **approved, zero defects**.

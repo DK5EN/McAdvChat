@@ -1,5 +1,6 @@
 import re
-import sys
+
+from ..logging_setup import has_console as _has_console
 
 # Response chunking constants
 MAX_RESPONSE_LENGTH = 140  # Maximum characters per message chunk
@@ -29,4 +30,6 @@ COMMAND_THROTTLING = {
     # All other commands use default 5 minutes
 }
 
-has_console = sys.stdout.isatty()
+# X-03: single has_console computation lives in logging_setup; this just calls it once
+# at import time so existing `if has_console:` call sites don't need to change.
+has_console = _has_console()

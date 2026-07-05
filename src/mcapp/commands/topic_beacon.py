@@ -7,8 +7,10 @@ import contextlib
 from datetime import datetime
 from typing import Any
 
+from ..logging_setup import get_logger
 from ._base import CommandHandlerBase
-from .constants import has_console
+
+logger = get_logger(__name__)
 
 _TEXT_PREVIEW_CHARS = 30
 _STATUS_PREVIEW_CHARS = 50
@@ -119,12 +121,10 @@ class TopicBeaconMixin(CommandHandlerBase):
 
             task.add_done_callback(self.topic_tasks.discard)
 
-            if has_console:
-                print(f"📡 Started beacon for group {group}: interval {interval_seconds}s")
+            logger.debug("Started beacon for group %s: interval %ds", group, interval_seconds)
 
-        except Exception as e:
-            if has_console:
-                print(f"❌ Failed to start beacon for group {group}: {e}")
+        except Exception:
+            logger.exception("Failed to start beacon for group %s", group)
             return False
 
         else:
@@ -146,12 +146,10 @@ class TopicBeaconMixin(CommandHandlerBase):
 
             del self.active_topics[group]
 
-            if has_console:
-                print(f"📡 Stopped beacon for group {group}")
+            logger.debug("Stopped beacon for group %s", group)
 
-        except Exception as e:
-            if has_console:
-                print(f"❌ Failed to stop beacon for group {group}: {e}")
+        except Exception:
+            logger.exception("Failed to stop beacon for group %s", group)
             return False
 
         else:
@@ -168,17 +166,14 @@ class TopicBeaconMixin(CommandHandlerBase):
 
                 await self._send_beacon_message(group, text)
 
-                if has_console:
-                    print(f"📡 Sent beacon to group {group}: '{text[:30]}...'")
+                logger.debug("Sent beacon to group %s: '%s...'", group, text[:_TEXT_PREVIEW_CHARS])
 
         except asyncio.CancelledError:
-            if has_console:
-                print(f"📡 Beacon loop cancelled for group {group}")
+            logger.debug("Beacon loop cancelled for group %s", group)
             raise
 
-        except Exception as e:
-            if has_console:
-                print(f"❌ Beacon loop error for group {group}: {e}")
+        except Exception:
+            logger.exception("Beacon loop error for group %s", group)
 
             if group in self.active_topics:
                 del self.active_topics[group]
@@ -196,14 +191,12 @@ class TopicBeaconMixin(CommandHandlerBase):
 
                 await self.message_router.publish("beacon", "udp_message", beacon_message)
 
-        except Exception as e:
-            if has_console:
-                print(f"❌ Failed to send beacon message to group {group}: {e}")
+        except Exception:
+            logger.exception("Failed to send beacon message to group %s", group)
 
     async def cleanup_topic_beacons(self) -> None:
         """Clean up all running beacon tasks"""
-        if has_console:
-            print(f"🧹 Cleaning up {len(self.active_topics)} beacon tasks...")
+        logger.debug("Cleaning up %d beacon tasks...", len(self.active_topics))
 
         groups_to_stop = list(self.active_topics.keys())
         for group in groups_to_stop:
@@ -219,5 +212,4 @@ class TopicBeaconMixin(CommandHandlerBase):
 
         self.topic_tasks.clear()
 
-        if has_console:
-            print("✅ All beacon tasks cleaned up")
+        logger.debug("All beacon tasks cleaned up")
