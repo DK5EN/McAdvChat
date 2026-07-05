@@ -75,7 +75,7 @@ git subtree pull --prefix=src/mcapp/classifier mc-chat classifier --squash
 
 The `mc-chat` remote is a local path remote already configured in this repo.
 
-Schema migrations: add new columns to `messages` or new tables via a `current_version < N` block in `sqlite_storage.initialize()` and bump `SCHEMA_VERSION`. Current schema: v16.
+Schema migrations: add new columns to `messages` or new tables via a `current_version < N` block in `sqlite_storage.initialize()` and bump `SCHEMA_VERSION`. Current schema: v19.
 
 ## Configuration
 
@@ -86,7 +86,8 @@ BLE mode: `remote` or `disabled` (`MCAPP_BLE_MODE` env override). See `ble_servi
 
 - **All DB timestamps are in milliseconds** (not seconds). Divide by 1000 for `datetime.fromtimestamp()`. Forgetting this causes `ValueError: year 58089 is out of range`.
 - **SSH + python3 -c quoting**: Use single quotes for Python code, `\"` for strings inside. Never use f-strings with dict key access — use `%` formatting. Or write a temp script with `cat > /tmp/q.py << 'PYEOF'`.
-- **MHeard beacons** (RSSI/SNR, no coordinates) and **position beacons** (lat/lon, no signal) are disjoint packet types. `station_positions` merges them per callsign with independent field-group updates.
+- **MHeard beacons** (RSSI/SNR, no coordinates) and **position beacons** (lat/lon, no signal) used to be disjoint packet types. Since firmware `c4ad78bb`, an Extern-UDP `pos` packet (`src_type=="lora"`) carries **both** — `store_message()` updates both `station_positions` field groups (signal + position) in that case. See `doc/2026-02-11_1400-position-signal-architecture-ADR.md`'s 2026-07-05 amendment and `doc/UDP-2.0-impl.md`.
+- **Extern-UDP wire format** (node → proxy, JSON, port 1799, bidirectional): `rssi`/`snr` are present only on `pos`/`msg` packets, only since firmware `c4ad78bb` (2026-03-01) — detect capability by key presence, there's no protocol version field. Both are already final values: RSSI is dBm as-is, SNR is already ÷4 in firmware — **never re-scale either**. Only `src_type=="lora"` (received over RF) carries real signal; `"node"`/`"udp"` send a `0/0` sentinel and must be excluded by an explicit `src_type` check, not just a range check.
 
 ## Deployment
 
@@ -97,7 +98,7 @@ Two Raspberry Pi Zero 2W targets: `mcapp.local` (production) and `rpizero.local`
 - Service: `systemctl status mcapp` — `ExecStart=/home/martin/.local/bin/uv run mcapp`
 - Source: `~/mcapp-slots/current/src/mcapp/`
 - Config: `/etc/mcapp/config.json`
-- DB: `/var/lib/mcapp/messages.db` (SQLite, WAL mode, schema v16)
+- DB: `/var/lib/mcapp/messages.db` (SQLite, WAL mode, schema v19)
 - Logs: `sudo journalctl -u mcapp.service -f`
 
 See `bootstrap/README.md` for installation, `doc/tls-architecture.md` for TLS setup, `doc/tls-maintenance-SOP.md` for maintenance.

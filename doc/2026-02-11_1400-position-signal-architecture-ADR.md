@@ -6,6 +6,32 @@
 
 ---
 
+## Amendment (2026-07-05): the "disjoint packet" invariant no longer holds for Extern-UDP
+
+Section 1 states MHeard beacons and position beacons "are **completely disjoint** -- no
+single packet ever contains both RSSI/SNR AND coordinates." That was true for the BLE
+MHeard vs. LoRa-position sources this ADR was written against, but **firmware commit
+`c4ad78bb`** ("extudp rssi snr", 2026-03-01) added `rssi`/`snr` to the Extern-UDP `pos`
+packet (`src_type=="lora"`) alongside its existing `lat`/`long` — so a single `pos`
+packet from that interface now carries **both** signal and position data.
+
+MCProxy handles this (implemented in **UDP 2.0 Track U**, see `doc/UDP-2.0-impl.md`) by
+routing such a packet through **both** field-group update paths in one `store_message`
+call: `_ingest_signal()` (new, generalizes the old BLE-only `is_mheard` gate to also
+match `src_type=="lora"` `pos`/`msg` packets with valid signal) updates the `signal`
+group, and the existing position branch (§3.1's "Position beacon" row) updates the
+`location` group — unchanged from each other, since §3.1's per-field-group UPSERT
+design already anticipated independent updates. **No schema or table-design change was
+needed for this** — the architecture in §3 was already general enough; only the
+`store_message` gate in §4 needed generalizing from an if/elif to two independent
+branches. `signal_log` additionally gained a `source TEXT` column (`'mheard'` |
+`'lora'`) to distinguish which transport measured a given signal_log row (schema v19).
+
+Read `doc/UDP-2.0-impl.md` for the full design; this note exists so a reader of this ADR
+doesn't take "completely disjoint" as still-current.
+
+---
+
 ## 1. Problem Statement
 
 The original architecture stored all position-related data in a single `messages` table with `type='pos'`. This mixed two fundamentally different packet types:
