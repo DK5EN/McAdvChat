@@ -36,11 +36,12 @@ from .score import compute as score_compute
 from .template import (
     _AUTO_BEACON_MIN_TOKENS,
     _HUMAN_CATEGORIES,
-    _tokenize_normalized,
+    check_only,
     fingerprint,
     update_and_check,
 )
 from .types import (
+    TEMPLATE_HASH_LEN,
     Classification,
     EventBusProtocol,
     SSEEvent,
@@ -54,7 +55,7 @@ ProgressCallback = Callable[["ReclassifyJob"], Awaitable[None]]
 
 def _fallback_hash(text: str) -> str:
     """Plain SHA-1 of raw text, no normalization.  Used in the exception path."""
-    return hashlib.sha1(text.encode("utf-8"), usedforsecurity=False).hexdigest()[:12]
+    return hashlib.sha1(text.encode("utf-8"), usedforsecurity=False).hexdigest()[:TEMPLATE_HASH_LEN]
 
 
 @dataclass
@@ -148,14 +149,13 @@ class Classifier:
                         is_beacon = False
                     else:
                         is_beacon = bool(tpl["auto_beacon"])
-                        # Apply exemptions even in reclassify path
+                        # Apply exemptions even in reclassify path (CLS-02: via
+                        # template's public check_only(), the same exemption
+                        # logic update_and_check() uses on the live path — this
+                        # now also checks directedness, which this reclassify
+                        # branch's old private-import reimplementation missed).
                         if is_beacon and not user_action:
-                            tokens = _tokenize_normalized(msg.get("msg") or "")
-                            if (
-                                len(tokens) <= _AUTO_BEACON_MIN_TOKENS
-                                or category in _HUMAN_CATEGORIES
-                            ):
-                                is_beacon = False
+                            is_beacon = not check_only(msg, category)
                     if is_beacon:
                         tag_set.add("auto_beacon")
                 else:
