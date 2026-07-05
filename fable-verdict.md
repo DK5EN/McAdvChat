@@ -1241,3 +1241,72 @@ Review checklist:
   deletes the key and returns, then `_handle_ack_message` deletes it again, raising `KeyError`
   that's silently swallowed by the outer `try/except Exception`. Worth a dedicated correctness
   pass in a future wave.
+
+- [2026-07-06] Wave 6 sub-commit 5/5 complete (ble_service: BLE-03, BLE-05, BLE-06, BLE-09,
+  BLE-10, BLE-11, BLE-13) — **this was the last sub-commit of Wave 6.** BLE-03: ~10 module
+  globals in `ble_service/src/main.py` (`ble_adapter`, `_ble_pin`, `_reconnect_task`,
+  `_auto_connect_task`, `_user_disconnected`, `_last_connected_mac`, `_last_connected_name`,
+  `_reconnecting`, `_reconnect_attempt`, `_reconnect_max_attempts`) plus
+  `notification_queue`/`notification_event`/`_activity_log` consolidated into one
+  `@dataclass ServiceState` singleton (`state = ServiceState()`); every `global` statement in the
+  file removed. Fixes a real pre-existing latent bug as a side effect: `lifespan()`'s startup PIN
+  load used to do a bare `_ble_pin = ...` without `global`, silently shadowing instead of updating
+  the module global — the service always started with PIN disabled regardless of persisted/env
+  state. BLE-11: new `BLEAdapter.is_busy` property + `reset_bus()` method replace 3×
+  `ble_adapter._operation_lock.locked()  # noqa: SLF001` and a hand-rolled bus-reset block. BLE-10:
+  named `STATUS_*`/`REASON_BUSY` constants for the SSE status-event/409-reason wire vocabulary,
+  mirrored (not imported — separate processes) in `ble_client_remote.py`, documented in a new
+  "Status/reason wire vocabulary" section of `ble_service/README.md`. BLE-09: `BLEClientBase` ABC
+  gained 4 new abstract methods (`cancel_reconnect`/`get_activity`/`set_ble_pin`/`refresh_status`)
+  that previously existed only on `BLEClientRemote`, with no-op implementations added to
+  `BLEClientDisabled`; the now-redundant `hasattr(client, ...)` guards at call sites in
+  `main.py`/`sse_handler.py`/`sse_routes/deploy.py` were deliberately left alone (out of scope —
+  those files were finalized in earlier sub-commits). BLE-13: new `BLEServiceError(RuntimeError)`
+  carrying `status_code`/`reason` fields, raised by `ble_client_remote.py`'s `_request()` instead
+  of a plain `RuntimeError`, so `scan()` branches on typed fields instead of substring-sniffing the
+  exception message. BLE-05/06: `decode_binary_message` now returns `dict | None` instead of
+  `dict | str` (explicit `logger.warning()` + `None` instead of bare error strings); the
+  locals()-dict-comprehension return replaced with an explicit dict via two new extracted helpers
+  (`_decode_ack_frame`/`_decode_data_frame`); named constants
+  (`_HEADER_FORMAT`/`_HEADER_LEN`/`_FOOTER_FORMAT`/`_FOOTER_LEN`/`_FCS_EXCLUDED_TRAILER_LEN`) plus
+  a frame-layout comment block replace the magic byte offsets. The `None`-check at the one caller
+  (`ble_client_remote.py`'s `_transform_notification`) incidentally fixed a latent bug where
+  `dispatcher()` used to be called unconditionally via `cast(dict, decoded)` even when `decoded`
+  was an error string.
+
+  **Self-review caught and fixed three real bugs** introduced by a blind whole-file regex rename
+  used for the BLE-03 globals-to-dataclass conversion: (1) the rename also corrupted
+  `from .ble_adapter import ...` into `from .state.ble_adapter import ...`, which would have broken
+  the module at import time; (2) `_push_status_event(state: str, **kwargs)`'s parameter name
+  collided with the new module-level `state` singleton, so `state.notification_queue.append(...)`
+  inside that function would have tried calling `.notification_queue` on a plain string — fixed by
+  renaming the parameter to `conn_state`; (3) `_startup_auto_connect`'s local
+  `state = json.load(f)` similarly shadowed the singleton, so `state.last_connected_name =
+  state.get(...)` tried setting an attribute on a plain dict (silently swallowed by a broad except)
+  and a bare `state.last_connected_mac = mac` afterward would raise `UnboundLocalError` whenever the
+  state file didn't exist yet — fixed by renaming the local to `saved_state`. All three verified
+  fixed with live import/smoke tests before sending for review. BLE-05/06's equivalence was verified
+  with a scratchpad script comparing old-vs-new `decode_binary_message` output on synthetic ACK/msg/
+  pos frames (byte-identical). Opus review independently re-ran an AST-based shadowing scan across
+  all of `ble_service/src/main.py` looking for a fourth instance of the same bug class — found none,
+  but flagged one MINOR naming-trap: `_save_ble_state`/`_load_ble_state`/`_load_ble_pin`/
+  `_save_ble_pin` each kept a local variable literally named `state` (safe today — each is a
+  self-contained local dict that never touches the singleton — but inconsistent with the fix applied
+  to `_startup_auto_connect` and a foot-gun for a future edit); renamed all four to `saved_state` for
+  consistency before committing. Independently re-derived the BLE-05/06 equivalence check from
+  scratch (constructed ACK/msg/pos/malformed frames via `struct.pack`, diffed old vs new
+  byte-for-byte) and confirmed the `_decode_data_frame` `PLR0913` noqa is load-bearing. **Verdict:
+  approve.** Gates green (ruff check, ruff format --check, startup tests — 5 suites), noqa counts
+  accounted for (main.py 10→7, ble_protocol.py 3→4 with the one addition confirmed load-bearing,
+  others unchanged), classifier subtree untouched, scope discipline confirmed (only the 7
+  ble_service/ble-client-stack files touched).
+
+  **Wave 6 completeness note:** across all 5 sub-commits, Section 7's Wave 6 scope is covered
+  (ST-04/05/06, SSE-01, CO-04/05/07, CMD-03/04/09, BLE-03/05/06/09/10/11/13) **except "SCR-04
+  structure items"** (`scripts/update-runner.py`: module globals → a `Paths`-style dataclass;
+  `publish()`'s unbounded `queue.Full` suppression + unbounded `_history` growth) — confirmed via
+  `git diff --stat` that `update-runner.py` was never touched across Wave 6 (last touched in
+  Wave 1). This is a MINOR/grouped scripts-only item that doesn't fit any of the 5 sub-commit
+  boundaries (storage/sse/main/ctcping/ble_service) used for this wave. **Deferred, not forgotten**
+  — pick up alongside Wave 7 (which already works in the scripts/perf space) or as its own small
+  follow-up commit before Wave 7 starts.

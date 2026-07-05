@@ -197,6 +197,26 @@ The `state` field in status responses reflects the current connection lifecycle:
 | `disconnecting` | Disconnect in progress |
 | `error` | Connection failed (cleared by calling disconnect) |
 
+### Status/reason wire vocabulary (BLE-10)
+
+Two additional values are layered on top of the five connection states above,
+used only in SSE `status` events (`event: status`) pushed to `/api/ble/notifications`
+and in the `reason` field of 409 responses. They are **not** part of the
+`ConnectionState` enum — they describe the auto-reconnect process itself, not
+BlueZ's connection state:
+
+| Value | Where it appears | Meaning |
+|-------|-------------------|---------|
+| `reconnecting` | SSE `status.state`, 409 `reason` | An auto-reconnect attempt is in progress (`attempt`/`max_attempts`/`next_retry_in` accompany it) |
+| `reconnect_exhausted` | SSE `status.state` | All reconnect attempts failed (`attempts`/`device_name` accompany it) |
+| `busy` | 409 `reason` | Another BLE operation (scan/connect/pair) holds the operation lock — not a reconnect |
+
+⚠ These are string constants (`STATUS_RECONNECTING`, `STATUS_RECONNECT_EXHAUSTED`,
+`REASON_BUSY`) mirrored — not imported — between `ble_service/src/main.py` and
+`src/mcapp/ble_client_remote.py`, since the two are separate processes with no
+shared code. Changing a value on one side without the other is a wire-format
+break.
+
 ## Error Codes
 
 | Code | Meaning | Example |

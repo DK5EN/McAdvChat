@@ -7,7 +7,6 @@ and Server-Sent Events for real-time notifications.
 
 import asyncio
 import base64
-import contextlib
 import json
 import logging
 import os
@@ -15,6 +14,7 @@ import secrets
 import time
 from collections import deque
 from contextlib import asynccontextmanager
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Annotated
 
@@ -37,6 +37,20 @@ SSE_PING_INTERVAL_S = 30.0  # ⚠ client (ble_client_remote.py SSE_READ_TIMEOUT_
 POST_CONNECT_SETTLE_S = 1.0
 INTER_MESSAGE_DELAY_S = 0.2
 
+# SSE `status` event `state` values and 409-response `reason` values (BLE-10).
+# This is a small transitional/error vocabulary layered on top of BlueZ's own
+# connection states — NOT the same thing as mcapp.ble_client.ConnectionState,
+# which models BLEAdapter's low-level D-Bus state. ble_service and mcapp are
+# separate processes (no shared code), so these are mirrored — not imported —
+# as string constants in src/mcapp/ble_client_remote.py. Documented in
+# ble_service/README.md's "Status/reason wire vocabulary" section. ⚠ changing
+# any of these values is a wire-format break with the mcapp client.
+STATUS_CONNECTED = "connected"
+STATUS_DISCONNECTED = "disconnected"
+STATUS_RECONNECTING = "reconnecting"
+STATUS_RECONNECT_EXHAUSTED = "reconnect_exhausted"
+REASON_BUSY = "busy"
+
 
 def _now_ms() -> int:
     """Current time in milliseconds, matching the DB's millisecond timestamp convention.
@@ -58,24 +72,40 @@ BLE_AUTO_CONNECT = os.getenv("BLE_AUTO_CONNECT", "true").lower() != "false"
 AUTO_CONNECT_DELAY = int(os.getenv("BLE_AUTO_CONNECT_DELAY", "8"))
 _BLE_PIN_ENV = int(os.getenv("BLE_SERVICE_BLE_PIN", "0"))  # startup default from env
 
-# Global state
-ble_adapter: BLEAdapter | None = None
-_ble_pin: int = 0  # active PIN; 0 = disabled
-notification_queue: deque[dict] = deque(maxlen=NOTIFICATION_QUEUE_SIZE)
-notification_event = asyncio.Event()
-_reconnect_task: asyncio.Task | None = None
-_auto_connect_task: asyncio.Task | None = None
-_user_disconnected: bool = False
-_last_connected_mac: str | None = None
-_last_connected_name: str | None = None
 
-# Reconnect tracking (visible to status endpoint and 409 responses)
-_reconnecting: bool = False
-_reconnect_attempt: int = 0
-_reconnect_max_attempts: int = 0
+@dataclass
+class ServiceState:
+    """All mutable BLE-service state (BLE-03), replacing what used to be ~10
+    module globals individually rebound via scattered `global` statements.
 
-# Activity log ring buffer
-_activity_log: deque[dict] = deque(maxlen=ACTIVITY_LOG_SIZE)
+    That scattering had already caused a latent bug: `lifespan()`'s startup PIN
+    load assigned a bare `_ble_pin = ...` without declaring `global _ble_pin`,
+    so it silently created a function-local shadow instead of updating the
+    module global — the service always started with `ble_pin == 0` regardless
+    of persisted/env state. Mutating `state.ble_pin` here can't have that bug:
+    attribute assignment on an existing object never needs `global`.
+    """
+
+    ble_adapter: BLEAdapter | None = None
+    ble_pin: int = 0  # active PIN; 0 = disabled
+    notification_queue: deque = field(default_factory=lambda: deque(maxlen=NOTIFICATION_QUEUE_SIZE))
+    notification_event: asyncio.Event = field(default_factory=asyncio.Event)
+    reconnect_task: asyncio.Task | None = None
+    auto_connect_task: asyncio.Task | None = None
+    user_disconnected: bool = False
+    last_connected_mac: str | None = None
+    last_connected_name: str | None = None
+
+    # Reconnect tracking (visible to status endpoint and 409 responses)
+    reconnecting: bool = False
+    reconnect_attempt: int = 0
+    reconnect_max_attempts: int = 0
+
+    # Activity log ring buffer
+    activity_log: deque = field(default_factory=lambda: deque(maxlen=ACTIVITY_LOG_SIZE))
+
+
+state = ServiceState()
 
 
 def crc16_ccitt(data: bytes) -> int:
@@ -130,8 +160,8 @@ def notification_callback(data: bytes):
         logger.warning("Notification decode error: %s", e)
         notification["format"] = "raw"
 
-    notification_queue.append(notification)
-    notification_event.set()
+    state.notification_queue.append(notification)
+    state.notification_event.set()
     logger.debug("Notification queued: %s", notification.get("format", "unknown"))
 
 
@@ -143,7 +173,7 @@ def _save_ble_state(mac: str, name: str | None = None) -> None:
     try:
         # Preserve ble_pin if already stored
         existing_pin = _load_ble_pin()
-        state = {
+        saved_state = {
             "device_mac": mac,
             "device_name": name,
             "connected_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
@@ -151,7 +181,7 @@ def _save_ble_state(mac: str, name: str | None = None) -> None:
         }
         tmp = BLE_STATE_FILE.with_name(BLE_STATE_FILE.name + ".tmp")
         with tmp.open("w") as f:
-            json.dump(state, f)
+            json.dump(saved_state, f)
         tmp.replace(BLE_STATE_FILE)
         logger.info("Saved BLE state: %s (%s)", mac, name or "no name")
     except Exception as e:
@@ -162,10 +192,10 @@ def _load_ble_state() -> str | None:
     """Load last-connected MAC from disk. Returns None if no state."""
     try:
         with BLE_STATE_FILE.open() as f:
-            state = json.load(f)
-        mac = state.get("device_mac")
+            saved_state = json.load(f)
+        mac = saved_state.get("device_mac")
         if mac:
-            logger.info("Loaded BLE state: %s (%s)", mac, state.get("device_name", "no name"))
+            logger.info("Loaded BLE state: %s (%s)", mac, saved_state.get("device_name", "no name"))
     except (FileNotFoundError, json.JSONDecodeError, KeyError):
         return None
 
@@ -186,8 +216,8 @@ def _load_ble_pin() -> int:
     """Load persisted BLE PIN from state file. Returns 0 if not set."""
     try:
         with BLE_STATE_FILE.open() as f:
-            state = json.load(f)
-        return int(state.get("ble_pin", 0))
+            saved_state = json.load(f)
+        return int(saved_state.get("ble_pin", 0))
     except (FileNotFoundError, json.JSONDecodeError, ValueError):
         return 0
 
@@ -197,13 +227,13 @@ def _save_ble_pin(pin: int) -> None:
     try:
         try:
             with BLE_STATE_FILE.open() as f:
-                state = json.load(f)
+                saved_state = json.load(f)
         except (FileNotFoundError, json.JSONDecodeError):
-            state = {}
-        state["ble_pin"] = pin
+            saved_state = {}
+        saved_state["ble_pin"] = pin
         tmp = BLE_STATE_FILE.with_name(BLE_STATE_FILE.name + ".tmp")
         with tmp.open("w") as f:
-            json.dump(state, f)
+            json.dump(saved_state, f)
         tmp.replace(BLE_STATE_FILE)
         logger.info("Saved BLE PIN: %s", "disabled" if pin == 0 else "set")
     except Exception as e:
@@ -216,17 +246,14 @@ def _save_ble_pin(pin: int) -> None:
 async def _connect_and_initialize(mac: str) -> bool:
     """Connect to device and run post-connect initialization. Returns True on success."""
     # Clean up stale bus before reconnect
-    if ble_adapter.bus:
-        with contextlib.suppress(Exception):
-            ble_adapter.bus.disconnect()
-        ble_adapter.bus = None
+    state.ble_adapter.reset_bus()
 
-    success = await ble_adapter.connect(mac)
+    success = await state.ble_adapter.connect(mac)
     if success:
-        await ble_adapter.start_notify()
-        await ble_adapter.send_hello()
+        await state.ble_adapter.start_notify()
+        await state.ble_adapter.send_hello()
         await asyncio.sleep(POST_CONNECT_SETTLE_S)
-        await ble_adapter.query_extended_registers()
+        await state.ble_adapter.query_extended_registers()
     return success
 
 
@@ -235,7 +262,7 @@ async def _connect_and_initialize(mac: str) -> bool:
 
 def _log_activity(action: str, detail: str = "", level: str = "info"):
     """Append an entry to the activity log ring buffer."""
-    _activity_log.append(
+    state.activity_log.append(
         {
             "ts": _now_ms(),
             "action": action,
@@ -245,30 +272,29 @@ def _log_activity(action: str, detail: str = "", level: str = "info"):
     )
 
 
-def _push_status_event(state: str, **kwargs):
+def _push_status_event(conn_state: str, **kwargs):
     """Push a BLE status change event into the notification queue for SSE delivery."""
     event = {
         "event_type": "status",
-        "state": state,
+        "state": conn_state,
         "timestamp": _now_ms(),
         **kwargs,
     }
-    notification_queue.append(event)
-    notification_event.set()
-    logger.info("Status event pushed: %s", state)
+    state.notification_queue.append(event)
+    state.notification_event.set()
+    logger.info("Status event pushed: %s", conn_state)
 
 
 def _on_adapter_disconnect():
     """Called by BLEAdapter when an unexpected disconnect is detected"""
-    global _reconnect_task
-    _push_status_event("disconnected")
+    _push_status_event(STATUS_DISCONNECTED)
     _log_activity("disconnect", "Unexpected connection loss", "warn")
-    if _user_disconnected:
+    if state.user_disconnected:
         return
     logger.warning("Unexpected disconnect detected, scheduling auto-reconnect")
     # Schedule reconnect (can't await from sync callback)
-    if _reconnect_task is None or _reconnect_task.done():
-        _reconnect_task = asyncio.create_task(_auto_reconnect())
+    if state.reconnect_task is None or state.reconnect_task.done():
+        state.reconnect_task = asyncio.create_task(_auto_reconnect())
 
 
 async def _retry_connect(  # noqa: PLR0912, PLR0913, PLR0915 - consolidates two near-duplicate loops (BLE-02); params cover both callers' distinct behaviors
@@ -298,29 +324,28 @@ async def _retry_connect(  # noqa: PLR0912, PLR0913, PLR0915 - consolidates two 
     keyword params rather than unified, since none of those wording diffs were
     a listed finding.
     """
-    global _reconnecting, _reconnect_attempt, _reconnect_max_attempts
-    _reconnecting = True
-    _reconnect_max_attempts = len(delays)
+    state.reconnecting = True
+    state.reconnect_max_attempts = len(delays)
 
     for attempt, delay in enumerate(delays, 1):
-        if _user_disconnected:
+        if state.user_disconnected:
             if log_cancel_info:
                 logger.info("%s cancelled (user disconnected)", label)
-            _reconnecting = False
-            _reconnect_attempt = 0
+            state.reconnecting = False
+            state.reconnect_attempt = 0
             if log_cancel_activity:
                 _log_activity("reconnect_cancelled", "Cancelled by user", "info")
             return False
-        if not sleep_before_attempt and ble_adapter.is_connected:
+        if not sleep_before_attempt and state.ble_adapter.is_connected:
             logger.info("Already connected, stopping %s", label.lower())
-            _reconnecting = False
-            _reconnect_attempt = 0
+            state.reconnecting = False
+            state.reconnect_attempt = 0
             return False
 
-        _reconnect_attempt = attempt
+        state.reconnect_attempt = attempt
         if sleep_before_attempt:
             _push_status_event(
-                "reconnecting",
+                STATUS_RECONNECTING,
                 attempt=attempt,
                 max_attempts=len(delays),
                 next_retry_in=delay,
@@ -335,20 +360,20 @@ async def _retry_connect(  # noqa: PLR0912, PLR0913, PLR0915 - consolidates two 
             logger.info("%s attempt %d/%d in %ds to %s", label, attempt, len(delays), delay, mac)
             await asyncio.sleep(delay)
 
-            if _user_disconnected:
-                _reconnecting = False
-                _reconnect_attempt = 0
+            if state.user_disconnected:
+                state.reconnecting = False
+                state.reconnect_attempt = 0
                 if log_cancel_activity:
                     _log_activity("reconnect_cancelled", "Cancelled by user", "info")
                 return False
-            if ble_adapter.is_connected:
+            if state.ble_adapter.is_connected:
                 logger.info("Already reconnected, stopping %s", label.lower())
-                _reconnecting = False
-                _reconnect_attempt = 0
+                state.reconnecting = False
+                state.reconnect_attempt = 0
                 return False
         else:
             _push_status_event(
-                "reconnecting",
+                STATUS_RECONNECTING,
                 attempt=attempt,
                 max_attempts=len(delays),
                 next_retry_in=delay,
@@ -371,9 +396,9 @@ async def _retry_connect(  # noqa: PLR0912, PLR0913, PLR0915 - consolidates two 
             )
             if success:
                 logger.info("%s successful to %s", label, mac)
-                _reconnecting = False
-                _reconnect_attempt = 0
-                _push_status_event("connected", device_address=mac, device_name=name)
+                state.reconnecting = False
+                state.reconnect_attempt = 0
+                _push_status_event(STATUS_CONNECTED, device_address=mac, device_name=name)
                 _log_activity(success_action, f"{success_detail} {name}", "info")
                 return True
             logger.warning("%s attempt %d failed", label, attempt)
@@ -394,10 +419,10 @@ async def _retry_connect(  # noqa: PLR0912, PLR0913, PLR0915 - consolidates two 
             logger.info("Retrying in %ds...", delay)
             await asyncio.sleep(delay)
 
-    _reconnecting = False
-    _reconnect_attempt = 0
+    state.reconnecting = False
+    state.reconnect_attempt = 0
     _push_status_event(
-        "reconnect_exhausted",
+        STATUS_RECONNECT_EXHAUSTED,
         attempts=len(delays),
         device_name=name,
         device_address=mac,
@@ -416,8 +441,8 @@ async def _retry_connect(  # noqa: PLR0912, PLR0913, PLR0915 - consolidates two 
 
 async def _auto_reconnect():
     """Attempt to reconnect with exponential backoff after unexpected disconnect."""
-    mac = _last_connected_mac
-    name = _last_connected_name or mac or "unknown"
+    mac = state.last_connected_mac
+    name = state.last_connected_name or mac or "unknown"
     if not mac:
         logger.warning("No previous MAC address for auto-reconnect")
         return
@@ -442,7 +467,6 @@ async def _auto_reconnect():
 
 async def _startup_auto_connect():
     """Auto-connect to last-known device after service startup."""
-    global _last_connected_mac, _last_connected_name, _user_disconnected
 
     mac = _load_ble_state()
     if not mac:
@@ -452,14 +476,14 @@ async def _startup_auto_connect():
     # Also load device name from state file
     try:
         with BLE_STATE_FILE.open() as f:  # noqa: ASYNC230 - one-shot state read at startup
-            state = json.load(f)
-        _last_connected_name = state.get("device_name")
+            saved_state = json.load(f)
+        state.last_connected_name = saved_state.get("device_name")
     except Exception as e:
         logger.debug("Could not read device name from state: %s", e)
 
-    _last_connected_mac = mac
-    _user_disconnected = False
-    name = _last_connected_name or mac
+    state.last_connected_mac = mac
+    state.user_disconnected = False
+    name = state.last_connected_name or mac
 
     logger.info("Auto-connect: waiting %ds for Bluetooth hardware...", AUTO_CONNECT_DELAY)
     _log_activity("startup_auto_connect", f"Waiting {AUTO_CONNECT_DELAY}s for hardware", "info")
@@ -486,26 +510,25 @@ async def _startup_auto_connect():
 @asynccontextmanager
 async def lifespan(_app: FastAPI):
     """Startup and shutdown lifecycle"""
-    global ble_adapter, _auto_connect_task
 
     logger.info("Starting BLE Service")
     if not API_KEY:
         logger.warning("No API key configured — BLE service is unauthenticated")
 
     # PIN: persisted state takes priority over env var default
-    _ble_pin = _load_ble_pin() or _BLE_PIN_ENV
-    logger.info("BLE PIN: %s", "disabled" if _ble_pin == 0 else "set")
+    state.ble_pin = _load_ble_pin() or _BLE_PIN_ENV
+    logger.info("BLE PIN: %s", "disabled" if state.ble_pin == 0 else "set")
 
-    ble_adapter = BLEAdapter(
+    state.ble_adapter = BLEAdapter(
         notification_callback=notification_callback,
-        hello_bytes=build_hello_bytes(_ble_pin),
+        hello_bytes=build_hello_bytes(state.ble_pin),
     )
-    ble_adapter.pairing_passkey = _ble_pin
-    ble_adapter._disconnect_callback = _on_adapter_disconnect  # noqa: SLF001 - framework wiring
+    state.ble_adapter.pairing_passkey = state.ble_pin
+    state.ble_adapter._disconnect_callback = _on_adapter_disconnect  # noqa: SLF001 - framework wiring
 
     # Auto-connect to last-known device if enabled
     if BLE_AUTO_CONNECT:
-        _auto_connect_task = asyncio.create_task(_startup_auto_connect())
+        state.auto_connect_task = asyncio.create_task(_startup_auto_connect())
     else:
         logger.info("Auto-connect disabled (BLE_AUTO_CONNECT=false)")
 
@@ -513,17 +536,17 @@ async def lifespan(_app: FastAPI):
 
     # Cleanup
     logger.info("Shutting down BLE Service")
-    if _auto_connect_task and not _auto_connect_task.done():
-        _auto_connect_task.cancel()
-    if _reconnect_task and not _reconnect_task.done():
-        _reconnect_task.cancel()
+    if state.auto_connect_task and not state.auto_connect_task.done():
+        state.auto_connect_task.cancel()
+    if state.reconnect_task and not state.reconnect_task.done():
+        state.reconnect_task.cancel()
 
     # Notify SSE clients before closing
-    _push_status_event("disconnected", reason="service_shutdown")
+    _push_status_event(STATUS_DISCONNECTED, reason="service_shutdown")
     await asyncio.sleep(0.5)  # allow SSE delivery
 
-    if ble_adapter and ble_adapter.is_connected:
-        await ble_adapter.disconnect()
+    if state.ble_adapter and state.ble_adapter.is_connected:
+        await state.ble_adapter.disconnect()
 
 
 app = FastAPI(
@@ -632,18 +655,18 @@ class SetPinRequest(BaseModel):
 @app.get("/api/ble/status", response_model=StatusResponse)
 async def get_status(_: bool = Depends(verify_api_key)):
     """Get current BLE connection status"""
-    status = ble_adapter.status
+    status = state.ble_adapter.status
 
     return StatusResponse(
-        connected=ble_adapter.is_connected,
-        state="reconnecting" if _reconnecting else status.state.value,
-        device_address=status.device.address if status.device else _last_connected_mac,
-        device_name=status.device.name if status.device else _last_connected_name,
+        connected=state.ble_adapter.is_connected,
+        state=STATUS_RECONNECTING if state.reconnecting else status.state.value,
+        device_address=status.device.address if status.device else state.last_connected_mac,
+        device_name=status.device.name if status.device else state.last_connected_name,
         last_activity=status.last_activity,
         error=status.error,
-        reconnecting=_reconnecting,
-        reconnect_attempt=_reconnect_attempt if _reconnecting else None,
-        reconnect_max_attempts=_reconnect_max_attempts if _reconnecting else None,
+        reconnecting=state.reconnecting,
+        reconnect_attempt=state.reconnect_attempt if state.reconnecting else None,
+        reconnect_max_attempts=state.reconnect_max_attempts if state.reconnecting else None,
     )
 
 
@@ -654,33 +677,33 @@ async def scan_devices(
     _: bool = Depends(verify_api_key),
 ):
     """Scan for BLE devices"""
-    if ble_adapter._operation_lock.locked():  # noqa: SLF001 - framework wiring
+    if state.ble_adapter.is_busy:
         detail = {
             "message": "Cannot scan: auto-reconnect in progress"
-            if _reconnecting
+            if state.reconnecting
             else "Another BLE operation is in progress",
-            "reason": "reconnecting" if _reconnecting else "busy",
-            "device_name": _last_connected_name,
+            "reason": STATUS_RECONNECTING if state.reconnecting else REASON_BUSY,
+            "device_name": state.last_connected_name,
         }
-        if _reconnecting:
-            detail["attempt"] = _reconnect_attempt
-            detail["max_attempts"] = _reconnect_max_attempts
+        if state.reconnecting:
+            detail["attempt"] = state.reconnect_attempt
+            detail["max_attempts"] = state.reconnect_max_attempts
             detail["suggested_action"] = "wait_or_cancel"
         raise HTTPException(status_code=409, detail=detail)
-    if ble_adapter.is_connected:
+    if state.ble_adapter.is_connected:
         raise HTTPException(
             status_code=409,
             detail={
                 "message": "Cannot scan while connected. Disconnect first.",
-                "reason": "connected",
-                "device_name": _last_connected_name,
+                "reason": STATUS_CONNECTED,
+                "device_name": state.last_connected_name,
                 "suggested_action": "disconnect_first",
             },
         )
 
     _log_activity("scan_start", f"Scanning for {timeout}s (prefix={prefix})", "info")
     try:
-        devices = await ble_adapter.scan(timeout=timeout, prefix=prefix)
+        devices = await state.ble_adapter.scan(timeout=timeout, prefix=prefix)
         _log_activity("scan_result", f"Found {len(devices)} device(s)", "info")
         return ScanResponse(
             devices=[
@@ -706,7 +729,7 @@ async def connect(request: ConnectRequest, _: bool = Depends(verify_api_key)):
     # If only name provided, scan for device
     mac = request.device_address
     if not mac and request.device_name:
-        devices = await ble_adapter.scan(timeout=5.0)
+        devices = await state.ble_adapter.scan(timeout=5.0)
         for device in devices:
             if device.name == request.device_name:
                 mac = device.address
@@ -715,13 +738,12 @@ async def connect(request: ConnectRequest, _: bool = Depends(verify_api_key)):
             raise HTTPException(status_code=404, detail=f"Device '{request.device_name}' not found")
 
     try:
-        global _user_disconnected, _last_connected_mac, _last_connected_name
-        _user_disconnected = False
+        state.user_disconnected = False
         _log_activity("connect_start", f"Connecting to {mac}", "info")
         success = await _connect_and_initialize(mac)
         if success:
-            _last_connected_mac = mac
-            _last_connected_name = request.device_name
+            state.last_connected_mac = mac
+            state.last_connected_name = request.device_name
             _save_ble_state(mac, request.device_name)
             _log_activity("connect_success", f"Connected to {mac}", "info")
             return ResultResponse(success=True, message=f"Connected to {mac}")
@@ -736,28 +758,26 @@ async def connect(request: ConnectRequest, _: bool = Depends(verify_api_key)):
 @app.post("/api/ble/disconnect", response_model=ResultResponse)
 async def disconnect(_: bool = Depends(verify_api_key)):
     """Disconnect from current device (also resets ERROR state)"""
-    global _user_disconnected, _reconnect_task, _auto_connect_task
-    global _reconnecting, _reconnect_attempt
-    _user_disconnected = True
+    state.user_disconnected = True
     _clear_ble_state()
 
     # Cancel any pending auto-reconnect or auto-connect
-    if _auto_connect_task and not _auto_connect_task.done():
-        _auto_connect_task.cancel()
-        _auto_connect_task = None
-    if _reconnect_task and not _reconnect_task.done():
-        _reconnect_task.cancel()
-        _reconnect_task = None
+    if state.auto_connect_task and not state.auto_connect_task.done():
+        state.auto_connect_task.cancel()
+        state.auto_connect_task = None
+    if state.reconnect_task and not state.reconnect_task.done():
+        state.reconnect_task.cancel()
+        state.reconnect_task = None
 
-    _reconnecting = False
-    _reconnect_attempt = 0
+    state.reconnecting = False
+    state.reconnect_attempt = 0
 
-    if ble_adapter.status.state == ConnectionState.DISCONNECTED:
+    if state.ble_adapter.status.state == ConnectionState.DISCONNECTED:
         _log_activity("disconnect", "Already disconnected (user request)", "info")
         return ResultResponse(success=True, message="Already disconnected")
 
     try:
-        await ble_adapter.disconnect()
+        await state.ble_adapter.disconnect()
         _log_activity("disconnect", "User disconnected", "info")
         return ResultResponse(success=True, message="Disconnected")
     except Exception as e:
@@ -769,24 +789,22 @@ async def disconnect(_: bool = Depends(verify_api_key)):
 @app.post("/api/ble/cancel_reconnect", response_model=ResultResponse)
 async def cancel_reconnect(_: bool = Depends(verify_api_key)):
     """Cancel any in-progress auto-reconnect and return to idle state."""
-    global _user_disconnected, _reconnect_task, _auto_connect_task
-    global _reconnecting, _reconnect_attempt
-    _user_disconnected = True
+    state.user_disconnected = True
     _clear_ble_state()
 
     cancelled = False
-    if _reconnect_task and not _reconnect_task.done():
-        _reconnect_task.cancel()
-        _reconnect_task = None
+    if state.reconnect_task and not state.reconnect_task.done():
+        state.reconnect_task.cancel()
+        state.reconnect_task = None
         cancelled = True
-    if _auto_connect_task and not _auto_connect_task.done():
-        _auto_connect_task.cancel()
-        _auto_connect_task = None
+    if state.auto_connect_task and not state.auto_connect_task.done():
+        state.auto_connect_task.cancel()
+        state.auto_connect_task = None
         cancelled = True
 
-    _reconnecting = False
-    _reconnect_attempt = 0
-    _push_status_event("disconnected", reason="reconnect_cancelled")
+    state.reconnecting = False
+    state.reconnect_attempt = 0
+    _push_status_event(STATUS_DISCONNECTED, reason="reconnect_cancelled")
     _log_activity(
         "reconnect_cancelled",
         "User cancelled reconnect" if cancelled else "No reconnect in progress",
@@ -802,34 +820,34 @@ async def cancel_reconnect(_: bool = Depends(verify_api_key)):
 @app.get("/api/ble/activity")
 async def get_activity(_: bool = Depends(verify_api_key)):
     """Return the activity log (last 50 events)."""
-    return {"events": list(_activity_log), "count": len(_activity_log)}
+    return {"events": list(state.activity_log), "count": len(state.activity_log)}
 
 
 @app.post("/api/ble/send", response_model=ResultResponse)
 async def send_data(request: SendRequest, _: bool = Depends(verify_api_key)):
     """Send data to connected device"""
-    if not ble_adapter.is_connected:
+    if not state.ble_adapter.is_connected:
         raise HTTPException(status_code=409, detail="Not connected")
 
     try:
         # Determine what to send
         if request.command:
-            success = await ble_adapter.send_command(request.command)
+            success = await state.ble_adapter.send_command(request.command)
         elif request.message is not None and request.group is not None:
-            success = await ble_adapter.send_message(request.message, request.group)
+            success = await state.ble_adapter.send_message(request.message, request.group)
         elif request.data_base64:
             data = base64.b64decode(request.data_base64)
-            success = await ble_adapter.write(data)
+            success = await state.ble_adapter.write(data)
         elif request.data_hex:
             data = bytes.fromhex(request.data_hex)
-            success = await ble_adapter.write(data)
+            success = await state.ble_adapter.write(data)
         else:
             raise HTTPException(  # noqa: TRY301 - HTTP error response raised inline
                 status_code=400, detail="Provide command, message+group, data_base64, or data_hex"
             )
 
         # If write failed, check if device disconnected during the write
-        if not success and not ble_adapter.is_connected:
+        if not success and not state.ble_adapter.is_connected:
             raise HTTPException(  # noqa: TRY301 - HTTP error response raised inline
                 status_code=409, detail="Not connected"
             )
@@ -864,14 +882,14 @@ async def pair_device(request: ConnectRequest, _: bool = Depends(verify_api_key)
     if not request.device_address:
         raise HTTPException(status_code=400, detail="device_address required")
 
-    if ble_adapter._operation_lock.locked():  # noqa: SLF001 - framework wiring
+    if state.ble_adapter.is_busy:
         raise HTTPException(status_code=409, detail="Another BLE operation is in progress")
 
-    if ble_adapter.is_connected:
+    if state.ble_adapter.is_connected:
         raise HTTPException(status_code=409, detail="Disconnect before pairing")
 
     try:
-        success = await ble_adapter.pair(request.device_address)
+        success = await state.ble_adapter.pair(request.device_address)
         return ResultResponse(
             success=success,
             message=f"Paired with {request.device_address}" if success else "Pairing failed",
@@ -887,11 +905,11 @@ async def unpair_device(request: ConnectRequest, _: bool = Depends(verify_api_ke
     if not request.device_address:
         raise HTTPException(status_code=400, detail="device_address required")
 
-    if ble_adapter._operation_lock.locked():  # noqa: SLF001 - framework wiring
+    if state.ble_adapter.is_busy:
         raise HTTPException(status_code=409, detail="Another BLE operation is in progress")
 
     try:
-        success = await ble_adapter.unpair(request.device_address)
+        success = await state.ble_adapter.unpair(request.device_address)
         return ResultResponse(
             success=success,
             message=f"Unpaired {request.device_address}" if success else "Unpair failed",
@@ -904,11 +922,11 @@ async def unpair_device(request: ConnectRequest, _: bool = Depends(verify_api_ke
 @app.post("/api/ble/settime", response_model=ResultResponse)
 async def set_device_time(_: bool = Depends(verify_api_key)):
     """Set current time on connected device"""
-    if not ble_adapter.is_connected:
+    if not state.ble_adapter.is_connected:
         raise HTTPException(status_code=409, detail="Not connected")
 
     try:
-        success = await ble_adapter.set_time()
+        success = await state.ble_adapter.set_time()
         return ResultResponse(
             success=success, message="Time set" if success else "Failed to set time"
         )
@@ -920,11 +938,11 @@ async def set_device_time(_: bool = Depends(verify_api_key)):
 @app.post("/api/ble/config/callsign", response_model=ResultResponse)
 async def set_callsign(callsign: str, _: bool = Depends(verify_api_key)):
     """Set device callsign (0x50 message)"""
-    if not ble_adapter.is_connected:
+    if not state.ble_adapter.is_connected:
         raise HTTPException(status_code=409, detail="Not connected")
 
     try:
-        success = await ble_adapter.set_callsign(callsign)
+        success = await state.ble_adapter.set_callsign(callsign)
         return ResultResponse(
             success=success,
             message=f"Callsign set to {callsign}" if success else "Failed to set callsign",
@@ -939,11 +957,11 @@ async def set_callsign(callsign: str, _: bool = Depends(verify_api_key)):
 @app.post("/api/ble/config/wifi", response_model=ResultResponse)
 async def set_wifi(ssid: str, password: str, _: bool = Depends(verify_api_key)):
     """Configure WiFi credentials (0x55 message)"""
-    if not ble_adapter.is_connected:
+    if not state.ble_adapter.is_connected:
         raise HTTPException(status_code=409, detail="Not connected")
 
     try:
-        success = await ble_adapter.set_wifi(ssid, password)
+        success = await state.ble_adapter.set_wifi(ssid, password)
         return ResultResponse(
             success=success,
             message=f"WiFi configured: {ssid}" if success else "Failed to configure WiFi",
@@ -960,16 +978,16 @@ async def set_position(
     lat: float, lon: float, alt: int, save: bool = False, _: bool = Depends(verify_api_key)
 ):
     """Set GPS position (0x70/0x80/0x90 messages)"""
-    if not ble_adapter.is_connected:
+    if not state.ble_adapter.is_connected:
         raise HTTPException(status_code=409, detail="Not connected")
 
     try:
         # Send all three position messages
-        success_lat = await ble_adapter.set_latitude(lat, save)
+        success_lat = await state.ble_adapter.set_latitude(lat, save)
         await asyncio.sleep(INTER_MESSAGE_DELAY_S)
-        success_lon = await ble_adapter.set_longitude(lon, save)
+        success_lon = await state.ble_adapter.set_longitude(lon, save)
         await asyncio.sleep(INTER_MESSAGE_DELAY_S)
-        success_alt = await ble_adapter.set_altitude(alt, save)
+        success_alt = await state.ble_adapter.set_altitude(alt, save)
 
         success = success_lat and success_lon and success_alt
         return ResultResponse(
@@ -986,11 +1004,11 @@ async def set_position(
 @app.post("/api/ble/config/aprs", response_model=ResultResponse)
 async def set_aprs_symbols(primary: str, secondary: str, _: bool = Depends(verify_api_key)):
     """Set APRS symbol (0x95 message)"""
-    if not ble_adapter.is_connected:
+    if not state.ble_adapter.is_connected:
         raise HTTPException(status_code=409, detail="Not connected")
 
     try:
-        success = await ble_adapter.set_aprs_symbols(primary, secondary)
+        success = await state.ble_adapter.set_aprs_symbols(primary, secondary)
         return ResultResponse(
             success=success,
             message=f"APRS symbol set: {primary}{secondary}" if success else "Failed",
@@ -1013,15 +1031,14 @@ async def set_ble_pin(request: SetPinRequest, _: bool = Depends(verify_api_key))
     This does NOT change the PIN on the device itself — use --btcode <value> for that.
     Call this endpoint after the device has accepted the PIN change to keep them in sync.
     """
-    global _ble_pin
     pin = request.pin
     if pin != 0 and not (_BLE_PIN_MIN <= pin <= _BLE_PIN_MAX):
         raise HTTPException(status_code=400, detail="PIN must be 0 or 100000–999999")
-    _ble_pin = pin
+    state.ble_pin = pin
     _save_ble_pin(pin)
-    if ble_adapter is not None:
-        ble_adapter.hello_bytes = build_hello_bytes(pin)
-        ble_adapter.pairing_passkey = pin
+    if state.ble_adapter is not None:
+        state.ble_adapter.hello_bytes = build_hello_bytes(pin)
+        state.ble_adapter.pairing_passkey = pin
     logger.info("BLE PIN updated: %s", "disabled" if pin == 0 else "set")
     return {"ok": True}
 
@@ -1033,11 +1050,11 @@ async def save_config(_: bool = Depends(verify_api_key)):
 
     WARNING: This will immediately reboot the device and disconnect BLE.
     """
-    if not ble_adapter.is_connected:
+    if not state.ble_adapter.is_connected:
         raise HTTPException(status_code=409, detail="Not connected")
 
     try:
-        success = await ble_adapter.save_and_reboot()
+        success = await state.ble_adapter.save_and_reboot()
         return ResultResponse(
             success=success,
             message="Device rebooting (settings saved)" if success else "Failed to save",
@@ -1070,7 +1087,7 @@ async def stream_notifications(x_api_key: Annotated[str | None, Header()] = None
     async def event_generator():
         """Generate SSE events from notification queue.
 
-        Single-consumer contract: notification_queue is a module-level deque shared
+        Single-consumer contract: state.notification_queue is a module-level deque shared
         across all connected SSE clients; popleft() already guarantees each queued
         event is delivered exactly once, so a second concurrent consumer (e.g. a
         debugging curl session) steals events round-robin instead of duplicating them.
@@ -1080,8 +1097,8 @@ async def stream_notifications(x_api_key: Annotated[str | None, Header()] = None
             "event": "status",
             "data": json.dumps(
                 {
-                    "connected": ble_adapter.is_connected,
-                    "state": ble_adapter.status.state.value,
+                    "connected": state.ble_adapter.is_connected,
+                    "state": state.ble_adapter.status.state.value,
                     "timestamp": _now_ms(),
                 }
             ),
@@ -1090,16 +1107,16 @@ async def stream_notifications(x_api_key: Annotated[str | None, Header()] = None
         while True:
             # Wait for new notifications
             try:
-                await asyncio.wait_for(notification_event.wait(), timeout=SSE_PING_INTERVAL_S)
-                notification_event.clear()
+                await asyncio.wait_for(state.notification_event.wait(), timeout=SSE_PING_INTERVAL_S)
+                state.notification_event.clear()
             except TimeoutError:
                 # Send keepalive ping
                 yield {"event": "ping", "data": json.dumps({"timestamp": _now_ms()})}
                 continue
 
             # Send all queued notifications/status events
-            while notification_queue:
-                notification = notification_queue.popleft()
+            while state.notification_queue:
+                notification = state.notification_queue.popleft()
                 # Status events use "status" SSE event type
                 if notification.get("event_type") == "status":
                     yield {"event": "status", "data": json.dumps(notification)}
@@ -1117,7 +1134,7 @@ async def health_check():
     """Health check endpoint"""
     return {
         "status": "healthy",
-        "ble_connected": ble_adapter.is_connected if ble_adapter else False,
+        "ble_connected": state.ble_adapter.is_connected if state.ble_adapter else False,
         "timestamp": _now_ms(),
     }
 

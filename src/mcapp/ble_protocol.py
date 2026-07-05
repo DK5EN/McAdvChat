@@ -54,118 +54,165 @@ def strip_prefix(msg: str, prefix: str = ":") -> str:
     return msg[1:] if msg.startswith(prefix) else msg
 
 
-def decode_binary_message(byte_msg: bytes) -> dict[str, Any] | str:
-    """Decode binary BLE message (@ prefix format)"""
+# --- @-frame binary layout (BLE-06) ---
+#
+# byte_msg is the full GATT notification, '@'-prefixed:
+#   [0]        '@' (already checked by caller / the [:2] checks below)
+#   [1:1+_HEADER_LEN]   _HEADER_FORMAT: payload_type(B) msg_id(I,LE) max_hop_raw(B)
+#   [1+_HEADER_LEN:-_FOOTER_LEN]   variable-length routing path + dest + message text
+#   [-_FOOTER_LEN:-1]   _FOOTER_FORMAT: zero(B) hardware_id(B) lora_mod(B) fcs(H)
+#                       fw(B) lasthw(B) fw_sub(B) ending(B) time_ms(I)
+#   [-1]       trailing terminator byte (not unpacked)
+#
+# The FCS (footer offset 3, 2 bytes) covers byte_msg[1:-_FCS_EXCLUDED_TRAILER_LEN] —
+# header + variable body + the footer's first 3 bytes (zero/hardware_id/lora_mod) —
+# explicitly excluding the FCS field itself and everything after it.
+_HEADER_FORMAT = "<BIB"  # payload_type, msg_id, max_hop_raw
+_HEADER_LEN = 6  # bytes covered by _HEADER_FORMAT
+# zero, hardware_id, lora_mod, fcs, fw, lasthw, fw_sub, ending, time_ms
+_FOOTER_FORMAT = "<BBBHBBBBI"
+_FOOTER_LEN = 14  # total trailing footer width, incl. the 1 terminator byte
+_FCS_EXCLUDED_TRAILER_LEN = 11  # FCS covers byte_msg[1 : -_FCS_EXCLUDED_TRAILER_LEN]
+
+
+def _decode_ack_frame(
+    payload_type: int, msg_id: int, max_hop_raw: int, byte_msg: bytes
+) -> dict[str, Any]:
+    """Decode an ACK frame (@A prefix) — extracted from decode_binary_message (BLE-05).
+
+    Firmware sends 7-byte ACKs to BLE (never 12-byte):
+      BLE payload: [0x41][orig_msg_id×4][ack_type][0x00]
+      GATT frame:  [0x40][0x41][orig_msg_id×4][ack_type][0x00][timestamp×4]
+
+    Header parsing (byte_msg[1:7]) maps to:
+      payload_type (byte 1) = 0x41
+      msg_id       (bytes 2-5) = original message ID being acknowledged
+      max_hop_raw  (byte 6) = ack_type (0x00=Node, 0x01=Gateway) — NOT flags!
+
+    Bytes 7+ are terminator (0x00) + 4-byte unix timestamp appended by firmware.
+    """
+    logger.debug("ACK raw hex: %s (len=%d)", byte_msg.hex(), len(byte_msg))
+
+    ack_type = max_hop_raw  # byte 6 is ack_type in ACK frames
+    if ack_type == 0x00:
+        ack_type_text = "Node ACK"
+    elif ack_type == 0x01:
+        ack_type_text = "Gateway ACK"
+    else:
+        ack_type_text = f"Unknown ({ack_type})"
+
+    return {
+        "payload_type": payload_type,
+        "msg_id": msg_id,
+        "ack_type": ack_type,
+        "ack_type_text": ack_type_text,
+    }
+
+
+def _decode_data_frame(  # noqa: PLR0913 - all fields are needed from the shared header/fcs computation
+    byte_msg: bytes,
+    payload_type: int,
+    msg_id: int,
+    max_hop: int,
+    mesh_info: int,
+    remaining_msg: bytes,
+    calced_fcs: int,
+) -> dict[str, Any] | None:
+    """Decode a msg/pos data frame (@: or @! prefix) — extracted from
+    decode_binary_message (BLE-05). Returns None for a malformed frame.
+    """
+    split_idx = remaining_msg.find(b">")
+    if split_idx == -1:
+        logger.warning("Invalid binary frame: no routing path terminator ('>') found")
+        return None
+
+    path = remaining_msg[: split_idx + 1].decode("utf-8", errors="ignore")
+    remaining_msg = remaining_msg[split_idx + 1 :]
+
+    # Extrahiere Dest-Type (`dt`)
+    if payload_type == PAYLOAD_TYPE_MSG:
+        split_idx = remaining_msg.find(b":")
+    elif payload_type == PAYLOAD_TYPE_POS:
+        split_idx = remaining_msg.find(b"*") + 1
+    else:
+        logger.warning("Payload type not matched! %d", payload_type)
+
+    if split_idx == -1:
+        logger.warning("Invalid binary frame: destination separator not found")
+        return None
+
+    dest = remaining_msg[:split_idx].decode("utf-8", errors="ignore")
+
+    raw = remaining_msg[split_idx : remaining_msg.find(b"\00")]
+    message = raw.decode("utf-8", errors="ignore").strip()
+
+    # Extract binary footer (fixed structure at end of message)
+    [_zero, hardware_id, lora_mod, fcs, fw, lasthw, fw_sub, _ending, _time_ms] = unpack(
+        _FOOTER_FORMAT, byte_msg[-_FOOTER_LEN:-1]
+    )
+
+    # Split lasthw byte into hardware ID and last sending flag
+    last_hw_id = lasthw & 0x7F  # Bits 0-6: Hardware-Typ (0-127)
+    last_sending = bool(lasthw & 0x80)  # Bit 7: Last Sending Flag (True/False)
+
+    # Verify frame checksum
+    fcs_ok = calced_fcs == fcs
+
+    # FCS validation (permissive mode - log at debug level, continue processing)
+    if not fcs_ok:
+        logger.debug(
+            "Frame checksum mismatch: calculated=0x%04X, received=0x%04X, msg_id=%s",
+            calced_fcs,
+            fcs,
+            format(msg_id, "08X"),
+        )
+        # Permissive mode: log at debug level but continue processing
+
+    return {
+        "payload_type": payload_type,
+        "msg_id": msg_id,
+        "max_hop": max_hop,
+        "mesh_info": mesh_info,
+        "path": path,
+        "dest": dest,
+        "message": message,
+        "hardware_id": hardware_id,
+        "lora_mod": lora_mod,
+        "fw": fw,
+        "fw_sub": fw_sub,
+        "last_hw_id": last_hw_id,
+        "last_sending": last_sending,
+    }
+
+
+def decode_binary_message(byte_msg: bytes) -> dict[str, Any] | None:
+    """Decode binary BLE message (@ prefix format). Returns None for a
+    malformed/unrecognized frame (BLE-05) — callers no longer need to
+    isinstance-sniff a dict-or-error-string return.
+    """
     # little-endian unpack
-    raw_header = byte_msg[1:7]
-    [payload_type, msg_id, max_hop_raw] = unpack("<BIB", raw_header)
+    raw_header = byte_msg[1 : 1 + _HEADER_LEN]
+    [payload_type, msg_id, max_hop_raw] = unpack(_HEADER_FORMAT, raw_header)
 
     # Bit shift operations
     max_hop = max_hop_raw & 0x0F
     mesh_info = max_hop_raw >> 4
 
     # Calculate frame checksum
-    calced_fcs = calc_fcs(byte_msg[1:-11])
+    calced_fcs = calc_fcs(byte_msg[1:-_FCS_EXCLUDED_TRAILER_LEN])
 
-    remaining_msg = byte_msg[7:].rstrip(b"\x00")  # Extract data after hop count byte
+    remaining_msg = byte_msg[1 + _HEADER_LEN :].rstrip(b"\x00")  # data after hop count byte
 
     if byte_msg[:2] == b"@A":  # Check if this is an ACK frame
-        logger.debug("ACK raw hex: %s (len=%d)", byte_msg.hex(), len(byte_msg))
-
-        # Firmware sends 7-byte ACKs to BLE (never 12-byte):
-        #   BLE payload: [0x41][orig_msg_id×4][ack_type][0x00]
-        #   GATT frame:  [0x40][0x41][orig_msg_id×4][ack_type][0x00][timestamp×4]
-        #
-        # Header parsing (byte_msg[1:7]) maps to:
-        #   payload_type (byte 1) = 0x41
-        #   msg_id       (bytes 2-5) = original message ID being acknowledged
-        #   max_hop_raw  (byte 6) = ack_type (0x00=Node, 0x01=Gateway) — NOT flags!
-        #
-        # Bytes 7+ are terminator (0x00) + 4-byte unix timestamp appended by firmware.
-
-        ack_type = max_hop_raw  # byte 6 is ack_type in ACK frames
-        if ack_type == 0x00:
-            ack_type_text = "Node ACK"
-        elif ack_type == 0x01:
-            ack_type_text = "Gateway ACK"
-        else:
-            ack_type_text = f"Unknown ({ack_type})"
-
-        return {
-            "payload_type": payload_type,
-            "msg_id": msg_id,
-            "ack_type": ack_type,
-            "ack_type_text": ack_type_text,
-        }
+        return _decode_ack_frame(payload_type, msg_id, max_hop_raw, byte_msg)
 
     if bytes(byte_msg[:2]) in {b"@:", b"@!"}:
-        split_idx = remaining_msg.find(b">")
-        if split_idx == -1:
-            return "Invalid routing format"
-
-        path = remaining_msg[: split_idx + 1].decode("utf-8", errors="ignore")
-        remaining_msg = remaining_msg[split_idx + 1 :]
-
-        # Extrahiere Dest-Type (`dt`)
-        if payload_type == PAYLOAD_TYPE_MSG:
-            split_idx = remaining_msg.find(b":")
-        elif payload_type == PAYLOAD_TYPE_POS:
-            split_idx = remaining_msg.find(b"*") + 1
-        else:
-            logger.warning("Payload type not matched! %d", payload_type)
-
-        if split_idx == -1:
-            return "Destination not found"
-
-        dest = remaining_msg[:split_idx].decode("utf-8", errors="ignore")
-
-        raw = remaining_msg[split_idx : remaining_msg.find(b"\00")]
-        message = raw.decode("utf-8", errors="ignore").strip()
-
-        # Extract binary footer (fixed structure at end of message)
-        [zero, hardware_id, lora_mod, fcs, fw, lasthw, fw_sub, ending, time_ms] = unpack(
-            "<BBBHBBBBI", byte_msg[-14:-1]
+        return _decode_data_frame(
+            byte_msg, payload_type, msg_id, max_hop, mesh_info, remaining_msg, calced_fcs
         )
 
-        # Split lasthw byte into hardware ID and last sending flag
-        last_hw_id = lasthw & 0x7F  # Bits 0-6: Hardware-Typ (0-127)
-        last_sending = bool(lasthw & 0x80)  # Bit 7: Last Sending Flag (True/False)
-
-        # Verify frame checksum
-        fcs_ok = calced_fcs == fcs
-
-        # FCS validation (permissive mode - log at debug level, continue processing)
-        if not fcs_ok:
-            logger.debug(
-                "Frame checksum mismatch: calculated=0x%04X, received=0x%04X, msg_id=%s",
-                calced_fcs,
-                fcs,
-                format(msg_id, "08X"),
-            )
-            # Permissive mode: log at debug level but continue processing
-
-        return {
-            k: v
-            for k, v in locals().items()
-            if k
-            in [
-                "payload_type",
-                "msg_id",
-                "max_hop",
-                "mesh_info",
-                "path",
-                "dest",
-                "message",
-                "hardware_id",
-                "lora_mod",
-                "fw",
-                "fw_sub",
-                "last_hw_id",
-                "last_sending",
-            ]
-        }
-
-    return "Invalid mesh format"
+    logger.warning("Invalid mesh format: unrecognized frame prefix %r", byte_msg[:2])
+    return None
 
 
 def timestamp_from_date_time(date: str, time_str: str) -> int:

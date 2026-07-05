@@ -281,6 +281,22 @@ class BLEAdapter:
         """Check if connected to a device"""
         return self._status.state == ConnectionState.CONNECTED
 
+    @property
+    def is_busy(self) -> bool:
+        """True while a scan/connect/pair/unpair operation holds the operation lock (BLE-11)."""
+        return self._operation_lock.locked()
+
+    def reset_bus(self) -> None:
+        """Disconnect and drop the D-Bus connection, ignoring errors (BLE-11).
+
+        Used before a reconnect attempt to clear a stale bus from a previous
+        session rather than reusing a possibly-dead connection.
+        """
+        if self.bus:
+            with contextlib.suppress(Exception):
+                self.bus.disconnect()
+            self.bus = None
+
     def _mac_to_dbus_path(self, mac: str) -> str:
         """Convert MAC address to D-Bus device path"""
         return f"{ADAPTER_PATH}/dev_{mac.replace(':', '_')}"

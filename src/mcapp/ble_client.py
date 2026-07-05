@@ -268,6 +268,45 @@ class BLEClientBase(ABC):
         Stop the BLE client and clean up resources.
         """
 
+    @abstractmethod
+    async def cancel_reconnect(self) -> bool:
+        """
+        Cancel any in-progress auto-reconnect (BLE-09).
+
+        Returns:
+            True if a reconnect was cancelled or there was nothing to cancel.
+        """
+
+    @abstractmethod
+    async def get_activity(self) -> list[dict[str, Any]]:
+        """
+        Fetch the backend's recent activity log (BLE-09).
+
+        Returns:
+            List of activity log entries, empty if none/not applicable.
+        """
+
+    @abstractmethod
+    async def set_ble_pin(self, pin: int) -> bool:
+        """
+        Update the BLE app-layer PIN used for device authentication (BLE-09).
+
+        Args:
+            pin: 0 disables PIN auth; 100000-999999 enables it.
+
+        Returns:
+            True if the PIN was updated successfully.
+        """
+
+    @abstractmethod
+    async def refresh_status(self) -> BLEStatus:
+        """
+        Refresh and return the current BLE status from the backend (BLE-09).
+
+        Returns:
+            Up-to-date BLEStatus.
+        """
+
 
 async def create_ble_client(  # noqa: PLR0913 - signature fixed by call sites
     mode: BLEMode = BLEMode.DISABLED,

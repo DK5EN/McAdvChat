@@ -9,7 +9,14 @@ import logging
 from collections.abc import Callable
 from typing import Any
 
-from .ble_client import MESHCOM_NAME_PREFIX, BLEClientBase, BLEDevice, BLEMode, ConnectionState
+from .ble_client import (
+    MESHCOM_NAME_PREFIX,
+    BLEClientBase,
+    BLEDevice,
+    BLEMode,
+    BLEStatus,
+    ConnectionState,
+)
 from .util import now_ms
 
 logger = logging.getLogger(__name__)
@@ -121,6 +128,24 @@ class BLEClientDisabled(BLEClientBase):
     async def stop(self) -> None:
         """Stop the disabled client (no-op)"""
         logger.info("BLE client (disabled) stopped")
+
+    async def cancel_reconnect(self) -> bool:
+        """No-op cancel reconnect - nothing is ever reconnecting (BLE-09)"""
+        logger.debug("BLE disabled - cancel reconnect skipped")
+        return True
+
+    async def get_activity(self) -> list[dict[str, Any]]:
+        """No-op activity log - always empty (BLE-09)"""
+        return []
+
+    async def set_ble_pin(self, _pin: int) -> bool:
+        """No-op set PIN - nothing to configure (BLE-09)"""
+        logger.debug("BLE disabled - set PIN skipped")
+        return False
+
+    async def refresh_status(self) -> BLEStatus:
+        """No-op refresh - status never changes on its own (BLE-09)"""
+        return self._status
 
     @property
     def is_connected(self) -> bool:

@@ -43,6 +43,29 @@ CONNECT_REQUEST_TIMEOUT_S = 45.0  # = 3x10s BLE adapter connect attempts + clean
 # ⚠ must exceed ble_service's SSE_PING_INTERVAL_S (30.0) or the client times out first.
 SSE_READ_TIMEOUT_S = 90.0
 
+# SSE `status` event `state` values and 409-response `reason` values (BLE-10).
+# Mirrored (not imported — ble_service is a separate process) from
+# ble_service/src/main.py's STATUS_*/REASON_* constants. Documented in
+# ble_service/README.md's "Status/reason wire vocabulary" section. ⚠ these
+# must stay byte-identical to ble_service's copies — changing one side without
+# the other is a wire-format break.
+STATUS_RECONNECTING = "reconnecting"
+STATUS_RECONNECT_EXHAUSTED = "reconnect_exhausted"
+
+
+class BLEServiceError(RuntimeError):
+    """Raised by _request() for a non-2xx response from the BLE service (BLE-13).
+
+    Carries the structured (status_code, reason) fields from ble_service's error
+    responses so callers can branch on them instead of substring-sniffing the
+    exception message.
+    """
+
+    def __init__(self, message: str, status_code: int, reason: str = "") -> None:
+        super().__init__(message)
+        self.status_code = status_code
+        self.reason = reason
+
 
 class BLEClientRemote(BLEClientBase):
     """
@@ -148,11 +171,12 @@ class BLEClientRemote(BLEClientBase):
 
                 if response.status_code >= HTTPStatus.BAD_REQUEST:
                     detail = response_data.get("detail", "Unknown error")
+                    reason = ""
                     # Structured detail (dict) from enriched 409 responses
                     if isinstance(detail, dict):
                         error_msg = detail.get("message", str(detail))
                         reason = detail.get("reason", "")
-                        if reason == "reconnecting":
+                        if reason == STATUS_RECONNECTING:
                             attempt_no = detail.get("attempt", "?")
                             max_a = detail.get("max_attempts", "?")
                             dev = detail.get("device_name", "")
@@ -161,7 +185,11 @@ class BLEClientRemote(BLEClientBase):
                             )
                     else:
                         error_msg = str(detail)
-                    raise RuntimeError(f"API error ({response.status_code}): {error_msg}")
+                    raise BLEServiceError(
+                        f"API error ({response.status_code}): {error_msg}",
+                        status_code=response.status_code,
+                        reason=reason,
+                    )
 
             except httpx.HTTPError as e:
                 if attempt < retries:
@@ -226,12 +254,12 @@ class BLEClientRemote(BLEClientBase):
 
             await self._publish_status("scan BLE result", "ok", f"Found {len(devices)} devices")
 
-        except RuntimeError as e:
-            error_str = str(e)
-            logger.exception("Scan error: %s", error_str)
-            # Produce a user-friendly message for reconnect-blocked scans
-            msg = error_str
-            if "reconnect" in error_str.lower() or "409" in error_str:
+        except BLEServiceError as e:
+            msg = str(e)
+            logger.exception("Scan error: %s", msg)
+            # Produce a user-friendly message for reconnect-blocked scans (BLE-13:
+            # branch on the typed status_code/reason fields, not string-sniffing).
+            if e.reason == STATUS_RECONNECTING or e.status_code == HTTPStatus.CONFLICT:
                 msg = (
                     "Cannot scan: the backend is reconnecting to the device. "
                     "Wait for reconnect to finish or cancel it first."
@@ -664,7 +692,7 @@ class BLEClientRemote(BLEClientBase):
                     raw_bytes = base64.b64decode(raw_b64)
                     if raw_bytes.startswith(b"@"):
                         decoded = decode_binary_message(raw_bytes)
-                        if isinstance(decoded, dict):
+                        if decoded is not None:
                             pt = decoded.get("payload_type", 0)
                             msg = decoded.get("message", "")
                             # All BLE binary messages at DEBUG (stored in DB, visible in frontend)
@@ -680,9 +708,9 @@ class BLEClientRemote(BLEClientBase):
                                 decoded.get("dest", ""),
                                 msg,
                             )
-                        output = dispatcher(cast(dict[str, Any], decoded), own_call)
-                        if output:
-                            return self._finalize_transformed_output(output, notification)
+                            output = dispatcher(decoded, own_call)
+                            if output:
+                                return self._finalize_transformed_output(output, notification)
                 except Exception as e:
                     logger.warning("Failed to decode binary notification: %s", e)
             # Fallback: return raw if decoding failed
@@ -706,7 +734,7 @@ class BLEClientRemote(BLEClientBase):
             state_str = status.get("state", "disconnected")
 
             # --- Reconnecting: BLE service is retrying connection ---
-            if state_str == "reconnecting":
+            if state_str == STATUS_RECONNECTING:
                 self._status.state = ConnectionState.CONNECTING
                 attempt = status.get("attempt", 0)
                 max_attempts = status.get("max_attempts", 4)
@@ -735,7 +763,7 @@ class BLEClientRemote(BLEClientBase):
                 return
 
             # --- Reconnect exhausted: all retry attempts failed ---
-            if state_str == "reconnect_exhausted":
+            if state_str == STATUS_RECONNECT_EXHAUSTED:
                 self._status.state = ConnectionState.ERROR
                 device_name = status.get("device_name", "")
                 attempts = status.get("attempts", 4)
