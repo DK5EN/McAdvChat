@@ -32,6 +32,7 @@ import time
 import traceback
 import urllib.error
 import urllib.request
+from collections import deque
 from datetime import UTC, datetime
 from http import HTTPStatus
 from pathlib import Path
@@ -45,6 +46,14 @@ BOOTSTRAP_TIMEOUT_S = 900  # 15 minutes
 GRACE_PERIOD_S = 30  # Time to keep server alive after completion
 HEALTH_CHECK_RETRIES = 8
 HEALTH_CHECK_INTERVAL_S = 3
+SSE_KEEPALIVE_COMMENT_INTERVAL_S = 30  # how often the /stream handler sends ": keepalive"
+EVENT_HISTORY_SIZE = 2000  # SCR-04: replay buffer cap (was unbounded)
+CLIENT_QUEUE_SIZE = 2000  # SCR-04: per-SSE-client queue cap (was unbounded, so Full never fired)
+# EventBus.subscribe() replays history into a fresh queue with a blocking put() while
+# holding the bus lock; that's only safe because a full history can never exceed a
+# fresh queue's capacity. If this ever broke, replay would deadlock the whole bus.
+assert EVENT_HISTORY_SIZE <= CLIENT_QUEUE_SIZE, "history replay must fit in a fresh client queue"  # noqa: S101 - module-load invariant, not a runtime test assertion
+MCAPP_SSE_HEALTH_URL = "http://localhost:2981/health"  # mcapp's own health endpoint
 
 # Paths (resolved at runtime from slot layout)
 SLOTS_DIR = None  # ~/mcapp-slots
@@ -52,6 +61,7 @@ META_DIR = None  # ~/mcapp-slots/meta
 home = None  # User home directory (inferred from script location)
 DB_PATH = Path("/var/lib/mcapp/messages.db")
 WEBAPP_SLOTS_DIR = Path("/var/www/html/webapp-slots")
+UPDATE_TRIGGER_FILE = Path("/var/lib/mcapp/update-trigger")  # must match sse_handler.py's copy
 _ANSI_RE = re.compile(r"\x1b\[[0-9;]*[a-zA-Z]")  # all ANSI escape sequences
 _DECORATIVE_LINE_RE = re.compile(r"^[\s╔╗╚╝═─┌┐└┘│┤├]+$")  # pure box-drawing decoration
 _BANNER_LINE_RE = re.compile(r"^\s*║\s*(.*?)\s*║?\s*$")  # ║ content ║ banner lines
@@ -80,10 +90,17 @@ class EventBus:
     def __init__(self):
         self._clients: list[queue.Queue] = []
         self._lock = threading.Lock()
-        self._history: list[str] = []  # Replay buffer for late joiners
+        # Replay buffer for late joiners. Bounded (SCR-04) — a single verbose bootstrap
+        # run can publish thousands of "log" events; without a cap this grows for the
+        # whole process lifetime (short-lived, but comfortably covers realistic output).
+        self._history: deque[str] = deque(maxlen=EVENT_HISTORY_SIZE)
 
     def subscribe(self) -> queue.Queue:
-        q: queue.Queue = queue.Queue()
+        # Bounded (SCR-04): unbounded (maxsize=0) made publish()'s `suppress(queue.Full)`
+        # dead code — Full could never actually be raised, so a stalled client's queue
+        # grew without limit. A slow/stalled client now drops new events past this cap
+        # instead of leaking memory.
+        q: queue.Queue = queue.Queue(maxsize=CLIENT_QUEUE_SIZE)
         with self._lock:
             # Send history to new subscriber
             for event in self._history:
@@ -268,7 +285,7 @@ def run_health_checks(bus: EventBus) -> bool:
         ("mcapp_service", lambda: _check_systemd("mcapp")),
         ("lighttpd_service", lambda: _check_systemd("lighttpd")),
         ("webapp_http", lambda: _check_http("http://localhost/webapp/index.html")),
-        ("sse_health", lambda: _check_http("http://localhost:2981/health")),
+        ("sse_health", lambda: _check_http(MCAPP_SSE_HEALTH_URL)),
         ("lighttpd_proxy", lambda: _check_http("http://localhost/health")),
     ]
 
@@ -388,6 +405,19 @@ def run_update(bus: EventBus, dev_mode: bool = False) -> dict:  # noqa: PLR0912,
             # Check if the target slot is now active
             current_active = get_active_slot()
             if current_active == target_slot:
+                # SCR-04: the slot is live but our own set_slot_meta() call below (the
+                # `if success:` branch) never ran, so without this the slot would stay
+                # excluded from rollback candidates (get_rollback_slot() requires
+                # version+deployed_at) despite actually being the running version.
+                set_slot_meta(
+                    target_slot,
+                    {
+                        "slot": target_slot,
+                        "version": _read_version(target_slot),
+                        "status": "active",
+                        "deployed_at": datetime.now(UTC).isoformat(),
+                    },
+                )
                 bus.publish(
                     "log",
                     {
@@ -689,7 +719,7 @@ class UpdateHandler(http.server.BaseHTTPRequestHandler):
         try:
             while True:
                 try:
-                    event = q.get(timeout=30)
+                    event = q.get(timeout=SSE_KEEPALIVE_COMMENT_INTERVAL_S)
                     self.wfile.write(event.encode())
                     self.wfile.flush()
                 except queue.Empty:
@@ -758,7 +788,7 @@ def main():  # noqa: PLR0915 - complex handler kept intact
     # If --args-file provided, read args from JSON and clean up trigger files
     if args.args_file:
         args_path = Path(args.args_file)
-        trigger_path = Path("/var/lib/mcapp/update-trigger")
+        trigger_path = UPDATE_TRIGGER_FILE
         if args_path.exists():
             file_args = json.loads(args_path.read_text())
             if not args.mode:

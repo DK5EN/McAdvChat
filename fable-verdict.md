@@ -1310,3 +1310,33 @@ Review checklist:
   boundaries (storage/sse/main/ctcping/ble_service) used for this wave. **Deferred, not forgotten**
   — pick up alongside Wave 7 (which already works in the scripts/perf space) or as its own small
   follow-up commit before Wave 7 starts.
+
+- [2026-07-06] SCR-04 follow-up complete (standalone commit, not part of any wave sub-commit —
+  `scripts/update-runner.py` only). Fixed a real correctness bug embedded in the finding: when
+  the bootstrap script exited non-zero but the target slot got activated anyway
+  (`get_active_slot() == target_slot`), the code logged a message and proceeded straight to
+  health checks without ever calling `set_slot_meta(...)` for that slot — so the now-live slot's
+  meta stayed stale/empty, meaning `get_rollback_slot()` (requires `version`+`deployed_at`) would
+  never recognize it as a valid rollback target, and `get_oldest_slot()` could treat it as
+  reusable/overwritable despite being the actively running deployment. Fixed by calling
+  `set_slot_meta(...)` in that branch too, mirroring the `if success:` branch's shape exactly
+  (verified `_read_version()` is fully defensive and never raises, even if the version file is
+  somehow missing). `EventBus._history` (unbounded `list`) and each SSE client's `queue.Queue`
+  (unbounded, `maxsize=0` — meaning `publish()`'s `suppress(queue.Full)` was dead code) both
+  bounded to 2000 entries; verified no deadlock in `subscribe()`'s blocking history-replay
+  (`EVENT_HISTORY_SIZE == CLIENT_QUEUE_SIZE` by construction — added a load-time `assert` to
+  harden that invariant per the reviewer's suggestion, since if it ever broke the blocking `put()`
+  under the bus lock would deadlock the whole EventBus) and confirmed `queue.Full` is now
+  reachable for a genuinely stalled client. Named 3 previously-inline constants
+  (`MCAPP_SSE_HEALTH_URL`, `SSE_KEEPALIVE_COMMENT_INTERVAL_S`, `UPDATE_TRIGGER_FILE` — the last
+  cross-checked byte-for-byte against `sse_handler.py`'s copy of the same path). Deliberately
+  **not** done: converting the `SLOTS_DIR`/`META_DIR`/`home` module globals into a `Paths`
+  dataclass — judged lower-value/higher-risk for a script that's hard to safely exercise
+  end-to-end in this sandboxed environment (real systemd/filesystem operations meant for a Pi),
+  especially right after this session's ble_service work demonstrated how a mechanical
+  globals-to-dataclass rename can introduce shadowing bugs; confirmed not silently half-done.
+  Opus review: **approved**. Gates green (ruff check, ruff format --check, startup tests — 5
+  suites; `update-runner.py` confirmed fully standalone, not imported by anything under
+  `src/mcapp/`), noqa count stable (17→17 before the hardening assert, 18 after — one new
+  justified `S101` on the module-load invariant check), scope discipline confirmed (only
+  `scripts/update-runner.py` touched).
