@@ -156,6 +156,8 @@ def get_oldest_slot() -> int:
     active = get_active_slot()
     # Prefer empty slots
     for i in range(3):
+        if i == active:
+            continue
         meta = get_slot_meta(i)
         if meta.get("status") == "empty" or not meta.get("version"):
             return i
@@ -573,19 +575,35 @@ def _run_bootstrap_streaming(cmd: list[str], env: dict, bus: EventBus) -> bool:
 
         deadline = time.time() + BOOTSTRAP_TIMEOUT_S
 
-        for raw in process.stdout:
-            line = _clean_line(raw.rstrip("\n"))
-            if line is None:
-                continue
-            print(f"[BOOTSTRAP] {line}", flush=True)
-            bus.publish("log", {"line": line, "phase": "bootstrap"})
+        lines: queue.Queue[str | None] = queue.Queue()
 
-            if time.time() > deadline:
+        def _reader() -> None:
+            for raw in process.stdout:
+                lines.put(raw)
+            lines.put(None)
+
+        reader_thread = threading.Thread(target=_reader, daemon=True)
+        reader_thread.start()
+
+        while True:
+            remaining = deadline - time.time()
+            if remaining <= 0:
                 process.kill()
                 bus.publish(
                     "log", {"line": "TIMEOUT: Bootstrap exceeded 15 minutes", "phase": "bootstrap"}
                 )
                 return False
+            try:
+                raw = lines.get(timeout=remaining)
+            except queue.Empty:
+                continue
+            if raw is None:
+                break
+            line = _clean_line(raw.rstrip("\n"))
+            if line is None:
+                continue
+            print(f"[BOOTSTRAP] {line}", flush=True)
+            bus.publish("log", {"line": line, "phase": "bootstrap"})
 
         process.wait()
         if process.returncode != 0:

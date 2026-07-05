@@ -28,6 +28,64 @@ async def _ensure_storage(handler: Any) -> None:
         print(f"    Loaded test DB: {_TEST_DB_PATH}")
 
 
+def test_meteo_timezone_validators() -> bool:
+    """C-04 regression: Berlin-local <-> UTC conversion must be DST-aware, not a fixed offset.
+
+    Network-free: exercises the pure conversion/day-night helpers directly with
+    synthetic winter (CET, UTC+1) and summer (CEST, UTC+2) timestamps.
+    """
+    from datetime import UTC, datetime
+
+    from ..meteo import WeatherService, _messzeitpunkt_to_utc
+
+    results: list[tuple[str, bool]] = []
+
+    winter_utc = _messzeitpunkt_to_utc("2026-01-15T12:00")
+    results.append(
+        (
+            "Winter (CET, UTC+1) naive timestamp converts correctly",
+            winter_utc == datetime(2026, 1, 15, 11, 0, tzinfo=UTC),
+        )
+    )
+
+    summer_utc = _messzeitpunkt_to_utc("2026-07-15T12:00")
+    results.append(
+        (
+            "Summer (CEST, UTC+2) naive timestamp converts correctly",
+            summer_utc == datetime(2026, 7, 15, 10, 0, tzinfo=UTC),
+        )
+    )
+
+    aware_utc = _messzeitpunkt_to_utc("2026-01-15T11:00:00+00:00")
+    results.append(
+        (
+            "Offset-aware (Bright Sky style) timestamp is not double-converted",
+            aware_utc == datetime(2026, 1, 15, 11, 0, tzinfo=UTC),
+        )
+    )
+
+    weather = WeatherService(lat=48.15, lon=11.58, stat_name="TestStation")
+    results.append(
+        (
+            "Summer evening (19:30 local, CEST) classifies as daytime",
+            weather._is_daytime("2026-07-15T19:30") is True,
+        )
+    )
+    results.append(
+        (
+            "Winter early morning (05:30 local, CET) classifies as nighttime",
+            not weather._is_daytime("2026-01-15T05:30"),
+        )
+    )
+
+    for label, ok in results:
+        status = "✅ PASS" if ok else "❌ FAIL"
+        if has_console:
+            print(f"    {status} | {label}")
+
+    return all(ok for _, ok in results)
+
+
 async def run_all_tests(handler: Any) -> bool:
     """Run complete test suite for CommandHandler"""
     if has_console:
@@ -37,6 +95,7 @@ async def run_all_tests(handler: Any) -> bool:
 
     await _ensure_storage(handler)
 
+    meteo_tz_passed = test_meteo_timezone_validators()
     basic_passed = test_reception_logic(handler)
     intent_passed = test_intent_based_reception_logic(handler)
     edge_passed = await test_reception_edge_cases(handler)
@@ -50,6 +109,7 @@ async def run_all_tests(handler: Any) -> bool:
     incoming_personal_passed = await test_incoming_personal_commands(handler)
     total_passed = all(
         [
+            meteo_tz_passed,
             basic_passed,
             intent_passed,
             edge_passed,

@@ -238,7 +238,7 @@ class MessageRouter:
         if self.storage_handler:
             message_data = routed_message["data"]
 
-            src = message_data.get("src", "").split(",")[0].upper()
+            src = (message_data.get("src") or "").split(",")[0].upper()
             if self._is_callsign_blocked(src):
                 self._logger.debug("Blocked message from %s", src)
                 return
@@ -513,7 +513,10 @@ class MessageRouter:
         """Handle paginated message fetch."""
         dst = params.get("dst", "*")
         before = params.get("before", int(time.time() * 1000))
-        limit = min(params.get("limit", 20), 100)
+        try:
+            limit = max(1, min(int(params.get("limit", 20)), 100))
+        except (TypeError, ValueError):
+            limit = 20
         src = params.get("src")  # Own callsign for DM conversation pagination
 
         page_data = await self.storage_handler.get_messages_page(dst, before, limit, src=src)
@@ -1111,8 +1114,8 @@ class MessageRouter:
         self, original_message: dict[str, Any], protocol_type: str = "udp"
     ) -> dict[str, Any]:
         """Create a synthetic message that looks like it came from LoRa (uses normalized data)"""
-        current_time = int(time.time())
-        msg_id = f"{current_time:08X}"
+        current_time_ms = int(time.time() * 1000)
+        msg_id = f"{current_time_ms:012X}"
 
         return {
             "src": original_message.get("src"),  # Already uppercase
@@ -1121,11 +1124,11 @@ class MessageRouter:
             "msg_id": msg_id,
             "type": "msg",
             "src_type": protocol_type,
-            "timestamp": current_time * 1000,
+            "timestamp": current_time_ms,
         }
 
     async def _handle_outgoing_message(
-        self, message_data: dict[str, Any], _protocol_type: str = "udp"
+        self, message_data: dict[str, Any], protocol_type: str = "udp"
     ) -> bool:
         """Unified handler for outgoing messages - handles self-message detection"""
 
@@ -1134,7 +1137,7 @@ class MessageRouter:
                 "Detected self-message to %s, routing to CommandHandler only",
                 message_data.get("dst"),
             )
-            synthetic_message = self._create_synthetic_message(message_data)
+            synthetic_message = self._create_synthetic_message(message_data, protocol_type)
             await self._route_to_command_handler(synthetic_message)
             return True  # Indicates message was handled as self-message
 
@@ -1586,6 +1589,7 @@ async def main() -> None:  # noqa: PLR0912, PLR0915 - complex handler kept intac
         logger.warning("Beacon cleanup timeout")
 
     await command_handler.stop_dedup_cleanup()
+    await command_handler.stop_pending_responses()
 
     # Clean shutdown sequence with timeouts
     try:

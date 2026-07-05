@@ -156,6 +156,7 @@ class CommandHandler(
         self._init_ctcping()
         self._init_dedup()
         self._init_weather()
+        self._init_response()
 
         # GPS caching is handled centrally in main.py via _cache_gps
 

@@ -935,3 +935,15 @@ Review checklist:
 ## Discovered during waves
 
 (Fix agents append here: `- [date] [finding] file:line — description — deferred because <reason>`)
+
+- [2026-07-05] Wave 1 complete (C-01…C-08, ST-11, BLE-07, SCR-02, CO-14). Gates green
+  (ruff check, ruff format --check, startup tests incl. new `udp_handler.run_startup_tests()`
+  C-01 regression test and `test_meteo_timezone_validators` C-04 winter/summer regression
+  tests). Opus review: **approved**. Review flagged one should-fix — C-06's new
+  `_response_bg_tasks` (background chunk-send tasks) were tracked but never cancelled on
+  shutdown — fixed in the same commit via `ResponseMixin.stop_pending_responses()`, wired
+  into `main.py`'s shutdown sequence alongside `stop_dedup_cleanup()`. Review also noted
+  (non-blocking, accepted tradeoff): making chunk-sends a background task means two
+  concurrent multi-chunk responses can now interleave their chunks on the LoRa air
+  interface (per-response order is still preserved) — inherent to the fix the verdict
+  requested, not a defect.

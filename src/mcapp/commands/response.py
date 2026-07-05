@@ -3,12 +3,14 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import time
+from typing import Any
 
 from ..logging_setup import get_logger
 from ._base import CommandHandlerBase
-from .constants import MAX_CHUNKS, MAX_RESPONSE_LENGTH, has_console
+from .constants import CHUNK_SEND_DELAY_SECONDS, MAX_CHUNKS, MAX_RESPONSE_LENGTH, has_console
 
 logger = get_logger(__name__)
 
@@ -16,11 +18,39 @@ logger = get_logger(__name__)
 class ResponseMixin(CommandHandlerBase):
     """Mixin providing response sending and chunking methods."""
 
-    async def send_response(self, response: str, recipient: str, src_type: str = "udp") -> None:  # noqa: PLR0912 - complex handler kept intact
-        """Send response back to requester, chunking if necessary"""
+    def _init_response(self) -> None:
+        """Initialize response background-task tracking. Called from CommandHandler.__init__."""
+        self._response_bg_tasks: set[asyncio.Task[Any]] = set()
+
+    async def stop_pending_responses(self) -> None:
+        """Cancel in-flight background chunk-sends. Call during shutdown."""
+        pending = [task for task in self._response_bg_tasks if not task.done()]
+        for task in pending:
+            task.cancel()
+        if pending:
+            with contextlib.suppress(Exception):
+                await asyncio.gather(*pending, return_exceptions=True)
+        self._response_bg_tasks.clear()
+
+    async def send_response(self, response: str, recipient: str, src_type: str = "udp") -> None:
+        """Send response back to requester, chunking in a background task.
+
+        Chunk sends are spaced by CHUNK_SEND_DELAY_SECONDS (LoRa airtime), so a
+        multi-chunk response must not block the caller (message routing / the
+        inbound pipeline) for that duration — hence the background task.
+        """
         if not response:
             return
 
+        chunks = self._chunk_response(response)
+        task = asyncio.create_task(self._send_chunks(chunks, recipient, src_type))
+        self._response_bg_tasks.add(task)
+        task.add_done_callback(self._response_bg_tasks.discard)
+
+    async def _send_chunks(  # noqa: PLR0912 - complex handler kept intact
+        self, chunks: list[str], recipient: str, src_type: str
+    ) -> None:
+        """Send response chunks in order, preserving the 12 s LoRa airtime spacing."""
         if has_console:
             print(
                 f"🐛 send_response:"
@@ -29,9 +59,6 @@ class ResponseMixin(CommandHandlerBase):
                 f" equal="
                 f"{recipient.upper() == self.my_callsign}"
             )
-
-        # Split response into chunks if too long
-        chunks = self._chunk_response(response)
 
         for i, raw_chunk in enumerate(chunks[:MAX_CHUNKS]):
             chunk = raw_chunk
@@ -105,7 +132,7 @@ class ResponseMixin(CommandHandlerBase):
 
             # Small delay between chunks
             if i < len(chunks) - 1:
-                await asyncio.sleep(12)
+                await asyncio.sleep(CHUNK_SEND_DELAY_SECONDS)
 
             if has_console:
                 print(f"📋 CommandHandler: Sent response chunk {i + 1} to {recipient}")

@@ -9,8 +9,9 @@ import logging
 import math
 import sys
 import time
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, datetime
 from typing import Any
+from zoneinfo import ZoneInfo
 
 import httpx
 
@@ -18,6 +19,23 @@ _DAY_START_HOUR = 6
 _DAY_END_HOUR = 20
 _RAIN_REPORT_MIN_MM = 0.1
 _MAX_LORA_MSG_LEN = 149
+
+_BERLIN_TZ = ZoneInfo("Europe/Berlin")
+
+
+def _messzeitpunkt_to_utc(timestamp_str: str) -> datetime:
+    """Parse a messzeitpunkt string to an aware UTC datetime.
+
+    Bright Sky returns offset-aware ISO timestamps; Open-Meteo returns naive ISO
+    timestamps in the requested "Europe/Berlin" timezone (the API request pins
+    "timezone": "Europe/Berlin") — interpreting those as a fixed UTC+1/+2 offset
+    is wrong for half the year, so this uses zoneinfo for DST-aware conversion.
+    """
+    parsed = datetime.fromisoformat(timestamp_str)
+    if parsed.tzinfo is not None:
+        return parsed.astimezone(UTC)
+    return parsed.replace(tzinfo=_BERLIN_TZ).astimezone(UTC)
+
 
 VERSION = "v0.46.0"
 
@@ -291,14 +309,7 @@ class WeatherService:
             }
 
         try:
-            if messzeitpunkt_str.endswith("+00:00"):
-                measurement_time = datetime.fromisoformat(messzeitpunkt_str)
-            elif "T" in messzeitpunkt_str and len(messzeitpunkt_str) == 16:  # noqa: PLR2004 - ISO minute-precision length
-                naive_time = datetime.fromisoformat(messzeitpunkt_str)
-                measurement_time = naive_time.replace(tzinfo=UTC) - timedelta(hours=2)
-            else:
-                measurement_time = datetime.fromisoformat(messzeitpunkt_str)
-
+            measurement_time = _messzeitpunkt_to_utc(messzeitpunkt_str)
             now = datetime.now(UTC)
             age_delta = now - measurement_time
             age_minutes = age_delta.total_seconds() / 60
@@ -547,9 +558,7 @@ class WeatherService:
             # Default: Tag annehmen
             return True
         try:
-            ts = datetime.fromisoformat(timestamp_str)
-            # Konvertiere zu lokaler Zeit (CET/CEST = UTC+1/+2)
-            local_hour = (ts.hour + 1) % 24  # Grobe CET-Annäherung
+            local_hour = _messzeitpunkt_to_utc(timestamp_str).astimezone(_BERLIN_TZ).hour
         except (ValueError, TypeError):
             return True
 

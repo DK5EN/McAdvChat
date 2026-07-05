@@ -1021,9 +1021,13 @@ async def stream_notifications(x_api_key: Annotated[str | None, Header()] = None
         raise HTTPException(status_code=401, detail="Invalid API key")
 
     async def event_generator():
-        """Generate SSE events from notification queue"""
-        last_sent = 0
+        """Generate SSE events from notification queue.
 
+        Single-consumer contract: notification_queue is a module-level deque shared
+        across all connected SSE clients; popleft() already guarantees each queued
+        event is delivered exactly once, so a second concurrent consumer (e.g. a
+        debugging curl session) steals events round-robin instead of duplicating them.
+        """
         # Send initial status
         yield {
             "event": "status",
@@ -1049,13 +1053,11 @@ async def stream_notifications(x_api_key: Annotated[str | None, Header()] = None
             # Send all queued notifications/status events
             while notification_queue:
                 notification = notification_queue.popleft()
-                if notification["timestamp"] > last_sent:
-                    last_sent = notification["timestamp"]
-                    # Status events use "status" SSE event type
-                    if notification.get("event_type") == "status":
-                        yield {"event": "status", "data": json.dumps(notification)}
-                    else:
-                        yield {"event": "notification", "data": json.dumps(notification)}
+                # Status events use "status" SSE event type
+                if notification.get("event_type") == "status":
+                    yield {"event": "status", "data": json.dumps(notification)}
+                else:
+                    yield {"event": "notification", "data": json.dumps(notification)}
 
     return EventSourceResponse(event_generator())
 

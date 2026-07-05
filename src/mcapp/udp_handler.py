@@ -152,12 +152,15 @@ class UDPHandler:
         try:
             while self._running:
                 if self.listen_socket is None:
-                    raise RuntimeError("self.listen_socket is unexpectedly None")  # noqa: TRY301 - HTTP error response raised inline
-                data, addr = await loop.sock_recvfrom(self.listen_socket, 1024)
-                await self._process_received_message(data, addr)
-
-        except Exception as e:
-            print(f"Error in UDP listener: {e}")
+                    raise RuntimeError("self.listen_socket is unexpectedly None")
+                try:
+                    data, addr = await loop.sock_recvfrom(self.listen_socket, 1024)
+                    await self._process_received_message(data, addr)
+                except asyncio.CancelledError:
+                    raise
+                except Exception:
+                    logger.exception("Error in UDP listener; continuing")
+                    continue
 
         finally:
             if self.listen_socket:
@@ -253,3 +256,51 @@ class UDPHandler:
 
     def is_running(self) -> bool:
         return self._running
+
+
+_MIN_CALLS_TO_PROVE_RECOVERY = 2
+
+
+async def run_startup_tests() -> bool:
+    """C-01 regression: an exception from one datagram must not permanently kill the listen loop.
+
+    Exercises the real `_listen_loop` (bound to a loopback socket) with a processing
+    callback that raises on the first datagram, then verifies a second datagram still
+    gets through.
+    """
+    handler = UDPHandler(listen_port=0, target_host="127.0.0.1", target_port=0)
+    handler.listen_socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    handler.listen_socket.bind(("127.0.0.1", 0))
+    handler.listen_socket.setblocking(False)
+    port = handler.listen_socket.getsockname()[1]
+    handler._running = True  # noqa: SLF001 - white-box test drives loop internals directly
+
+    call_count = 0
+
+    async def _flaky(_data: bytes, _addr: tuple[str, int]) -> None:
+        nonlocal call_count
+        call_count += 1
+        if call_count == 1:
+            raise RuntimeError("simulated processing failure")
+
+    handler._process_received_message = _flaky  # type: ignore[method-assign]  # noqa: SLF001 - white-box test
+
+    task = asyncio.create_task(handler._listen_loop())  # noqa: SLF001 - white-box test
+    sender = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        sender.sendto(b"{}", ("127.0.0.1", port))
+        await asyncio.sleep(0.2)
+        sender.sendto(b"{}", ("127.0.0.1", port))
+        await asyncio.sleep(0.2)
+    finally:
+        sender.close()
+        handler._running = False  # noqa: SLF001 - white-box test
+        task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await task
+        if handler.listen_socket:
+            handler.listen_socket.close()
+
+    passed = call_count >= _MIN_CALLS_TO_PROVE_RECOVERY
+    print(f"    {'✅ PASS' if passed else '❌ FAIL'} | Listen loop survives a mid-loop exception")
+    return passed

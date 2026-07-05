@@ -40,6 +40,7 @@ HOURLY_BUCKET_MS = 3600000
 HOURLY_GAP_THRESHOLD = 6 * 3600  # 6 hours in seconds
 GAP_THRESHOLD_MULTIPLIER = 6
 MIN_DATAPOINTS_FOR_STATS = 10
+SQLITE_BUSY_TIMEOUT_S = 60  # tolerate nightly VACUUM holding the DB longer than the 5s default
 
 # Columns to SELECT when building message JSON (avoids fetching raw_json)
 _MSG_SELECT = (
@@ -1102,7 +1103,7 @@ class SQLiteStorage:
         """Execute a query in thread pool. Returns rows if fetch=True, rowcount otherwise."""
 
         def _run() -> list[dict[str, Any]] | int:
-            with sqlite3.connect(self.db_path) as conn:
+            with sqlite3.connect(self.db_path, timeout=SQLITE_BUSY_TIMEOUT_S) as conn:
                 conn.row_factory = sqlite3.Row
                 cursor = conn.execute(query, params)
                 if fetch:
@@ -1116,7 +1117,7 @@ class SQLiteStorage:
         """Execute many queries in thread pool."""
 
         def _run() -> None:
-            with sqlite3.connect(self.db_path) as conn:
+            with sqlite3.connect(self.db_path, timeout=SQLITE_BUSY_TIMEOUT_S) as conn:
                 conn.executemany(query, params_list)
                 conn.commit()
 
@@ -1438,17 +1439,25 @@ class SQLiteStorage:
             conversation_key,
             *cls_cols,
         )
-        await self._execute(
-            "INSERT INTO messages"
-            " (msg_id, src, dst, msg, type, timestamp, rssi, snr, src_type, raw_json,"
-            "  via, hw_id, lora_mod, max_hop, mesh_info, firmware, fw_sub,"
-            "  last_hw_id, last_sending, transformer, echo_id, conversation_key,"
-            "  category, tags, info_score, template_hash, classifier_ver)"
-            " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,"
-            "         ?, ?, ?, ?, ?)",
-            params,
-            fetch=False,
-        )
+        try:
+            await self._execute(
+                "INSERT INTO messages"
+                " (msg_id, src, dst, msg, type, timestamp, rssi, snr, src_type, raw_json,"
+                "  via, hw_id, lora_mod, max_hop, mesh_info, firmware, fw_sub,"
+                "  last_hw_id, last_sending, transformer, echo_id, conversation_key,"
+                "  category, tags, info_score, template_hash, classifier_ver)"
+                " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,"
+                "         ?, ?, ?, ?, ?)",
+                params,
+                fetch=False,
+            )
+        except sqlite3.OperationalError:
+            logger.exception(
+                "store_message: INSERT failed for msg_id=%s src=%s dst=%s (message dropped)",
+                msg_id,
+                callsign,
+                dst,
+            )
 
     @staticmethod
     def _build_message_dict(row: dict[str, Any]) -> dict[str, Any]:
@@ -2956,13 +2965,16 @@ class SQLiteStorage:
     async def get_positions(self, callsign: str, days: int) -> list[dict[str, Any]]:
         """Get position data for a callsign."""
         cutoff_ms = int((time.time() - days * 86400) * 1000)
+        escaped_callsign = (
+            callsign.upper().replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+        )
 
         rows_raw = await self._execute(
             "SELECT raw_json FROM messages"
             " WHERE type = 'pos' AND timestamp >= ?"
-            " AND UPPER(src) LIKE ?"
+            " AND UPPER(src) LIKE ? ESCAPE '\\'"
             " ORDER BY timestamp DESC",
-            (cutoff_ms, f"%{callsign}%"),
+            (cutoff_ms, f"%{escaped_callsign}%"),
         )
         rows = cast(list[dict[str, Any]], rows_raw)
 

@@ -18,6 +18,7 @@ import sys
 
 from mcapp.commands.handler import create_command_handler
 from mcapp.main import MessageRouter
+from mcapp.udp_handler import run_startup_tests as run_udp_handler_tests
 
 
 async def main() -> int:
@@ -26,6 +27,9 @@ async def main() -> int:
     suppression_ok = router.test_suppression_logic()
     print(f"suppression: {'PASS' if suppression_ok else 'FAIL'}")
 
+    udp_ok = await run_udp_handler_tests()
+    print(f"udp_handler: {'PASS' if udp_ok else 'FAIL'}")
+
     handler = create_command_handler(
         router, None, "DK5EN", 48.15, 11.58, "TestStation", "MeshCom Test Node"
     )
@@ -33,7 +37,7 @@ async def main() -> int:
     commands_ok = await handler.run_all_tests()
     print(f"commands: {'PASS' if commands_ok else 'FAIL'}")
 
-    return 0 if (suppression_ok and commands_ok) else 1
+    return 0 if (suppression_ok and udp_ok and commands_ok) else 1
 
 
 if __name__ == "__main__":

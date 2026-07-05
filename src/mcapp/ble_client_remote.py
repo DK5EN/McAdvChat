@@ -105,7 +105,6 @@ class BLEClientRemote(BLEClientBase):
                     json=data or None,
                     timeout=timeout,
                 )
-                response_data: dict[str, Any] = response.json()
 
                 if response.status_code == HTTPStatus.CONFLICT and attempt < retries:
                     logger.info(
@@ -117,6 +116,15 @@ class BLEClientRemote(BLEClientBase):
                     )
                     await asyncio.sleep(retry_delay)
                     continue
+
+                try:
+                    response_data: dict[str, Any] = response.json()
+                except ValueError as e:
+                    # Non-JSON body (e.g. an nginx 502 HTML page) — treat as retryable,
+                    # same as a connection error, instead of bypassing retry entirely.
+                    raise httpx.HTTPError(
+                        f"Invalid JSON response ({response.status_code}): {e}"
+                    ) from e
 
                 if response.status_code >= HTTPStatus.BAD_REQUEST:
                     detail = response_data.get("detail", "Unknown error")
