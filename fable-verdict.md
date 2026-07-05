@@ -1455,3 +1455,39 @@ Review checklist:
   check, ruff format --check, startup tests — 5 suites including `commands`, which exercises the
   reviewed ACK/timeout flows), noqa counts unchanged (ctcping.py: 1, ble_service/src/main.py: 7),
   scope discipline confirmed (only these two files touched).
+
+- [2026-07-06] Track M complete (classifier fixes in mc-chat + subtree sync into MCProxy):
+  CLS-01, CLS-02, CLS-03, CLS-04, CLS-05. Implemented and committed in
+  `/Users/martinwerner/WebDev/mc-chat` first (`7fd6317`), since this package is subtree-synced,
+  then pulled into MCProxy via `git subtree split`/`pull` per CLAUDE.md's recipe (merge commit
+  ancestor of the MCProxy-side follow-up commit below). **CLS-01**: new `classifier/tests.py` —
+  a startup regression suite (rules/template/score/Classifier end-to-end, ephemeral tempfile
+  SQLite) that tries both mc-chat's and MCProxy's storage import path since the module is
+  subtree-synced into both; this closes a real pre-existing gap (the classifier had zero test
+  coverage despite CLAUDE.md documenting a suite that didn't exist — DOC-02). **CLS-02**:
+  `template.py` gained public `is_exempt()`/`check_only()` for the auto-beacon exemption
+  decision; `classify.py`'s reclassify path now uses it instead of its old private-import
+  reimplementation, which had drifted — **behavior change**: reclassify now also demotes
+  auto-beacon status for directed messages (dst is a callsign-SSID), matching the live-ingest
+  path, which it previously didn't. **CLS-03**: `template.py`'s normalization pipeline
+  consolidated into one `_normalize()`, run once per message; fingerprint and tokenization both
+  derive from that single result instead of each independently re-running the same 5-step regex
+  pipeline. **CLS-04**: `_ms_to_zulu` made public (`ms_to_zulu`) in mc-chat's `types.py`;
+  MCProxy's `storage/classifier_api.py` (both call sites, lines ~217-219 and ~454-456) switched
+  from the private-symbol import to the public one as the MCProxy-side follow-up. **CLS-05**:
+  `EMOJI_RE` unified into `types.py` as the one canonical definition — **behavior change (bug
+  fix)**: `score.py` previously carried a deliberately separate copy with a subtle semantic
+  drift (the variation-selector code point was inside the character class instead of an optional
+  suffix), which double-counted an emoji+selector as two matches in `emoji_density`, now
+  correctly one; `CATEGORIES` now derived from `MessageCategory` via `get_args()` instead of
+  duplicating the same 10 strings in a second literal; `TEMPLATE_HASH_LEN` replaces a bare
+  `[:12]` duplicated in two places; `rules.py`'s `match_rules()` now precomputes per-scope match
+  targets once per message instead of once per rule (~40x/message). Both behavior changes (CLS-02
+  and CLS-05) were flagged explicitly by review rather than silently absorbed. mc-chat side:
+  ruff/mypy clean, 164 classifier-related pytest cases pass (883 total, matching baseline).
+  MCProxy side (separate commit after the subtree pull): `storage/classifier_api.py`'s two
+  `_ms_to_zulu` imports switched to `ms_to_zulu`; `classifier.tests.run_all_tests` wired into
+  `scripts/run_startup_tests.py` as a new `classifier` suite (now 6 suites total). Opus review
+  (of the mc-chat-side work): **approved**, no defects. Gates green in both repos (MCProxy: ruff
+  check, ruff format --check — 57 files, startup tests — 6 suites incl. the new `classifier`
+  suite exercising all 3 layers + the orchestrator's live and reclassify paths).

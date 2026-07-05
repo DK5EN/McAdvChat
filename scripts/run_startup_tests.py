@@ -16,6 +16,7 @@ text must contain "Node" — the built-in test cases assume both.
 import asyncio
 import sys
 
+from mcapp.classifier.tests import run_all_tests as run_classifier_tests
 from mcapp.commands.handler import create_command_handler
 from mcapp.main import MessageRouter
 from mcapp.sqlite_storage import run_startup_tests as run_storage_tests
@@ -38,6 +39,9 @@ async def main() -> int:
     sse_ok = await run_sse_tests()
     print(f"sse: {'PASS' if sse_ok else 'FAIL'}")
 
+    classifier_ok = await run_classifier_tests()
+    print(f"classifier: {'PASS' if classifier_ok else 'FAIL'}")
+
     handler = create_command_handler(
         router, None, "DK5EN", 48.15, 11.58, "TestStation", "MeshCom Test Node"
     )
@@ -45,7 +49,8 @@ async def main() -> int:
     commands_ok = await handler.run_all_tests()
     print(f"commands: {'PASS' if commands_ok else 'FAIL'}")
 
-    return 0 if (suppression_ok and udp_ok and storage_ok and sse_ok and commands_ok) else 1
+    all_ok = suppression_ok and udp_ok and storage_ok and sse_ok and classifier_ok and commands_ok
+    return 0 if all_ok else 1
 
 
 if __name__ == "__main__":

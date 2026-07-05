@@ -214,9 +214,9 @@ class ClassifierApiMixin(StorageBase):
     async def upsert_beacon_template(
         self, hash_: str, msg: str, src: str, now_ms: int
     ) -> dict[str, Any]:
-        from ..classifier.types import _ms_to_zulu  # noqa: PLC0415 - avoid circular import
+        from ..classifier.types import ms_to_zulu  # noqa: PLC0415 - avoid circular import
 
-        now_zulu = _ms_to_zulu(now_ms)
+        now_zulu = ms_to_zulu(now_ms)
 
         def _run() -> None:
             with sqlite3.connect(self.db_path) as conn:
@@ -451,9 +451,9 @@ class ClassifierApiMixin(StorageBase):
     async def get_top_beacon_templates(
         self, since_ms: int, limit: int = 10
     ) -> list[dict[str, Any]]:
-        from ..classifier.types import _ms_to_zulu  # noqa: PLC0415 - avoid circular import
+        from ..classifier.types import ms_to_zulu  # noqa: PLC0415 - avoid circular import
 
-        cutoff = _ms_to_zulu(since_ms)
+        cutoff = ms_to_zulu(since_ms)
         rows = await self._query(
             "SELECT template_hash, example_msg, count, auto_beacon "
             "FROM beacon_templates WHERE last_seen >= ? "
