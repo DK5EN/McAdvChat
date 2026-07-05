@@ -21,7 +21,7 @@ and the consistency couplings between feature and quality work.
 
 ---
 
-## 0. Session Handoff (2026-07-05, end of session — READ THIS FIRST)
+## 0. Session Handoff (2026-07-06, start of session — READ THIS FIRST)
 
 **Committed and done, in order, on `development`:**
 | Commit | What |
@@ -33,91 +33,21 @@ and the consistency couplings between feature and quality work.
 | `34d01c1` | Wave 2 — magic numbers → named constants (two passes + two Opus reviews) |
 | `89cc26b` | Wave 3 — dead code removal (zero defects on review) |
 | `575bd7d` | Wave 4 — logging unification (zero defects on review) |
+| `57e218a` | Wave 5 part 1 (superseded by the completion commit below) |
+| *(next)* | Wave 5 completion — BLE-02/04/08/15/16 + D1 fix, Opus-reviewed, see "Discovered" below |
 
-Each of the above was independently gate-verified (ruff check, ruff format --check, startup
-tests) and passed an adversarial Opus review per Section 8 before committing. Full detail on
-each wave's implementation and review outcome is in "Discovered during waves" at the bottom of
-this file.
+Every commit through Wave 5 was independently gate-verified and passed an adversarial Opus review
+per Section 8 before committing. Wave 5 is now **DONE** (see "Discovered during waves" for the
+full outcome, including the one MAJOR defect the Opus review caught and its fix).
 
-**IN PROGRESS, NOT YET COMMITTED — Wave 5 (duplication consolidation):**
-
-A fork implemented most of Wave 5's scope in the working tree, but ran out of turns before
-finishing (its last message cut off mid-sentence while starting on CMD-10's regex-consolidation
-check) — **it never wrote a final report, and none of this has been reviewed by Opus or by me
-beyond a basic gate check.** Do not trust it beyond what's verified below. Nothing has been
-committed; the working tree currently has these uncommitted changes:
-
-```
- src/mcapp/commands/ctcping.py         |   3 +-
- src/mcapp/commands/parsing.py         |  13 +-
- src/mcapp/commands/simple_commands.py |  22 +-
- src/mcapp/config_loader.py            |  82 +++-
- src/mcapp/main.py                     | 198 +++------
- src/mcapp/sqlite_storage.py           | 794 +++++++++++++---------------------
- src/mcapp/sse_handler.py              | 291 ++++---------
- 7 files changed, 543 insertions(+), 860 deletions(-)
-```
-
-**What it appears to have covered** (inferred from the diff, not confirmed against each finding
-individually — verify before trusting): ST-03 (chart-builder consolidation in
-`sqlite_storage.py` — this is "the big one," ~450 lines removed there, **the mandatory
-old-vs-new JSON comparison script for ST-03 was never shown to me and its existence/output
-is unverified — this is the single highest-risk item to check first on resume**), likely
-ST-13/ST-14/ST-18's BucketTuple+filter-string items (also in sqlite_storage.py's diff), CO-02/
-CO-03 (main.py's 198-line net removal is consistent with the `_udp_message_handler`/
-`_ble_message_handler` and mheard-dump-handler consolidations), CO-11 (config_loader.py),
-SSE-02/03/04/07's helper items (sse_handler.py's 291-line diff), and CMD-05 (simple_commands.py
-help-from-COMMANDS, 22 lines) plus a CMD-10 fragment (parsing.py/ctcping.py, small).
-
-**What it did NOT reach — zero files touched:** all of BLE-02, BLE-04 (the risky
-GATT-frame-consolidation item), BLE-08's finalize-extraction, BLE-15, BLE-16's mapping/API-key
-helpers. No file under `ble_service/` or `ble_client_remote.py`/`ble_protocol.py` was touched at
-all. CMD-07 was reportedly already done in Wave 2 (unverified this session). CMD-10's other
-helper items (path-header stripping, inline regexes) — unclear how much was reached before the
-cutoff.
-
-**Gate check performed at session end (quick, by the coordinating agent, not a full review):**
-- `uvx ruff check` → **All checks passed!**
-- `uvx ruff format --check .` → **42 files already formatted**
-- `MCAPP_ENV=dev uv run python scripts/run_startup_tests.py` → **exit 0**, all 5 suites
-  (suppression, udp_handler, storage, sse, commands) PASS, 0 `❌ FAIL` lines, 231 `✅ PASS` lines.
-- `grep -c "noqa: SLF001" src/mcapp/sse_handler.py` → **1** (wave's hard acceptance criterion is
-  0). The one remaining hit, at `sse_handler.py:1304`, is
-  `await manager._broadcast_handler(routed_message)  # noqa: SLF001 - white-box startup test` —
-  this is inside `run_startup_tests()` (added in Track U wave U3), a legitimate white-box test
-  reaching into a private method, **not** one of SSE-02's raw-SQL-via-`storage._execute()`
-  violations. My read is this is fine and the real target of the acceptance criterion (raw SQL
-  reaching into the storage layer from REST endpoints) is gone — but this has NOT been
-  independently confirmed by an Opus review; verify this reasoning on resume rather than
-  trusting it.
-- `git diff --stat -- src/mcapp/classifier/` → empty (subtree untouched, good).
-
-**Exact next steps to resume:**
-1. Read the current diff (`git diff`) yourself — don't trust this summary's inference about
-   what was done; the fork's own report was cut off before it could summarize.
-2. **Specifically hunt for the ST-03 verification evidence** — check if a comparison script was
-   left in a scratchpad directory or `/tmp`, and if not, you likely need to reconstruct/rerun the
-   old-vs-new JSON-output comparison yourself before trusting the chart-builder consolidation.
-   This is the wave's highest-risk item per its own rules ("compare output JSON of old vs new
-   implementation on a fixture DB before deleting the old code").
-3. Decide whether to resume the same fork (agent id no longer addressable across sessions — you
-   will need to either re-derive its work from the diff directly, or launch a fresh
-   general-purpose agent/fork to finish the untouched BLE items: BLE-02, BLE-04, BLE-08, BLE-15,
-   BLE-16) or treat the current partial diff as "Wave 5a" and do the BLE items as a follow-up
-   pass before the wave's single commit.
-4. Once satisfied the diff is complete and correct (including BLE-02/04/08/15/16 and a
-   confirmed-zero SLF001 count, or a documented reason the count can't reach exactly 0), launch
-   an Opus review per Section 8 — emphasize behavior-preservation for every consolidation, same
-   as the original Wave 5 fork instructions asked for (a `Task`/`Agent` call transcript is not
-   preserved across sessions, so re-read Section 7 "Wave 5" and Sections 3/4's ST-03/ST-13/
-   ST-14/ST-18/CO-02/CO-03/CO-11/SSE-02/03/04/07/CMD-05/CMD-07/CMD-10/BLE-02/04/08/15/16 findings
-   yourself to reconstruct the full scope before reviewing).
-5. Fix any issues the review finds, update this file's "Discovered during waves" section and the
-   note above, commit as one `[refactor] Wave 5: ...` commit (matching the style of the Wave 2-4
-   commit messages already in git log), then continue with Wave 6 (structural decomposition),
-   Wave 7 (performance), Track M (classifier via mc-chat, a different repo), and Track D (docs)
-   per the wave plan in Section 7 — same implement → verify → Opus review → fix → document →
-   commit → next-wave cycle used for every wave so far.
+**Next up:** Wave 6 (structural decomposition, 5 sub-commits: storage mixins, sse_handler
+APIRouter split, main.py decomposition, ctcping dataclasses, ble_service ServiceState), then
+Wave 7 (performance), Track M (classifier via mc-chat), Track D (docs) — per Section 7's wave
+plan, same implement → verify → Opus review → fix → document → commit → next-wave cycle used so
+far. One carry-over item for Wave 6: the reviewer flagged `_retry_connect` in
+`ble_service/src/main.py` (BLE-02's consolidation) as a 13-keyword-argument function that's
+correct but dense — consider replacing the loose kwargs with a small config dataclass when
+Wave 6 touches `ble_service` structure (BLE-03's `ServiceState`).
 
 ---
 
@@ -1132,3 +1062,35 @@ Review checklist:
   pattern, not the systemd-invisible-logging problem this wave targets) and all of
   `ble_service/` (separate process, own already-intentional `logging.basicConfig` setup, outside
   this wave's `src/mcapp/` scope). Opus review: **approved, zero defects**.
+
+- [2026-07-06] Wave 5 complete (ST-03, ST-13, ST-14, ST-18's BucketTuple/filter-string items,
+  CO-02, CO-03, CO-11, SSE-02/03/04/07, CMD-05, CMD-07, a CMD-10 fragment, BLE-02, BLE-04, BLE-08,
+  BLE-15, BLE-16's mapping/API-key items). Landed in two pieces reconciled into one reviewed
+  wave: `57e218a` (storage/main/sse_handler/config_loader/commands consolidation, ST-03's
+  ~450-line chart-builder dedup being the largest single change) plus a second pass adding the
+  five previously-untouched BLE items. ST-03 was verified with a fixture-DB comparison script
+  (old vs new chart methods on two populated DBs, all 6 combinations byte-identical JSON) before
+  the temporary old-implementation helper module was deleted; BLE-04's frame consolidation
+  (`MsgType(IntEnum)` + `_frame()` helper replacing 9 hand-built GATT frames) was independently
+  spot-checked byte-for-byte, including the `save_and_reboot` zero-payload case. BLE-02's
+  `_retry_connect` consolidates `_auto_reconnect`/`_startup_auto_connect` behind 13 keyword
+  params — correct and behavior-preserving (verified line-by-line: identical log wording,
+  activity-log actions, and timing for both callers) but dense; flagged as a Wave-6 candidate to
+  replace the kwargs with a small config dataclass once `ble_service`'s `ServiceState` (BLE-03)
+  work touches the same file. Opus review (adversarial, re-ran all gates independently) found one
+  **MAJOR, fix-required** regression: `sse_handler.py`'s `patch_classifier_rule` noop-guard
+  (`updatable = {"name","pattern","scope","category","priority","enabled"}`) omitted
+  `extra_tags`, so an extra_tags-only PATCH silently no-op'd instead of persisting (the old code
+  handled `extra_tags` as a separate clause) — a wire-facing REST regression the webapp's rule
+  editor would have hit. Fixed by adding `"extra_tags"` to the `updatable` set (one line);
+  `update_classifier_rule`'s own `allowed` set already covered it end-to-end. Gates re-run green
+  after the fix. Noted but deliberately not changed (non-blocking, doesn't affect reads):
+  `insert_classifier_rule` now stores empty `extra_tags` as SQL NULL vs the old code's `"[]"` —
+  normalized reads are identical either way; only the raw broadcast payload differs, and
+  builtin/legacy rows can already be null, so this is consistent with existing behavior. Also
+  noted: SSE-02's stated acceptance grep (`noqa: SLF001` count in sse_handler.py = 0) is
+  literally 1 post-wave — that one is `sse_handler.py:1304`'s pre-existing white-box startup-test
+  access (`manager._broadcast_handler`), not a raw-SQL violation; SSE-02's actual target (raw SQL
+  out of the transport layer) is fully met. Second Opus review after the D1 fix: **approved**.
+  Gates green throughout (ruff check, ruff format --check, startup tests — 5 suites, 0 failures);
+  `git diff --stat -- src/mcapp/classifier/` empty (subtree untouched).

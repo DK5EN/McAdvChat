@@ -828,7 +828,15 @@ class SSEManager:
             fields = body.model_dump(exclude_unset=True)
             if not await storage.classifier_rule_exists(rule_id):
                 raise HTTPException(status_code=404, detail="Rule not found")
-            updatable = {"name", "pattern", "scope", "category", "priority", "enabled"}
+            updatable = {
+                "name",
+                "pattern",
+                "scope",
+                "category",
+                "priority",
+                "enabled",
+                "extra_tags",
+            }
             if not any(key in fields for key in updatable):
                 return {"status": "noop"}
             await storage.update_classifier_rule(rule_id, **fields)

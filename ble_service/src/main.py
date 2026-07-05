@@ -11,6 +11,7 @@ import contextlib
 import json
 import logging
 import os
+import secrets
 import time
 from collections import deque
 from contextlib import asynccontextmanager
@@ -270,78 +271,128 @@ def _on_adapter_disconnect():
         _reconnect_task = asyncio.create_task(_auto_reconnect())
 
 
-async def _auto_reconnect():
-    """Attempt to reconnect with exponential backoff after unexpected disconnect."""
+async def _retry_connect(  # noqa: PLR0912, PLR0913, PLR0915 - consolidates two near-duplicate loops (BLE-02); params cover both callers' distinct behaviors
+    mac: str,
+    name: str,
+    *,
+    label: str,
+    delays: tuple[int, ...] = RECONNECT_DELAYS_S,
+    sleep_before_attempt: bool,
+    connect_timeout: float | None,
+    attempt_action: str,
+    attempt_log_level: str,
+    failed_action: str,
+    success_action: str,
+    success_detail: str,
+    log_cancel_activity: bool,
+    log_cancel_info: bool,
+    exhausted_detail: str,
+    exhausted_log_count: bool,
+) -> bool:
+    """Shared retry-with-backoff loop for BLE-02's two near-duplicate callers:
+    `_auto_reconnect` (reacts to an unexpected disconnect — backs off *before*
+    each attempt, no per-attempt timeout) and `_startup_auto_connect` (tries
+    immediately after the initial hardware-settle wait, backs off *between*
+    attempts on failure, wraps each attempt in a 30s timeout). The two callers'
+    log/activity wording and ordering quirks are preserved exactly via the
+    keyword params rather than unified, since none of those wording diffs were
+    a listed finding.
+    """
     global _reconnecting, _reconnect_attempt, _reconnect_max_attempts
-    mac = _last_connected_mac
-    name = _last_connected_name or mac or "unknown"
-    if not mac:
-        logger.warning("No previous MAC address for auto-reconnect")
-        return
-
-    delays = RECONNECT_DELAYS_S
     _reconnecting = True
     _reconnect_max_attempts = len(delays)
 
     for attempt, delay in enumerate(delays, 1):
         if _user_disconnected:
-            logger.info("Auto-reconnect cancelled (user disconnected)")
+            if log_cancel_info:
+                logger.info("%s cancelled (user disconnected)", label)
             _reconnecting = False
             _reconnect_attempt = 0
-            _log_activity("reconnect_cancelled", "Cancelled by user", "info")
-            return
+            if log_cancel_activity:
+                _log_activity("reconnect_cancelled", "Cancelled by user", "info")
+            return False
+        if not sleep_before_attempt and ble_adapter.is_connected:
+            logger.info("Already connected, stopping %s", label.lower())
+            _reconnecting = False
+            _reconnect_attempt = 0
+            return False
 
         _reconnect_attempt = attempt
-        _push_status_event(
-            "reconnecting",
-            attempt=attempt,
-            max_attempts=len(delays),
-            next_retry_in=delay,
-            device_name=name,
-            device_address=mac,
-        )
-        _log_activity(
-            "reconnect_attempt",
-            f"Attempt {attempt}/{len(delays)} to {name} (waiting {delay}s)",
-            "warn",
-        )
+        if sleep_before_attempt:
+            _push_status_event(
+                "reconnecting",
+                attempt=attempt,
+                max_attempts=len(delays),
+                next_retry_in=delay,
+                device_name=name,
+                device_address=mac,
+            )
+            _log_activity(
+                attempt_action,
+                f"Attempt {attempt}/{len(delays)} to {name} (waiting {delay}s)",
+                attempt_log_level,
+            )
+            logger.info("%s attempt %d/%d in %ds to %s", label, attempt, len(delays), delay, mac)
+            await asyncio.sleep(delay)
 
-        logger.info("Auto-reconnect attempt %d/%d in %ds to %s", attempt, len(delays), delay, mac)
-        await asyncio.sleep(delay)
-
-        if _user_disconnected:
-            _reconnecting = False
-            _reconnect_attempt = 0
-            _log_activity("reconnect_cancelled", "Cancelled by user", "info")
-            return
-        if ble_adapter.is_connected:
-            logger.info("Already reconnected, stopping auto-reconnect")
-            _reconnecting = False
-            _reconnect_attempt = 0
-            return
+            if _user_disconnected:
+                _reconnecting = False
+                _reconnect_attempt = 0
+                if log_cancel_activity:
+                    _log_activity("reconnect_cancelled", "Cancelled by user", "info")
+                return False
+            if ble_adapter.is_connected:
+                logger.info("Already reconnected, stopping %s", label.lower())
+                _reconnecting = False
+                _reconnect_attempt = 0
+                return False
+        else:
+            _push_status_event(
+                "reconnecting",
+                attempt=attempt,
+                max_attempts=len(delays),
+                next_retry_in=delay,
+                device_name=name,
+                device_address=mac,
+            )
+            logger.info("%s attempt %d/%d to %s", label, attempt, len(delays), mac)
+            _log_activity(
+                attempt_action,
+                f"Attempt {attempt}/{len(delays)} to {name}",
+                attempt_log_level,
+            )
 
         try:
-            success = await _connect_and_initialize(mac)
+            coro = _connect_and_initialize(mac)
+            success = (
+                await asyncio.wait_for(coro, timeout=connect_timeout)
+                if connect_timeout is not None
+                else await coro
+            )
             if success:
-                logger.info("Auto-reconnect successful to %s", mac)
+                logger.info("%s successful to %s", label, mac)
                 _reconnecting = False
                 _reconnect_attempt = 0
                 _push_status_event("connected", device_address=mac, device_name=name)
-                _log_activity("reconnect_success", f"Reconnected to {name}", "info")
-                return
-            logger.warning("Auto-reconnect attempt %d failed", attempt)
+                _log_activity(success_action, f"{success_detail} {name}", "info")
+                return True
+            logger.warning("%s attempt %d failed", label, attempt)
             _log_activity(
-                "reconnect_failed",
+                failed_action,
                 f"Attempt {attempt}/{len(delays)} failed",
                 "error",
             )
         except Exception as e:
-            logger.warning("Auto-reconnect attempt %d error: %s", attempt, e)
+            logger.warning("%s attempt %d error: %s", label, attempt, e)
             _log_activity(
-                "reconnect_failed",
+                failed_action,
                 f"Attempt {attempt}/{len(delays)} error: {e}",
                 "error",
             )
+
+        if not sleep_before_attempt and attempt < len(delays):
+            logger.info("Retrying in %ds...", delay)
+            await asyncio.sleep(delay)
 
     _reconnecting = False
     _reconnect_attempt = 0
@@ -353,16 +404,45 @@ async def _auto_reconnect():
     )
     _log_activity(
         "reconnect_exhausted",
-        f"All {len(delays)} attempts to {name} failed",
+        f"All {len(delays)}{exhausted_detail} to {name} failed",
         "error",
     )
-    logger.error("Auto-reconnect exhausted all %d attempts for %s", len(delays), mac)
+    if exhausted_log_count:
+        logger.error("%s exhausted all %d attempts for %s", label, len(delays), mac)
+    else:
+        logger.error("%s exhausted all attempts for %s", label, mac)
+    return False
 
 
-async def _startup_auto_connect():  # noqa: PLR0915 - complex handler kept intact
+async def _auto_reconnect():
+    """Attempt to reconnect with exponential backoff after unexpected disconnect."""
+    mac = _last_connected_mac
+    name = _last_connected_name or mac or "unknown"
+    if not mac:
+        logger.warning("No previous MAC address for auto-reconnect")
+        return
+
+    await _retry_connect(
+        mac,
+        name,
+        label="Auto-reconnect",
+        sleep_before_attempt=True,
+        connect_timeout=None,
+        attempt_action="reconnect_attempt",
+        attempt_log_level="warn",
+        failed_action="reconnect_failed",
+        success_action="reconnect_success",
+        success_detail="Reconnected to",
+        log_cancel_activity=True,
+        log_cancel_info=True,
+        exhausted_detail=" attempts",
+        exhausted_log_count=True,
+    )
+
+
+async def _startup_auto_connect():
     """Auto-connect to last-known device after service startup."""
     global _last_connected_mac, _last_connected_name, _user_disconnected
-    global _reconnecting, _reconnect_attempt, _reconnect_max_attempts
 
     mac = _load_ble_state()
     if not mac:
@@ -385,79 +465,22 @@ async def _startup_auto_connect():  # noqa: PLR0915 - complex handler kept intac
     _log_activity("startup_auto_connect", f"Waiting {AUTO_CONNECT_DELAY}s for hardware", "info")
     await asyncio.sleep(AUTO_CONNECT_DELAY)
 
-    delays = RECONNECT_DELAYS_S
-    _reconnecting = True
-    _reconnect_max_attempts = len(delays)
-
-    for attempt, delay in enumerate(delays, 1):
-        if _user_disconnected:
-            logger.info("Startup auto-connect cancelled (user disconnected)")
-            _reconnecting = False
-            _reconnect_attempt = 0
-            return
-        if ble_adapter.is_connected:
-            logger.info("Already connected, stopping startup auto-connect")
-            _reconnecting = False
-            _reconnect_attempt = 0
-            return
-
-        _reconnect_attempt = attempt
-        _push_status_event(
-            "reconnecting",
-            attempt=attempt,
-            max_attempts=len(delays),
-            next_retry_in=delay,
-            device_name=name,
-            device_address=mac,
-        )
-
-        logger.info("Startup auto-connect attempt %d/%d to %s", attempt, len(delays), mac)
-        _log_activity(
-            "startup_connect_attempt",
-            f"Attempt {attempt}/{len(delays)} to {name}",
-            "info",
-        )
-        try:
-            success = await asyncio.wait_for(_connect_and_initialize(mac), timeout=30.0)
-            if success:
-                logger.info("Startup auto-connect successful to %s", mac)
-                _reconnecting = False
-                _reconnect_attempt = 0
-                _push_status_event("connected", device_address=mac, device_name=name)
-                _log_activity("connect_success", f"Connected to {name}", "info")
-                return
-            logger.warning("Startup auto-connect attempt %d failed", attempt)
-            _log_activity(
-                "connect_failed",
-                f"Attempt {attempt}/{len(delays)} failed",
-                "error",
-            )
-        except Exception as e:
-            logger.warning("Startup auto-connect attempt %d error: %s", attempt, e)
-            _log_activity(
-                "connect_failed",
-                f"Attempt {attempt}/{len(delays)} error: {e}",
-                "error",
-            )
-
-        if attempt < len(delays):
-            logger.info("Retrying in %ds...", delay)
-            await asyncio.sleep(delay)
-
-    _reconnecting = False
-    _reconnect_attempt = 0
-    _push_status_event(
-        "reconnect_exhausted",
-        attempts=len(delays),
-        device_name=name,
-        device_address=mac,
+    await _retry_connect(
+        mac,
+        name,
+        label="Startup auto-connect",
+        sleep_before_attempt=False,
+        connect_timeout=30.0,
+        attempt_action="startup_connect_attempt",
+        attempt_log_level="info",
+        failed_action="connect_failed",
+        success_action="connect_success",
+        success_detail="Connected to",
+        log_cancel_activity=False,
+        log_cancel_info=True,
+        exhausted_detail=" startup attempts",
+        exhausted_log_count=False,
     )
-    _log_activity(
-        "reconnect_exhausted",
-        f"All {len(delays)} startup attempts to {name} failed",
-        "error",
-    )
-    logger.error("Startup auto-connect exhausted all attempts for %s", mac)
 
 
 @asynccontextmanager
@@ -523,12 +546,20 @@ app.add_middleware(
 # --- Authentication ---
 
 
-async def verify_api_key(x_api_key: Annotated[str | None, Header()] = None):
-    """Verify API key header"""
+def _api_key_valid(x_api_key: str | None) -> bool:
+    """Constant-time API-key check (BLE-16). No key configured — or explicitly
+    "disabled" — means auth is off and any request is authorized.
+    """
     if not API_KEY or API_KEY == "disabled":
         return True
+    if x_api_key is None:
+        return False
+    return secrets.compare_digest(x_api_key, API_KEY)
 
-    if x_api_key != API_KEY:
+
+async def verify_api_key(x_api_key: Annotated[str | None, Header()] = None):
+    """Verify API key header"""
+    if not _api_key_valid(x_api_key):
         raise HTTPException(status_code=401, detail="Invalid API key")
     return True
 
@@ -1033,8 +1064,7 @@ async def stream_notifications(x_api_key: Annotated[str | None, Header()] = None
     - parsed: Parsed JSON data (if format is "json")
     """
     # Verify API key
-    api_key_required = API_KEY and API_KEY != "disabled"
-    if api_key_required and x_api_key != API_KEY:
+    if not _api_key_valid(x_api_key):
         raise HTTPException(status_code=401, detail="Invalid API key")
 
     async def event_generator():

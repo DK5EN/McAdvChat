@@ -55,6 +55,17 @@ class ConnectionState(Enum):
     DISCONNECTING = "disconnecting"
     ERROR = "error"
 
+    @classmethod
+    def from_wire(cls, state_str: str) -> ConnectionState:
+        """Map a wire-format state string to a ConnectionState, defaulting to
+        DISCONNECTED for any value not in this enum (e.g. an unrecognized
+        future state from a newer ble_service).
+        """
+        try:
+            return cls(state_str)
+        except ValueError:
+            return cls.DISCONNECTED
+
 
 @dataclass
 class BLEDevice:

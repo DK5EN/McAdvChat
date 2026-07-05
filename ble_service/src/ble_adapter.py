@@ -43,7 +43,7 @@ import time
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
-from enum import Enum
+from enum import Enum, IntEnum
 
 from dbus_next import Variant
 from dbus_next.aio import MessageBus
@@ -98,6 +98,37 @@ def build_hello_bytes(pin: int) -> bytes:
         digest = hashlib.sha256(f"{pin:06d}".encode()).digest()
         return bytes([0x24, 0x10, 0x20, 0x30]) + digest
     return OPEN_HELLO
+
+
+class MsgType(IntEnum):
+    """GATT write-frame type byte (see module docstring's Supported Message Types)."""
+
+    TIME_SYNC = 0x20
+    SET_CALLSIGN = 0x50
+    SET_WIFI = 0x55
+    SET_LATITUDE = 0x70
+    SET_LONGITUDE = 0x80
+    SET_ALTITUDE = 0x90
+    SET_APRS_SYMBOLS = 0x95
+    TEXT_COMMAND = 0xA0
+    SAVE_AND_REBOOT = 0xF0
+
+
+# save_and_reboot-style trailer byte on set_latitude/longitude/altitude: whether
+# the new value is persisted to flash immediately or kept RAM-only until a
+# separate --save / MsgType.SAVE_AND_REBOOT.
+SAVE_TO_FLASH = 0x0A
+RAM_ONLY = 0x0B
+
+
+def _frame(msg_type: MsgType, payload: bytes = b"") -> bytes:
+    """Build a GATT write frame: length-byte + type-byte + payload.
+
+    `length` is len(payload) + 2 — it counts the type byte and the payload,
+    matching the firmware's frame-length convention (see module docstring).
+    """
+    length = len(payload) + 2
+    return length.to_bytes(1, "big") + bytes([msg_type]) + payload
 
 
 class ConnectionState(Enum):
@@ -775,11 +806,7 @@ class BLEAdapter:
             True if send successful
         """
         message = "{" + group + "}" + msg
-        byte_array = bytearray(message.encode("utf-8"))
-        length = len(byte_array) + 2
-        byte_array = length.to_bytes(1, "big") + bytes([0xA0]) + byte_array
-
-        return await self.write(bytes(byte_array))
+        return await self.write(_frame(MsgType.TEXT_COMMAND, message.encode("utf-8")))
 
     async def send_hello(self) -> bool:
         """Send hello/wakeup command to device"""
@@ -797,11 +824,7 @@ class BLEAdapter:
         Returns:
             True if send successful
         """
-        byte_array = bytearray(cmd.encode("utf-8"))
-        length = len(byte_array) + 2
-        byte_array = length.to_bytes(1, "big") + bytes([0xA0]) + byte_array
-
-        return await self.write(bytes(byte_array))
+        return await self.write(_frame(MsgType.TEXT_COMMAND, cmd.encode("utf-8")))
 
     async def set_time(self) -> bool:
         """Set current time and UTC offset on device.
@@ -828,8 +851,7 @@ class BLEAdapter:
 
         # Send Unix timestamp
         now = int(time.time())
-        data = (6).to_bytes(1, "big") + bytes([0x20]) + now.to_bytes(4, byteorder="little")
-        return await self.write(data)
+        return await self.write(_frame(MsgType.TIME_SYNC, now.to_bytes(4, byteorder="little")))
 
     async def set_callsign(self, callsign: str) -> bool:
         """
@@ -854,8 +876,7 @@ class BLEAdapter:
         if length > _BLE_MTU_LIMIT:
             raise ValueError(f"Callsign too long: {length} bytes (max 247)")
 
-        byte_array = length.to_bytes(1, "big") + bytes([0x50]) + callsign_bytes
-        return await self.write(bytes(byte_array))
+        return await self.write(_frame(MsgType.SET_CALLSIGN, callsign_bytes))
 
     async def set_wifi(self, ssid: str, password: str) -> bool:
         """
@@ -881,14 +902,13 @@ class BLEAdapter:
         pwd_bytes = password.encode("utf-8")
 
         # Wire format: SSID_len byte, SSID bytes, PWD_len byte, PWD bytes
-        byte_array = bytes([len(ssid_bytes)]) + ssid_bytes + bytes([len(pwd_bytes)]) + pwd_bytes
-        length = len(byte_array) + 2
+        payload = bytes([len(ssid_bytes)]) + ssid_bytes + bytes([len(pwd_bytes)]) + pwd_bytes
+        length = len(payload) + 2
 
         if length > _BLE_MTU_LIMIT:
             raise ValueError(f"WiFi config too long: {length} bytes (max 247)")
 
-        byte_array = length.to_bytes(1, "big") + bytes([0x55]) + byte_array
-        return await self.write(bytes(byte_array))
+        return await self.write(_frame(MsgType.SET_WIFI, payload))
 
     async def set_latitude(self, lat: float, save: bool = False) -> bool:
         """
@@ -907,12 +927,9 @@ class BLEAdapter:
         if not -90.0 <= lat <= 90.0:  # noqa: PLR2004 - geographic bound
             raise ValueError("Latitude must be between -90.0 and 90.0")
 
-        save_flag = 0x0A if save else 0x0B
-        byte_array = struct.pack("<f", lat) + bytes([save_flag])
-        length = len(byte_array) + 2
-
-        byte_array = length.to_bytes(1, "big") + bytes([0x70]) + byte_array
-        return await self.write(bytes(byte_array))
+        save_flag = SAVE_TO_FLASH if save else RAM_ONLY
+        payload = struct.pack("<f", lat) + bytes([save_flag])
+        return await self.write(_frame(MsgType.SET_LATITUDE, payload))
 
     async def set_longitude(self, lon: float, save: bool = False) -> bool:
         """
@@ -931,12 +948,9 @@ class BLEAdapter:
         if not -180.0 <= lon <= 180.0:  # noqa: PLR2004 - geographic bound
             raise ValueError("Longitude must be between -180.0 and 180.0")
 
-        save_flag = 0x0A if save else 0x0B
-        byte_array = struct.pack("<f", lon) + bytes([save_flag])
-        length = len(byte_array) + 2
-
-        byte_array = length.to_bytes(1, "big") + bytes([0x80]) + byte_array
-        return await self.write(bytes(byte_array))
+        save_flag = SAVE_TO_FLASH if save else RAM_ONLY
+        payload = struct.pack("<f", lon) + bytes([save_flag])
+        return await self.write(_frame(MsgType.SET_LONGITUDE, payload))
 
     async def set_altitude(self, alt: int, save: bool = False) -> bool:
         """
@@ -955,12 +969,9 @@ class BLEAdapter:
         if not -1000 <= alt <= 10000:  # noqa: PLR2004 - altitude bound
             raise ValueError("Altitude must be between -1000 and 10000 meters")
 
-        save_flag = 0x0A if save else 0x0B
-        byte_array = alt.to_bytes(4, byteorder="little", signed=True) + bytes([save_flag])
-        length = len(byte_array) + 2
-
-        byte_array = length.to_bytes(1, "big") + bytes([0x90]) + byte_array
-        return await self.write(bytes(byte_array))
+        save_flag = SAVE_TO_FLASH if save else RAM_ONLY
+        payload = alt.to_bytes(4, byteorder="little", signed=True) + bytes([save_flag])
+        return await self.write(_frame(MsgType.SET_ALTITUDE, payload))
 
     async def set_aprs_symbols(self, primary: str, secondary: str) -> bool:
         """
@@ -982,11 +993,8 @@ class BLEAdapter:
         primary_byte = ord(primary)
         secondary_byte = ord(secondary)
 
-        byte_array = bytes([primary_byte, secondary_byte])
-        length = len(byte_array) + 2
-
-        byte_array = length.to_bytes(1, "big") + bytes([0x95]) + byte_array
-        return await self.write(bytes(byte_array))
+        payload = bytes([primary_byte, secondary_byte])
+        return await self.write(_frame(MsgType.SET_APRS_SYMBOLS, payload))
 
     async def save_and_reboot(self) -> bool:
         """
@@ -1001,8 +1009,7 @@ class BLEAdapter:
         if not self.is_connected:
             raise RuntimeError("Not connected")
 
-        byte_array = bytes([0x02, 0xF0])  # Length=2, ID=0xF0, no data
-        return await self.write(byte_array)
+        return await self.write(_frame(MsgType.SAVE_AND_REBOOT))  # length=2, no payload
 
     async def query_extended_registers(self):
         """

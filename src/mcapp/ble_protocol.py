@@ -419,6 +419,9 @@ def transform_ble(input_dict: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+ROUTINE_JSON_TYPS = ("I", "SN", "G", "SA", "W", "IO", "TM", "AN", "SE", "SW", "S1", "S2")
+
+
 def dispatcher(input_dict: dict[str, Any], own_callsign: str = "") -> dict[str, Any] | None:
     """
     Route BLE messages to appropriate transformer based on type.
@@ -440,20 +443,7 @@ def dispatcher(input_dict: dict[str, Any], own_callsign: str = "") -> dict[str, 
     if "TYP" in input_dict:
         if input_dict["TYP"] == "MH":
             return transform_mh(input_dict)
-        if input_dict["TYP"] in [
-            "I",
-            "SN",
-            "G",
-            "SA",
-            "W",
-            "IO",
-            "TM",
-            "AN",
-            "SE",
-            "SW",
-            "S1",
-            "S2",
-        ]:
+        if input_dict["TYP"] in ROUTINE_JSON_TYPS:
             logger.debug("BLE JSON TYP=%s", input_dict["TYP"])
             return transform_ble(input_dict)
         logger.warning("Type not found! %s", input_dict)

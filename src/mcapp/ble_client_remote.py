@@ -26,7 +26,7 @@ from .ble_client import (
     BLEStatus,
     ConnectionState,
 )
-from .ble_protocol import decode_binary_message, dispatcher
+from .ble_protocol import ROUTINE_JSON_TYPS, decode_binary_message, dispatcher
 from .util import now_ms
 
 logger = logging.getLogger(__name__)
@@ -623,6 +623,19 @@ class BLEClientRemote(BLEClientBase):
         """Get own callsign from message router if available."""
         return getattr(self.message_router, "my_callsign", "") if self.message_router else ""
 
+    @staticmethod
+    def _finalize_transformed_output(
+        output: dict[str, Any], notification: dict[str, Any]
+    ) -> dict[str, Any]:
+        """Stamp timestamp + src_type onto a dispatcher() result, shared by the
+        JSON and binary-decoded branches of _transform_notification.
+        generic_ble/mh transformers already set their own src_type — don't override it.
+        """
+        output["timestamp"] = notification.get("timestamp", now_ms())
+        if output.get("transformer") not in ("generic_ble", "mh"):
+            output["src_type"] = "ble_remote"
+        return output
+
     def _transform_notification(self, notification: dict[str, Any]) -> dict[str, Any] | None:
         """Transform SSE notification to match local BLE handler format"""
         own_call = self._get_own_callsign()
@@ -630,32 +643,17 @@ class BLEClientRemote(BLEClientBase):
             # JSON notification - run through dispatcher like local mode
             parsed = cast(dict[str, Any], notification["parsed"])
             typ = parsed.get("TYP", "?")
-            _routine_typs = {
-                "MH",
-                "G",
-                "I",
-                "SA",
-                "SN",
-                "W",
-                "IO",
-                "TM",
-                "AN",
-                "SE",
-                "SW",
-                "S1",
-                "S2",
-                "CONFFIN",
-            }
+            # Superset of ble_protocol's dispatch-routing list: also treat MH (has its
+            # own transform_mh() path) and CONFFIN (handled before this method is
+            # even called) as routine for logging purposes.
+            _routine_typs = {*ROUTINE_JSON_TYPS, "MH", "CONFFIN"}
             if typ in _routine_typs:
                 logger.debug("BLE JSON TYP=%s: %s", typ, parsed)
             else:
                 logger.info("BLE JSON TYP=%s: %s", typ, parsed)
             output = dispatcher(parsed, own_call)
             if output:
-                output["timestamp"] = notification.get("timestamp", now_ms())
-                if output.get("transformer") not in ("generic_ble", "mh"):
-                    output["src_type"] = "ble_remote"
-                return output
+                return self._finalize_transformed_output(output, notification)
             return None  # Unknown TYP — don't publish
 
         if notification.get("format") == "binary":
@@ -684,10 +682,7 @@ class BLEClientRemote(BLEClientBase):
                             )
                         output = dispatcher(cast(dict[str, Any], decoded), own_call)
                         if output:
-                            if output.get("transformer") not in ("generic_ble", "mh"):
-                                output["src_type"] = "ble_remote"
-                            output["timestamp"] = notification.get("timestamp", now_ms())
-                            return output
+                            return self._finalize_transformed_output(output, notification)
                 except Exception as e:
                     logger.warning("Failed to decode binary notification: %s", e)
             # Fallback: return raw if decoding failed
@@ -703,7 +698,7 @@ class BLEClientRemote(BLEClientBase):
         notification["src_type"] = "ble_remote"
         return notification
 
-    async def _handle_status(self, data: str) -> None:  # noqa: PLR0912 - complex handler kept intact
+    async def _handle_status(self, data: str) -> None:
         """Handle SSE status update"""
         try:
             status: dict[str, Any] = json.loads(data)
@@ -765,11 +760,7 @@ class BLEClientRemote(BLEClientBase):
                 return
 
             # --- Standard state transitions ---
-            try:
-                new_state = ConnectionState(state_str)
-            except ValueError:
-                new_state = ConnectionState.DISCONNECTED
-
+            new_state = ConnectionState.from_wire(state_str)
             self._status.state = new_state
 
             if old_state != new_state:
@@ -823,10 +814,7 @@ class BLEClientRemote(BLEClientBase):
                 self._status.device_name = response.get("device_name")
             else:
                 state_str = response.get("state", "disconnected")
-                try:
-                    self._status.state = ConnectionState(state_str)
-                except ValueError:
-                    self._status.state = ConnectionState.DISCONNECTED
+                self._status.state = ConnectionState.from_wire(state_str)
                 self._status.device_address = None
 
             self._status.error = response.get("error")
