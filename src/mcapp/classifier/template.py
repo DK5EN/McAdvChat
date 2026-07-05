@@ -23,9 +23,9 @@ from .types import StorageProtocol as Storage
 # so each recent-message SQL query only runs when the cheaper branch missed.
 
 AUTO_BEACON_RULES: tuple[tuple[int, int | None], ...] = (
-    (8, None),   # any template seen >= 8 times, lifetime
-    (5, 24),     # fast beacons: >= 5 in 24 h
-    (3, 72),     # slow beacons: >= 3 in 72 h (hourly / 3x daily)
+    (8, None),  # any template seen >= 8 times, lifetime
+    (5, 24),  # fast beacons: >= 5 in 24 h
+    (3, 72),  # slow beacons: >= 3 in 72 h (hourly / 3x daily)
 )
 
 # Templates with <= this many tokens after normalization are too short to
@@ -47,12 +47,12 @@ _HUMAN_CATEGORIES: frozenset[str] = frozenset({"greeting", "directed", "alert"})
 URL_RE: re.Pattern[str] = re.compile(r"https?://\S+")
 
 EMOJI_RE: re.Pattern[str] = re.compile(
-    "["                      # start character class
-    "\U0001F300-\U0001FAFF"  # Misc Symbols & Pictographs through Symbols & Pictographs Ext-A
-    "\u2600-\u27BF"          # Misc Symbols, Dingbats
-    "\u2300-\u23FF"          # Misc Technical (⏰ ⏳ etc.)
+    "["  # start character class
+    "\U0001f300-\U0001faff"  # Misc Symbols & Pictographs through Symbols & Pictographs Ext-A
+    "\u2600-\u27bf"  # Misc Symbols, Dingbats
+    "\u2300-\u23ff"  # Misc Technical (⏰ ⏳ etc.)
     "]"
-    "\ufe0f?"                # optional variation selector
+    "\ufe0f?"  # optional variation selector
 )
 
 
@@ -98,7 +98,7 @@ def fingerprint(text: str) -> str:
     t = re.sub(r"\d+(?:[.,]\d+)?", "#", t)
     t = re.sub(r"\s+", " ", t)
     t = t.lower()
-    return hashlib.sha1(t.encode("utf-8")).hexdigest()[:12]
+    return hashlib.sha1(t.encode("utf-8"), usedforsecurity=False).hexdigest()[:12]
 
 
 # ── Result type ──────────────────────────────────────────────────────────
@@ -107,16 +107,16 @@ def fingerprint(text: str) -> str:
 @dataclass(frozen=True, slots=True)
 class BeaconResult:
     template_hash: str
-    is_beacon: bool       # should the classifier emit an 'auto_beacon' tag
-    transitioned: bool    # True iff this call flipped auto_beacon from 0 to 1
-    count: int            # current template row count after upsert
+    is_beacon: bool  # should the classifier emit an 'auto_beacon' tag
+    transitioned: bool  # True iff this call flipped auto_beacon from 0 to 1
+    count: int  # current template row count after upsert
     user_action: str | None  # 'promote' | 'demote' | None
 
 
 # ── Core async function ──────────────────────────────────────────────────
 
 
-async def update_and_check(
+async def update_and_check(  # noqa: PLR0911 - complex handler kept intact
     storage: Storage,
     msg: dict[str, Any],
     now_ms: int,
@@ -180,17 +180,20 @@ async def update_and_check(
     dst: str = (msg.get("dst") or "").strip().upper()
     is_directed = _DIRECTED_DST_RE.match(dst) is not None
 
-    if tpl["auto_beacon"] and user_action is None:
-        if is_short or is_human_category or is_directed:
-            # Self-heal: clear the auto_beacon flag
-            await storage.set_template_auto_beacon(hash_, False)
-            return BeaconResult(
-                template_hash=hash_,
-                is_beacon=False,
-                transitioned=False,
-                count=count,
-                user_action=user_action,
-            )
+    if (
+        tpl["auto_beacon"]
+        and user_action is None
+        and (is_short or is_human_category or is_directed)
+    ):
+        # Self-heal: clear the auto_beacon flag
+        await storage.set_template_auto_beacon(hash_, False)
+        return BeaconResult(
+            template_hash=hash_,
+            is_beacon=False,
+            transitioned=False,
+            count=count,
+            user_action=user_action,
+        )
 
     # 4. Already flagged as auto-beacon
     if tpl["auto_beacon"]:
@@ -228,9 +231,7 @@ async def update_and_check(
                 break
             continue
         since_ms = now_ms - window_hours * 3600 * 1000
-        stored = await storage.count_recent_messages_by_template_src(
-            hash_, msg["src"], since_ms
-        )
+        stored = await storage.count_recent_messages_by_template_src(hash_, msg["src"], since_ms)
         if stored + 1 >= min_count:
             triggered = True
             break

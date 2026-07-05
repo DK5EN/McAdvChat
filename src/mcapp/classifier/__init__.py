@@ -30,6 +30,6 @@ __all__ = [
     "CATEGORIES",
     "CLASSIFIER_SCHEMA_VERSION",
     "Classification",
-    "MessageCategory",
     "Classifier",
+    "MessageCategory",
 ]

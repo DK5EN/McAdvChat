@@ -36,9 +36,7 @@ import re
 #
 # The variation selector is included in the class so it adds to the count
 # alongside the base character — both are replaced when fingerprinting.
-EMOJI_RE: re.Pattern[str] = re.compile(
-    r"[\U0001F300-\U0001FAFF\u2600-\u27BF\u2300-\u23FF\ufe0f]"
-)
+EMOJI_RE: re.Pattern[str] = re.compile(r"[\U0001F300-\U0001FAFF\u2600-\u27BF\u2300-\u23FF\ufe0f]")
 
 # ── Weights (tune here) ─────────────────────────────────────────────────────
 _W_LEN_FACTOR: float = 0.30
@@ -49,7 +47,7 @@ _W_EMOJI_DENSITY: float = -0.25
 _W_URL_DENSITY: float = -0.10
 _W_KNOWN_BEACON: float = -0.40
 
-_LEN_CAP: float = 15.0   # word count that saturates len_factor
+_LEN_CAP: float = 15.0  # word count that saturates len_factor
 
 # Clamp ceilings for low-value content.
 _BOT_COMMAND_CAP: float = 0.25

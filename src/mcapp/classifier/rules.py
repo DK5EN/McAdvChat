@@ -21,7 +21,7 @@ logger = logging.getLogger(__name__)
 class CompiledRule:
     id: int
     name: str
-    scope: str            # 'msg' | 'src' | 'dst' | 'combined'
+    scope: str  # 'msg' | 'src' | 'dst' | 'combined'
     category: str
     extra_tags: tuple[str, ...]
     priority: int
@@ -29,7 +29,7 @@ class CompiledRule:
     regex: re.Pattern[str]
 
 
-async def load_rules(storage: "StorageProtocol") -> list[CompiledRule]:
+async def load_rules(storage: StorageProtocol) -> list[CompiledRule]:
     """Load enabled rules from storage, compile each regex, sort by (priority, id).
 
     On regex compile error log a warning and skip that rule.

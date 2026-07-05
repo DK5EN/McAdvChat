@@ -151,7 +151,7 @@ DEFAULT_RULES: list[dict[str, Any]] = [
         "extra_tags": ["beacon"],
     },
     {
-        # Matches: "🌙WX nördl.🌲¼ ▫️Temp.: 8.3 °C ▫️Feuchte: 57 % ▫️Wind: 3 km/h"
+        # Example: 🌙WX nördl.🌲¼ ▫️Temp.: 8.3 °C ▫️Feuchte: 57 % ▫️Wind: 3 km/h
         # No hPa/QNH — uses Feuchte/Regen/Wind/Solar instead.
         "priority": 28,
         "name": "WX German no-hPa",
@@ -161,7 +161,7 @@ DEFAULT_RULES: list[dict[str, Any]] = [
         "extra_tags": ["beacon"],
     },
     {
-        # Matches: "JO44qp 1,3 Grad C, Wind NE 5 km/h, 1028 hPa. QAM 73, Timo"
+        # Example: JO44qp 1,3 Grad C, Wind NE 5 km/h, 1028 hPa. QAM 73, Timo
         # Locator-style manual WX reports with Grad C/F + hPa.
         "priority": 29,
         "name": "WX Grad hPa",
@@ -389,7 +389,7 @@ def _needs_update(existing: dict[str, Any], default: dict[str, Any]) -> bool:
     return existing_tags != default_tags
 
 
-async def seed_defaults(storage: "StorageProtocol") -> tuple[int, int]:
+async def seed_defaults(storage: StorageProtocol) -> tuple[int, int]:
     """Upsert DEFAULT_RULES by name.
 
     Returns ``(inserted, updated)``.  User-created rules (``builtin=0``)
