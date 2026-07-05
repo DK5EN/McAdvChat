@@ -21,33 +21,39 @@ and the consistency couplings between feature and quality work.
 
 ---
 
-## 0. Session Handoff (2026-07-06, start of session — READ THIS FIRST)
+## 0. Session Handoff (2026-07-06, end of session — READ THIS FIRST)
 
-**Committed and done, in order, on `development`:**
+**The full wave plan (Section 7) is DONE.** Waves 1-7, Track U (UDP 2.0), Track M (classifier),
+and Track D (docs) are all implemented, adversarially Opus-reviewed, and committed on
+`development`. Every commit passed the gates in Section 8's preamble (ruff check, ruff format
+--check, `run_startup_tests.py` exit 0) and an independent review before landing — see
+"Discovered during waves" (end of file) for the full per-wave outcome log, including every
+defect a reviewer caught and how it was fixed.
+
+**Commit log, in order:**
 | Commit | What |
 |---|---|
 | `03db743` | Wave 1 — critical fixes (C-01..C-08, ST-11, BLE-07, SCR-02, CO-14) |
-| `edab1a3` | Track U waves U1+U2 — UDP-lora signal routing, dedup, migration to v19 |
-| `4d03f28` | Track U wave U3 — SSE surfacing verification + historical signal backfill |
-| `0e007ba` | Track U wave U4 — docs/ADR reconciliation (Track U fully DONE) |
-| `34d01c1` | Wave 2 — magic numbers → named constants (two passes + two Opus reviews) |
-| `89cc26b` | Wave 3 — dead code removal (zero defects on review) |
-| `575bd7d` | Wave 4 — logging unification (zero defects on review) |
-| `57e218a` | Wave 5 part 1 (superseded by the completion commit below) |
-| *(next)* | Wave 5 completion — BLE-02/04/08/15/16 + D1 fix, Opus-reviewed, see "Discovered" below |
+| `edab1a3`/`4d03f28`/`0e007ba` | Track U waves U1-U4 — UDP-lora signal routing → v19 migration → SSE/backfill → docs |
+| `34d01c1` | Wave 2 — magic numbers → named constants |
+| `89cc26b` | Wave 3 — dead code removal |
+| `575bd7d` | Wave 4 — logging unification |
+| `57e218a` + `7f40d04` | Wave 5 — duplication consolidation (ST-03/13/14/18, CO-02/03/11, SSE-02/03/04/07, CMD-05/07/10, BLE-02/04/08/15/16) |
+| `0ec876f`..`057b145` | Wave 6, 5 sub-commits — storage mixins, sse_routes split, main.py decomposition, ctcping dataclasses, ble_service ServiceState |
+| `a908c85` | SCR-04 follow-up (update-runner slot-meta bug + EventBus/queue bounding) |
+| `5ccf85e` | Wave 7 — performance (ST-07/08/09/18, SSE-05/06, CO-08/10/22, BLE-12, CMD-10) |
+| `d82e29d` | Legibility/complexity audit fixes (ctcping invariants + dead code, BLE `_RetryProfile`) — a standalone pass triggered mid-session by a maintainer concern that structural refactoring might have become hard to follow; verdict was ~90% genuine improvement, one file needed cleanup |
+| `409dca2`/`57cdf64`/`fe3fa42` | Track M — classifier fixes (CLS-01..05) in mc-chat, subtree-synced, MCProxy-side `ms_to_zulu`/startup-test wiring |
+| `3841048` | Track D — `doc/tech-debt.md` refreshed against Waves 1-7 outcomes |
 
-Every commit through Wave 5 was independently gate-verified and passed an adversarial Opus review
-per Section 8 before committing. Wave 5 is now **DONE** (see "Discovered during waves" for the
-full outcome, including the one MAJOR defect the Opus review caught and its fix).
-
-**Next up:** Wave 6 (structural decomposition, 5 sub-commits: storage mixins, sse_handler
-APIRouter split, main.py decomposition, ctcping dataclasses, ble_service ServiceState), then
-Wave 7 (performance), Track M (classifier via mc-chat), Track D (docs) — per Section 7's wave
-plan, same implement → verify → Opus review → fix → document → commit → next-wave cycle used so
-far. One carry-over item for Wave 6: the reviewer flagged `_retry_connect` in
-`ble_service/src/main.py` (BLE-02's consolidation) as a 13-keyword-argument function that's
-correct but dense — consider replacing the loose kwargs with a small config dataclass when
-Wave 6 touches `ble_service` structure (BLE-03's `ServiceState`).
+**What's left, if anyone picks this up again:** everything in Section 7 is done. Remaining
+possibilities are things explicitly deferred as non-blocking along the way (search "Deferred" /
+"not fixed" in "Discovered during waves") — e.g. Wave 7's ST-02 (connection-reuse, needs real Pi
+hardware measurement), and the deferred wire-format items in Section 7's closing paragraph
+(BLE-14, SSE-07's `matches` rename, ST-12) that need coordinated webapp changes. (Wave 6.4's
+flagged latent double-`del self.active_pings[ack_id]`/`KeyError` bug is no longer open — it was
+fixed by the legibility-audit pass's M3, see `d82e29d`.) None of these were requested by any
+wave's acceptance criteria; treat this document as the audit trail, not a new backlog.
 
 ---
 
