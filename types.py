@@ -9,7 +9,7 @@ git subtree in other packages without importing meshcom_mock directly.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from typing import Any, Literal, Protocol, runtime_checkable
 
 # ── Category vocabulary ─────────────────────────────────────────────────
@@ -56,7 +56,7 @@ CLASSIFIER_SCHEMA_VERSION: int = 1
 
 def _ms_to_zulu(ms: int) -> str:
     """Convert millisecond epoch to ISO 8601 UTC string."""
-    dt = datetime.fromtimestamp(ms / 1000, tz=timezone.utc)
+    dt = datetime.fromtimestamp(ms / 1000, tz=UTC)
     return dt.strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
@@ -85,7 +85,7 @@ class EventBusProtocol(Protocol):
 class StorageProtocol(Protocol):
     # Rules
     async def get_classifier_rules(self, enabled_only: bool = False) -> list[dict[str, Any]]: ...
-    async def insert_classifier_rule(
+    async def insert_classifier_rule(  # noqa: PLR0913 - signature fixed by call sites
         self,
         *,
         name: str,
@@ -130,7 +130,7 @@ class StorageProtocol(Protocol):
         limit: int = 500,
         offset: int = 0,
     ) -> list[dict[str, Any]]: ...
-    async def update_message_classification(
+    async def update_message_classification(  # noqa: PLR0913 - signature fixed by call sites
         self,
         row_id: Any,
         *,

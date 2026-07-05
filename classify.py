@@ -27,8 +27,9 @@ import hashlib
 import logging
 import time
 import uuid
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
-from typing import Any, Awaitable, Callable
+from typing import Any
 
 from .rules import CompiledRule, load_rules, match_rules
 from .score import compute as score_compute
@@ -53,7 +54,7 @@ ProgressCallback = Callable[["ReclassifyJob"], Awaitable[None]]
 
 def _fallback_hash(text: str) -> str:
     """Plain SHA-1 of raw text, no normalization.  Used in the exception path."""
-    return hashlib.sha1(text.encode("utf-8")).hexdigest()[:12]
+    return hashlib.sha1(text.encode("utf-8"), usedforsecurity=False).hexdigest()[:12]
 
 
 @dataclass
@@ -91,11 +92,9 @@ class Classifier:
         """Fetch rules + current version from the DB and cache them."""
         self.version = await self.storage.get_classifier_version()
         self.rules = await load_rules(self.storage)
-        logger.debug(
-            "Classifier loaded: version=%d, rules=%d", self.version, len(self.rules)
-        )
+        logger.debug("Classifier loaded: version=%d, rules=%d", self.version, len(self.rules))
 
-    async def classify(
+    async def classify(  # noqa: PLR0912 - complex handler kept intact
         self,
         msg: dict[str, Any],
         *,
@@ -123,9 +122,7 @@ class Classifier:
 
             if update_stats:
                 # Layer 2 (live path): upsert stats, decide auto-beacon
-                beacon = await update_and_check(
-                    self.storage, msg, now_ms, category=category
-                )
+                beacon = await update_and_check(self.storage, msg, now_ms, category=category)
                 template_hash = beacon.template_hash
                 template_count = beacon.count
                 if beacon.is_beacon:
@@ -227,9 +224,7 @@ class Classifier:
 
         target_version = self.version
 
-        total = await self.storage.count_messages_to_classify(
-            classifier_ver_below=target_version
-        )
+        total = await self.storage.count_messages_to_classify(classifier_ver_below=target_version)
         job_id = str(uuid.uuid4())
         job = ReclassifyJob(job_id=job_id, total=total)
         self._jobs[job_id] = job
@@ -244,10 +239,10 @@ class Classifier:
                 progress_cb=progress_cb,
             )
         )
-        job._task = task
+        job._task = task  # noqa: SLF001 - framework wiring
         return job
 
-    async def _run_reclassify(
+    async def _run_reclassify(  # noqa: PLR0913 - signature fixed by call sites
         self,
         *,
         job: ReclassifyJob,
@@ -283,9 +278,9 @@ class Classifier:
                 batch_ids = {int(row["id"]) for row in batch}
                 if batch_ids <= skipped_ids:
                     logger.error(
-                        "Reclassify job %s stalled on %d rows that all "
-                        "fail their UPDATE; aborting",
-                        job.job_id, len(batch_ids),
+                        "Reclassify job %s stalled on %d rows that all fail their UPDATE; aborting",
+                        job.job_id,
+                        len(batch_ids),
                     )
                     break
 
@@ -324,9 +319,7 @@ class Classifier:
         finally:
             await self._cleanup_stale_auto_beacons()
             job.done = True
-            await self.storage.set_meta(
-                "last_reclassify_ms", str(int(time.time() * 1000))
-            )
+            await self.storage.set_meta("last_reclassify_ms", str(int(time.time() * 1000)))
             if progress_cb is not None:
                 try:
                     await progress_cb(job)
@@ -349,12 +342,8 @@ class Classifier:
             }
         """
         now_ms = int(time.time() * 1000)
-        counts = await self.storage.count_messages_by_category(
-            now_ms - 30 * 24 * 3600 * 1000
-        )
-        recent_24h = await self.storage.count_messages_by_category(
-            now_ms - 24 * 3600 * 1000
-        )
+        counts = await self.storage.count_messages_by_category(now_ms - 30 * 24 * 3600 * 1000)
+        recent_24h = await self.storage.count_messages_by_category(now_ms - 24 * 3600 * 1000)
 
         # timestamp_beacon is not persisted (drop-on-classify); surface the
         # in-memory 24h counter so the FE badge stays accurate.
@@ -362,9 +351,7 @@ class Classifier:
         if heartbeat_n:
             recent_24h["timestamp_beacon"] = heartbeat_n
 
-        top_templates = await self.storage.get_top_beacon_templates(
-            now_ms - 7 * 24 * 3600 * 1000
-        )
+        top_templates = await self.storage.get_top_beacon_templates(now_ms - 7 * 24 * 3600 * 1000)
         auto_beacon_total = await self.storage.count_auto_beacon_templates()
 
         return {
