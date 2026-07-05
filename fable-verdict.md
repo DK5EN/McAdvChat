@@ -1094,3 +1094,34 @@ Review checklist:
   out of the transport layer) is fully met. Second Opus review after the D1 fix: **approved**.
   Gates green throughout (ruff check, ruff format --check, startup tests — 5 suites, 0 failures);
   `git diff --stat -- src/mcapp/classifier/` empty (subtree untouched).
+
+- [2026-07-06] Wave 6 sub-commit 1/5 complete (storage decomposition: ST-04, ST-05, ST-06).
+  `SQLiteStorage` (~4073 lines, ~90 methods, 8 concerns) split into a `src/mcapp/storage/`
+  package — `_base.py` (`StorageBase` Protocol, mirrors `commands/_base.py`'s existing mixin
+  pattern), `constants.py`, `migrations.py` (schema + all 18 `current_version < N` blocks,
+  v2-v19, moved byte-identical — independently AST-diffed, confirmed verbatim), `ingest.py`
+  (store_message/store_telemetry/signal-bucket accumulation), `query.py` (charts/stats/dump/
+  paging), `prefs.py`, `classifier_api.py` (classifier_rules/beacon_templates CRUD, with the
+  CLS-04 private-symbol imports' relative depth fixed `.classifier` → `..classifier` for the
+  deeper file location). `sqlite_storage.py` is now a ~540-line facade:
+  `SQLiteStorage(MigrationsMixin, IngestMixin, QueryMixin, PrefsMixin, ClassifierApiMixin)` plus
+  construction/`_query`/`_mutate`/`_execute_many`/`close`/`create_sqlite_storage`/
+  `run_startup_tests`. ST-06: `_execute(query, params, fetch=...) -> list | int` replaced by
+  `_query(...) -> list[dict]` / `_mutate(...) -> int` across all 90 call sites (mechanical
+  AST-based transform, independently reconciled by the reviewer: 90 → 51 `_query` + 39
+  `_mutate`, zero SQL-verb/function mismatches), deleting 9 now-dead
+  `isinstance(rows, list)` guards and ~25 leftover `X_raw = ...; X = X_raw` no-op alias lines
+  (collapsed during self-review before sending for Opus review). ST-05: extracted
+  `_handle_ack`/`_store_position`/`_store_mheard`/`_insert_message_row` from `store_message`
+  (325 → 199 lines); dedup-before-signal-ingestion ordering and the lora-`pos`-updates-both-
+  field-groups logic (UDP 2.0 Track U) independently verified preserved exactly, including every
+  early-return point. Public `SQLiteStorage` surface confirmed unchanged via a repo-wide
+  caller-grep (every `storage.<method>`/`storage_handler.<method>` call site still resolves
+  through the new mixin MRO). Opus review: **approved**, gates green
+  (ruff check, ruff format --check — 49 files, startup tests — 5 suites, 0 failures), noqa count
+  unchanged (74), classifier subtree untouched. One MINOR non-blocking note (not fixed, not a
+  listed finding — noting per ground rule 10 instead of scope-creeping the fix in):
+  `storage/ingest.py`'s `_insert_message_row`'s `OperationalError` diagnostic log now logs the
+  full `src` relay path instead of the normalized `callsign` the old inline code used — error-path-
+  only (fires only on a DB-locked INSERT failure), arguably more informative, but flagging in case
+  a future pass wants the log argument changed back to the normalized callsign.

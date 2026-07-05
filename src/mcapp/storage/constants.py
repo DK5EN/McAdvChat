@@ -1,0 +1,191 @@
+"""Module-level constants, schema SQL, and small pure helpers shared across all
+SQLiteStorage mixins (ST-04). Moved verbatim out of sqlite_storage.py.
+"""
+
+from typing import NamedTuple
+
+# Constants matching message_storage.py
+BUCKET_SECONDS = 5 * 60
+VALID_RSSI_RANGE = (-140, -30)
+VALID_SNR_RANGE = (-30, 12)
+DEDUP_WINDOW_MS = 60 * 60 * 1000  # 60-minute dedup window (milliseconds)
+SEVEN_DAYS_MS = 7 * 24 * 60 * 60 * 1000
+ONE_MONTH_MS = 30 * 24 * 60 * 60 * 1000
+ONE_YEAR_MS = 365 * 24 * 60 * 60 * 1000
+HOURLY_BUCKET_MS = 3600000
+HOURLY_GAP_THRESHOLD = 6 * 3600  # 6 hours in seconds
+GAP_THRESHOLD_MULTIPLIER = 6
+MIN_DATAPOINTS_FOR_STATS = 10
+SQLITE_BUSY_TIMEOUT_S = 60  # tolerate nightly VACUUM holding the DB longer than the 5s default
+SIGNAL_BACKFILL_WINDOW_HOURS = 192  # 8 days — matches signal_log's own prune retention
+SIGNAL_BACKFILL_BATCH_SIZE = 500
+EIGHT_DAYS_MS = SIGNAL_BACKFILL_WINDOW_HOURS * 3600 * 1000
+
+MHEARD_THROTTLE_MS = 120_000  # 2 minutes
+ACK_DIAG_WINDOW_MS = 300_000
+TELEMETRY_DEDUP_WINDOW_MS = 60_000
+
+# Barometric formula: QFE = QNH × (1 - LAPSE_RATE × alt / STD_TEMP)^EXPONENT
+BARO_LAPSE_RATE_K_PER_M = 0.0065
+BARO_STD_TEMP_K = 288.15
+BARO_EXPONENT = 5.255
+
+DEFAULT_POS_RETENTION_HOURS = 192  # 8 days
+LONG_RETENTION_DAYS = 365
+STATION_RETENTION_DAYS = 30
+
+PRUNE_TARGET_FRACTION = 0.9  # aim for 90% of MAX_DB_SIZE_MB to avoid re-trigger
+EST_BYTES_PER_ROW = 200  # conservative average across all tables
+MIN_PRUNE_ROWS = 1000
+
+INITIAL_ACK_LIMIT = 200
+DEFAULT_PAGE_SIZE = 20  # align with core's DEFAULT_PAGE_LIMIT
+
+HOURLY_BUCKET_S = 3600
+MHEARD_STATION_SCAN_LIMIT = 4000
+SECONDS_PER_DAY = 86400
+TELEMETRY_BUCKET_MS = 4 * 3600 * 1000
+HOURS_PER_YEAR = 8760
+
+# Shared between _should_filter_message (rejects new rows) and prune_messages
+# (sweeps out any that slipped in before the filter existed).
+INVALID_CHARACTER_MSG = "-- invalid character --"
+CORE_DUMP_FILTER_TEXT = "No core dump"
+
+# Columns to SELECT when building message JSON (avoids fetching raw_json)
+_MSG_SELECT = (
+    "msg_id, src, dst, msg, type, timestamp, rssi, snr, src_type,"
+    " via, hw_id, lora_mod, max_hop, mesh_info, firmware, fw_sub,"
+    " last_hw_id, last_sending, transformer, echo_id, acked, send_success,"
+    " category, tags, info_score, template_hash, classifier_ver"
+)
+
+
+class BucketTuple(NamedTuple):
+    """A completed signal_buckets row, ready for INSERT OR REPLACE."""
+
+    callsign: str
+    bucket_ts: int
+    bucket_size: int
+    rssi_avg: float
+    rssi_min: float | int
+    rssi_max: float | int
+    snr_avg: float
+    snr_min: float
+    snr_max: float
+    count: int
+
+
+def compute_conversation_key(src: str, dst: str) -> str | None:
+    """Compute conversation key for message grouping.
+
+    Groups → dst, DMs → sorted base callsigns joined with '<>'.
+
+    Via-routed dst is 'VIA[,VIA2],TARGET' — the real target is the LAST
+    comma component (e.g. 'OE1KBC-12,232' → group 232). The src field
+    carries the relay path the other way round: FIRST component = sender.
+    """
+    if not dst:
+        return None
+    target = dst.rsplit(",", maxsplit=1)[-1].strip()
+    if target.isdigit() or target == "TEST":
+        return target
+    if target == "*":
+        return "*"
+    # DM: strip SSIDs, sort alphabetically
+    base_src = src.split(",", maxsplit=1)[0].split("-", maxsplit=1)[0]
+    base_dst = target.split("-")[0]
+    pair = sorted([base_src, base_dst])
+    return f"{pair[0]}<>{pair[1]}"
+
+
+CREATE_SCHEMA_SQL = """
+-- Main messages table
+CREATE TABLE IF NOT EXISTS messages (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    msg_id TEXT,
+    src TEXT NOT NULL,
+    dst TEXT NOT NULL,
+    msg TEXT,
+    type TEXT DEFAULT 'msg',
+    timestamp INTEGER NOT NULL,
+    rssi INTEGER,
+    snr REAL,
+    src_type TEXT,
+    raw_json TEXT,
+    created_at TEXT DEFAULT CURRENT_TIMESTAMP
+);
+
+-- Indexes for common queries
+CREATE INDEX IF NOT EXISTS idx_messages_timestamp ON messages(timestamp);
+CREATE INDEX IF NOT EXISTS idx_messages_src ON messages(src);
+CREATE INDEX IF NOT EXISTS idx_messages_dst ON messages(dst);
+CREATE INDEX IF NOT EXISTS idx_messages_type ON messages(type);
+
+-- Composite indexes for heavy query patterns
+CREATE INDEX IF NOT EXISTS idx_messages_type_timestamp ON messages(type, timestamp DESC);
+CREATE INDEX IF NOT EXISTS idx_messages_type_dst_timestamp ON messages(type, dst, timestamp DESC);
+CREATE INDEX IF NOT EXISTS idx_messages_type_src_timestamp ON messages(type, src, timestamp DESC);
+CREATE INDEX IF NOT EXISTS idx_messages_msgid_timestamp ON messages(msg_id, timestamp DESC);
+
+-- Schema version tracking
+CREATE TABLE IF NOT EXISTS schema_version (
+    version INTEGER PRIMARY KEY
+);
+"""
+
+# New tables for separated position/signal architecture (schema v2)
+CREATE_SCHEMA_V2_SQL = """
+-- Latest position per station (one row per unique callsign)
+CREATE TABLE IF NOT EXISTS station_positions (
+    callsign        TEXT PRIMARY KEY,
+    lat             REAL,
+    lon             REAL,
+    alt             REAL,
+    lat_dir         TEXT DEFAULT '',
+    lon_dir         TEXT DEFAULT '',
+    hw_id           INTEGER,
+    firmware        TEXT,
+    fw_sub          TEXT,
+    aprs_symbol     TEXT,
+    aprs_symbol_group TEXT,
+    batt            INTEGER,
+    lora_mod        INTEGER,
+    mesh            INTEGER,
+    gw              INTEGER DEFAULT 0,
+    rssi            INTEGER,
+    snr             REAL,
+    via_shortest    TEXT DEFAULT '',
+    via_paths       TEXT DEFAULT '[]',
+    position_ts     INTEGER,
+    signal_ts       INTEGER,
+    last_seen       INTEGER,
+    source          TEXT DEFAULT 'local'
+);
+
+-- Raw RSSI/SNR measurements from MHeard beacons
+CREATE TABLE IF NOT EXISTS signal_log (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    callsign    TEXT NOT NULL,
+    timestamp   INTEGER NOT NULL,
+    rssi        INTEGER NOT NULL,
+    snr         REAL NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_signal_log_cs_ts ON signal_log(callsign, timestamp DESC);
+
+-- Pre-aggregated time buckets for chart rendering
+CREATE TABLE IF NOT EXISTS signal_buckets (
+    callsign    TEXT NOT NULL,
+    bucket_ts   INTEGER NOT NULL,
+    bucket_size INTEGER NOT NULL,
+    rssi_avg    REAL,
+    rssi_min    INTEGER,
+    rssi_max    INTEGER,
+    snr_avg     REAL,
+    snr_min     REAL,
+    snr_max     REAL,
+    count       INTEGER,
+    PRIMARY KEY (callsign, bucket_ts, bucket_size)
+);
+"""
