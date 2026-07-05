@@ -6,11 +6,11 @@ useful for testing non-BLE features or running without Bluetooth hardware.
 """
 
 import logging
-import time
 from collections.abc import Callable
 from typing import Any
 
-from .ble_client import BLEClientBase, BLEDevice, BLEMode, ConnectionState
+from .ble_client import MESHCOM_NAME_PREFIX, BLEClientBase, BLEDevice, BLEMode, ConnectionState
+from .util import now_ms
 
 logger = logging.getLogger(__name__)
 
@@ -47,11 +47,13 @@ class BLEClientDisabled(BLEClientBase):
                     "command": command,
                     "result": result,
                     "msg": msg,
-                    "timestamp": int(time.time() * 1000),
+                    "timestamp": now_ms(),
                 },
             )
 
-    async def scan(self, _timeout: float = 5.0, _prefix: str = "MC-") -> list[BLEDevice]:
+    async def scan(
+        self, _timeout: float = 5.0, _prefix: str = MESHCOM_NAME_PREFIX
+    ) -> list[BLEDevice]:
         """No-op scan - returns empty list"""
         logger.info("BLE disabled - scan skipped")
         await self._publish_status("scan BLE", "info", "BLE disabled - scan not available")

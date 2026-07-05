@@ -35,6 +35,8 @@ from typing import Any
 
 logger = logging.getLogger(__name__)
 
+MESHCOM_NAME_PREFIX = "MC-"
+
 
 class BLEMode(Enum):
     """BLE operation modes"""
@@ -107,7 +109,11 @@ class BLEClientBase(ABC):
         return self._status.state == ConnectionState.CONNECTED
 
     @abstractmethod
-    async def scan(self, timeout: float = 5.0, prefix: str = "MC-") -> list[BLEDevice]:  # noqa: ASYNC109 - public API takes timeout
+    async def scan(
+        self,
+        timeout: float = 5.0,  # noqa: ASYNC109 - public API takes timeout
+        prefix: str = MESHCOM_NAME_PREFIX,
+    ) -> list[BLEDevice]:
         """
         Scan for BLE devices.
 

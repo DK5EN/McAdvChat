@@ -17,10 +17,11 @@ import contextlib
 import json
 import logging
 import re
-import time
 from datetime import datetime
 from struct import unpack
 from typing import Any
+
+from .util import FEET_TO_METERS, now_ms
 
 PAYLOAD_TYPE_MSG = 58  # ":" text message frame
 PAYLOAD_TYPE_POS = 33  # "!" position/telemetry frame
@@ -227,7 +228,7 @@ def parse_aprs_position(message: str) -> dict[str, Any] | None:  # noqa: PLR0912
     alt_match = re.search(r"/A=(\d{6})", message)
     if alt_match:
         altitude_ft = int(alt_match.group(1))
-        result["alt"] = round(altitude_ft * 0.3048)
+        result["alt"] = round(altitude_ft * FEET_TO_METERS)
 
     # Battery level: /B=085
     battery_match = re.search(r"/B=(\d{3})", message)
@@ -338,7 +339,7 @@ def transform_common_fields(input_dict: dict[str, Any], own_callsign: str = "") 
         "lora_mod": input_dict.get("lora_mod"),
         "last_hw_id": input_dict.get("last_hw_id"),
         "last_sending": input_dict.get("last_sending"),
-        "timestamp": int(time.time() * 1000),
+        "timestamp": now_ms(),
     }
 
 
@@ -367,7 +368,7 @@ def transform_ack(input_dict: dict[str, Any]) -> dict[str, Any]:
         "type": "ack",
         **input_dict,
         "msg_id": format(input_dict.get("msg_id"), "08X"),
-        "timestamp": int(time.time() * 1000),
+        "timestamp": now_ms(),
     }
 
 
@@ -429,7 +430,7 @@ def transform_ble(input_dict: dict[str, Any]) -> dict[str, Any]:
         "transformer": "generic_ble",
         "src_type": "BLE",
         **input_dict,
-        "timestamp": int(time.time() * 1000),
+        "timestamp": now_ms(),
     }
 
 

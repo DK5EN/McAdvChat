@@ -21,8 +21,23 @@ from typing import Any, ClassVar
 
 from .ble_client import ConnectionState
 from .logging_setup import get_logger
+from .util import now_ms
 
 _MAX_TESTER_MATCHES = 10  # classifier rule dry-run result cap
+
+SSE_CLIENT_QUEUE_SIZE = 256
+SSE_KEEPALIVE_SECONDS = 30.0
+CLIENT_ID_LENGTH = 8
+TELEMETRY_MAX_HOURS = 744
+RULE_TEST_SCAN_LIMIT = 500
+TEMPLATE_LIST_MAX = 500
+TEMPLATE_PREVIEW_LIMIT = 20
+UPDATE_ARGS_FILE = pathlib.Path("/var/lib/mcapp/update-args.json")
+UPDATE_TRIGGER_FILE = pathlib.Path("/var/lib/mcapp/update-trigger")
+UPDATE_RUNNER_PORT = 2985  # ⚠ must match scripts/update-runner.py's listen port
+SLOT_COUNT = 3  # ⚠ must match scripts/update-runner.py's NUM_SLOTS
+SERVER_SHUTDOWN_TIMEOUT = 5.0
+DEFAULT_SSE_PORT = 2981
 
 # Module-level TimezoneFinder singleton: the constructor loads a ~100 KB dataset
 # into memory, so we instantiate once on first use and reuse across requests.
@@ -88,7 +103,7 @@ class SSEClient:
         # serialized once and shared across all clients instead of re-formatted N times.
         # Bounded so a slow/stalled consumer can't grow the queue without limit; on
         # overflow the client is disconnected rather than backpressuring the broadcaster.
-        self.queue: asyncio.Queue[str] = asyncio.Queue(maxsize=256)
+        self.queue: asyncio.Queue[str] = asyncio.Queue(maxsize=SSE_CLIENT_QUEUE_SIZE)
         self.connected = True
         self.connected_at = time.time()
 
@@ -180,7 +195,7 @@ class SSEManager:
 
             Clients connect here to receive real-time message updates.
             """
-            client_id = str(uuid.uuid4())[:8]
+            client_id = str(uuid.uuid4())[:CLIENT_ID_LENGTH]
             client = SSEClient(client_id)
 
             async with self.clients_lock:
@@ -195,7 +210,7 @@ class SSEManager:
                         {
                             "type": "connected",
                             "client_id": client_id,
-                            "timestamp": int(time.time() * 1000),
+                            "timestamp": now_ms(),
                         },
                         "system:connected",
                     )
@@ -356,7 +371,7 @@ class SSEManager:
                                     "device_address": status.device_address,
                                     "device_name": status.device_name,
                                     "mode": status.mode.value,
-                                    "timestamp": int(time.time() * 1000),
+                                    "timestamp": now_ms(),
                                 }
                             else:
                                 ble_info = {
@@ -365,7 +380,7 @@ class SSEManager:
                                     "command": "disconnect",
                                     "result": "ok",
                                     "msg": "BLE not connected",
-                                    "timestamp": int(time.time() * 1000),
+                                    "timestamp": now_ms(),
                                 }
                             yield self._format_sse_event(ble_info, "ble:status")
 
@@ -399,14 +414,16 @@ class SSEManager:
 
                         try:
                             # Wait for pre-formatted event with timeout (for keepalive)
-                            event = await asyncio.wait_for(client.queue.get(), timeout=30.0)
+                            event = await asyncio.wait_for(
+                                client.queue.get(), timeout=SSE_KEEPALIVE_SECONDS
+                            )
                             yield event
                         except TimeoutError:
                             # Send keepalive ping
                             yield self._format_sse_event(
                                 {
                                     "type": "ping",
-                                    "timestamp": int(time.time() * 1000),
+                                    "timestamp": now_ms(),
                                 },
                                 "system:ping",
                             )
@@ -656,7 +673,7 @@ class SSEManager:
                         await ble.send_command("--pos")
                     return {
                         "error": "Warte auf GPS vom Gerät...",
-                        "timestamp": int(time.time() * 1000),
+                        "timestamp": now_ms(),
                     }
 
             return await asyncio.to_thread(self.weather_service.get_weather_data)
@@ -682,7 +699,7 @@ class SSEManager:
         async def get_time() -> dict[str, int | str]:
             """Return server time for frontend clock sync."""
             return {
-                "server_time_ms": int(time.time() * 1000),
+                "server_time_ms": now_ms(),
                 "timezone": time.tzname[time.daylight and time.localtime().tm_isdst],
             }
 
@@ -693,7 +710,7 @@ class SSEManager:
             storage = self.message_router.storage_handler if self.message_router else None
             if not storage or not hasattr(storage, "get_telemetry_chart_data"):
                 raise HTTPException(status_code=503, detail="Telemetry not available")
-            return await storage.get_telemetry_chart_data(hours=min(hours, 744))
+            return await storage.get_telemetry_chart_data(hours=min(hours, TELEMETRY_MAX_HOURS))
 
         @app.get("/api/telemetry/yearly")
         async def get_telemetry_yearly() -> Any:
@@ -914,7 +931,8 @@ class SSEManager:
 
             rows = await storage._execute(  # noqa: SLF001 - framework wiring
                 "SELECT id, msg_id, src, dst, msg, type, timestamp FROM messages "
-                "ORDER BY id DESC LIMIT 500"
+                "ORDER BY id DESC LIMIT ?",
+                (RULE_TEST_SCAN_LIMIT,),
             )
             matches: list[dict[str, Any]] = []
             for row in rows:
@@ -952,7 +970,7 @@ class SSEManager:
             if auto_only:
                 where.append("auto_beacon = 1")
             where_sql = f" WHERE {' AND '.join(where)}" if where else ""
-            params.append(max(1, min(limit, 500)))
+            params.append(max(1, min(limit, TEMPLATE_LIST_MAX)))
             return await storage._execute(  # noqa: SLF001 - framework wiring
                 f"SELECT template_hash, example_msg, example_src, srcs, count, "  # noqa: S608 - identifiers from fixed set; values parameterized
                 f"first_seen, last_seen, auto_beacon, user_action "
@@ -986,8 +1004,8 @@ class SSEManager:
             rows = await storage._execute(  # noqa: SLF001 - framework wiring
                 "SELECT id, msg_id, src, dst, msg, type, timestamp, category, tags, "
                 "info_score FROM messages WHERE template_hash = ? "
-                "ORDER BY timestamp DESC LIMIT 20",
-                (template_hash,),
+                "ORDER BY timestamp DESC LIMIT ?",
+                (template_hash, TEMPLATE_PREVIEW_LIMIT),
             )
             return {"template_hash": template_hash, "messages": rows}
 
@@ -1065,11 +1083,11 @@ class SSEManager:
 
         logger.info("Update requested: mode=%s dev=%s", mode, dev)
 
-        # Check if runner is already active (port 2985 in use)
+        # Check if runner is already active (port in use)
         try:
             sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             sock.settimeout(1)
-            result = sock.connect_ex(("127.0.0.1", 2985))
+            result = sock.connect_ex(("127.0.0.1", UPDATE_RUNNER_PORT))
             sock.close()
             if result == 0:
                 raise HTTPException(
@@ -1080,14 +1098,11 @@ class SSEManager:
             pass
 
         # Write args file and trigger file for systemd .path unit
-        args_file = pathlib.Path("/var/lib/mcapp/update-args.json")
-        trigger_file = pathlib.Path("/var/lib/mcapp/update-trigger")
-
         await asyncio.to_thread(
-            args_file.write_text,
+            UPDATE_ARGS_FILE.write_text,
             json.dumps({"mode": mode, "dev": dev}),
         )
-        await asyncio.to_thread(trigger_file.write_text, "")
+        await asyncio.to_thread(UPDATE_TRIGGER_FILE.write_text, "")
         logger.info("Update trigger file written")
 
         # Frontend will retry stream connection until runner is ready
@@ -1098,8 +1113,8 @@ class SSEManager:
         return {
             "status": "launched",
             "mode": mode,
-            "stream_url": f"http://{host}:2985/stream",
-            "status_url": f"http://{host}:2985/status",
+            "stream_url": f"http://{host}:{UPDATE_RUNNER_PORT}/stream",
+            "status_url": f"http://{host}:{UPDATE_RUNNER_PORT}/status",
         }
 
     def _read_slot_info(self) -> dict[str, Any]:
@@ -1120,7 +1135,7 @@ class SSEManager:
                 active_slot = int(target.split("-")[1])
 
         slots = []
-        for i in range(3):
+        for i in range(SLOT_COUNT):
             meta_file = meta_dir / f"slot-{i}.json"
             if meta_file.exists():
                 meta = json.loads(meta_file.read_text())
@@ -1338,7 +1353,7 @@ class SSEManager:
             # Wait for server to stop
             if self._server_task:
                 try:
-                    await asyncio.wait_for(self._server_task, timeout=5.0)
+                    await asyncio.wait_for(self._server_task, timeout=SERVER_SHUTDOWN_TIMEOUT)
                 except TimeoutError:
                     self._server_task.cancel()
                     with contextlib.suppress(asyncio.CancelledError):
@@ -1355,7 +1370,7 @@ class SSEManager:
 # Convenience function for backward compatibility
 def create_sse_manager(
     host: str = "127.0.0.1",
-    port: int = 2981,
+    port: int = DEFAULT_SSE_PORT,
     message_router: Any = None,
     weather_service: Any = None,
 ) -> SSEManager | None:

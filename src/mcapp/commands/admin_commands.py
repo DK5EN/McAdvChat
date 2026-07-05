@@ -1,10 +1,9 @@
 """AdminCommandsMixin: group control and kickban commands."""
 
-import re
 from typing import Any
 
 from ._base import CommandHandlerBase
-from .constants import has_console
+from .constants import CALLSIGN_STRICT_RE, has_console
 
 
 class AdminCommandsMixin(CommandHandlerBase):
@@ -61,7 +60,7 @@ class AdminCommandsMixin(CommandHandlerBase):
         action = kwargs.get("action", "").lower()
 
         # Validate callsign
-        if not re.match(r"^[A-Z]{1,2}[0-9][A-Z]{1,3}(-\d{1,2})?$", callsign):
+        if not CALLSIGN_STRICT_RE.match(callsign):
             return "❌ Invalid callsign format"
 
         # Prevent self-blocking

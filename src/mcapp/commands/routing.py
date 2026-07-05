@@ -94,7 +94,8 @@ class RoutingMixin(CommandHandlerBase):
         if self._is_throttled(content_hash):
             logger.debug("Throttled: %s command '%s'", src, msg_text)
             await self.send_response(
-                "⏳ Command throttled. Same command allowed once per 5min",
+                f"⏳ Command throttled. Same command allowed once per "
+                f"{DEFAULT_THROTTLE_TIMEOUT // 60}min",
                 response_target,
                 src_type,
             )

@@ -6,6 +6,8 @@ from ..meteo import WeatherService
 from ._base import CommandHandlerBase
 from .constants import has_console
 
+WEATHER_MAX_AGE_MINUTES = 30
+
 
 class WeatherCommandMixin(CommandHandlerBase):
     """Mixin providing the weather command handler."""
@@ -15,7 +17,9 @@ class WeatherCommandMixin(CommandHandlerBase):
 
         weather_service: WeatherService | None
         try:
-            weather_service = WeatherService(self.lat, self.lon, self.stat_name, max_age_minutes=30)
+            weather_service = WeatherService(
+                self.lat, self.lon, self.stat_name, max_age_minutes=WEATHER_MAX_AGE_MINUTES
+            )
             if has_console:
                 print("🌤️  CommandHandler: Weather service initialized (location from GPS)")
         except ImportError as e:

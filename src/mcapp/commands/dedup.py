@@ -16,6 +16,11 @@ logger = get_logger(__name__)
 # entries are evicted even during quiet traffic periods.
 CLEANUP_INTERVAL_SECONDS = 3600
 
+MSG_ID_TIMEOUT_SECONDS = 5 * 60
+MAX_FAILED_ATTEMPTS = 3
+BLOCK_DURATION_SECONDS = 5 * DEFAULT_THROTTLE_TIMEOUT
+CONTENT_HASH_LENGTH = 8
+
 
 class DedupMixin(CommandHandlerBase):
     """Mixin providing dedup/throttle/abuse protection methods."""
@@ -24,7 +29,7 @@ class DedupMixin(CommandHandlerBase):
         """Initialize dedup/throttle state. Called from CommandHandler.__init__."""
         # Primary deduplication (msg_id based)
         self.processed_msg_ids = {}  # {msg_id: timestamp}
-        self.msg_id_timeout = 5 * 60  # 5 minutes
+        self.msg_id_timeout = MSG_ID_TIMEOUT_SECONDS
 
         # Secondary throttling (content hash based)
         self.command_throttle = {}  # {content_hash: timestamp}
@@ -32,9 +37,9 @@ class DedupMixin(CommandHandlerBase):
 
         # Abuse protection
         self.failed_attempts = {}  # {src: [timestamp, timestamp, ...]}
-        self.max_failed_attempts = 3
+        self.max_failed_attempts = MAX_FAILED_ATTEMPTS
         self.failed_attempt_window = DEFAULT_THROTTLE_TIMEOUT
-        self.block_duration = 5 * DEFAULT_THROTTLE_TIMEOUT
+        self.block_duration = BLOCK_DURATION_SECONDS
         self.blocked_users = {}  # {src: block_timestamp}
         self.block_notifications_sent = set()
 
@@ -102,7 +107,9 @@ class DedupMixin(CommandHandlerBase):
         else:
             content = f"{src}:{msg_text}"
 
-        hash_value = hashlib.md5(content.encode(), usedforsecurity=False).hexdigest()[:8]
+        hash_value = hashlib.md5(content.encode(), usedforsecurity=False).hexdigest()[
+            :CONTENT_HASH_LENGTH
+        ]
         logger.debug("Hash generation: %r -> %s", content, hash_value)
 
         return hash_value

@@ -14,6 +14,9 @@ _TEXT_PREVIEW_CHARS = 30
 _STATUS_PREVIEW_CHARS = 50
 _MAX_BEACON_TEXT_CHARS = 120
 _MAX_INTERVAL_MINUTES = 1440
+DEFAULT_BEACON_INTERVAL_MINUTES = 30
+BEACON_EARLY_SEND_SECONDS = 10
+MIN_BEACON_INTERVAL_SECONDS = 10
 
 
 class TopicBeaconMixin(CommandHandlerBase):
@@ -61,7 +64,7 @@ class TopicBeaconMixin(CommandHandlerBase):
         # !topic GROUP TEXT [interval]
         group = kwargs.get("group", "")
         text = kwargs.get("text", "")
-        interval = kwargs.get("interval", 30)
+        interval = kwargs.get("interval", DEFAULT_BEACON_INTERVAL_MINUTES)
 
         if not group:
             return "❌ Group required"
@@ -73,12 +76,12 @@ class TopicBeaconMixin(CommandHandlerBase):
             return "❌ Beacon text required"
 
         if len(str(text)) > _MAX_BEACON_TEXT_CHARS:
-            return "❌ Beacon text too long (max 120 chars)"
+            return f"❌ Beacon text too long (max {_MAX_BEACON_TEXT_CHARS} chars)"
 
         try:
             interval_int = int(interval)
             if interval_int < 1 or interval_int > _MAX_INTERVAL_MINUTES:
-                return "❌ Interval must be between 1 and 1440 minutes"
+                return f"❌ Interval must be between 1 and {_MAX_INTERVAL_MINUTES} minutes"
         except (ValueError, TypeError):
             return "❌ Invalid interval format"
 
@@ -91,7 +94,7 @@ class TopicBeaconMixin(CommandHandlerBase):
             return (
                 f"✅ Beacon started for group"
                 f" {group}:"
-                f" '{text[:50]}"
+                f" '{text[:_STATUS_PREVIEW_CHARS]}"
                 f"{'...' if len(text) > _STATUS_PREVIEW_CHARS else ''}'"
                 f" every {interval}min"
             )
@@ -100,8 +103,8 @@ class TopicBeaconMixin(CommandHandlerBase):
     async def _start_topic_beacon(self, group: str, text: str, interval_minutes: int) -> bool:
         """Start a beacon task for a group"""
         try:
-            interval_seconds = (interval_minutes * 60) - 10
-            interval_seconds = max(interval_seconds, 10)
+            interval_seconds = (interval_minutes * 60) - BEACON_EARLY_SEND_SECONDS
+            interval_seconds = max(interval_seconds, MIN_BEACON_INTERVAL_SECONDS)
 
             task = asyncio.create_task(self._beacon_loop(group, text, interval_seconds))
 

@@ -20,6 +20,26 @@ _DAY_END_HOUR = 20
 _RAIN_REPORT_MIN_MM = 0.1
 _MAX_LORA_MSG_LEN = 149
 
+HTTP_TIMEOUT_S = 10
+MAX_RETRIES = 2
+RETRY_DELAY_S = 1
+
+_MAGNUS_A = 17.27
+_MAGNUS_B = 237.7
+_MAGNUS_E0_HPA = 6.112
+
+_PERCENT_PER_OKTA = 12.5
+_CALM_WIND_KMH = 1
+_ERROR_PREVIEW_LEN = 25
+
+# Data-quality ladder: (threshold %, label). Highest threshold first.
+_QUALITY_LADDER = (
+    (100, "Exzellent (alle Parameter)"),
+    (80, "Sehr gut (fast alle Parameter)"),
+    (60, "Gut (wichtigste Parameter)"),
+    (40, "Ausreichend (Grundparameter)"),
+)
+
 _BERLIN_TZ = ZoneInfo("Europe/Berlin")
 
 
@@ -75,8 +95,8 @@ class WeatherService:
         self.max_age_minutes = max_age_minutes
 
         # Request timeout und retry config
-        self.timeout = 10
-        self.max_retries = 2
+        self.timeout = HTTP_TIMEOUT_S
+        self.max_retries = MAX_RETRIES
 
         logger.info(
             "WeatherService initialisiert für %s %s/%s, Hybrid-Modus: DWD + OpenMeteo",
@@ -287,14 +307,9 @@ class WeatherService:
 
         quality_score = (available_critical / total_critical) * 100
 
-        if quality_score >= 100:  # noqa: PLR2004 - quality score ladder
-            return "Exzellent (alle Parameter)"
-        if quality_score >= 80:  # noqa: PLR2004 - quality score ladder
-            return "Sehr gut (fast alle Parameter)"
-        if quality_score >= 60:  # noqa: PLR2004 - quality score ladder
-            return "Gut (wichtigste Parameter)"
-        if quality_score >= 40:  # noqa: PLR2004 - quality score ladder
-            return "Ausreichend (Grundparameter)"
+        for threshold, label in _QUALITY_LADDER:
+            if quality_score >= threshold:
+                return label
         return "Unvollständig (kritische Parameter fehlen)"
 
     def _validate_data_age(self, weather_data: dict[str, Any]) -> dict[str, Any]:
@@ -345,11 +360,11 @@ class WeatherService:
     ) -> int | None:
         """Berechne relative Luftfeuchtigkeit aus Temperatur und Taupunkt"""
         try:
-            a, b = 17.27, 237.7
+            a, b = _MAGNUS_A, _MAGNUS_B
             alpha_temp = (a * temperature_c) / (b + temperature_c)
-            es_temp = 6.112 * math.exp(alpha_temp)
+            es_temp = _MAGNUS_E0_HPA * math.exp(alpha_temp)
             alpha_dew = (a * dewpoint_c) / (b + dewpoint_c)
-            es_dew = 6.112 * math.exp(alpha_dew)
+            es_dew = _MAGNUS_E0_HPA * math.exp(alpha_dew)
             relative_humidity = (es_dew / es_temp) * 100
             return round(max(0, min(100, relative_humidity)))
         except (ValueError, ZeroDivisionError, OverflowError):
@@ -529,11 +544,11 @@ class WeatherService:
             except httpx.TimeoutException as e:
                 if attempt == self.max_retries:
                     raise WeatherServiceError("Request Timeout") from e
-                time.sleep(1)
+                time.sleep(RETRY_DELAY_S)
             except httpx.HTTPError as e:
                 if attempt == self.max_retries:
                     raise WeatherServiceError(f"HTTP-Fehler: {e}") from e
-                time.sleep(1)
+                time.sleep(RETRY_DELAY_S)
             else:
                 return response
         raise WeatherServiceError("Request failed after retries")
@@ -574,7 +589,7 @@ class WeatherService:
         if cloud_percent is None:
             return "unbekannt"
 
-        eighths = round(cloud_percent / 12.5)
+        eighths = round(cloud_percent / _PERCENT_PER_OKTA)
         eighths = max(0, min(8, eighths))
         is_day = self._is_daytime(timestamp_str)
 
@@ -591,7 +606,7 @@ class WeatherService:
     def format_for_lora(self, weather_data: dict[str, Any], prefix_text: str = "") -> str:
         """Ham Radio optimiertes LoRa-Format"""
         if "error" in weather_data:
-            return f"WX ERR: {weather_data['error'][:25]}"
+            return f"WX ERR: {weather_data['error'][:_ERROR_PREVIEW_LEN]}"
 
         temp = weather_data.get("temperatur_celsius", 0)
         humid = weather_data.get("luftfeuchtigkeit_prozent", 0)
@@ -611,7 +626,7 @@ class WeatherService:
         wind_speed = weather_data.get("windgeschwindigkeit_kmh", 0) or 0
         wind_dir = weather_data.get("windrichtung_grad")
 
-        if wind_speed >= 1:
+        if wind_speed >= _CALM_WIND_KMH:
             wind_compass = self._wind_direction_to_compass(wind_dir)
             if wind_compass:
                 wind_info = f"Wind {wind_speed:.1f}km/h {wind_compass}"

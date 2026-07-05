@@ -22,11 +22,28 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from sse_starlette.sse import EventSourceResponse
 
-from .ble_adapter import BLEAdapter, ConnectionState, build_hello_bytes
+from .ble_adapter import MESHCOM_NAME_PREFIX, BLEAdapter, ConnectionState, build_hello_bytes
 
 _MIN_FRAME_WITH_FCS = 4  # 2 payload bytes + 2 FCS bytes
 _BLE_PIN_MIN = 100_000
 _BLE_PIN_MAX = 999_999
+CRC16_POLY = 0x1021
+CRC16_MSB = 0x8000
+NOTIFICATION_QUEUE_SIZE = 1000
+ACTIVITY_LOG_SIZE = 50
+RECONNECT_DELAYS_S = (5, 10, 20, 60)
+SSE_PING_INTERVAL_S = 30.0  # ⚠ client (ble_client_remote.py SSE_READ_TIMEOUT_S) must exceed this
+POST_CONNECT_SETTLE_S = 1.0
+INTER_MESSAGE_DELAY_S = 0.2
+
+
+def _now_ms() -> int:
+    """Current time in milliseconds, matching the DB's millisecond timestamp convention.
+
+    Not shared with src/mcapp/util.py.now_ms() — ble_service is a separate process.
+    """
+    return int(time.time() * 1000)
+
 
 # Configure logging
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(name)s: %(message)s")
@@ -43,7 +60,7 @@ _BLE_PIN_ENV = int(os.getenv("BLE_SERVICE_BLE_PIN", "0"))  # startup default fro
 # Global state
 ble_adapter: BLEAdapter | None = None
 _ble_pin: int = 0  # active PIN; 0 = disabled
-notification_queue: deque[dict] = deque(maxlen=1000)
+notification_queue: deque[dict] = deque(maxlen=NOTIFICATION_QUEUE_SIZE)
 notification_event = asyncio.Event()
 _reconnect_task: asyncio.Task | None = None
 _auto_connect_task: asyncio.Task | None = None
@@ -57,7 +74,7 @@ _reconnect_attempt: int = 0
 _reconnect_max_attempts: int = 0
 
 # Activity log ring buffer
-_activity_log: deque[dict] = deque(maxlen=50)
+_activity_log: deque[dict] = deque(maxlen=ACTIVITY_LOG_SIZE)
 
 
 def crc16_ccitt(data: bytes) -> int:
@@ -66,14 +83,14 @@ def crc16_ccitt(data: bytes) -> int:
     for byte in data:
         crc ^= byte << 8
         for _ in range(8):
-            crc = crc << 1 ^ 4129 if crc & 32768 else crc << 1
+            crc = crc << 1 ^ CRC16_POLY if crc & CRC16_MSB else crc << 1
             crc &= 0xFFFF
     return crc
 
 
 def notification_callback(data: bytes):
     """Called when BLE notification received"""
-    timestamp = int(time.time() * 1000)
+    timestamp = _now_ms()
 
     # Try to parse as JSON or binary
     notification = {
@@ -207,7 +224,7 @@ async def _connect_and_initialize(mac: str) -> bool:
     if success:
         await ble_adapter.start_notify()
         await ble_adapter.send_hello()
-        await asyncio.sleep(1.0)
+        await asyncio.sleep(POST_CONNECT_SETTLE_S)
         await ble_adapter.query_extended_registers()
     return success
 
@@ -219,7 +236,7 @@ def _log_activity(action: str, detail: str = "", level: str = "info"):
     """Append an entry to the activity log ring buffer."""
     _activity_log.append(
         {
-            "ts": int(time.time() * 1000),
+            "ts": _now_ms(),
             "action": action,
             "detail": detail,
             "level": level,
@@ -232,7 +249,7 @@ def _push_status_event(state: str, **kwargs):
     event = {
         "event_type": "status",
         "state": state,
-        "timestamp": int(time.time() * 1000),
+        "timestamp": _now_ms(),
         **kwargs,
     }
     notification_queue.append(event)
@@ -262,7 +279,7 @@ async def _auto_reconnect():
         logger.warning("No previous MAC address for auto-reconnect")
         return
 
-    delays = [5, 10, 20, 60]
+    delays = RECONNECT_DELAYS_S
     _reconnecting = True
     _reconnect_max_attempts = len(delays)
 
@@ -368,7 +385,7 @@ async def _startup_auto_connect():  # noqa: PLR0915 - complex handler kept intac
     _log_activity("startup_auto_connect", f"Waiting {AUTO_CONNECT_DELAY}s for hardware", "info")
     await asyncio.sleep(AUTO_CONNECT_DELAY)
 
-    delays = [5, 10, 20, 60]
+    delays = RECONNECT_DELAYS_S
     _reconnecting = True
     _reconnect_max_attempts = len(delays)
 
@@ -602,7 +619,7 @@ async def get_status(_: bool = Depends(verify_api_key)):
 @app.get("/api/ble/devices", response_model=ScanResponse)
 async def scan_devices(
     timeout: float = Query(default=5.0, ge=1.0, le=30.0),  # noqa: ASYNC109 - public API takes timeout
-    prefix: str = Query(default="MC-"),
+    prefix: str = Query(default=MESHCOM_NAME_PREFIX),
     _: bool = Depends(verify_api_key),
 ):
     """Scan for BLE devices"""
@@ -918,9 +935,9 @@ async def set_position(
     try:
         # Send all three position messages
         success_lat = await ble_adapter.set_latitude(lat, save)
-        await asyncio.sleep(0.2)
+        await asyncio.sleep(INTER_MESSAGE_DELAY_S)
         success_lon = await ble_adapter.set_longitude(lon, save)
-        await asyncio.sleep(0.2)
+        await asyncio.sleep(INTER_MESSAGE_DELAY_S)
         success_alt = await ble_adapter.set_altitude(alt, save)
 
         success = success_lat and success_lon and success_alt
@@ -1035,7 +1052,7 @@ async def stream_notifications(x_api_key: Annotated[str | None, Header()] = None
                 {
                     "connected": ble_adapter.is_connected,
                     "state": ble_adapter.status.state.value,
-                    "timestamp": int(time.time() * 1000),
+                    "timestamp": _now_ms(),
                 }
             ),
         }
@@ -1043,11 +1060,11 @@ async def stream_notifications(x_api_key: Annotated[str | None, Header()] = None
         while True:
             # Wait for new notifications
             try:
-                await asyncio.wait_for(notification_event.wait(), timeout=30.0)
+                await asyncio.wait_for(notification_event.wait(), timeout=SSE_PING_INTERVAL_S)
                 notification_event.clear()
             except TimeoutError:
                 # Send keepalive ping
-                yield {"event": "ping", "data": json.dumps({"timestamp": int(time.time() * 1000)})}
+                yield {"event": "ping", "data": json.dumps({"timestamp": _now_ms()})}
                 continue
 
             # Send all queued notifications/status events
@@ -1071,7 +1088,7 @@ async def health_check():
     return {
         "status": "healthy",
         "ble_connected": ble_adapter.is_connected if ble_adapter else False,
-        "timestamp": int(time.time() * 1000),
+        "timestamp": _now_ms(),
     }
 
 

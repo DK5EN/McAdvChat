@@ -5,21 +5,23 @@ import asyncio
 import contextlib
 import json
 import socket
-import time
 import unicodedata
 from typing import Any
 
 from .logging_setup import get_logger
+from .util import FEET_TO_METERS, now_ms
 
 logger = get_logger(__name__)
 
 VERSION = "v0.48.0"
 
+UDP_RECV_BUFFER_BYTES = 1024
+
 
 def _normalize_altitude_to_meters(message: dict[str, Any]) -> None:
     """Convert APRS altitude from feet to meters in-place."""
     if message.get("alt"):
-        message["alt"] = round(message["alt"] * 0.3048)
+        message["alt"] = round(message["alt"] * FEET_TO_METERS)
 
 
 def is_allowed_char(ch: str) -> bool:  # noqa: PLR0911 - complex handler kept intact
@@ -154,7 +156,7 @@ class UDPHandler:
                 if self.listen_socket is None:
                     raise RuntimeError("self.listen_socket is unexpectedly None")
                 try:
-                    data, addr = await loop.sock_recvfrom(self.listen_socket, 1024)
+                    data, addr = await loop.sock_recvfrom(self.listen_socket, UDP_RECV_BUFFER_BYTES)
                     await self._process_received_message(data, addr)
                 except asyncio.CancelledError:
                     raise
@@ -175,7 +177,7 @@ class UDPHandler:
 
         if "msg" not in message:
             if message.get("type") == "tele":
-                message["timestamp"] = int(time.time() * 1000)
+                message["timestamp"] = now_ms()
                 _normalize_altitude_to_meters(message)
 
                 # Generate pseudo-callsign from sender IP if src is missing
@@ -219,7 +221,7 @@ class UDPHandler:
             logger.debug("Non-chat message without msg field: %s", message)
             return
 
-        message["timestamp"] = int(time.time() * 1000)
+        message["timestamp"] = now_ms()
         _normalize_altitude_to_meters(message)
         if isinstance(message, dict) and isinstance(message.get("msg"), str):
             if self.message_callback:

@@ -8,10 +8,10 @@ The MessageValidator class in main.py delegates to these functions.
 
 from __future__ import annotations
 
-import re
 from collections.abc import Callable
 from typing import Any
 
+from .commands.constants import DST_CALLSIGN_RE
 from .commands.parsing import extract_target_callsign
 
 
@@ -30,7 +30,7 @@ def is_valid_destination(dst: str, is_group_func: Callable[[str], bool]) -> bool
     if not dst or dst in ("*", "ALL"):
         return False
 
-    if re.match(r"^[A-Z0-9]{2,8}(-\d{1,2})?$", dst):
+    if DST_CALLSIGN_RE.match(dst):
         return True
 
     return is_group_func(dst)

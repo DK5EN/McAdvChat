@@ -7,7 +7,7 @@ import re
 from collections.abc import Callable
 from typing import Any
 
-from .constants import CALLSIGN_TARGET_PATTERN
+from .constants import CALLSIGN_TARGET_RE
 
 _MAX_GROUP_NUM = 99999
 
@@ -42,7 +42,7 @@ def extract_target_callsign(msg: str) -> str | None:  # noqa: PLR0911 - complex 
             potential = part[7:]  # Remove 'TARGET:' prefix
             if potential in ["LOCAL", ""]:
                 return None  # Explicit local execution
-            if re.match(CALLSIGN_TARGET_PATTERN, potential):
+            if CALLSIGN_TARGET_RE.match(potential):
                 return potential
             return None  # Invalid target format
 
@@ -51,7 +51,7 @@ def extract_target_callsign(msg: str) -> str | None:  # noqa: PLR0911 - complex 
         if ":" in part:
             continue  # Skip key:value arguments
         potential = part.strip()
-        if re.match(CALLSIGN_TARGET_PATTERN, potential):
+        if CALLSIGN_TARGET_RE.match(potential):
             return potential
 
     return None

@@ -56,6 +56,18 @@ _BLE_MTU_LIMIT = 247
 _MAX_SSID_LEN = 32
 _MAX_WIFI_PASSWORD_LEN = 63
 
+# Timing constants (seconds)
+CONNECT_TIMEOUT_S = 10.0
+WRITE_TIMEOUT_S = 5.0
+DISCONNECT_TIMEOUT_S = 3.0
+# Pre-connect stale-state cleanup; distinct value from DISCONNECT_TIMEOUT_S.
+STALE_DISCONNECT_TIMEOUT_S = 5.0
+KEEPALIVE_INTERVAL_S = 300
+DST_CHECK_INTERVAL_S = 3600
+POST_PAIR_SETTLE_S = 2
+REGISTER_QUERY_DELAY_S = 0.8
+MESHCOM_NAME_PREFIX = "MC-"  # not shared with src/mcapp — ble_service is a separate process
+
 logger = logging.getLogger(__name__)
 
 # D-Bus constants
@@ -67,6 +79,8 @@ GATT_CHARACTERISTIC_INTERFACE = "org.bluez.GattCharacteristic1"
 PROPERTIES_INTERFACE = "org.freedesktop.DBus.Properties"
 OBJECT_MANAGER_INTERFACE = "org.freedesktop.DBus.ObjectManager"
 AGENT_PATH = "/com/mcapp/agent"
+ADAPTER_PATH = "/org/bluez/hci0"
+OPEN_HELLO = b"\x04\x10\x20\x30"
 
 # Nordic UART Service UUIDs
 NUS_RX_UUID = "6e400002-b5a3-f393-e0a9-e50e24dcca9e"  # Write to device
@@ -83,7 +97,7 @@ def build_hello_bytes(pin: int) -> bytes:
     if pin > 0:
         digest = hashlib.sha256(f"{pin:06d}".encode()).digest()
         return bytes([0x24, 0x10, 0x20, 0x30]) + digest
-    return b"\x04\x10\x20\x30"
+    return OPEN_HELLO
 
 
 class ConnectionState(Enum):
@@ -191,7 +205,7 @@ class BLEAdapter:
         self,
         read_uuid: str = NUS_TX_UUID,
         write_uuid: str = NUS_RX_UUID,
-        hello_bytes: bytes = b"\x04\x10\x20\x30",
+        hello_bytes: bytes = OPEN_HELLO,
         notification_callback: Callable[[bytes], None] | None = None,
     ):
         self.read_uuid = read_uuid
@@ -238,14 +252,18 @@ class BLEAdapter:
 
     def _mac_to_dbus_path(self, mac: str) -> str:
         """Convert MAC address to D-Bus device path"""
-        return f"/org/bluez/hci0/dev_{mac.replace(':', '_')}"
+        return f"{ADAPTER_PATH}/dev_{mac.replace(':', '_')}"
 
     async def _ensure_bus(self):
         """Ensure D-Bus connection is established"""
         if self.bus is None:
             self.bus = await MessageBus(bus_type=BusType.SYSTEM).connect()
 
-    async def scan(self, timeout: float = 5.0, prefix: str = "MC-") -> list[BLEDevice]:  # noqa: ASYNC109 - public API takes timeout
+    async def scan(
+        self,
+        timeout: float = 5.0,  # noqa: ASYNC109 - public API takes timeout
+        prefix: str = MESHCOM_NAME_PREFIX,
+    ) -> list[BLEDevice]:
         """
         Scan for BLE devices with optional name prefix filter.
 
@@ -263,7 +281,7 @@ class BLEAdapter:
             known_devices: list[BLEDevice] = []
 
             # Get adapter
-            path = "/org/bluez/hci0"
+            path = ADAPTER_PATH
             introspection = await self.bus.introspect(BLUEZ_SERVICE_NAME, path)
             adapter_obj = self.bus.get_proxy_object(BLUEZ_SERVICE_NAME, path, introspection)
             adapter = adapter_obj.get_interface(ADAPTER_INTERFACE)
@@ -424,32 +442,37 @@ class BLEAdapter:
             if connected:
                 logger.warning("BlueZ reports connected (possibly stale), forcing disconnect")
                 with contextlib.suppress(Exception):
-                    await asyncio.wait_for(self.dev_iface.call_disconnect(), timeout=5.0)
+                    await asyncio.wait_for(
+                        self.dev_iface.call_disconnect(), timeout=STALE_DISCONNECT_TIMEOUT_S
+                    )
                 await asyncio.sleep(0.5)
         except Exception as e:
             logger.debug("Pre-connect state check failed: %s", e)
 
         # Attempt connection
         try:
-            await asyncio.wait_for(self.dev_iface.call_connect(), timeout=10.0)
+            await asyncio.wait_for(self.dev_iface.call_connect(), timeout=CONNECT_TIMEOUT_S)
         except TimeoutError as e:
-            raise ConnectionError("Connection timeout after 10 seconds") from e
+            msg = f"Connection timeout after {CONNECT_TIMEOUT_S:.0f} seconds"
+            raise ConnectionError(msg) from e
         except DBusError as e:
             if "In Progress" in str(e):
                 # BlueZ has a pending connection from a previous attempt
                 logger.warning("Stale 'In Progress' in BlueZ, clearing before retry")
                 with contextlib.suppress(Exception):
-                    await asyncio.wait_for(self.dev_iface.call_disconnect(), timeout=3.0)
+                    await asyncio.wait_for(
+                        self.dev_iface.call_disconnect(), timeout=DISCONNECT_TIMEOUT_S
+                    )
                 raise ConnectionError("Cleared stale BlueZ state, will retry") from e
             raise ConnectionError(f"Connect failed: {e}") from e
 
         # Wait for services to resolve
-        if not await self._wait_for_services_resolved(timeout=10.0):
+        if not await self._wait_for_services_resolved(timeout=CONNECT_TIMEOUT_S):
             raise ConnectionError("Services not resolved within timeout")
 
         # Find GATT characteristics (with timeout to prevent hangs)
         try:
-            await asyncio.wait_for(self._find_characteristics(path), timeout=10.0)
+            await asyncio.wait_for(self._find_characteristics(path), timeout=CONNECT_TIMEOUT_S)
         except TimeoutError as e:
             raise ConnectionError("GATT characteristic discovery timeout") from e
 
@@ -544,7 +567,9 @@ class BLEAdapter:
         try:
             if self.dev_iface:
                 with contextlib.suppress(Exception):
-                    await asyncio.wait_for(self.dev_iface.call_disconnect(), timeout=3.0)
+                    await asyncio.wait_for(
+                        self.dev_iface.call_disconnect(), timeout=DISCONNECT_TIMEOUT_S
+                    )
         except Exception as e:
             logger.warning("Cleanup error: %s", e)
         finally:
@@ -600,7 +625,9 @@ class BLEAdapter:
         # Disconnect
         try:
             if self.dev_iface:
-                await asyncio.wait_for(self.dev_iface.call_disconnect(), timeout=3.0)
+                await asyncio.wait_for(
+                    self.dev_iface.call_disconnect(), timeout=DISCONNECT_TIMEOUT_S
+                )
         except Exception as e:
             logger.warning("Disconnect error: %s", e)
 
@@ -685,7 +712,7 @@ class BLEAdapter:
         async with self._write_lock:
             try:
                 await asyncio.wait_for(
-                    self.write_char_iface.call_write_value(data, {}), timeout=5.0
+                    self.write_char_iface.call_write_value(data, {}), timeout=WRITE_TIMEOUT_S
                 )
                 self._status.last_activity = time.time()
             except TimeoutError:
@@ -989,8 +1016,8 @@ class BLEAdapter:
             return
 
         commands = [
-            ("--io", 0.8),  # TYP: IO (GPIO status)
-            ("--tel", 0.8),  # TYP: TM (telemetry config)
+            ("--io", REGISTER_QUERY_DELAY_S),  # TYP: IO (GPIO status)
+            ("--tel", REGISTER_QUERY_DELAY_S),  # TYP: TM (telemetry config)
         ]
 
         for cmd, delay in commands:
@@ -1010,7 +1037,7 @@ class BLEAdapter:
         """Send periodic keepalive commands"""
         try:
             while self.is_connected:
-                await asyncio.sleep(300)  # 5 minutes
+                await asyncio.sleep(KEEPALIVE_INTERVAL_S)
                 if self.is_connected:
                     logger.debug("Sending keepalive")
                     await self.send_command("--pos")
@@ -1028,7 +1055,7 @@ class BLEAdapter:
 
         try:
             while self.is_connected:
-                await asyncio.sleep(3600)
+                await asyncio.sleep(DST_CHECK_INTERVAL_S)
                 if not self.is_connected:
                     break
 
@@ -1097,7 +1124,7 @@ class BLEAdapter:
                 logger.info("Paired with %s: %s", mac, is_paired)
 
                 # Disconnect after pairing
-                await asyncio.sleep(2)
+                await asyncio.sleep(POST_PAIR_SETTLE_S)
                 with contextlib.suppress(Exception):
                     await dev_iface.call_disconnect()
 
@@ -1122,7 +1149,7 @@ class BLEAdapter:
             await self._ensure_bus()
 
             device_path = self._mac_to_dbus_path(mac)
-            adapter_path = "/org/bluez/hci0"
+            adapter_path = ADAPTER_PATH
 
             adapter_obj = self.bus.get_proxy_object(
                 BLUEZ_SERVICE_NAME,

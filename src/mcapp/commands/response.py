@@ -9,8 +9,15 @@ import time
 from typing import Any
 
 from ..logging_setup import get_logger
+from ..util import now_ms
 from ._base import CommandHandlerBase
-from .constants import CHUNK_SEND_DELAY_SECONDS, MAX_CHUNKS, MAX_RESPONSE_LENGTH, has_console
+from .constants import (
+    CHUNK_SEND_DELAY_SECONDS,
+    CHUNK_SEPARATOR_RESERVE,
+    MAX_CHUNKS,
+    MAX_RESPONSE_LENGTH,
+    has_console,
+)
 
 logger = get_logger(__name__)
 
@@ -80,7 +87,7 @@ class ResponseMixin(CommandHandlerBase):
                         "msg": chunk,
                         "src_type": "ble",
                         "type": "msg",
-                        "timestamp": int(time.time() * 1000),
+                        "timestamp": now_ms(),
                     }
                     await self.message_router.publish(
                         "command", "websocket_message", websocket_message
@@ -172,7 +179,9 @@ class ResponseMixin(CommandHandlerBase):
 
         return chunks[:MAX_CHUNKS]
 
-    def _pad_for_chunk_break(self, text: str, target_length: int = MAX_RESPONSE_LENGTH - 2) -> str:
+    def _pad_for_chunk_break(
+        self, text: str, target_length: int = MAX_RESPONSE_LENGTH - CHUNK_SEPARATOR_RESERVE
+    ) -> str:
         """Pad text to force clean chunk boundary using byte-aware calculation"""
         text_bytes = text.encode("utf-8")
 

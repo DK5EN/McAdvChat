@@ -6,6 +6,11 @@ from typing import Any
 from mcapp import __version__
 
 from ._base import CommandHandlerBase
+from .constants import CHUNK_SEPARATOR_RESERVE, MAX_RESPONSE_LENGTH
+
+DEFAULT_SEARCH_DAYS = 1
+DEFAULT_STATS_HOURS = 24
+DEFAULT_MHEARD_LIMIT = 5
 
 
 class DataCommandsMixin(CommandHandlerBase):
@@ -15,7 +20,7 @@ class DataCommandsMixin(CommandHandlerBase):
         """Search messages by user and timeframe - show
         summary with counts, last seen, and destinations"""
         user = kwargs.get("call", "*")
-        days = int(kwargs.get("days", 1))
+        days = int(kwargs.get("days", DEFAULT_SEARCH_DAYS))
 
         if not self.storage_handler:
             return "❌ Message storage not available"
@@ -66,7 +71,7 @@ class DataCommandsMixin(CommandHandlerBase):
 
     async def handle_stats(self, kwargs: dict[str, Any], _requester: str) -> str:
         """Show message statistics"""
-        hours = int(kwargs.get("hours", 24))
+        hours = int(kwargs.get("hours", DEFAULT_STATS_HOURS))
 
         if not self.storage_handler:
             return "❌ Message storage not available"
@@ -90,7 +95,7 @@ class DataCommandsMixin(CommandHandlerBase):
 
     async def handle_mheard(self, kwargs: dict[str, Any], _requester: str) -> str:
         """Show recently heard stations with optional type filtering"""
-        limit = int(kwargs.get("limit", 5))
+        limit = int(kwargs.get("limit", DEFAULT_MHEARD_LIMIT))
         msg_type = kwargs.get("type", "all").lower()
 
         if not self.storage_handler:
@@ -134,5 +139,7 @@ class DataCommandsMixin(CommandHandlerBase):
         if len(lines) == 1:
             return lines[0]
         line1 = lines[0]
-        padding_needed = max(0, 138 - len(line1.encode("utf-8")))
+        padding_needed = max(
+            0, MAX_RESPONSE_LENGTH - CHUNK_SEPARATOR_RESERVE - len(line1.encode("utf-8"))
+        )
         return line1 + " " * padding_needed + ", " + lines[1]

@@ -8,6 +8,8 @@ from typing import Any
 
 from ._base import CommandHandlerBase
 
+DEFAULT_POSITION_SEARCH_DAYS = 7
+
 
 class SimpleCommandsMixin(CommandHandlerBase):
     """Mixin providing simple command handlers."""
@@ -98,7 +100,7 @@ class SimpleCommandsMixin(CommandHandlerBase):
     async def handle_position(self, kwargs: dict[str, Any], _requester: str) -> str:
         """Show position data for callsign"""
         callsign = kwargs.get("call", "").upper()
-        days = int(kwargs.get("days", 7))
+        days = int(kwargs.get("days", DEFAULT_POSITION_SEARCH_DAYS))
 
         if not callsign:
             return "❌ Callsign required (call:CALLSIGN)"

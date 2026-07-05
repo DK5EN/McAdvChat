@@ -960,3 +960,21 @@ Review checklist:
   requires gating `station_positions` on validity, and "fixing" it would make the lora
   path diverge from the BLE path's established behavior. Deferred, not fixed — flag if a
   future wave wants `station_positions` signal fields validated too.
+
+- [2026-07-05] Wave 2 complete (Section 5 magic-number inventories except classifier/Track M,
+  X-02 `now_ms()`, X-04 `FEET_TO_METERS`, X-05 named callsign regex patterns, CMD-08's `138`
+  padding constant, error-text f-strings). New `src/mcapp/util.py` holds the two genuinely
+  shared helpers; `ble_service/` (separate process) keeps its own independent copies
+  (`_now_ms()`, `MESHCOM_NAME_PREFIX`, etc.) rather than importing from `src/mcapp/`. Took two
+  implementation passes: the first covered core/commands/BLE/meteo/sse_handler but skipped the
+  entire storage-module table (~22 constants) and introduced two `S608` f-string LIMIT
+  interpolations in `sse_handler.py` where a `?`-bound parameter was already the sibling
+  endpoint's pattern; both gaps were completed in a second pass. Two independent Opus review
+  rounds: first approved everything except those two gaps (value preservation was flawless
+  across ~70 sampled constants); second round re-verified the completed storage table
+  (22 constants incl. `EIGHT_DAYS_MS` coupled to `SIGNAL_BACKFILL_WINDOW_HOURS`, `BARO_*`
+  algebraic equivalence, `DEFAULT_PAGE_SIZE` at all three call sites, ST-15's five raw
+  `3600000` SQL literals now reusing `HOURLY_BUCKET_MS`) and the S608 fix — **approved, no
+  defects**. X-05's three callsign patterns (`CALLSIGN_TARGET_RE`, `CALLSIGN_STRICT_RE`,
+  `DST_CALLSIGN_RE`) confirmed distinct and correctly mapped to call sites, none merged.
+  Gates green throughout (ruff check, ruff format --check, startup tests — 5 suites).

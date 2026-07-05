@@ -18,10 +18,30 @@ from urllib.parse import urljoin
 
 import httpx
 
-from .ble_client import BLEClientBase, BLEDevice, BLEMode, BLEStatus, ConnectionState
+from .ble_client import (
+    MESHCOM_NAME_PREFIX,
+    BLEClientBase,
+    BLEDevice,
+    BLEMode,
+    BLEStatus,
+    ConnectionState,
+)
 from .ble_protocol import decode_binary_message, decode_json_message, dispatcher
+from .util import now_ms
 
 logger = logging.getLogger(__name__)
+
+CONNECT_COOLDOWN_S = 15.0
+SSE_DISCONNECT_GRACE_S = 2.0
+SSE_BACKOFF_INITIAL_S = 5.0
+SSE_BACKOFF_FACTOR = 2
+SSE_BACKOFF_MAX_S = 60
+REQUEST_RETRIES = 2
+REQUEST_RETRY_DELAY_S = 1.5
+STARTUP_STATUS_RETRIES = 4
+CONNECT_REQUEST_TIMEOUT_S = 45.0  # = 3x10s BLE adapter connect attempts + cleanup slack
+# ⚠ must exceed ble_service's SSE_PING_INTERVAL_S (30.0) or the client times out first.
+SSE_READ_TIMEOUT_S = 90.0
 
 
 class BLEClientRemote(BLEClientBase):
@@ -51,9 +71,9 @@ class BLEClientRemote(BLEClientBase):
         self._running = False
         self._status.mode = BLEMode.REMOTE
         self._last_connect_attempt: float = 0
-        self._connect_cooldown: float = 15.0
-        self._sse_disconnect_buffer: float = 2.0  # seconds to wait before declaring disconnect
-        self._sse_backoff: float = 5.0
+        self._connect_cooldown: float = CONNECT_COOLDOWN_S
+        self._sse_disconnect_buffer: float = SSE_DISCONNECT_GRACE_S
+        self._sse_backoff: float = SSE_BACKOFF_INITIAL_S
 
     def _headers(self) -> dict[str, str]:
         """Get request headers with API key"""
@@ -81,8 +101,8 @@ class BLEClientRemote(BLEClientBase):
         method: str,
         endpoint: str,
         data: dict[str, Any] | None = None,
-        retries: int = 2,
-        retry_delay: float = 1.5,
+        retries: int = REQUEST_RETRIES,
+        retry_delay: float = REQUEST_RETRY_DELAY_S,
         request_timeout: float | None = None,
         quiet: bool = False,
     ) -> dict[str, Any]:
@@ -176,11 +196,15 @@ class BLEClientRemote(BLEClientBase):
                     "command": command,
                     "result": result,
                     "msg": msg,
-                    "timestamp": int(time.time() * 1000),
+                    "timestamp": now_ms(),
                 },
             )
 
-    async def scan(self, timeout: float = 5.0, prefix: str = "MC-") -> list[BLEDevice]:  # noqa: ASYNC109 - public API takes timeout
+    async def scan(
+        self,
+        timeout: float = 5.0,  # noqa: ASYNC109 - public API takes timeout
+        prefix: str = MESHCOM_NAME_PREFIX,
+    ) -> list[BLEDevice]:
         """Scan for devices via remote service"""
         try:
             await self._publish_status("scan BLE", "info", "Starting remote scan...")
@@ -246,7 +270,7 @@ class BLEClientRemote(BLEClientBase):
                 "/api/ble/connect",
                 {"device_address": mac},
                 retries=0,  # BLE service has internal retries; don't retry 409 here
-                request_timeout=45.0,  # Allow for 3×10s BLE attempts + cleanup
+                request_timeout=CONNECT_REQUEST_TIMEOUT_S,
             )
 
             success = cast(bool, response.get("success", False))
@@ -429,7 +453,9 @@ class BLEClientRemote(BLEClientBase):
         # Check connection to remote service
         try:
             await self._ensure_client()
-            status = await self._request("GET", "/api/ble/status", retries=4, quiet=True)
+            status = await self._request(
+                "GET", "/api/ble/status", retries=STARTUP_STATUS_RETRIES, quiet=True
+            )
             logger.info("Remote service status: %s", status.get("state", "unknown"))
 
             # Update local status based on remote
@@ -480,7 +506,7 @@ class BLEClientRemote(BLEClientBase):
                     httpx.AsyncClient(
                         timeout=httpx.Timeout(
                             connect=30.0,
-                            read=90.0,
+                            read=SSE_READ_TIMEOUT_S,
                             write=30.0,
                             pool=30.0,
                         )
@@ -488,7 +514,7 @@ class BLEClientRemote(BLEClientBase):
                     sse_client.stream("GET", url, headers=headers) as response,
                 ):
                     response.raise_for_status()
-                    self._sse_backoff = 5  # Reset on successful connection
+                    self._sse_backoff = SSE_BACKOFF_INITIAL_S  # Reset on successful connection
 
                     event_type: str = ""
                     event_data: str = ""
@@ -542,17 +568,19 @@ class BLEClientRemote(BLEClientBase):
                                 "disconnect BLE", "lost", "BLE service connection lost"
                             )
                     if not hasattr(self, "_sse_backoff"):
-                        self._sse_backoff = 5
+                        self._sse_backoff = SSE_BACKOFF_INITIAL_S
                     logger.warning(
                         "SSE connection error: %s, reconnecting in %ds...", e, self._sse_backoff
                     )
                     await asyncio.sleep(self._sse_backoff)
-                    self._sse_backoff = min(self._sse_backoff * 2, 60)
+                    self._sse_backoff = min(
+                        self._sse_backoff * SSE_BACKOFF_FACTOR, SSE_BACKOFF_MAX_S
+                    )
                 else:
                     break
             else:
                 # Reset backoff on clean exit from stream (shouldn't normally happen)
-                self._sse_backoff = 5
+                self._sse_backoff = SSE_BACKOFF_INITIAL_S
 
     async def _handle_notification(self, data: str) -> None:
         """Handle incoming SSE notification"""
@@ -572,7 +600,7 @@ class BLEClientRemote(BLEClientBase):
                             "command": "conffin",
                             "result": "ok",
                             "msg": "✅ finished sending config",
-                            "timestamp": int(time.time() * 1000),
+                            "timestamp": now_ms(),
                         },
                     )
                     return
@@ -626,7 +654,7 @@ class BLEClientRemote(BLEClientBase):
                 logger.info("BLE JSON TYP=%s: %s", typ, parsed)
             output = dispatcher(parsed, own_call)
             if output:
-                output["timestamp"] = notification.get("timestamp", int(time.time() * 1000))
+                output["timestamp"] = notification.get("timestamp", now_ms())
                 if output.get("transformer") not in ("generic_ble", "mh"):
                     output["src_type"] = "ble_remote"
                 return output
@@ -660,9 +688,7 @@ class BLEClientRemote(BLEClientBase):
                         if output:
                             if output.get("transformer") not in ("generic_ble", "mh"):
                                 output["src_type"] = "ble_remote"
-                            output["timestamp"] = notification.get(
-                                "timestamp", int(time.time() * 1000)
-                            )
+                            output["timestamp"] = notification.get("timestamp", now_ms())
                             return output
                     elif raw_bytes.startswith(b"D{"):
                         decoded_maybe = decode_json_message(raw_bytes)
@@ -673,9 +699,7 @@ class BLEClientRemote(BLEClientBase):
                         if output:
                             if output.get("transformer") not in ("generic_ble", "mh"):
                                 output["src_type"] = "ble_remote"
-                            output["timestamp"] = notification.get(
-                                "timestamp", int(time.time() * 1000)
-                            )
+                            output["timestamp"] = notification.get("timestamp", now_ms())
                             return output
                 except Exception as e:
                     logger.warning("Failed to decode binary notification: %s", e)
@@ -685,7 +709,7 @@ class BLEClientRemote(BLEClientBase):
                 "format": "binary",
                 "raw_base64": raw_b64,
                 "raw_hex": notification.get("raw_hex"),
-                "timestamp": notification.get("timestamp", int(time.time() * 1000)),
+                "timestamp": notification.get("timestamp", now_ms()),
             }
 
         # Unknown format - pass through
@@ -723,7 +747,7 @@ class BLEClientRemote(BLEClientBase):
                             "device_name": device_name,
                             "device_address": status.get("device_address", ""),
                             "next_retry_in": status.get("next_retry_in", 0),
-                            "timestamp": int(time.time() * 1000),
+                            "timestamp": now_ms(),
                         },
                     )
                 return
@@ -748,7 +772,7 @@ class BLEClientRemote(BLEClientBase):
                             "attempts": attempts,
                             "device_name": device_name,
                             "device_address": status.get("device_address", ""),
-                            "timestamp": int(time.time() * 1000),
+                            "timestamp": now_ms(),
                         },
                     )
                 return

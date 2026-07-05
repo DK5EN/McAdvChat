@@ -7,11 +7,16 @@ import time
 from typing import Any
 
 from ..logging_setup import get_logger
+from ..util import now_ms
 from ._base import CommandHandlerBase
+from .constants import CALLSIGN_STRICT_RE
 
 _MIN_PING_PAYLOAD = 25
 _MAX_PING_PAYLOAD = 140
 _MAX_PING_REPEAT = 5
+PING_ACK_TIMEOUT_SECONDS = 30.0
+PING_INTERVAL_SECONDS = 20.0
+PING_TEST_MAX_WAIT_SECONDS = 300
 
 logger = get_logger(__name__)
 
@@ -23,7 +28,7 @@ class CTCPingMixin(CommandHandlerBase):
         """Initialize CTC ping state. Called from CommandHandler.__init__."""
         self.active_pings = {}  # {ping_id: PingTest}
         self.ping_tests = {}
-        self.ping_timeout = 30.0  # 30 seconds per ping
+        self.ping_timeout = PING_ACK_TIMEOUT_SECONDS
         self._completion_events = {}
         self._ping_bg_tasks: set[asyncio.Task[Any]] = set()
 
@@ -440,7 +445,7 @@ class CTCPingMixin(CommandHandlerBase):
         if not ping_target:
             return "❌ Target callsign required (call:TARGET)"
 
-        if not re.match(r"^[A-Z]{1,2}[0-9][A-Z]{1,3}(-\d{1,2})?$", ping_target):
+        if not CALLSIGN_STRICT_RE.match(ping_target):
             return "❌ Invalid target callsign format"
 
         if ping_target == self.my_callsign:
@@ -452,14 +457,17 @@ class CTCPingMixin(CommandHandlerBase):
         try:
             payload_size = int(payload_size)
             if payload_size < _MIN_PING_PAYLOAD or payload_size > _MAX_PING_PAYLOAD:
-                return "❌ Payload size must be between 25 and 140 bytes"
+                return (
+                    f"❌ Payload size must be between {_MIN_PING_PAYLOAD} and "
+                    f"{_MAX_PING_PAYLOAD} bytes"
+                )
         except (ValueError, TypeError):
             return "❌ Invalid payload size"
 
         try:
             repeat_count = int(repeat_count)
             if repeat_count < 1 or repeat_count > _MAX_PING_REPEAT:
-                return "❌ Repeat count must be between 1 and 5"
+                return f"❌ Repeat count must be between 1 and {_MAX_PING_REPEAT}"
         except (ValueError, TypeError):
             return "❌ Invalid repeat count"
 
@@ -518,7 +526,7 @@ class CTCPingMixin(CommandHandlerBase):
                 )
 
                 if sequence < repeat_count:
-                    await asyncio.sleep(20.0)
+                    await asyncio.sleep(PING_INTERVAL_SECONDS)
 
             monitor_task = asyncio.create_task(self._monitor_test_completion(test_id))
             test_summary["monitor_task"] = monitor_task
@@ -558,7 +566,7 @@ class CTCPingMixin(CommandHandlerBase):
         """Monitor test completion and send summary when done"""
         try:
             start_time = time.time()
-            max_wait = 300
+            max_wait = PING_TEST_MAX_WAIT_SECONDS
 
             while (time.time() - start_time) < max_wait:
                 if test_id not in self.ping_tests:
@@ -671,15 +679,15 @@ class CTCPingMixin(CommandHandlerBase):
         try:
             if self.message_router:
                 if requester == self.my_callsign:
-                    now_ms = int(time.time() * 1000)
+                    ts_ms = now_ms()
                     result_data = {
                         "src": self.my_callsign,
                         "dst": target or requester,
                         "msg": result_message,
-                        "msg_id": now_ms,
+                        "msg_id": ts_ms,
                         "src_type": "node",
                         "type": "msg",
-                        "timestamp": now_ms,
+                        "timestamp": ts_ms,
                     }
                     await self.message_router.publish("ctcping", "websocket_message", result_data)
                 else:

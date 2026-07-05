@@ -45,9 +45,22 @@ from .classifier import Classifier
 from .classifier.seed import seed_defaults
 from .classifier.types import SSEEvent
 from .sqlite_storage import SQLiteStorage, create_sqlite_storage
+from .util import now_ms
 
 _MSG_PREVIEW_CHARS = 20
 _FORCE_EXIT_WINDOW_S = 5.0  # second Ctrl-C within this window forces exit
+
+DEFAULT_PAGE_LIMIT = 20
+MAX_PAGE_LIMIT = 100
+BLE_CMD_MAX_RETRIES = 3
+NIGHTLY_PRUNE_HOUR = 4
+CLASSIFIER_STATS_INTERVAL_S = 60.0
+SHUTDOWN_TIMEOUT_TOPIC_BEACONS_S = 5.0
+SHUTDOWN_TIMEOUT_BLE_S = 5.0
+SHUTDOWN_TIMEOUT_UDP_S = 3.0
+SHUTDOWN_TIMEOUT_SSE_S = 3.0
+# Registers the device auto-sends on BLE connect; cached for serving on SSE reconnect.
+BLE_REGISTER_TYPES = ("I", "SN", "G", "SA", "SE", "S1", "SW", "S2", "W", "AN", "IO", "TM")
 
 VERSION = f"v{__version__}"
 
@@ -117,7 +130,7 @@ class MessageRouter:
                 "command": command,
                 "result": result,
                 "msg": msg,
-                "timestamp": int(time.time() * 1000),
+                "timestamp": now_ms(),
             },
         )
 
@@ -130,7 +143,7 @@ class MessageRouter:
                 "src_type": "system",
                 "type": msg_type,
                 "msg": msg,
-                "timestamp": int(time.time() * 1000),
+                "timestamp": now_ms(),
             },
         )
 
@@ -143,7 +156,7 @@ class MessageRouter:
                 "src_type": "system",
                 "type": "error",
                 "msg": msg,
-                "timestamp": int(time.time() * 1000),
+                "timestamp": now_ms(),
             },
         )
 
@@ -271,7 +284,7 @@ class MessageRouter:
             "source": source,
             "type": message_type,
             "data": data,
-            "timestamp": int(time.time() * 1000),
+            "timestamp": now_ms(),
         }
 
         # Send to all subscribers of this message type
@@ -376,7 +389,7 @@ class MessageRouter:
                         "src_type": "system",
                         "type": "error",
                         "msg": f"Unknown command: {command}",
-                        "timestamp": int(time.time() * 1000),
+                        "timestamp": now_ms(),
                     }
                     await self.publish("router", "websocket_message", error_msg)
 
@@ -387,7 +400,7 @@ class MessageRouter:
                     "src_type": "system",
                     "type": "error",
                     "msg": f"Command failed: {command} - {e!s}",
-                    "timestamp": int(time.time() * 1000),
+                    "timestamp": now_ms(),
                 }
                 await self.publish("router", "websocket_message", error_msg)
 
@@ -512,11 +525,11 @@ class MessageRouter:
     ) -> None:
         """Handle paginated message fetch."""
         dst = params.get("dst", "*")
-        before = params.get("before", int(time.time() * 1000))
+        before = params.get("before", now_ms())
         try:
-            limit = max(1, min(int(params.get("limit", 20)), 100))
+            limit = max(1, min(int(params.get("limit", DEFAULT_PAGE_LIMIT)), MAX_PAGE_LIMIT))
         except (TypeError, ValueError):
-            limit = 20
+            limit = DEFAULT_PAGE_LIMIT
         src = params.get("src")  # Own callsign for DM conversation pagination
 
         page_data = await self.storage_handler.get_messages_page(dst, before, limit, src=src)
@@ -607,7 +620,11 @@ class MessageRouter:
         return self.get_protocol("ble_client")
 
     async def _send_ble_command_with_retry(
-        self, client: Any, cmd: str, max_retries: int = 3, base_delay: float = BLE_RETRY_BASE_DELAY
+        self,
+        client: Any,
+        cmd: str,
+        max_retries: int = BLE_CMD_MAX_RETRIES,
+        base_delay: float = BLE_RETRY_BASE_DELAY,
     ) -> bool:
         """
         Send BLE command with exponential backoff retry.
@@ -718,7 +735,7 @@ class MessageRouter:
         client = self._get_ble_client()
         if client:
             devices = await client.scan()
-            ts = int(time.time() * 1000)
+            ts = now_ms()
 
             paired = [d for d in devices if d.known]
             unpaired = [d for d in devices if not d.known]
@@ -851,7 +868,7 @@ class MessageRouter:
                 "device_address": status.device_address,
                 "device_name": status.device_name,
                 "mode": status.mode.value,
-                "timestamp": int(time.time() * 1000),
+                "timestamp": now_ms(),
             }
         else:
             ble_info = {
@@ -860,7 +877,7 @@ class MessageRouter:
                 "command": "disconnect",
                 "result": "ok",
                 "msg": "BLE not connected",
-                "timestamp": int(time.time() * 1000),
+                "timestamp": now_ms(),
             }
 
         if websocket:
@@ -894,7 +911,7 @@ class MessageRouter:
                     "command": "resolve-ip",
                     "result": "ok",
                     "msg": ip,
-                    "timestamp": int(time.time() * 1000),
+                    "timestamp": now_ms(),
                 },
             )
         except Exception as e:
@@ -908,7 +925,7 @@ class MessageRouter:
                     "command": "resolve-ip",
                     "result": "error",
                     "msg": str(e),
-                    "timestamp": int(time.time() * 1000),
+                    "timestamp": now_ms(),
                 },
             )
 
@@ -1035,7 +1052,7 @@ class MessageRouter:
                         "src_type": "system",
                         "type": "error",
                         "msg": f"Failed to send UDP message: {e}",
-                        "timestamp": int(time.time() * 1000),
+                        "timestamp": now_ms(),
                     },
                 )
         else:
@@ -1047,7 +1064,7 @@ class MessageRouter:
                     "src_type": "system",
                     "type": "error",
                     "msg": "UDP handler not available",
-                    "timestamp": int(time.time() * 1000),
+                    "timestamp": now_ms(),
                 },
             )
 
@@ -1114,7 +1131,7 @@ class MessageRouter:
         self, original_message: dict[str, Any], protocol_type: str = "udp"
     ) -> dict[str, Any]:
         """Create a synthetic message that looks like it came from LoRa (uses normalized data)"""
-        current_time_ms = int(time.time() * 1000)
+        current_time_ms = now_ms()
         msg_id = f"{current_time_ms:012X}"
 
         return {
@@ -1151,7 +1168,7 @@ class MessageRouter:
             "source": "self",
             "type": "ble_notification",
             "data": synthetic_message,
-            "timestamp": int(time.time() * 1000),
+            "timestamp": now_ms(),
         }
 
         self._logger.debug(
@@ -1252,7 +1269,7 @@ async def main() -> None:  # noqa: PLR0912, PLR0915 - complex handler kept intac
         """Cache BLE register notifications for serving on SSE reconnect."""
         data = routed_message["data"]
         typ = data.get("TYP")
-        if typ in ("I", "SN", "G", "SA", "SE", "S1", "SW", "S2", "W", "AN", "IO", "TM"):
+        if typ in BLE_REGISTER_TYPES:
             message_router.cached_ble_registers[typ] = data
 
     message_router.subscribe("ble_notification", _cache_ble_register)
@@ -1466,7 +1483,7 @@ async def main() -> None:  # noqa: PLR0912, PLR0915 - complex handler kept intac
         """Background task: prune old messages daily at 04:00."""
         while not stop_event.is_set():
             now = datetime.now()  # noqa: DTZ005 - prune schedule uses local wall clock
-            tomorrow_4am = now.replace(hour=4, minute=0, second=0, microsecond=0)
+            tomorrow_4am = now.replace(hour=NIGHTLY_PRUNE_HOUR, minute=0, second=0, microsecond=0)
             if tomorrow_4am <= now:
                 tomorrow_4am += timedelta(days=1)
             wait_seconds = (tomorrow_4am - now).total_seconds()
@@ -1570,7 +1587,7 @@ async def main() -> None:  # noqa: PLR0912, PLR0915 - complex handler kept intac
             except Exception as exc:
                 logger.warning("classifier stats broadcast failed: %s", exc)
             try:
-                await asyncio.wait_for(stop_event.wait(), timeout=60.0)
+                await asyncio.wait_for(stop_event.wait(), timeout=CLASSIFIER_STATS_INTERVAL_S)
             except TimeoutError:
                 continue
 
@@ -1593,7 +1610,9 @@ async def main() -> None:  # noqa: PLR0912, PLR0915 - complex handler kept intac
     try:
         # Step 1: Clean up beacons
         logger.info("Stopping beacon tasks...")
-        await asyncio.wait_for(command_handler.cleanup_topic_beacons(), timeout=5.0)
+        await asyncio.wait_for(
+            command_handler.cleanup_topic_beacons(), timeout=SHUTDOWN_TIMEOUT_TOPIC_BEACONS_S
+        )
     except TimeoutError:
         logger.warning("Beacon cleanup timeout")
 
@@ -1605,17 +1624,19 @@ async def main() -> None:  # noqa: PLR0912, PLR0915 - complex handler kept intac
         # Step 2: Stop BLE client with timeout
         logger.info("Stopping BLE client...")
         if ble_client:
-            await asyncio.wait_for(ble_client.stop(), timeout=5.0)
+            await asyncio.wait_for(ble_client.stop(), timeout=SHUTDOWN_TIMEOUT_BLE_S)
         else:
             # Fallback to legacy disconnect
-            await asyncio.wait_for(message_router.route_command("disconnect BLE"), timeout=5.0)
+            await asyncio.wait_for(
+                message_router.route_command("disconnect BLE"), timeout=SHUTDOWN_TIMEOUT_BLE_S
+            )
     except TimeoutError:
         logger.warning("BLE disconnect timeout")
 
     try:
         # Step 3: Stop UDP handler
         logger.info("Stopping UDP handler...")
-        await asyncio.wait_for(udp_handler.stop_listening(), timeout=3.0)
+        await asyncio.wait_for(udp_handler.stop_listening(), timeout=SHUTDOWN_TIMEOUT_UDP_S)
     except TimeoutError:
         logger.warning("UDP stop timeout")
 
@@ -1623,7 +1644,7 @@ async def main() -> None:  # noqa: PLR0912, PLR0915 - complex handler kept intac
     if sse_manager:
         try:
             logger.info("Stopping SSE server...")
-            await asyncio.wait_for(sse_manager.stop_server(), timeout=3.0)
+            await asyncio.wait_for(sse_manager.stop_server(), timeout=SHUTDOWN_TIMEOUT_SSE_S)
         except TimeoutError:
             logger.warning("SSE stop timeout")
 

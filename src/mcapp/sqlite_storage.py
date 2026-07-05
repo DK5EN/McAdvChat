@@ -20,6 +20,7 @@ from statistics import mean
 from typing import Any, cast
 
 from .logging_setup import get_logger
+from .util import FEET_TO_METERS, now_ms
 
 _MAX_FORENSIC_HOPS = 4  # log raw data for messages routed over more hops
 _MIN_PLAUSIBLE_HPA = 850  # pressure below this is a firmware mapping error
@@ -44,6 +45,35 @@ MIN_DATAPOINTS_FOR_STATS = 10
 SQLITE_BUSY_TIMEOUT_S = 60  # tolerate nightly VACUUM holding the DB longer than the 5s default
 SIGNAL_BACKFILL_WINDOW_HOURS = 192  # 8 days — matches signal_log's own prune retention
 SIGNAL_BACKFILL_BATCH_SIZE = 500
+EIGHT_DAYS_MS = SIGNAL_BACKFILL_WINDOW_HOURS * 3600 * 1000
+
+MHEARD_THROTTLE_MS = 120_000  # 2 minutes
+ACK_DIAG_WINDOW_MS = 300_000
+TELEMETRY_DEDUP_WINDOW_MS = 60_000
+
+# Barometric formula: QFE = QNH × (1 - LAPSE_RATE × alt / STD_TEMP)^EXPONENT
+BARO_LAPSE_RATE_K_PER_M = 0.0065
+BARO_STD_TEMP_K = 288.15
+BARO_EXPONENT = 5.255
+
+DEFAULT_POS_RETENTION_HOURS = 192  # 8 days
+LONG_RETENTION_DAYS = 365
+STATION_RETENTION_DAYS = 30
+
+PRUNE_TARGET_FRACTION = 0.9  # aim for 90% of MAX_DB_SIZE_MB to avoid re-trigger
+EST_BYTES_PER_ROW = 200  # conservative average across all tables
+MIN_PRUNE_ROWS = 1000
+
+INITIAL_MSG_LIMIT = 1000
+INITIAL_POS_LIMIT = 500
+INITIAL_ACK_LIMIT = 200
+DEFAULT_PAGE_SIZE = 20  # align with core's DEFAULT_PAGE_LIMIT
+
+HOURLY_BUCKET_S = 3600
+MHEARD_STATION_SCAN_LIMIT = 4000
+SECONDS_PER_DAY = 86400
+TELEMETRY_BUCKET_MS = 4 * 3600 * 1000
+HOURS_PER_YEAR = 8760
 
 # Columns to SELECT when building message JSON (avoids fetching raw_json)
 _MSG_SELECT = (
@@ -909,9 +939,9 @@ class SQLiteStorage:
     async def _init_bucket_accumulators(self) -> None:
         """Load current partial buckets from signal_log into memory."""
         bucket_ms = BUCKET_SECONDS * 1000
-        now_ms = int(time.time() * 1000)
+        now_ts_ms = now_ms()
         # Load signal_log entries from the current (partial) bucket period
-        current_bucket_start = (now_ms // bucket_ms) * bucket_ms
+        current_bucket_start = (now_ts_ms // bucket_ms) * bucket_ms
         rows_result = await self._execute(
             "SELECT callsign, timestamp, rssi, snr FROM signal_log"
             " WHERE timestamp >= ?"
@@ -1005,7 +1035,7 @@ class SQLiteStorage:
 
         update_type: 'signal' (MHeard) or 'position' (position beacon)
         """
-        timestamp = data.get("timestamp", int(time.time() * 1000))
+        timestamp = data.get("timestamp", now_ms())
 
         if update_type == "signal":
             await self._execute(
@@ -1172,7 +1202,7 @@ class SQLiteStorage:
             logger.info("Signal backfill marker present (%s), skipping", marker_key)
             return {"skipped": True, "scanned": 0, "inserted": 0}
 
-        cutoff_ms = int(time.time() * 1000) - SIGNAL_BACKFILL_WINDOW_HOURS * 3600 * 1000
+        cutoff_ms = now_ms() - SIGNAL_BACKFILL_WINDOW_HOURS * 3600 * 1000
         rows_raw = await self._execute(
             "SELECT src, timestamp, rssi, snr FROM messages"
             " WHERE src_type = 'lora' AND rssi IS NOT NULL AND snr IS NOT NULL"
@@ -1338,7 +1368,7 @@ class SQLiteStorage:
         dst = message.get("dst", "")
         msg = message.get("msg", "")
         msg_type = message.get("type", "msg")
-        timestamp = message.get("timestamp", int(time.time() * 1000))
+        timestamp = message.get("timestamp", now_ms())
         rssi = message.get("rssi")
         snr = message.get("snr")
         src_type = message.get("src_type", "")
@@ -1423,7 +1453,7 @@ class SQLiteStorage:
                     recent_result = await self._execute(
                         "SELECT msg_id, src, type FROM messages "
                         "WHERE timestamp > ? ORDER BY timestamp DESC LIMIT 5",
-                        (timestamp - 300_000,),
+                        (timestamp - ACK_DIAG_WINDOW_MS,),
                     )
                     recent = cast(list[dict[str, Any]], recent_result)
                     nearby = (
@@ -1536,7 +1566,7 @@ class SQLiteStorage:
             if not pos_data.get("alt"):
                 alt_match = re.search(r"/A=(\d{6})", pos_data.get("msg", ""))
                 if alt_match:
-                    pos_data["alt"] = round(int(alt_match.group(1)) * 0.3048)
+                    pos_data["alt"] = round(int(alt_match.group(1)) * FEET_TO_METERS)
 
             # Only upsert if we have coordinates
             lat = pos_data.get("lat")
@@ -1554,7 +1584,7 @@ class SQLiteStorage:
         # time, update the most recent entry for the same callsign if it is
         # within the throttle window.  This reduces DB bloat by ~90%.
         if is_mheard:
-            throttle_ms = 120_000  # 2 minutes
+            throttle_ms = MHEARD_THROTTLE_MS
             existing = await self._execute(
                 "SELECT id FROM messages"
                 " WHERE src = ? AND src_type = 'ble'"
@@ -1733,7 +1763,7 @@ class SQLiteStorage:
         if not callsign:
             return
 
-        timestamp = data.get("timestamp", int(time.time() * 1000))
+        timestamp = data.get("timestamp", now_ms())
         temp1 = data.get("temp1")
         temp2 = data.get("temp2")
         hum = data.get("hum")
@@ -1759,12 +1789,13 @@ class SQLiteStorage:
         if qfe is not None and qfe < _MIN_PLAUSIBLE_HPA:
             qfe = None
 
-        # If QFE missing but QNH + altitude available, calculate QFE
-        # Barometric formula: QFE = QNH × (1 - 0.0065 × alt / 288.15)^5.255
+        # If QFE missing but QNH + altitude available, calculate QFE (barometric formula)
         qnh = data.get("qnh")
         # Only use plausible QNH values
         if (qfe is None or qfe == 0) and qnh and alt and qnh > _MIN_PLAUSIBLE_HPA:
-            qfe = round(qnh * (1 - 0.0065 * alt / 288.15) ** 5.255, 1)
+            qfe = round(
+                qnh * (1 - BARO_LAPSE_RATE_K_PER_M * alt / BARO_STD_TEMP_K) ** BARO_EXPONENT, 1
+            )
 
         qnh = None  # Node QNH is unreliable; frontend calculates from QFE + alt
 
@@ -1778,7 +1809,7 @@ class SQLiteStorage:
         recent = await self._execute(
             "SELECT id, temp2, hum2, qfe, extras"
             " FROM telemetry WHERE callsign = ? AND timestamp > ?",
-            (callsign, timestamp - 60_000),
+            (callsign, timestamp - TELEMETRY_DEDUP_WINDOW_MS),
         )
         recent_list = cast(list[dict[str, Any]], recent)
         if recent_list:
@@ -1820,7 +1851,7 @@ class SQLiteStorage:
                     extras_json = existing["extras"]
                 await self._execute(
                     "DELETE FROM telemetry WHERE callsign = ? AND timestamp > ?",
-                    (callsign, timestamp - 60_000),
+                    (callsign, timestamp - TELEMETRY_DEDUP_WINDOW_MS),
                     fetch=False,
                 )
 
@@ -1947,8 +1978,8 @@ class SQLiteStorage:
         self,
         prune_hours: int,
         block_list: list[str],
-        prune_hours_pos: int = 192,
-        prune_hours_ack: int = 192,
+        prune_hours_pos: int = DEFAULT_POS_RETENTION_HOURS,
+        prune_hours_ack: int = DEFAULT_POS_RETENTION_HOURS,
     ) -> int:
         """Prune old messages with type-based retention.
 
@@ -2009,7 +2040,7 @@ class SQLiteStorage:
 
         # --- Prune new tables ---
         # telemetry: 365 days (supports "Last Year" WX view)
-        cutoff_telemetry_ms = int((now - timedelta(days=365)).timestamp() * 1000)
+        cutoff_telemetry_ms = int((now - timedelta(days=LONG_RETENTION_DAYS)).timestamp() * 1000)
         await self._execute(
             "DELETE FROM telemetry WHERE timestamp < ?",
             (cutoff_telemetry_ms,),
@@ -2027,14 +2058,14 @@ class SQLiteStorage:
             (BUCKET_SECONDS * 1000, cutoff_pos_ms),
             fetch=False,
         )
-        cutoff_1h_ms = int((now - timedelta(days=365)).timestamp() * 1000)
+        cutoff_1h_ms = int((now - timedelta(days=LONG_RETENTION_DAYS)).timestamp() * 1000)
         await self._execute(
-            "DELETE FROM signal_buckets WHERE bucket_size = 3600000 AND bucket_ts < ?",
-            (cutoff_1h_ms,),
+            "DELETE FROM signal_buckets WHERE bucket_size = ? AND bucket_ts < ?",
+            (HOURLY_BUCKET_MS, cutoff_1h_ms),
             fetch=False,
         )
-        # station_positions: optionally prune stations not seen in 30 days
-        cutoff_30d_ms = int((now - timedelta(days=30)).timestamp() * 1000)
+        # station_positions: optionally prune stations not seen in STATION_RETENTION_DAYS
+        cutoff_30d_ms = int((now - timedelta(days=STATION_RETENTION_DAYS)).timestamp() * 1000)
         await self._execute(
             "DELETE FROM station_positions WHERE last_seen IS NOT NULL AND last_seen < ?",
             (cutoff_30d_ms,),
@@ -2051,10 +2082,9 @@ class SQLiteStorage:
                 size_mb,
                 self.MAX_DB_SIZE_MB,
             )
-            target_mb = self.MAX_DB_SIZE_MB * 0.9  # aim for 90% to avoid re-trigger
+            target_mb = self.MAX_DB_SIZE_MB * PRUNE_TARGET_FRACTION
             excess_bytes = int((size_mb - target_mb) * 1024 * 1024)
-            # ~200 bytes per row is a conservative average across all tables
-            rows_to_free = max(1000, excess_bytes // 200)
+            rows_to_free = max(MIN_PRUNE_ROWS, excess_bytes // EST_BYTES_PER_ROW)
 
             for table, ts_col in [
                 ("signal_log", "timestamp"),
@@ -2095,19 +2125,19 @@ class SQLiteStorage:
         Called by the nightly prune job. Takes 5-min buckets older than 8 days
         and rolls them up into 1-hour buckets for long-term storage.
         """
-        now_ms = int(time.time() * 1000)
-        cutoff_ms = now_ms - (8 * 24 * 60 * 60 * 1000)  # 8 days ago
+        now_ts_ms = now_ms()
+        cutoff_ms = now_ts_ms - EIGHT_DAYS_MS
         bucket_5min_ms = BUCKET_SECONDS * 1000
 
         await self._execute(
-            """
+            f"""
             INSERT OR REPLACE INTO signal_buckets
                 (callsign, bucket_ts, bucket_size, rssi_avg, rssi_min, rssi_max,
                  snr_avg, snr_min, snr_max, count)
             SELECT
                 callsign,
-                (bucket_ts / 3600000) * 3600000 AS hour_ts,
-                3600000,
+                (bucket_ts / {HOURLY_BUCKET_MS}) * {HOURLY_BUCKET_MS} AS hour_ts,
+                {HOURLY_BUCKET_MS},
                 SUM(rssi_avg * count) / SUM(count),
                 MIN(rssi_min), MAX(rssi_max),
                 SUM(snr_avg * count) / SUM(count),
@@ -2117,7 +2147,7 @@ class SQLiteStorage:
             WHERE bucket_size = ?
               AND bucket_ts < ?
             GROUP BY callsign, hour_ts
-            """,
+            """,  # noqa: S608 - identifiers from fixed set; values parameterized
             (bucket_5min_ms, cutoff_ms),
             fetch=False,
         )
@@ -2138,7 +2168,7 @@ class SQLiteStorage:
             SELECT {_MSG_SELECT} FROM messages
             WHERE type = 'msg' AND msg NOT LIKE '%:ack%'
             ORDER BY timestamp DESC
-            LIMIT 1000
+            LIMIT {INITIAL_MSG_LIMIT}
         """  # noqa: S608 - identifiers from fixed set; values parameterized
         msg_rows_raw = await self._execute(msgs_query)
         msg_rows = cast(list[dict[str, Any]], msg_rows_raw)
@@ -2147,7 +2177,7 @@ class SQLiteStorage:
             SELECT {_MSG_SELECT} FROM messages
             WHERE type = 'pos'
             ORDER BY timestamp DESC
-            LIMIT 500
+            LIMIT {INITIAL_POS_LIMIT}
         """  # noqa: S608 - identifiers from fixed set; values parameterized
         pos_rows_raw = await self._execute(pos_query)
         pos_rows = cast(list[dict[str, Any]], pos_rows_raw)
@@ -2235,7 +2265,7 @@ class SQLiteStorage:
 
     async def get_smart_initial_with_summary(
         self,
-        limit_per_dst: int = 20,
+        limit_per_dst: int = DEFAULT_PAGE_SIZE,
     ) -> tuple[dict[str, Any], dict[str, Any]]:
         """Get smart initial payload + summary in a single thread call.
 
@@ -2281,7 +2311,7 @@ class SQLiteStorage:
                 ack_rows = conn.execute(
                     f"SELECT {_MSG_SELECT} FROM messages"  # noqa: S608 - identifiers from fixed set; values parameterized
                     " WHERE type = 'msg' AND msg LIKE '%:ack%'"
-                    " ORDER BY timestamp DESC LIMIT 200",
+                    f" ORDER BY timestamp DESC LIMIT {INITIAL_ACK_LIMIT}",
                 ).fetchall()
                 acks = [json.dumps(build_msg(dict(row)), ensure_ascii=False) for row in ack_rows]
 
@@ -2308,7 +2338,7 @@ class SQLiteStorage:
         )
         return initial, summary
 
-    async def get_smart_initial(self, limit_per_dst: int = 20) -> dict[str, Any]:
+    async def get_smart_initial(self, limit_per_dst: int = DEFAULT_PAGE_SIZE) -> dict[str, Any]:
         """Get smart initial payload (wrapper around get_smart_initial_with_summary)."""
         initial, _ = await self.get_smart_initial_with_summary(limit_per_dst)
         return initial
@@ -2322,7 +2352,7 @@ class SQLiteStorage:
         self,
         dst: str,
         before_timestamp: int | None = None,
-        limit: int = 20,
+        limit: int = DEFAULT_PAGE_SIZE,
         src: str | None = None,
     ) -> dict[str, Any]:
         """Get a page of messages for a destination, cursor-based.
@@ -2331,7 +2361,7 @@ class SQLiteStorage:
         to query via conversation_key for a single-index scan.
         """
         if before_timestamp is None:
-            before_timestamp = int(time.time() * 1000)
+            before_timestamp = now_ms()
 
         is_dm = dst and src and not dst.isdigit() and dst != "*"
         is_group = bool(dst) and (dst.isdigit() or dst == "TEST")
@@ -2422,8 +2452,8 @@ class SQLiteStorage:
         Reads from pre-aggregated signal_buckets table instead of scanning
         all messages. Falls back to legacy scan if signal_buckets is empty.
         """
-        now_ms = int(time.time() * 1000)
-        cutoff_ms = now_ms - SEVEN_DAYS_MS
+        now_ts_ms = now_ms()
+        cutoff_ms = now_ts_ms - SEVEN_DAYS_MS
         bucket_5min_ms = BUCKET_SECONDS * 1000
 
         if progress_callback:
@@ -2590,21 +2620,21 @@ class SQLiteStorage:
 
     async def process_mheard_yearly(self, progress_callback: Any = None) -> list[dict[str, Any]]:
         """Process 1-hour signal buckets for yearly mHeard statistics."""
-        now_ms = int(time.time() * 1000)
-        cutoff_ms = now_ms - ONE_YEAR_MS
+        now_ts_ms = now_ms()
+        cutoff_ms = now_ts_ms - ONE_YEAR_MS
 
         if progress_callback:
             await progress_callback("start", "Querying yearly data...")
 
         bucket_5min_ms = BUCKET_SECONDS * 1000
         bucket_rows_raw = await self._execute(
-            "SELECT callsign, bucket_ts, rssi_avg, rssi_min, rssi_max,"
+            "SELECT callsign, bucket_ts, rssi_avg, rssi_min, rssi_max,"  # noqa: S608 - identifiers from fixed set; values parameterized
             "       snr_avg, snr_min, snr_max, count"
             " FROM signal_buckets"
             " WHERE bucket_size = ? AND bucket_ts >= ?"
             " UNION ALL"
             " SELECT callsign,"
-            "       (bucket_ts / 3600000) * 3600000 AS bucket_ts,"
+            f"       (bucket_ts / {HOURLY_BUCKET_MS}) * {HOURLY_BUCKET_MS} AS bucket_ts,"
             "       SUM(rssi_avg * count) / SUM(count),"
             "       MIN(rssi_min), MAX(rssi_max),"
             "       SUM(snr_avg * count) / SUM(count),"
@@ -2612,7 +2642,7 @@ class SQLiteStorage:
             "       SUM(count)"
             " FROM signal_buckets"
             " WHERE bucket_size = ? AND bucket_ts >= ?"
-            " GROUP BY callsign, (bucket_ts / 3600000) * 3600000",
+            f" GROUP BY callsign, (bucket_ts / {HOURLY_BUCKET_MS}) * {HOURLY_BUCKET_MS}",
             (HOURLY_BUCKET_MS, cutoff_ms, bucket_5min_ms, cutoff_ms),
         )
         bucket_rows = cast(list[dict[str, Any]], bucket_rows_raw)
@@ -2659,7 +2689,7 @@ class SQLiteStorage:
                     final_result.append(
                         {
                             "src_type": "STATS",
-                            "timestamp": bucket_time - 3600,
+                            "timestamp": bucket_time - HOURLY_BUCKET_S,
                             "callsign": callsign,
                             "rssi": None,
                             "snr": None,
@@ -2706,21 +2736,21 @@ class SQLiteStorage:
 
     async def process_mheard_monthly(self, progress_callback: Any = None) -> list[dict[str, Any]]:
         """Process signal buckets for 30-day mHeard statistics."""
-        now_ms = int(time.time() * 1000)
-        cutoff_ms = now_ms - ONE_MONTH_MS
+        now_ts_ms = now_ms()
+        cutoff_ms = now_ts_ms - ONE_MONTH_MS
 
         if progress_callback:
             await progress_callback("start", "Querying monthly data...")
 
         bucket_5min_ms = BUCKET_SECONDS * 1000
         bucket_rows_raw = await self._execute(
-            "SELECT callsign, bucket_ts, rssi_avg, rssi_min, rssi_max,"
+            "SELECT callsign, bucket_ts, rssi_avg, rssi_min, rssi_max,"  # noqa: S608 - identifiers from fixed set; values parameterized
             "       snr_avg, snr_min, snr_max, count"
             " FROM signal_buckets"
             " WHERE bucket_size = ? AND bucket_ts >= ?"
             " UNION ALL"
             " SELECT callsign,"
-            "       (bucket_ts / 3600000) * 3600000 AS bucket_ts,"
+            f"       (bucket_ts / {HOURLY_BUCKET_MS}) * {HOURLY_BUCKET_MS} AS bucket_ts,"
             "       SUM(rssi_avg * count) / SUM(count),"
             "       MIN(rssi_min), MAX(rssi_max),"
             "       SUM(snr_avg * count) / SUM(count),"
@@ -2728,7 +2758,7 @@ class SQLiteStorage:
             "       SUM(count)"
             " FROM signal_buckets"
             " WHERE bucket_size = ? AND bucket_ts >= ?"
-            " GROUP BY callsign, (bucket_ts / 3600000) * 3600000",
+            f" GROUP BY callsign, (bucket_ts / {HOURLY_BUCKET_MS}) * {HOURLY_BUCKET_MS}",
             (HOURLY_BUCKET_MS, cutoff_ms, bucket_5min_ms, cutoff_ms),
         )
         bucket_rows = cast(list[dict[str, Any]], bucket_rows_raw)
@@ -2775,7 +2805,7 @@ class SQLiteStorage:
                     final_result.append(
                         {
                             "src_type": "STATS",
-                            "timestamp": bucket_time - 3600,
+                            "timestamp": bucket_time - HOURLY_BUCKET_S,
                             "callsign": callsign,
                             "rssi": None,
                             "snr": None,
@@ -3039,9 +3069,9 @@ class SQLiteStorage:
     async def get_mheard_stations(self, _limit: int, _msg_type: str) -> dict[str, Any]:
         """Get recently heard stations aggregated by callsign."""
         rows_raw = await self._execute(
-            "SELECT src, type, timestamp FROM messages"
+            "SELECT src, type, timestamp FROM messages"  # noqa: S608 - identifiers from fixed set; values parameterized
             " WHERE type IN ('msg', 'pos') AND src != ''"
-            " ORDER BY timestamp DESC LIMIT 4000",
+            f" ORDER BY timestamp DESC LIMIT {MHEARD_STATION_SCAN_LIMIT}",
         )
         rows = cast(list[dict[str, Any]], rows_raw)
 
@@ -3075,7 +3105,7 @@ class SQLiteStorage:
         search_type: str,
     ) -> dict[str, Any]:
         """Aggregate search: counts, last timestamps, destinations, SIDs."""
-        cutoff_ms = int((time.time() - days * 86400) * 1000)
+        cutoff_ms = int((time.time() - days * SECONDS_PER_DAY) * 1000)
 
         # Build src filter based on search type
         params: tuple[Any, ...] = ()
@@ -3147,7 +3177,7 @@ class SQLiteStorage:
 
     async def get_positions(self, callsign: str, days: int) -> list[dict[str, Any]]:
         """Get position data for a callsign."""
-        cutoff_ms = int((time.time() - days * 86400) * 1000)
+        cutoff_ms = int((time.time() - days * SECONDS_PER_DAY) * 1000)
         escaped_callsign = (
             callsign.upper().replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
         )
@@ -3262,10 +3292,12 @@ class SQLiteStorage:
         )
         return cast(list[dict[str, Any]], result)
 
-    async def get_telemetry_chart_data_bucketed(self, hours: int = 8760) -> list[dict[str, Any]]:
+    async def get_telemetry_chart_data_bucketed(
+        self, hours: int = HOURS_PER_YEAR
+    ) -> list[dict[str, Any]]:
         """Return telemetry aggregated into 4-hour buckets with min/max."""
         cutoff = int((time.time() - hours * 3600) * 1000)
-        bucket_ms = 4 * 3600 * 1000  # 4 hours
+        bucket_ms = TELEMETRY_BUCKET_MS
         result = await self._execute(
             f"""
             SELECT
@@ -3839,7 +3871,7 @@ class SQLiteStorage:
         texts = await self.get_blocked_texts()
         if not texts:
             return {}
-        since_ms = int(time.time() * 1000) - 24 * 3600 * 1000
+        since_ms = now_ms() - 24 * 3600 * 1000
         rows = await self._execute(
             "SELECT msg FROM messages WHERE timestamp >= ? AND msg IS NOT NULL",
             (since_ms,),
@@ -4227,7 +4259,7 @@ async def run_startup_tests() -> bool:  # noqa: PLR0915 - test suite lists one c
             # Must be within backfill_signal_log's retention window, which is relative
             # to real wall-clock time — the deterministic base_ts (fixed at an
             # arbitrary past date) would fall outside it.
-            backfill_ts = int(time.time() * 1000) - 3600_000
+            backfill_ts = now_ms() - 3600_000
             await storage._execute(  # noqa: SLF001 - white-box startup test
                 "INSERT INTO messages"
                 " (msg_id, src, dst, msg, type, timestamp, rssi, snr, src_type, raw_json)"
