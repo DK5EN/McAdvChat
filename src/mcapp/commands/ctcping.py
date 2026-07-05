@@ -45,7 +45,13 @@ class PingStatus(StrEnum):
 
 @dataclass
 class ActivePing:
-    """One in-flight ping echo awaiting its ACK (CMD-04)."""
+    """One in-flight ping echo awaiting its ACK (CMD-04).
+
+    `ack_processed` (not `status`) is the idempotence guard here — a single
+    ping never has more than two states (waiting, ack processed) so there's
+    no enum-driven state machine at this level; that lives on `PingTest`
+    below.
+    """
 
     target: str
     original_msg: str
@@ -53,13 +59,20 @@ class ActivePing:
     requester: str
     sequence_info: str | None
     test_id: str | None
-    status: PingStatus = PingStatus.WAITING_ACK
     ack_processed: bool = False
 
 
 @dataclass
 class PingTest:
-    """One `!ctcping` invocation's aggregate state (CMD-04)."""
+    """One `!ctcping` invocation's aggregate state (CMD-04).
+
+    `status` lifecycle: RUNNING -> COMPLETING -> COMPLETED (normal path, via
+    `_complete_test`), or RUNNING -> TIMEOUT (deadline fallback, via
+    `_monitor_test_completion`), or RUNNING -> ERROR (send failure, via
+    `_start_ping_test`). Once status leaves RUNNING, `_record_ping_result`/
+    `_check_test_completion` stop acting on this test — see the idempotence
+    invariant on `_trigger_completion_if_done` below.
+    """
 
     test_id: str
     target: str
@@ -255,7 +268,9 @@ class CTCPingMixin(CommandHandlerBase):
 
             if test_id and test_id in self.ping_tests:
                 await self._record_ack_result(ack_id, test_id, ping_info, result, rtt)
-            del self.active_pings[ack_id]
+            # Sole owner of this deletion — _record_ack_result never deletes
+            # active_pings itself, so there's exactly one place to look.
+            self.active_pings.pop(ack_id, None)
 
         except Exception:
             logger.exception("Error handling ACK message")
@@ -286,7 +301,6 @@ class CTCPingMixin(CommandHandlerBase):
             logger.debug(
                 "Sequence %s already completed, ignoring duplicate ACK %s", sequence, ack_id
             )
-            del self.active_pings[ack_id]
             return
 
         if sequence:
@@ -301,7 +315,18 @@ class CTCPingMixin(CommandHandlerBase):
         logger.debug("ACK processed: ID=%s, RTT=%.1fms", ack_id, rtt_ms)
 
     def _trigger_completion_if_done(self, test_id: str) -> bool:
-        """Check test completion and trigger async cleanup if done. Returns True if triggered."""
+        """Check test completion and trigger async cleanup if done. Returns True if triggered.
+
+        IDEMPOTENCE INVARIANT: there must be no `await` between the
+        `_check_test_completion()` call and `_completing_test_ids.add()` below.
+        Single-threaded asyncio gives no interleaving point across these
+        (synchronous) lines, so two concurrent callers (an ACK and the
+        deadline-fallback monitor, or two ACKs) can't both pass the
+        `test_id in self._completing_test_ids` check before either one adds
+        itself. Inserting an `await` here would reopen that gap and let a
+        test complete twice. `PingTest.status` leaving RUNNING is the second,
+        independent gate (see its docstring).
+        """
         if not self._check_test_completion(test_id):
             return False
 
@@ -408,9 +433,6 @@ class CTCPingMixin(CommandHandlerBase):
                 return
 
             ping_info = self.active_pings[message_id]
-
-            if ping_info.status != PingStatus.WAITING_ACK:
-                return
 
             timeout_result = {
                 "sequence": ping_info.sequence_info or "",
@@ -601,24 +623,12 @@ class CTCPingMixin(CommandHandlerBase):
                     test_summary.requester, f"🏓 {error_msg}", test_summary.target
                 )
             else:
-                results = test_summary.results
                 total_pings = test_summary.total_pings
 
-                successful_from_results = len([r for r in results if r["rtt"] is not None])
-                timeouts_from_results = len([r for r in results if r["rtt"] is None])
-
+                # test_summary.completed/.timeouts are the single source of
+                # truth (CMD-03: one increment site, in _record_ping_result).
                 successful = test_summary.completed
                 timeouts = test_summary.timeouts
-
-                if successful != successful_from_results or timeouts != timeouts_from_results:
-                    logger.warning(
-                        "Ping summary inconsistency: results=%d success/%d timeouts,"
-                        " tracked=%d success/%d timeouts",
-                        successful_from_results,
-                        timeouts_from_results,
-                        successful,
-                        timeouts,
-                    )
 
                 loss_percent = int((timeouts / total_pings) * 100)
 

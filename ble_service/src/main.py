@@ -297,53 +297,97 @@ def _on_adapter_disconnect():
         state.reconnect_task = asyncio.create_task(_auto_reconnect())
 
 
-async def _retry_connect(  # noqa: PLR0912, PLR0913, PLR0915 - consolidates two near-duplicate loops (BLE-02); params cover both callers' distinct behaviors
+@dataclass(frozen=True)
+class _RetryProfile:
+    """Per-caller behavior/wording for `_retry_connect` (BLE-02).
+
+    Only `sleep_before_attempt`/`connect_timeout` change control flow; the
+    rest vary the exact wording/level of the log lines and activity-log
+    entries. Those are wire-facing — the webapp's BLE activity log
+    (`BtActivityLog.vue`) renders `action` as text and color-codes rows by
+    `level` — so they're preserved verbatim per caller rather than unified;
+    do not change them without a coordinated webapp change.
+    """
+
+    label: str
+    sleep_before_attempt: bool
+    connect_timeout: float | None
+    attempt_action: str
+    attempt_log_level: str
+    failed_action: str
+    success_action: str
+    success_detail: str
+    log_cancel_activity: bool
+    log_cancel_info: bool
+    exhausted_detail: str
+    exhausted_log_count: bool
+
+
+_AUTO_RECONNECT_PROFILE = _RetryProfile(
+    label="Auto-reconnect",
+    sleep_before_attempt=True,
+    connect_timeout=None,
+    attempt_action="reconnect_attempt",
+    attempt_log_level="warn",
+    failed_action="reconnect_failed",
+    success_action="reconnect_success",
+    success_detail="Reconnected to",
+    log_cancel_activity=True,
+    log_cancel_info=True,
+    exhausted_detail=" attempts",
+    exhausted_log_count=True,
+)
+
+_STARTUP_CONNECT_PROFILE = _RetryProfile(
+    label="Startup auto-connect",
+    sleep_before_attempt=False,
+    connect_timeout=30.0,
+    attempt_action="startup_connect_attempt",
+    attempt_log_level="info",
+    failed_action="connect_failed",
+    success_action="connect_success",
+    success_detail="Connected to",
+    log_cancel_activity=False,
+    log_cancel_info=True,
+    exhausted_detail=" startup attempts",
+    exhausted_log_count=False,
+)
+
+
+async def _retry_connect(  # noqa: PLR0912, PLR0915 - consolidates two near-duplicate loops (BLE-02)
     mac: str,
     name: str,
-    *,
-    label: str,
+    profile: _RetryProfile,
     delays: tuple[int, ...] = RECONNECT_DELAYS_S,
-    sleep_before_attempt: bool,
-    connect_timeout: float | None,
-    attempt_action: str,
-    attempt_log_level: str,
-    failed_action: str,
-    success_action: str,
-    success_detail: str,
-    log_cancel_activity: bool,
-    log_cancel_info: bool,
-    exhausted_detail: str,
-    exhausted_log_count: bool,
 ) -> bool:
     """Shared retry-with-backoff loop for BLE-02's two near-duplicate callers:
     `_auto_reconnect` (reacts to an unexpected disconnect — backs off *before*
     each attempt, no per-attempt timeout) and `_startup_auto_connect` (tries
     immediately after the initial hardware-settle wait, backs off *between*
-    attempts on failure, wraps each attempt in a 30s timeout). The two callers'
-    log/activity wording and ordering quirks are preserved exactly via the
-    keyword params rather than unified, since none of those wording diffs were
-    a listed finding.
+    attempts on failure, wraps each attempt in a 30s timeout). See `profile`
+    (`_AUTO_RECONNECT_PROFILE`/`_STARTUP_CONNECT_PROFILE`) for what varies.
     """
+    label = profile.label
     state.reconnecting = True
     state.reconnect_max_attempts = len(delays)
 
     for attempt, delay in enumerate(delays, 1):
         if state.user_disconnected:
-            if log_cancel_info:
+            if profile.log_cancel_info:
                 logger.info("%s cancelled (user disconnected)", label)
             state.reconnecting = False
             state.reconnect_attempt = 0
-            if log_cancel_activity:
+            if profile.log_cancel_activity:
                 _log_activity("reconnect_cancelled", "Cancelled by user", "info")
             return False
-        if not sleep_before_attempt and state.ble_adapter.is_connected:
+        if not profile.sleep_before_attempt and state.ble_adapter.is_connected:
             logger.info("Already connected, stopping %s", label.lower())
             state.reconnecting = False
             state.reconnect_attempt = 0
             return False
 
         state.reconnect_attempt = attempt
-        if sleep_before_attempt:
+        if profile.sleep_before_attempt:
             _push_status_event(
                 STATUS_RECONNECTING,
                 attempt=attempt,
@@ -353,9 +397,9 @@ async def _retry_connect(  # noqa: PLR0912, PLR0913, PLR0915 - consolidates two 
                 device_address=mac,
             )
             _log_activity(
-                attempt_action,
+                profile.attempt_action,
                 f"Attempt {attempt}/{len(delays)} to {name} (waiting {delay}s)",
-                attempt_log_level,
+                profile.attempt_log_level,
             )
             logger.info("%s attempt %d/%d in %ds to %s", label, attempt, len(delays), delay, mac)
             await asyncio.sleep(delay)
@@ -363,7 +407,7 @@ async def _retry_connect(  # noqa: PLR0912, PLR0913, PLR0915 - consolidates two 
             if state.user_disconnected:
                 state.reconnecting = False
                 state.reconnect_attempt = 0
-                if log_cancel_activity:
+                if profile.log_cancel_activity:
                     _log_activity("reconnect_cancelled", "Cancelled by user", "info")
                 return False
             if state.ble_adapter.is_connected:
@@ -382,16 +426,16 @@ async def _retry_connect(  # noqa: PLR0912, PLR0913, PLR0915 - consolidates two 
             )
             logger.info("%s attempt %d/%d to %s", label, attempt, len(delays), mac)
             _log_activity(
-                attempt_action,
+                profile.attempt_action,
                 f"Attempt {attempt}/{len(delays)} to {name}",
-                attempt_log_level,
+                profile.attempt_log_level,
             )
 
         try:
             coro = _connect_and_initialize(mac)
             success = (
-                await asyncio.wait_for(coro, timeout=connect_timeout)
-                if connect_timeout is not None
+                await asyncio.wait_for(coro, timeout=profile.connect_timeout)
+                if profile.connect_timeout is not None
                 else await coro
             )
             if success:
@@ -399,23 +443,23 @@ async def _retry_connect(  # noqa: PLR0912, PLR0913, PLR0915 - consolidates two 
                 state.reconnecting = False
                 state.reconnect_attempt = 0
                 _push_status_event(STATUS_CONNECTED, device_address=mac, device_name=name)
-                _log_activity(success_action, f"{success_detail} {name}", "info")
+                _log_activity(profile.success_action, f"{profile.success_detail} {name}", "info")
                 return True
             logger.warning("%s attempt %d failed", label, attempt)
             _log_activity(
-                failed_action,
+                profile.failed_action,
                 f"Attempt {attempt}/{len(delays)} failed",
                 "error",
             )
         except Exception as e:
             logger.warning("%s attempt %d error: %s", label, attempt, e)
             _log_activity(
-                failed_action,
+                profile.failed_action,
                 f"Attempt {attempt}/{len(delays)} error: {e}",
                 "error",
             )
 
-        if not sleep_before_attempt and attempt < len(delays):
+        if not profile.sleep_before_attempt and attempt < len(delays):
             logger.info("Retrying in %ds...", delay)
             await asyncio.sleep(delay)
 
@@ -429,10 +473,10 @@ async def _retry_connect(  # noqa: PLR0912, PLR0913, PLR0915 - consolidates two 
     )
     _log_activity(
         "reconnect_exhausted",
-        f"All {len(delays)}{exhausted_detail} to {name} failed",
+        f"All {len(delays)}{profile.exhausted_detail} to {name} failed",
         "error",
     )
-    if exhausted_log_count:
+    if profile.exhausted_log_count:
         logger.error("%s exhausted all %d attempts for %s", label, len(delays), mac)
     else:
         logger.error("%s exhausted all attempts for %s", label, mac)
@@ -447,22 +491,7 @@ async def _auto_reconnect():
         logger.warning("No previous MAC address for auto-reconnect")
         return
 
-    await _retry_connect(
-        mac,
-        name,
-        label="Auto-reconnect",
-        sleep_before_attempt=True,
-        connect_timeout=None,
-        attempt_action="reconnect_attempt",
-        attempt_log_level="warn",
-        failed_action="reconnect_failed",
-        success_action="reconnect_success",
-        success_detail="Reconnected to",
-        log_cancel_activity=True,
-        log_cancel_info=True,
-        exhausted_detail=" attempts",
-        exhausted_log_count=True,
-    )
+    await _retry_connect(mac, name, _AUTO_RECONNECT_PROFILE)
 
 
 async def _startup_auto_connect():
@@ -489,22 +518,7 @@ async def _startup_auto_connect():
     _log_activity("startup_auto_connect", f"Waiting {AUTO_CONNECT_DELAY}s for hardware", "info")
     await asyncio.sleep(AUTO_CONNECT_DELAY)
 
-    await _retry_connect(
-        mac,
-        name,
-        label="Startup auto-connect",
-        sleep_before_attempt=False,
-        connect_timeout=30.0,
-        attempt_action="startup_connect_attempt",
-        attempt_log_level="info",
-        failed_action="connect_failed",
-        success_action="connect_success",
-        success_detail="Connected to",
-        log_cancel_activity=False,
-        log_cancel_info=True,
-        exhausted_detail=" startup attempts",
-        exhausted_log_count=False,
-    )
+    await _retry_connect(mac, name, _STARTUP_CONNECT_PROFILE)
 
 
 @asynccontextmanager

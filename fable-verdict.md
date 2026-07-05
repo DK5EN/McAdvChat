@@ -1406,3 +1406,52 @@ Review checklist:
   before. Gates green throughout (ruff check, ruff format --check — 56 files, startup tests — 5
   suites), noqa counts unchanged across all 9 files, classifier subtree untouched, no new
   indexes, scope discipline confirmed.
+
+- [2026-07-06] Legibility/complexity audit + fixes (standalone pass, not a wave sub-commit —
+  triggered by Martin's concern after watching the Wave 5/6/7 pipeline that recent structural
+  work might be "too complex to understand," separate from the correctness-only reviews every
+  wave already got). A dedicated Opus audit assumed correctness and asked only: could a solo,
+  non-professional maintainer reopen each file in six months and safely extend it? **Verdict:
+  ~90% of the recent work is a genuine legibility win, not over-engineering** — the storage
+  mixin split, `sse_routes/`, `ServiceState`, `_frame`/`MsgType`, and the chart-builder dedup are
+  all inherent-complexity reductions with discoverable conventions; explicitly do not churn them.
+  One file, `ctcping.py`, had real debt: its async completion state machine's safety invariants
+  lived only in this doc, not in the code, plus three small leftovers from CMD-04's
+  consolidation. One additional item outside `ctcping.py`: BLE-02's `_retry_connect` (Wave 5)
+  was supposed to get its 13 keyword args simplified when Wave 6.5 touched the same file for
+  `ServiceState` — that follow-up never happened.
+
+  Fixed (all documentation/dead-code/repackaging, zero behavior change, independently
+  re-verified by a second adversarial pass): **M1** — added an in-code "IDEMPOTENCE INVARIANT"
+  comment directly on `_trigger_completion_if_done` (no `await` may go between the
+  `_check_test_completion()` check and `_completing_test_ids.add()` — single-threaded asyncio
+  gives no interleaving point across those lines) plus a lifecycle comment on `PingTest.status`'s
+  legal transitions, so the proof lives next to the code a future edit would touch, not only in
+  this file. **M2** — deleted `ActivePing.status` (set once at construction, confirmed via
+  full-repo grep to never be reassigned or read anywhere) and the corresponding always-true dead
+  check in `_ping_timeout_task`; `ack_processed` remains the sole per-ping idempotence guard.
+  **M3** — fixed the split-ownership double-`del self.active_pings[ack_id]` that caused a
+  latent, silently-swallowed `KeyError` on a genuine duplicate-sequence ACK (flagged but deferred
+  in Wave 6.4's "Discovered during waves" entry, now actually fixed): `_record_ack_result` no
+  longer deletes; `_handle_ack_message` is the sole owner via `.pop(ack_id, None)`. **M4** —
+  deleted the dead "reconciliation" block in `_send_test_summary` that recomputed
+  success/timeout counts from `results` and warned on disagreement with
+  `test_summary.completed`/`.timeouts` — CMD-03's single-increment design already makes those two
+  counts equal by construction, so the block only ever told a reader "these can diverge" for a
+  case that can't happen; `test_summary.completed`/`.timeouts` are now used directly as the sole
+  source. **N1** — `ble_service/src/main.py`'s `_retry_connect` 13-kwarg signature replaced with
+  a frozen `_RetryProfile` dataclass (`_AUTO_RECONNECT_PROFILE`/`_STARTUP_CONNECT_PROFILE`
+  constants) carrying the exact same values; deliberately did NOT take the audit's alternate
+  "unify the cosmetic wording" suggestion after discovering `_log_activity`'s `action`/`level`
+  strings are wire-facing (the webapp's `BtActivityLog.vue` renders `action` as literal text and
+  color-codes rows by `level`) — unifying them would be a user-visible webapp-coordinated change,
+  not an internal refactor, so every field value was preserved verbatim per profile instead.
+  Second adversarial review independently re-confirmed the pre-existing double-KeyError bug is
+  gone (traced every path into `_record_ack_result`), that M2's field was genuinely dead
+  (full-repo grep), that N1's two profile constants match the old inline kwargs field-by-field,
+  and that the `delays` parameter's position-vs-keyword change breaks neither call site. One
+  harmless nit found and fixed before commit: a now-dead `results = test_summary.results`
+  assignment left over from M4's deletion. **Verdict: approve.** Gates green throughout (ruff
+  check, ruff format --check, startup tests — 5 suites including `commands`, which exercises the
+  reviewed ACK/timeout flows), noqa counts unchanged (ctcping.py: 1, ble_service/src/main.py: 7),
+  scope discipline confirmed (only these two files touched).
