@@ -1156,3 +1156,46 @@ Review checklist:
   --check — 55 files, startup tests — 5 suites including the UDP-lora→SSE regression check),
   noqa count unchanged (6), classifier subtree untouched, scope discipline confirmed (only
   `sse_handler.py` + new `sse_routes/` touched).
+
+- [2026-07-06] Wave 6 sub-commit 3/5 complete (main.py decomposition: CO-04, CO-05, CO-07's
+  main.py half). `main()` (~424 lines: storage/classifier/message-router wiring, 3 tiny BLE-cache
+  event closures, command/UDP/SSE/BLE-client wiring, an inline `_ClassifierBus`, stdin-reader +
+  signal-handling closures, 4 background-task closures, a 4-step shutdown ladder) reduced to
+  ~54 lines. Extracted: `AppContext` dataclass; `_ClassifierBus` moved to module level (no
+  closure needed); `_wire_ble_caches(message_router)`; `build_app(cfg) -> AppContext` doing all
+  sequential wiring (order preserved exactly, including the documented "UDP listening before BLE
+  init" and "SSE server start after BLE init" constraints); `_start_stdin_reader`/
+  `_install_signal_handlers` (the latter's assign-then-fall-through became try/except/**else**
+  to satisfy ruff's TRY300 — behaviorally identical); the 4 background-task closures became free
+  functions taking explicit params; a `_BackgroundTasks` dataclass + `_start_background_tasks`
+  creates all four tasks, `main()` holds the dataclass for the app's lifetime;
+  `_cancel_background_tasks` cancels only `prune_task`/`classifier_stats_task` (the two backfill
+  tasks are deliberately left running as one-shots, matching the original — the old
+  `# noqa: F841, RUF006 - ref lives for app lifetime` markers on those two are now gone because
+  the references genuinely flow into the dataclass instead of a discarded local, so ruff no
+  longer needs to be told to trust it); `_shutdown_services` does the identical 4-step ladder
+  (beacons → BLE → UDP → SSE) with identical timeouts and the identical unwrapped
+  `stop_dedup_cleanup()`/`stop_pending_responses()` calls in between (not "fixed" — wasn't asked
+  for). CO-05: `test_suppression_logic`'s ~74-line body moved verbatim into a new
+  `src/mcapp/router_tests.py`'s `run_suppression_tests(router)`; `MessageRouter
+  .test_suppression_logic()` is now a 1-line delegate; the two `self._logger` calls in the moved
+  body now go through the module logger like every other line already did (cosmetic
+  `%(name)s` change only). CO-07 (main.py half): all 8 `hasattr(self.storage_handler, ...)` /
+  `hasattr(storage_handler, ...)` guards removed (5 in `_handle_smart_initial_command` — the
+  `get_smart_initial_with_summary`/`get_smart_initial`+`get_summary` two-branch collapsed to the
+  unconditional call, deleting only the dead `else`; 2 in `build_app` for
+  `set_classifier`/`set_message_router`; 1 in `_classifier_stats_broadcast` for
+  `count_blocked_text_hits_24h`); `MessageRouter.storage_handler` retyped `SQLiteStorage | None`.
+  `get_smart_initial` (the now-orphaned method) deliberately left in place — that's a separate
+  dead-code finding for a later wave, not this one's scope. Opus review independently re-derived
+  the full old-vs-new wiring order in `build_app`, traced the background-task reference lifetime
+  end-to-end (nothing can be GC'd early), and confirmed the noqa arithmetic (14 → 10 in main.py;
+  −2 moved to router_tests.py, −2 genuinely no-longer-needed, main()'s complexity noqa removed,
+  build_app's added — net 12 across both files, non-increasing) including independently
+  re-verifying `build_app`'s new `PLR0915` is load-bearing. **Verdict: approve, zero defects.**
+  Gates green (ruff check, ruff format --check, startup tests — 5 suites incl. `suppression:
+  PASS`), classifier subtree untouched, scope discipline confirmed (only `main.py` + new
+  `router_tests.py` touched). Noted (not fixed, out of CO-07's scope — `storage_handler` only):
+  `hasattr(sse_manager, "set_classifier")` and `hasattr(command_handler, "blocked_callsigns")`
+  (the latter is CO-06's blocklist-unification finding) remain; both defensible to leave for a
+  future pass.

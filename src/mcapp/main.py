@@ -9,6 +9,7 @@ import sys
 import time
 from collections import defaultdict
 from collections.abc import Awaitable, Callable
+from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
@@ -29,6 +30,7 @@ from .config_loader import (
 # New modular imports
 from .logging_setup import get_logger, setup_logging
 from .logging_setup import has_console as check_console
+from .router_tests import run_suppression_tests
 from .suppression import get_suppression_reason, should_suppress_outbound
 from .udp_handler import UDPHandler
 
@@ -93,10 +95,10 @@ block_list = [
 
 
 class MessageRouter:
-    def __init__(self, message_storage_handler: Any = None) -> None:
+    def __init__(self, message_storage_handler: SQLiteStorage | None = None) -> None:
         self._subscribers: dict[str, list[Any]] = defaultdict(list)
         self._protocols: dict[str, Any] = {}
-        self.storage_handler = message_storage_handler
+        self.storage_handler: SQLiteStorage | None = message_storage_handler
         self.my_callsign: str | None = None
         self.validator: MessageValidator | None = None
         self._logger = get_logger(f"{__name__}.MessageRouter")
@@ -159,79 +161,9 @@ class MessageRouter:
         )
 
     def test_suppression_logic(self) -> bool:
-        """Test suppression logic based on the table scenarios"""
-        self._logger.info("Testing Suppression Logic:")
-        self._logger.info("=" * 50)
-
-        test_cases: list[tuple[str | None, str, str, bool, str]] = [
-            # Tuple layout: src, dst, msg, expected_suppression, description
-            (self.my_callsign, "20", "!WX", True, "Group ohne Target → lokal"),
-            (self.my_callsign, "20", "!WX OE5HWN-12", False, "Group mit anderem Target → senden"),
-            (
-                self.my_callsign,
-                "20",
-                f"!WX {self.my_callsign}",
-                True,
-                "Group mit meinem Target → lokal",
-            ),
-            (self.my_callsign, "TEST", "!WX", True, "Test-Gruppe ohne Target → lokal"),
-            (
-                self.my_callsign,
-                "TEST",
-                "!WX OE5HWN-12",
-                False,
-                "Test-Gruppe mit anderem Target → senden",
-            ),
-            (self.my_callsign, "OE5HWN-12", "!TIME", True, "Persönlich ohne Target → lokal"),
-            (
-                self.my_callsign,
-                "OE5HWN-12",
-                "!TIME OE5HWN-12",
-                False,
-                "Persönlich mit Target (gleich dst) → senden",
-            ),
-            (
-                self.my_callsign,
-                "OE5HWN-12",
-                f"!TIME {self.my_callsign}",
-                True,
-                "Persönlich mit Target (ich) → lokal",
-            ),
-            (self.my_callsign, "*", "!WX", True, "Ungültiges Ziel → suppress"),
-            (self.my_callsign, "ALL", "!WX", True, "Ungültiges Ziel → suppress"),
-            ("OE5HWN-12", "20", "!WX", False, "Nicht unsere Message → nicht suppessen"),
-        ]
-
-        results: list[tuple[str, str, bool, bool, str]] = []
-        for src_or_none, dst, msg, expected, description in test_cases:
-            test_data: dict[str, str | None] = {"src": src_or_none, "dst": dst, "msg": msg}
-            assert self.validator is not None  # noqa: S101 - test helper
-            normalized = self.validator.normalize_message_data(test_data)
-            actual = self.validator.should_suppress_outbound(normalized)
-
-            status = "✅ PASS" if actual == expected else "❌ FAIL"
-            assert self.validator is not None  # noqa: S101 - test helper
-            reason = self.validator.get_suppression_reason(normalized)
-
-            results.append((status, description, actual, expected, reason))
-
-            logger.info("%s | %s", status, description)
-            logger.info(
-                "     %s→%s '%s' → %s (expected: %s)", src_or_none, dst, msg, actual, expected
-            )
-            logger.info("     Reason: %s", reason)
-
-        # Summary
-        passed = sum(1 for r in results if r[0].startswith("✅"))
-        total = len(results)
-
-        logger.info("Test Summary: %d/%d tests passed", passed, total)
-        if passed == total:
-            logger.info("All suppression tests passed!")
-        else:
-            logger.warning("Some suppression tests failed - check logic!")
-
-        return passed == total
+        """Test suppression logic based on the table scenarios (CO-05: body lives
+        in router_tests.py; kept here as a thin delegate so callers don't change)."""
+        return run_suppression_tests(self)
 
     def log_message_routing_decision(
         self, message_data: dict[str, Any], decision_type: str, action: str, reason: str
@@ -426,11 +358,7 @@ class MessageRouter:
         self, websocket: Any, client_id: str | None = None
     ) -> None:
         """Handle smart initial payload - sends only last N messages per dst + summary."""
-        if hasattr(self.storage_handler, "get_smart_initial_with_summary"):
-            initial_data, summary = await self.storage_handler.get_smart_initial_with_summary()
-        else:
-            initial_data = await self.storage_handler.get_smart_initial()
-            summary = await self.storage_handler.get_summary()
+        initial_data, summary = await self.storage_handler.get_smart_initial_with_summary()
         acks_list = initial_data.get("acks", [])
 
         self._logger.debug(
@@ -466,47 +394,43 @@ class MessageRouter:
         await self._send_response(websocket, summary_payload, client_id)
 
         # Send persisted read counts for unread badge sync
-        if hasattr(self.storage_handler, "get_read_counts"):
-            read_counts = await self.storage_handler.get_read_counts()
-            if read_counts:
-                rc_payload = {
-                    "type": "response",
-                    "msg": "read_counts",
-                    "data": read_counts,
-                }
-                await self._send_response(websocket, rc_payload, client_id)
+        read_counts = await self.storage_handler.get_read_counts()
+        if read_counts:
+            rc_payload = {
+                "type": "response",
+                "msg": "read_counts",
+                "data": read_counts,
+            }
+            await self._send_response(websocket, rc_payload, client_id)
 
         # Send persisted hidden destinations for group visibility sync
-        if hasattr(self.storage_handler, "get_hidden_destinations"):
-            hidden_dsts = await self.storage_handler.get_hidden_destinations()
-            if hidden_dsts:
-                hd_payload = {
-                    "type": "response",
-                    "msg": "hidden_destinations",
-                    "data": hidden_dsts,
-                }
-                await self._send_response(websocket, hd_payload, client_id)
+        hidden_dsts = await self.storage_handler.get_hidden_destinations()
+        if hidden_dsts:
+            hd_payload = {
+                "type": "response",
+                "msg": "hidden_destinations",
+                "data": hidden_dsts,
+            }
+            await self._send_response(websocket, hd_payload, client_id)
 
         # Send persisted blocked texts for message text filtering
-        if hasattr(self.storage_handler, "get_blocked_texts"):
-            blocked_texts = await self.storage_handler.get_blocked_texts()
-            if blocked_texts:
-                bt_payload = {
-                    "type": "response",
-                    "msg": "blocked_texts",
-                    "data": blocked_texts,
-                }
-                await self._send_response(websocket, bt_payload, client_id)
+        blocked_texts = await self.storage_handler.get_blocked_texts()
+        if blocked_texts:
+            bt_payload = {
+                "type": "response",
+                "msg": "blocked_texts",
+                "data": blocked_texts,
+            }
+            await self._send_response(websocket, bt_payload, client_id)
 
         # Send persisted spam filter preferences
-        if hasattr(self.storage_handler, "get_filter_prefs"):
-            fp = await self.storage_handler.get_filter_prefs()
-            fp_payload = {
-                "type": "response",
-                "msg": "filter_prefs",
-                "data": fp,
-            }
-            await self._send_response(websocket, fp_payload, client_id)
+        fp = await self.storage_handler.get_filter_prefs()
+        fp_payload = {
+            "type": "response",
+            "msg": "filter_prefs",
+            "data": fp,
+        }
+        await self._send_response(websocket, fp_payload, client_id)
 
     async def _handle_summary_command(self, websocket: Any, client_id: str | None = None) -> None:
         """Handle summary command - sends message counts per destination."""
@@ -1160,41 +1084,33 @@ class MessageValidator:
         return get_suppression_reason(message_data, self.my_callsign, self.is_group)
 
 
-async def main() -> None:  # noqa: PLR0912, PLR0915 - complex handler kept intact
-    # Initialize SQLite storage backend
-    logger.info("Database: %s", cfg.storage.db_path)
-    storage_handler = await create_sqlite_storage(cfg.storage.db_path)
-    # One-time migration: import mcdump.json into SQLite, then rename to prevent re-import
-    dump_path = Path("mcdump.json")
-    if await asyncio.to_thread(dump_path.exists):
-        count = await storage_handler.load_dump(str(dump_path))
-        migrated_path = dump_path.with_suffix(".json.migrated")
-        await asyncio.to_thread(dump_path.rename, migrated_path)
-        logger.info("Migrated dump file → %s (%d messages imported)", migrated_path, count)
-    await storage_handler.prune_messages(
-        cfg.storage.prune_hours,
-        block_list,
-        prune_hours_pos=cfg.storage.prune_hours_pos,
-        prune_hours_ack=cfg.storage.prune_hours_ack,
-    )
+@dataclass
+class AppContext:
+    """Wired application components (CO-04), assembled once by build_app()."""
 
-    # Classifier — seeds builtin rules, loads + compiles them, and is wired to
-    # storage so store_message() annotates new rows inline.
-    logger.info("Initializing classifier...")
-    classifier = Classifier(storage_handler)
-    inserted, updated = await seed_defaults(storage_handler)
-    if inserted or updated:
-        logger.info("Seeded classifier rules: %d inserted, %d updated", inserted, updated)
-    await classifier.load()
-    if hasattr(storage_handler, "set_classifier"):
-        storage_handler.set_classifier(classifier)
+    storage_handler: SQLiteStorage
+    classifier: Classifier
+    message_router: MessageRouter
+    command_handler: Any
+    udp_handler: UDPHandler
+    sse_manager: Any  # SSEManager | None — Any here to avoid a hard fastapi import
+    ble_client: Any
+    ble_mode: BLEMode
 
-    message_router = MessageRouter(storage_handler)
-    message_router.set_callsign(cfg.call_sign)
-    if hasattr(storage_handler, "set_message_router"):
-        storage_handler.set_message_router(message_router)
-    message_router.cached_gps = None  # {lat, lon} — set when BLE device sends TYP="G"
-    message_router.cached_ble_registers = {}  # {TYP: dict} — cached on ble_notification
+
+class _ClassifierBus:
+    """Adapts SSEManager.broadcast_event to the classifier's SSEEvent publish() contract."""
+
+    def __init__(self, mgr: Any) -> None:
+        self._mgr = mgr
+
+    async def publish(self, event: SSEEvent) -> None:
+        await self._mgr.broadcast_event(event.event_type, event.data)
+
+
+def _wire_ble_caches(message_router: MessageRouter) -> None:
+    """Subscribe the BLE-register/GPS caching handlers used to serve SSE
+    reconnects instantly instead of re-querying the device."""
 
     async def _cache_ble_register(routed_message: dict[str, Any]) -> None:
         """Cache BLE register notifications for serving on SSE reconnect."""
@@ -1234,6 +1150,46 @@ async def main() -> None:  # noqa: PLR0912, PLR0915 - complex handler kept intac
 
     message_router.subscribe("ble_notification", _cache_gps)
 
+
+async def build_app(cfg: Config) -> AppContext:  # noqa: PLR0915 - sequential wiring steps kept together (CO-04)
+    """Wire up storage, classifier, message router, and the command/UDP/SSE/BLE
+    handlers. Extracted from main() (CO-04); returns everything main() needs to
+    log startup info, start background tasks, and drive the shutdown sequence.
+    """
+    # Initialize SQLite storage backend
+    logger.info("Database: %s", cfg.storage.db_path)
+    storage_handler = await create_sqlite_storage(cfg.storage.db_path)
+    # One-time migration: import mcdump.json into SQLite, then rename to prevent re-import
+    dump_path = Path("mcdump.json")
+    if await asyncio.to_thread(dump_path.exists):
+        count = await storage_handler.load_dump(str(dump_path))
+        migrated_path = dump_path.with_suffix(".json.migrated")
+        await asyncio.to_thread(dump_path.rename, migrated_path)
+        logger.info("Migrated dump file → %s (%d messages imported)", migrated_path, count)
+    await storage_handler.prune_messages(
+        cfg.storage.prune_hours,
+        block_list,
+        prune_hours_pos=cfg.storage.prune_hours_pos,
+        prune_hours_ack=cfg.storage.prune_hours_ack,
+    )
+
+    # Classifier — seeds builtin rules, loads + compiles them, and is wired to
+    # storage so store_message() annotates new rows inline.
+    logger.info("Initializing classifier...")
+    classifier = Classifier(storage_handler)
+    inserted, updated = await seed_defaults(storage_handler)
+    if inserted or updated:
+        logger.info("Seeded classifier rules: %d inserted, %d updated", inserted, updated)
+    await classifier.load()
+    storage_handler.set_classifier(classifier)
+
+    message_router = MessageRouter(storage_handler)
+    message_router.set_callsign(cfg.call_sign)
+    storage_handler.set_message_router(message_router)
+    message_router.cached_gps = None  # {lat, lon} — set when BLE device sends TYP="G"
+    message_router.cached_ble_registers = {}  # {TYP: dict} — cached on ble_notification
+    _wire_ble_caches(message_router)
+
     # Command Handler Plugin
     command_handler = create_command_handler(
         message_router,
@@ -1265,14 +1221,6 @@ async def main() -> None:  # noqa: PLR0912, PLR0915 - complex handler kept intac
             message_router.register_protocol("sse", sse_manager)
             if hasattr(sse_manager, "set_classifier"):
                 sse_manager.set_classifier(classifier)
-
-            class _ClassifierBus:
-                def __init__(self, mgr: Any) -> None:
-                    self._mgr = mgr
-
-                async def publish(self, event: SSEEvent) -> None:
-                    await self._mgr.broadcast_event(event.event_type, event.data)
-
             classifier.set_event_bus(_ClassifierBus(sse_manager))
     else:
         logger.warning("FastAPI/Uvicorn not installed — SSE transport unavailable")
@@ -1322,8 +1270,20 @@ async def main() -> None:  # noqa: PLR0912, PLR0915 - complex handler kept intac
     if sse_manager:
         await sse_manager.start_server()
 
-    loop = asyncio.get_running_loop()
-    stop_event = asyncio.Event()
+    return AppContext(
+        storage_handler=storage_handler,
+        classifier=classifier,
+        message_router=message_router,
+        command_handler=command_handler,
+        udp_handler=udp_handler,
+        sse_manager=sse_manager,
+        ble_client=ble_client,
+        ble_mode=ble_mode,
+    )
+
+
+def _start_stdin_reader(loop: asyncio.AbstractEventLoop, stop_event: asyncio.Event) -> None:
+    """If stdin is a TTY, watch for 'q' + Enter on a background thread to trigger shutdown."""
 
     def stdin_reader() -> None:
         while True:
@@ -1334,7 +1294,16 @@ async def main() -> None:  # noqa: PLR0912, PLR0915 - complex handler kept intac
                 loop.call_soon_threadsafe(stop_event.set)
                 break
 
-    # Signal handling with fallback
+    if sys.stdin.isatty():
+        logger.info("Press 'q' + Enter to stop and save")
+        loop.run_in_executor(None, stdin_reader)
+
+
+def _install_signal_handlers(loop: asyncio.AbstractEventLoop, stop_event: asyncio.Event) -> str:
+    """Install SIGINT/SIGTERM handlers with a force-exit-on-second-signal fallback.
+
+    Returns which mechanism was used ("asyncio" or "traditional"), for logging.
+    """
     _first_signal_time: float | None = None
 
     def handle_shutdown(signum: int | None = None, _frame: Any = None) -> None:
@@ -1363,30 +1332,249 @@ async def main() -> None:  # noqa: PLR0912, PLR0915 - complex handler kept intac
     try:
         loop.add_signal_handler(signal.SIGINT, handle_shutdown)
         loop.add_signal_handler(signal.SIGTERM, handle_shutdown)
-        signal_method = "asyncio"
     except Exception as e:
         logger.warning("Could not set asyncio signal handlers: %s", e)
         signal.signal(signal.SIGINT, handle_shutdown)
         signal.signal(signal.SIGTERM, handle_shutdown)
-        signal_method = "traditional"
+        return "traditional"
+    else:
+        return "asyncio"
 
+
+async def _nightly_prune(
+    storage_handler: SQLiteStorage, cfg: Config, stop_event: asyncio.Event
+) -> None:
+    """Background task: prune old messages daily at 04:00."""
+    while not stop_event.is_set():
+        now = datetime.now()  # noqa: DTZ005 - prune schedule uses local wall clock
+        tomorrow_4am = now.replace(hour=NIGHTLY_PRUNE_HOUR, minute=0, second=0, microsecond=0)
+        if tomorrow_4am <= now:
+            tomorrow_4am += timedelta(days=1)
+        wait_seconds = (tomorrow_4am - now).total_seconds()
+        logger.info("Next DB prune scheduled in %.0fh at 04:00", wait_seconds / 3600)
+
+        # Wait until 04:00 or stop event, whichever comes first
+        try:
+            await asyncio.wait_for(stop_event.wait(), timeout=wait_seconds)
+            break  # stop_event was set
+        except TimeoutError:
+            pass  # Timer expired — time to prune
+
+        if stop_event.is_set():
+            break
+
+        logger.info("Starting nightly DB prune...")
+        try:
+            # Roll up 5-min buckets into 1-hour buckets BEFORE pruning. prune_messages
+            # deletes 5-min buckets older than the retention window, so if it runs first
+            # the rollup finds them already gone and only ~2h/day survive into 1-hour
+            # buckets (corrupting the 30d/1y charts). See doc/charts-wrong.md §13.
+            await storage_handler.aggregate_hourly_buckets()
+            remaining = await storage_handler.prune_messages(
+                cfg.storage.prune_hours,
+                block_list,
+                prune_hours_pos=cfg.storage.prune_hours_pos,
+                prune_hours_ack=cfg.storage.prune_hours_ack,
+            )
+            logger.info("Nightly prune complete: %d messages remaining", remaining)
+        except Exception:
+            logger.exception("Nightly prune failed")
+
+
+async def _maybe_backfill_classifier(
+    classifier: Classifier, storage_handler: SQLiteStorage, sse_manager: Any
+) -> None:
+    """Backfill classification on unclassified rows once per classifier_version.
+
+    Auto-trigger semantics: "ON but only once per release slot" — the marker
+    lives in classifier_meta keyed by the current version, so a restart of
+    the same slot is a no-op and a rule edit (which bumps the version)
+    triggers a fresh backfill.
+    """
+    marker_key = f"backfill_done:v{classifier.version}"
+    marker = await storage_handler.get_meta(marker_key)
+    if marker:
+        logger.info(
+            "Classifier backfill marker present for v%d, skipping",
+            classifier.version,
+        )
+        return
+    total = await storage_handler.count_messages_to_classify(
+        classifier_ver_below=classifier.version
+    )
+    if total > 0:
+
+        async def _backfill_progress(job: Any) -> None:
+            if sse_manager is not None:
+                await sse_manager.broadcast_event(
+                    "proxy:reclassify_progress",
+                    {
+                        "job_id": job.job_id,
+                        "processed": job.processed,
+                        "total": job.total,
+                        "done": job.done,
+                    },
+                )
+
+        job = await classifier.reclassify(progress_cb=_backfill_progress)
+        logger.info(
+            "Classifier backfill scheduled: job=%s rows=%d",
+            job.job_id,
+            job.total,
+        )
+    await storage_handler.set_meta(marker_key, datetime.now(UTC).isoformat())
+
+
+async def _maybe_backfill_signal_log(storage_handler: SQLiteStorage) -> None:
+    """One-time signal_log backfill from historical UDP-lora messages (UDP 2.0 Track U, U3/D5)."""
+    try:
+        await storage_handler.backfill_signal_log()
+    except Exception:
+        logger.exception("Signal backfill failed")
+
+
+async def _classifier_stats_broadcast(
+    classifier: Classifier,
+    storage_handler: SQLiteStorage,
+    sse_manager: Any,
+    stop_event: asyncio.Event,
+) -> None:
+    """Emit aggregate classifier stats every 60 seconds."""
+    while not stop_event.is_set():
+        try:
+            if sse_manager is not None:
+                stats = await classifier.collect_stats()
+                stats["blocked_text_hits_24h"] = await storage_handler.count_blocked_text_hits_24h()
+                await sse_manager.broadcast_event(
+                    "proxy:classifier_stats",
+                    stats,
+                )
+        except Exception as exc:
+            logger.warning("classifier stats broadcast failed: %s", exc)
+        try:
+            await asyncio.wait_for(stop_event.wait(), timeout=CLASSIFIER_STATS_INTERVAL_S)
+        except TimeoutError:
+            continue
+
+    logger.debug("Classifier stats broadcaster stopped")
+
+
+@dataclass
+class _BackgroundTasks:
+    """Handles kept alive for the app's lifetime (main() holds the only
+    reference). Only prune/stats are cancelled at shutdown — the backfill
+    tasks are one-shots left to finish or be reaped by process exit."""
+
+    prune_task: asyncio.Task[None]
+    classifier_stats_task: asyncio.Task[None]
+    backfill_task: asyncio.Task[None]
+    signal_backfill_task: asyncio.Task[None]
+
+
+def _start_background_tasks(
+    ctx: AppContext, cfg: Config, stop_event: asyncio.Event
+) -> _BackgroundTasks:
+    """Start the nightly-prune, classifier-backfill, signal-backfill, and
+    classifier-stats-broadcast background tasks."""
+    prune_task = asyncio.create_task(_nightly_prune(ctx.storage_handler, cfg, stop_event))
+    # Reference lives for the app's lifetime (run() awaits until shutdown)
+    backfill_task = asyncio.create_task(
+        _maybe_backfill_classifier(ctx.classifier, ctx.storage_handler, ctx.sse_manager)
+    )
+    signal_backfill_task = asyncio.create_task(_maybe_backfill_signal_log(ctx.storage_handler))
+    classifier_stats_task = asyncio.create_task(
+        _classifier_stats_broadcast(
+            ctx.classifier, ctx.storage_handler, ctx.sse_manager, stop_event
+        )
+    )
+    return _BackgroundTasks(
+        prune_task=prune_task,
+        classifier_stats_task=classifier_stats_task,
+        backfill_task=backfill_task,
+        signal_backfill_task=signal_backfill_task,
+    )
+
+
+async def _cancel_background_tasks(tasks: _BackgroundTasks) -> None:
+    """Cancel the two long-running loops; backfill tasks are one-shots, left alone."""
+    tasks.prune_task.cancel()
+    tasks.classifier_stats_task.cancel()
+    with contextlib.suppress(asyncio.CancelledError):
+        await tasks.prune_task
+    with contextlib.suppress(asyncio.CancelledError):
+        await tasks.classifier_stats_task
+
+
+async def _shutdown_services(ctx: AppContext) -> None:
+    """4-step shutdown ladder: beacons → BLE → UDP → SSE, each with a timeout."""
+    logger.info("Stopping proxy server, saving to disc ..")
+
+    try:
+        # Step 1: Clean up beacons
+        logger.info("Stopping beacon tasks...")
+        await asyncio.wait_for(
+            ctx.command_handler.cleanup_topic_beacons(), timeout=SHUTDOWN_TIMEOUT_TOPIC_BEACONS_S
+        )
+    except TimeoutError:
+        logger.warning("Beacon cleanup timeout")
+
+    await ctx.command_handler.stop_dedup_cleanup()
+    await ctx.command_handler.stop_pending_responses()
+
+    # Clean shutdown sequence with timeouts
+    try:
+        # Step 2: Stop BLE client with timeout
+        logger.info("Stopping BLE client...")
+        if ctx.ble_client:
+            await asyncio.wait_for(ctx.ble_client.stop(), timeout=SHUTDOWN_TIMEOUT_BLE_S)
+        else:
+            # Fallback to legacy disconnect
+            await asyncio.wait_for(
+                ctx.message_router.route_command("disconnect BLE"), timeout=SHUTDOWN_TIMEOUT_BLE_S
+            )
+    except TimeoutError:
+        logger.warning("BLE disconnect timeout")
+
+    try:
+        # Step 3: Stop UDP handler
+        logger.info("Stopping UDP handler...")
+        await asyncio.wait_for(ctx.udp_handler.stop_listening(), timeout=SHUTDOWN_TIMEOUT_UDP_S)
+    except TimeoutError:
+        logger.warning("UDP stop timeout")
+
+    # Step 4: Stop SSE server if running
+    if ctx.sse_manager:
+        try:
+            logger.info("Stopping SSE server...")
+            await asyncio.wait_for(ctx.sse_manager.stop_server(), timeout=SHUTDOWN_TIMEOUT_SSE_S)
+        except TimeoutError:
+            logger.warning("SSE stop timeout")
+
+    logger.info("All services stopped")
+
+
+async def main() -> None:
+    ctx = await build_app(cfg)
+
+    loop = asyncio.get_running_loop()
+    stop_event = asyncio.Event()
+
+    signal_method = _install_signal_handlers(loop, stop_event)
     logger.debug("Signal handling: %s", signal_method)
 
-    if sys.stdin.isatty():
-        logger.info("Press 'q' + Enter to stop and save")
-        loop.run_in_executor(None, stdin_reader)
+    _start_stdin_reader(loop, stop_event)
 
     logger.info("UDP-Listen %d, Target MeshCom %s", MESHCOM_UDP_PORT, cfg.udp.target)
     logger.info(
         "MessageRouter: %d message types, %d protocols",
-        len(message_router._subscribers),  # noqa: SLF001 - framework wiring
-        len(message_router._protocols),  # noqa: SLF001 - framework wiring
+        len(ctx.message_router._subscribers),  # noqa: SLF001 - framework wiring
+        len(ctx.message_router._protocols),  # noqa: SLF001 - framework wiring
     )
-    if sse_manager:
+    if ctx.sse_manager:
         logger.info("SSE server available at http://%s:%d/events", SSE_HOST, SSE_PORT)
 
     # Log BLE configuration
-    if ble_mode == BLEMode.REMOTE:
+    if ctx.ble_mode == BLEMode.REMOTE:
         logger.info("BLE: remote mode -> %s", os.getenv("MCAPP_BLE_URL", BLE_SERVICE_URL))
     else:
         logger.info("BLE: disabled")
@@ -1396,10 +1584,10 @@ async def main() -> None:  # noqa: PLR0912, PLR0915 - complex handler kept intac
 
     if check_console():
         logger.info("Running suppression logic tests...")
-        suppression_passed = message_router.test_suppression_logic()
+        suppression_passed = ctx.message_router.test_suppression_logic()
 
         logger.info("Running command handler test suite...")
-        command_handler_passed = await command_handler.run_all_tests()
+        command_handler_passed = await ctx.command_handler.run_all_tests()
 
         if suppression_passed and command_handler_passed:
             logger.info("All tests passed! System ready.")
@@ -1408,177 +1596,12 @@ async def main() -> None:  # noqa: PLR0912, PLR0915 - complex handler kept intac
 
     ### unit tests
 
-    # Nightly pruning task — runs at 04:00 local time
-    async def _nightly_prune() -> None:
-        """Background task: prune old messages daily at 04:00."""
-        while not stop_event.is_set():
-            now = datetime.now()  # noqa: DTZ005 - prune schedule uses local wall clock
-            tomorrow_4am = now.replace(hour=NIGHTLY_PRUNE_HOUR, minute=0, second=0, microsecond=0)
-            if tomorrow_4am <= now:
-                tomorrow_4am += timedelta(days=1)
-            wait_seconds = (tomorrow_4am - now).total_seconds()
-            logger.info("Next DB prune scheduled in %.0fh at 04:00", wait_seconds / 3600)
-
-            # Wait until 04:00 or stop event, whichever comes first
-            try:
-                await asyncio.wait_for(stop_event.wait(), timeout=wait_seconds)
-                break  # stop_event was set
-            except TimeoutError:
-                pass  # Timer expired — time to prune
-
-            if stop_event.is_set():
-                break
-
-            logger.info("Starting nightly DB prune...")
-            try:
-                # Roll up 5-min buckets into 1-hour buckets BEFORE pruning. prune_messages
-                # deletes 5-min buckets older than the retention window, so if it runs first
-                # the rollup finds them already gone and only ~2h/day survive into 1-hour
-                # buckets (corrupting the 30d/1y charts). See doc/charts-wrong.md §13.
-                await storage_handler.aggregate_hourly_buckets()
-                remaining = await storage_handler.prune_messages(
-                    cfg.storage.prune_hours,
-                    block_list,
-                    prune_hours_pos=cfg.storage.prune_hours_pos,
-                    prune_hours_ack=cfg.storage.prune_hours_ack,
-                )
-                logger.info("Nightly prune complete: %d messages remaining", remaining)
-            except Exception:
-                logger.exception("Nightly prune failed")
-
-    prune_task = asyncio.create_task(_nightly_prune())
-
-    # Backfill classification on unclassified rows once per classifier_version.
-    # Auto-trigger semantics: "ON but only once per release slot" — the marker
-    # lives in classifier_meta keyed by the current version, so a restart of
-    # the same slot is a no-op and a rule edit (which bumps the version)
-    # triggers a fresh backfill.
-    async def _maybe_backfill_classifier() -> None:
-        marker_key = f"backfill_done:v{classifier.version}"
-        marker = await storage_handler.get_meta(marker_key)
-        if marker:
-            logger.info(
-                "Classifier backfill marker present for v%d, skipping",
-                classifier.version,
-            )
-            return
-        total = await storage_handler.count_messages_to_classify(
-            classifier_ver_below=classifier.version
-        )
-        if total > 0:
-
-            async def _backfill_progress(job: Any) -> None:
-                if sse_manager is not None:
-                    await sse_manager.broadcast_event(
-                        "proxy:reclassify_progress",
-                        {
-                            "job_id": job.job_id,
-                            "processed": job.processed,
-                            "total": job.total,
-                            "done": job.done,
-                        },
-                    )
-
-            job = await classifier.reclassify(progress_cb=_backfill_progress)
-            logger.info(
-                "Classifier backfill scheduled: job=%s rows=%d",
-                job.job_id,
-                job.total,
-            )
-        await storage_handler.set_meta(marker_key, datetime.now(UTC).isoformat())
-
-    # Reference lives for the app's lifetime (run() awaits until shutdown)
-    backfill_task = asyncio.create_task(_maybe_backfill_classifier())  # noqa: F841, RUF006 - ref lives for app lifetime
-
-    # One-time signal_log backfill from historical UDP-lora messages (UDP 2.0 Track U, U3/D5).
-    async def _maybe_backfill_signal_log() -> None:
-        try:
-            await storage_handler.backfill_signal_log()
-        except Exception:
-            logger.exception("Signal backfill failed")
-
-    signal_backfill_task = asyncio.create_task(_maybe_backfill_signal_log())  # noqa: F841, RUF006 - ref lives for app lifetime
-
-    # Classifier stats broadcaster — pushes proxy:classifier_stats every 60 s.
-    async def _classifier_stats_broadcast() -> None:
-        """Emit aggregate classifier stats every 60 seconds."""
-        while not stop_event.is_set():
-            try:
-                if sse_manager is not None:
-                    stats = await classifier.collect_stats()
-                    if hasattr(storage_handler, "count_blocked_text_hits_24h"):
-                        stats[
-                            "blocked_text_hits_24h"
-                        ] = await storage_handler.count_blocked_text_hits_24h()
-                    await sse_manager.broadcast_event(
-                        "proxy:classifier_stats",
-                        stats,
-                    )
-            except Exception as exc:
-                logger.warning("classifier stats broadcast failed: %s", exc)
-            try:
-                await asyncio.wait_for(stop_event.wait(), timeout=CLASSIFIER_STATS_INTERVAL_S)
-            except TimeoutError:
-                continue
-
-        logger.debug("Classifier stats broadcaster stopped")
-
-    classifier_stats_task = asyncio.create_task(_classifier_stats_broadcast())
+    tasks = _start_background_tasks(ctx, cfg, stop_event)
 
     await stop_event.wait()
 
-    # Cancel background tasks
-    prune_task.cancel()
-    classifier_stats_task.cancel()
-    with contextlib.suppress(asyncio.CancelledError):
-        await prune_task
-    with contextlib.suppress(asyncio.CancelledError):
-        await classifier_stats_task
-
-    logger.info("Stopping proxy server, saving to disc ..")
-
-    try:
-        # Step 1: Clean up beacons
-        logger.info("Stopping beacon tasks...")
-        await asyncio.wait_for(
-            command_handler.cleanup_topic_beacons(), timeout=SHUTDOWN_TIMEOUT_TOPIC_BEACONS_S
-        )
-    except TimeoutError:
-        logger.warning("Beacon cleanup timeout")
-
-    await command_handler.stop_dedup_cleanup()
-    await command_handler.stop_pending_responses()
-
-    # Clean shutdown sequence with timeouts
-    try:
-        # Step 2: Stop BLE client with timeout
-        logger.info("Stopping BLE client...")
-        if ble_client:
-            await asyncio.wait_for(ble_client.stop(), timeout=SHUTDOWN_TIMEOUT_BLE_S)
-        else:
-            # Fallback to legacy disconnect
-            await asyncio.wait_for(
-                message_router.route_command("disconnect BLE"), timeout=SHUTDOWN_TIMEOUT_BLE_S
-            )
-    except TimeoutError:
-        logger.warning("BLE disconnect timeout")
-
-    try:
-        # Step 3: Stop UDP handler
-        logger.info("Stopping UDP handler...")
-        await asyncio.wait_for(udp_handler.stop_listening(), timeout=SHUTDOWN_TIMEOUT_UDP_S)
-    except TimeoutError:
-        logger.warning("UDP stop timeout")
-
-    # Step 4: Stop SSE server if running
-    if sse_manager:
-        try:
-            logger.info("Stopping SSE server...")
-            await asyncio.wait_for(sse_manager.stop_server(), timeout=SHUTDOWN_TIMEOUT_SSE_S)
-        except TimeoutError:
-            logger.warning("SSE stop timeout")
-
-    logger.info("All services stopped")
+    await _cancel_background_tasks(tasks)
+    await _shutdown_services(ctx)
 
     logger.info("Shutdown complete")
 
