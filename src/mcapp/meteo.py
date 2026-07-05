@@ -7,6 +7,7 @@ Intelligente Daten-Fusion für optimale Genauigkeit
 
 import math
 import sys
+import threading
 import time
 from datetime import UTC, datetime
 from typing import Any
@@ -24,6 +25,7 @@ _MAX_LORA_MSG_LEN = 149
 HTTP_TIMEOUT_S = 10
 MAX_RETRIES = 2
 RETRY_DELAY_S = 1
+WEATHER_CACHE_TTL_S = 300  # SSE-06: 5 min — matches typical weather-update cadence
 
 _MAGNUS_A = 17.27
 _MAGNUS_B = 237.7
@@ -89,6 +91,15 @@ class WeatherService:
         self.timeout = HTTP_TIMEOUT_S
         self.max_retries = MAX_RETRIES
 
+        # SSE-06: TTL cache + single-flight guard. get_weather_data() runs via
+        # asyncio.to_thread() from multiple concurrent REST requests, so this is a
+        # real threading.Lock (not asyncio.Lock) — held across the whole fetch when
+        # the cache is stale, so concurrent callers block on the one in-flight
+        # fetch instead of each hitting the weather APIs.
+        self._cache: dict[str, Any] | None = None
+        self._cache_time: float = 0.0
+        self._cache_lock = threading.Lock()
+
         logger.info(
             "WeatherService initialisiert für %s %s/%s, Hybrid-Modus: DWD + OpenMeteo",
             self.stat_name,
@@ -102,8 +113,37 @@ class WeatherService:
         self.lon = lon
         if stat_name:
             self.stat_name = stat_name
+        # A stale cache would otherwise keep serving weather for the old location.
+        with self._cache_lock:
+            self._cache = None
+            self._cache_time = 0.0
 
-    def get_weather_data(self) -> dict[str, Any]:  # noqa: PLR0912, PLR0915 - complex handler kept intact
+    def get_weather_data(self, *, bypass_cache: bool = False) -> dict[str, Any]:
+        """Cached hybrid weather fetch (SSE-06).
+
+        `bypass_cache=True` is for the mesh `!wx` command (weather_command.py)
+        — a ham operator asking for weather over LoRa expects a live reading,
+        not a REST-poll-driven cache. REST callers (sse_routes/weather.py's
+        `/api/weather` and `/api/weather/preview`) use the default cached path.
+        Error responses (no GPS, all APIs down) are never cached, so a
+        transient failure can't outlive its actual cause by up to the TTL.
+        """
+        if bypass_cache:
+            return self._fetch_weather_data()
+
+        with self._cache_lock:
+            if (
+                self._cache is not None
+                and (time.monotonic() - self._cache_time) < WEATHER_CACHE_TTL_S
+            ):
+                return self._cache
+            data = self._fetch_weather_data()
+            if "error" not in data:
+                self._cache = data
+                self._cache_time = time.monotonic()
+            return data
+
+    def _fetch_weather_data(self) -> dict[str, Any]:  # noqa: PLR0912, PLR0915 - complex handler kept intact
         """
         Hybrid-Methode: DWD primär, OpenMeteo für fehlende Parameter
         """

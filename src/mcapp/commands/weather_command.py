@@ -35,7 +35,9 @@ class WeatherCommandMixin(CommandHandlerBase):
 
             logger.debug("Getting weather data for %s", requester)
 
-            weather_data = self.weather_service.get_weather_data()
+            # SSE-06: bypass the REST-facing cache — a ham operator asking !wx
+            # over the mesh expects a live reading, not a stale cached one.
+            weather_data = self.weather_service.get_weather_data(bypass_cache=True)
 
             if "error" in weather_data:
                 logger.warning("Weather error: %s", weather_data["error"])

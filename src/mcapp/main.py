@@ -1442,7 +1442,10 @@ async def _classifier_stats_broadcast(
     """Emit aggregate classifier stats every 60 seconds."""
     while not stop_event.is_set():
         try:
-            if sse_manager is not None:
+            # CO-22: skip the DB scans entirely when nobody's listening — this
+            # runs every 60s for the app's whole lifetime, so idle background
+            # cost matters on a Pi.
+            if sse_manager is not None and sse_manager.get_client_count() > 0:
                 stats = await classifier.collect_stats()
                 stats["blocked_text_hits_24h"] = await storage_handler.count_blocked_text_hits_24h()
                 await sse_manager.broadcast_event(

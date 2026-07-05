@@ -18,7 +18,6 @@ import asyncio
 import contextlib
 import json
 import pathlib
-import socket
 import time
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
@@ -395,18 +394,21 @@ class SSEManager:
 
         logger.info("Update requested: mode=%s dev=%s", mode, dev)
 
-        # Check if runner is already active (port in use)
+        # Check if runner is already active (port in use). SSE-05: a blocking
+        # socket.connect_ex() here would stall the event loop (and every other
+        # SSE stream) for up to 1s; asyncio.open_connection() is non-blocking.
         try:
-            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            sock.settimeout(1)
-            result = sock.connect_ex(("127.0.0.1", UPDATE_RUNNER_PORT))
-            sock.close()
-            if result == 0:
-                raise HTTPException(
-                    status_code=409,
-                    detail="Update already in progress",
-                )
-        except OSError:
+            _, writer = await asyncio.wait_for(
+                asyncio.open_connection("127.0.0.1", UPDATE_RUNNER_PORT), timeout=1.0
+            )
+            writer.close()
+            with contextlib.suppress(OSError):
+                await writer.wait_closed()
+            raise HTTPException(
+                status_code=409,
+                detail="Update already in progress",
+            )
+        except (OSError, TimeoutError):
             pass
 
         # Write args file and trigger file for systemd .path unit

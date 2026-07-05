@@ -309,6 +309,14 @@ class QueryMixin(StorageBase):
         """
         build_msg = self._build_message_dict
         build_pos = self._build_position_dict
+        # ST-07: bound both full-history scans by a generous window so SQLite's
+        # existing idx_messages_type_timestamp(type, timestamp DESC) index can do
+        # a range seek (type=? AND timestamp>=?) instead of walking every `type='msg'`
+        # row regardless of age. LONG_RETENTION_DAYS is the app's own definition of
+        # its outer retention horizon — actual configured prune_hours is normally far
+        # shorter, so this is a safety backstop, not an effective behavior change,
+        # confirmed via EXPLAIN QUERY PLAN on a fixture DB before/after this change.
+        window_cutoff_ms = now_ms() - LONG_RETENTION_DAYS * SECONDS_PER_DAY * 1000
 
         def _run() -> tuple[dict[str, Any], dict[str, Any]]:
             conn = sqlite3.connect(self.db_path)
@@ -323,10 +331,10 @@ class QueryMixin(StorageBase):
                     f"    PARTITION BY COALESCE(conversation_key, dst)"
                     f"    ORDER BY timestamp DESC"
                     f"  ) AS rn FROM messages"
-                    f"  WHERE type = 'msg' AND msg NOT LIKE '%:ack%'"
+                    f"  WHERE type = 'msg' AND msg NOT LIKE '%:ack%' AND timestamp >= ?"
                     f") ranked WHERE rn <= ?"
                     f" ORDER BY timestamp ASC",
-                    (limit_per_dst,),
+                    (window_cutoff_ms, limit_per_dst),
                 ).fetchall()
                 messages = [
                     json.dumps(build_msg(dict(row)), ensure_ascii=False) for row in msg_rows
@@ -352,8 +360,9 @@ class QueryMixin(StorageBase):
                 summary_rows = conn.execute(
                     "SELECT COALESCE(conversation_key, dst) AS key, COUNT(*) as cnt"
                     " FROM messages"
-                    " WHERE type = 'msg' AND msg NOT LIKE '%:ack%'"
+                    " WHERE type = 'msg' AND msg NOT LIKE '%:ack%' AND timestamp >= ?"
                     " GROUP BY key",
+                    (window_cutoff_ms,),
                 ).fetchall()
                 summary = {row["key"]: row["cnt"] for row in summary_rows if row["key"]}
 
@@ -746,31 +755,32 @@ class QueryMixin(StorageBase):
         return result
 
     async def get_stats(self, hours: int) -> dict[str, Any]:
-        """Get message statistics for the given time window."""
+        """Get message statistics for the given time window.
+
+        ST-09: msg/pos counts pushed into one grouped SQL query instead of
+        fetching every row in the window and counting in Python. Distinct
+        users still needs the relay-path split (`src.split(",")[0]`), which
+        isn't expressible in portable SQL, but only the *distinct* raw `src`
+        values are fetched now (typically orders of magnitude fewer rows than
+        every message in the window) rather than one row per message.
+        """
         cutoff_ms = int((time.time() - hours * 3600) * 1000)
 
-        rows = await self._query(
-            "SELECT type, src FROM messages WHERE timestamp >= ?",
+        type_counts = await self._query(
+            "SELECT type, COUNT(*) as cnt FROM messages WHERE timestamp >= ? GROUP BY type",
             (cutoff_ms,),
         )
+        counts_by_type = {row["type"]: row["cnt"] for row in type_counts}
 
-        msg_count = 0
-        pos_count = 0
-        users: set[str] = set()
-
-        for row in rows:
-            msg_type = row["type"]
-            src = row["src"]
-            if msg_type == "msg":
-                msg_count += 1
-                if src:
-                    users.add(src.split(",")[0])
-            elif msg_type == "pos":
-                pos_count += 1
+        src_rows = await self._query(
+            "SELECT DISTINCT src FROM messages WHERE timestamp >= ? AND type = 'msg'",
+            (cutoff_ms,),
+        )
+        users = {row["src"].split(",")[0] for row in src_rows if row["src"]}
 
         return {
-            "msg_count": msg_count,
-            "pos_count": pos_count,
+            "msg_count": counts_by_type.get("msg", 0),
+            "pos_count": counts_by_type.get("pos", 0),
             "users": users,
         }
 

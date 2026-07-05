@@ -21,6 +21,14 @@ PING_ACK_TIMEOUT_SECONDS = 30.0
 PING_INTERVAL_SECONDS = 20.0
 PING_TEST_MAX_WAIT_SECONDS = 300
 
+# CMD-10: compiled once at import instead of per-call re.search(pattern_str, ...).
+_ACK_SUFFIX_RE = re.compile(r"\s*:ack\d{3}$")  # _is_ack_message: boolean check
+_ECHO_SUFFIX_RE = re.compile(r"\{\d{3}$")  # _is_echo_message: boolean check
+_PING_TEST_SEQUENCE_RE = re.compile(r"ping test \d+/\d+")  # _is_ping_message: boolean check
+_PING_TEST_SEQUENCE_CAPTURE_RE = re.compile(r"ping test (\d+)/(\d+)")  # _extract_sequence_info
+_ECHO_ID_RE = re.compile(r"\{(\d{3})$")  # _handle_echo_message: extracts message id
+_ACK_ID_RE = re.compile(r"\s*:ack(\d{3})$")  # _handle_ack_message: extracts ack id
+
 logger = get_logger(__name__)
 
 
@@ -84,14 +92,13 @@ class CTCPingMixin(CommandHandlerBase):
         """Check if message is an ACK with :ackXXX pattern"""
         if not msg:
             return False
-        pattern = r"\s*:ack\d{3}$"
-        return bool(re.search(pattern, msg))
+        return bool(_ACK_SUFFIX_RE.search(msg))
 
     def _is_echo_message(self, msg: str) -> bool:
         """Check if message is a CTC ping echo with [CTC] signature and {xxx} suffix"""
         if not msg:
             return False
-        return "[CTC]" in msg and bool(re.search(r"\{\d{3}$", msg))
+        return "[CTC]" in msg and bool(_ECHO_SUFFIX_RE.search(msg))
 
     def _is_ping_message(self, msg: str) -> bool:
         """Check if message looks like a ping test message (not the 'started' message)"""
@@ -100,7 +107,7 @@ class CTCPingMixin(CommandHandlerBase):
 
         msg_lower = msg.lower()
 
-        has_sequence = bool(re.search(r"ping test \d+/\d+", msg_lower))
+        has_sequence = bool(_PING_TEST_SEQUENCE_RE.search(msg_lower))
         has_measurement = any(
             term in msg_lower
             for term in [
@@ -114,7 +121,7 @@ class CTCPingMixin(CommandHandlerBase):
 
     def _extract_sequence_info(self, msg: str) -> str | None:
         """Extract sequence info from ping message"""
-        match = re.search(r"ping test (\d+)/(\d+)", msg.lower())
+        match = _PING_TEST_SEQUENCE_CAPTURE_RE.search(msg.lower())
         if match:
             current = match.group(1)
             total = match.group(2)
@@ -143,7 +150,7 @@ class CTCPingMixin(CommandHandlerBase):
 
             logger.debug("Echo processing: src=%s, dst=%s, msg='%s...'", src, dst, msg[:30])
 
-            match = re.search(r"\{(\d{3})$", msg)
+            match = _ECHO_ID_RE.search(msg)
             if not match:
                 logger.debug("No message ID found in echo")
                 return
@@ -208,7 +215,7 @@ class CTCPingMixin(CommandHandlerBase):
             if "," in src_raw:
                 logger.debug("ACK path processing: '%s' → originator: '%s'", src_raw, src)
 
-            match = re.search(r"\s*:ack(\d{3})$", msg)
+            match = _ACK_ID_RE.search(msg)
             if not match:
                 return
 

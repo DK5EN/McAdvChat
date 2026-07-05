@@ -1340,3 +1340,69 @@ Review checklist:
   `src/mcapp/`), noqa count stable (17→17 before the hardening assert, 18 after — one new
   justified `S101` on the module-load invariant check), scope discipline confirmed (only
   `scripts/update-runner.py` touched).
+
+- [2026-07-06] Wave 7 (Performance) sub-commit 1 complete: ST-07, ST-08, ST-09, ST-18, SSE-05,
+  SSE-06, CO-08, CO-10, CO-22, BLE-12, CMD-10. Measured via `EXPLAIN QUERY PLAN` on a fixture DB
+  before changing anything (per the wave's "measure, then fix" methodology): the unbounded
+  `type='msg'` scans in `get_smart_initial_with_summary` (ST-07) already used
+  `idx_messages_type_timestamp`, but only via `type=?` — bounding both the window-function
+  messages query and the summary GROUP BY with `AND timestamp >= ?` (365-day
+  `LONG_RETENTION_DAYS` window — a safety backstop matching the app's own retention-horizon
+  concept, since actual configured `prune_hours` is normally far shorter) lets SQLite do a
+  `type=? AND timestamp>?` range seek instead. Verified via fixture-DB equivalence that NEW is a
+  byte-identical strict subset of OLD (every excluded item genuinely older than the cutoff, no
+  non-excluded item's count changed). ST-08: `count_blocked_text_hits_24h` now counts ASCII
+  blocked texts via SQL `LIKE ... ESCAPE '\'` (`COUNT(*)` pushed into SQLite instead of fetching
+  every message body into Python); texts containing non-ASCII characters still use the original
+  full-scan Python matching, because SQLite's `LIKE` only case-folds ASCII letters (verified live:
+  `LIKE '%ÜBER%'` does NOT match `'über'` in SQLite — the fallback is load-bearing, not
+  caution-for-its-own-sake). ST-09: `get_stats`'s `msg_count`/`pos_count` now via one grouped SQL
+  query; distinct `users` now fetches only `DISTINCT src` (not every row) before the
+  relay-path-split in Python, preserving the original's `type='msg'`-only restriction exactly.
+  `get_mheard_stations` deliberately left unchanged (already bounded by
+  `MHEARD_STATION_SCAN_LIMIT=4000`, not worth the SQL-rewrite risk for an already-small bounded
+  result). ST-18: `clear_stale_auto_beacons`'s N+1 per-hash `_mutate` loop batched into one
+  `_execute_many` call. ST-02 (connection reuse) and ST-17 (`get_full_dump`/`save_dump` streaming)
+  deliberately NOT done: ST-02 needs real Pi hardware measurement per the wave's own methodology;
+  ST-17's target methods turned out to have **zero callers anywhere in the codebase** — flagged as
+  dead-code-removal candidates for a future wave instead of "fixing" a performance property of
+  code nobody calls. SSE-05: blocking `socket.connect_ex()` in `launch_update_runner` replaced
+  with `asyncio.wait_for(asyncio.open_connection(...), timeout=1.0)`. SSE-06: `WeatherService
+  .get_weather_data()` split into a cached public wrapper (`WEATHER_CACHE_TTL_S=300`, a
+  `threading.Lock`-guarded single-flight cache — a real `threading.Lock` because the method runs
+  via `asyncio.to_thread` from multiple OS threads, not just multiple coroutines) and a renamed
+  `_fetch_weather_data()` holding the original body verbatim; error responses are never cached;
+  `update_location()` invalidates the cache; `weather_command.py`'s mesh `!wx` command passes
+  `bypass_cache=True` (a ham operator asking over LoRa expects a live reading) while the REST
+  endpoints get the cached path by default. CO-08: `try_repair_json`'s per-malformed-datagram
+  re-parse loop capped at `MAX_JSON_REPAIR_ATTEMPTS=10` (was unbounded, up to ~1024 re-parses for
+  a maximally-adversarial 1KB datagram). CO-10: `UDPHandler` now holds one long-lived
+  `send_socket` (created in `__init__`) instead of a fresh `socket.socket()` +
+  `run_in_executor` round-trip per outgoing datagram — UDP `sendto()` on a connectionless socket
+  doesn't block on the network the way TCP does, so no executor hop is needed; this also
+  structurally eliminates the old code's latent `NameError`-in-`finally` if `socket.socket()`
+  itself raised. CO-22: the 60s classifier-stats broadcaster now skips its DB scans entirely when
+  `sse_manager.get_client_count() == 0`. BLE-12: `_find_gatt_characteristic` replaced recursive
+  per-node `introspect()` calls with the same single `GetManagedObjects()` D-Bus call `scan()`
+  already uses, filtered by path prefix. CMD-10: 6 inline regex patterns in `ctcping.py` compiled
+  once at module level instead of per-call.
+
+  Opus review independently re-derived equivalence for ST-07/08/09/18 via its own fixture
+  construction (not trusting the implementer's scratchpad scripts), ran a live concurrency test
+  for SSE-06 proving true single-flight behavior (2 threads on a cold cache → exactly 1 fetch,
+  both receive the same object), confirmed `HTTPException`'s MRO doesn't intersect
+  `(OSError, TimeoutError)` for SSE-05, and reasoned through BLE-12's path-prefix filter against
+  `GetManagedObjects()`'s flat all-depths path list (explicitly noting hardware/D-Bus validation
+  is out of reach in this sandboxed environment — a structural review only for that one).
+  **Verdict: approve.** Two MINOR observations, both accepted as inherent to the design rather
+  than fixed: (1) SSE-06's lock is held across the entire blocking fetch (worst case ~60s under
+  a full DWD+OpenMeteo retry cascade), so a burst of concurrent cold-cache requests could park
+  several shared `to_thread` pool workers — inherent to any single-flight-across-threads design,
+  amortized by the TTL, narrow/rare on a small ham-radio proxy; (2) `send_socket` could leak if a
+  `UDPHandler` was constructed but `stop_listening()` called without ever starting it (the early
+  `if not self._running: return` guard used to skip the close) — this one **was** fixed before
+  commit (cheap, no behavior risk): `stop_listening()` now closes `send_socket` unconditionally
+  while keeping the listen-socket/log-message behavior gated on `self._running` exactly as
+  before. Gates green throughout (ruff check, ruff format --check — 56 files, startup tests — 5
+  suites), noqa counts unchanged across all 9 files, classifier subtree untouched, no new
+  indexes, scope discipline confirmed.

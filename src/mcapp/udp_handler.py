@@ -14,6 +14,7 @@ from .util import FEET_TO_METERS, now_ms
 logger = get_logger(__name__)
 
 UDP_RECV_BUFFER_BYTES = 1024
+MAX_JSON_REPAIR_ATTEMPTS = 10  # CO-08: cap re-parses per malformed datagram
 
 
 def _normalize_altitude_to_meters(message: dict[str, Any]) -> None:
@@ -79,8 +80,13 @@ def strip_invalid_utf8(data: bytes) -> str:
 
 
 def try_repair_json(text: str) -> dict[str, Any]:
-    """Try to repair malformed JSON by removing invalid characters"""
-    for i in range(len(text)):
+    """Try to repair malformed JSON by removing invalid characters.
+
+    CO-08: bounded to MAX_JSON_REPAIR_ATTEMPTS — an unbounded loop (one
+    re-parse per character) could re-parse a malformed 1KB datagram up to
+    ~1024 times on the event loop.
+    """
+    for i in range(min(len(text), MAX_JSON_REPAIR_ATTEMPTS)):
         try:
             result: dict[str, Any] = json.loads(text)
         except json.JSONDecodeError as e:
@@ -90,6 +96,7 @@ def try_repair_json(text: str) -> dict[str, Any]:
             text = text[:pos] + text[pos + 1 :]
         else:
             return result
+    logger.debug("JSON repair gave up after %d attempts", MAX_JSON_REPAIR_ATTEMPTS)
     return {"raw_text": text, "error": "invalid_json_repair_failed"}
 
 
@@ -108,6 +115,10 @@ class UDPHandler:
         self.message_router = message_router
 
         self.listen_socket: socket.socket | None = None
+        # CO-10: one long-lived send socket instead of a fresh socket() + executor
+        # round-trip per outgoing datagram — UDP sendto() doesn't block on a
+        # connectionless socket, so no executor hop is needed either.
+        self.send_socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         self._running = False
         self._listen_task: asyncio.Task[None] | None = None
 
@@ -124,20 +135,24 @@ class UDPHandler:
         self._listen_task = asyncio.create_task(self._listen_loop())
 
     async def stop_listening(self) -> None:
-        if not self._running:
-            return
+        if self._running:
+            self._running = False
+            if self._listen_task:
+                self._listen_task.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await self._listen_task
 
-        self._running = False
-        if self._listen_task:
-            self._listen_task.cancel()
-            with contextlib.suppress(asyncio.CancelledError):
-                await self._listen_task
+            if self.listen_socket:
+                self.listen_socket.close()
+                self.listen_socket = None
 
-        if self.listen_socket:
-            self.listen_socket.close()
-            self.listen_socket = None
+            logger.info("UDP listener stopped")
 
-        logger.info("UDP listener stopped")
+        # Close unconditionally (CO-10): send_socket is created in __init__, not
+        # start_listening(), so a handler that was constructed but never started
+        # would otherwise leak it since the early-return above used to skip past
+        # this entirely.
+        self.send_socket.close()
 
     async def _listen_loop(self) -> None:
         loop = asyncio.get_running_loop()
@@ -229,9 +244,6 @@ class UDPHandler:
 
     async def send_message(self, message_data: dict[str, Any]) -> None:
         try:
-            udp_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-            loop = asyncio.get_running_loop()
-
             json_data = json.dumps(message_data).encode("utf-8")
             logger.debug(
                 "UDP_SEND to %s (%d bytes): %.200s",
@@ -239,12 +251,10 @@ class UDPHandler:
                 len(json_data),
                 json_data.decode("utf-8"),
             )
-            await loop.run_in_executor(None, udp_sock.sendto, json_data, self.target_address)
+            self.send_socket.sendto(json_data, self.target_address)
 
         except Exception:
             logger.exception("UDP_SEND failed")
-        finally:
-            udp_sock.close()
 
     def is_running(self) -> bool:
         return self._running

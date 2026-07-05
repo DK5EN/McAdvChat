@@ -304,14 +304,20 @@ class ClassifierApiMixin(StorageBase):
             "SELECT template_hash, example_msg FROM beacon_templates "
             "WHERE auto_beacon = 1 AND user_action IS NULL"
         )
-        for row in rows:
-            tokens = _tokenize_normalized(row["example_msg"] or "")
-            if len(tokens) <= min_tokens:
-                await self._mutate(
-                    "UPDATE beacon_templates SET auto_beacon = 0 WHERE template_hash = ?",
-                    (row["template_hash"],),
-                )
-                cleared += 1
+        # ST-18: tokenization (Python-only, can't push into SQL) decides which rows
+        # qualify, but the UPDATEs themselves are batched into one _execute_many call
+        # instead of one _mutate (= one connection open/commit) per stale template.
+        stale_hashes = [
+            row["template_hash"]
+            for row in rows
+            if len(_tokenize_normalized(row["example_msg"] or "")) <= min_tokens
+        ]
+        if stale_hashes:
+            await self._execute_many(
+                "UPDATE beacon_templates SET auto_beacon = 0 WHERE template_hash = ?",
+                [(h,) for h in stale_hashes],
+            )
+        cleared += len(stale_hashes)
         return cleared
 
     async def get_classifier_version(self) -> int:
@@ -399,22 +405,47 @@ class ClassifierApiMixin(StorageBase):
 
         Mirrors the frontend ``isTextBlocked()`` semantics: case-insensitive
         substring match. Returns ``{text: count}`` for every blocked text.
+
+        ST-08: this used to fetch every message body from the last 24h into
+        Python and substring-match each one against every blocked text — run
+        from the 60s classifier-stats broadcast. ASCII blocked texts are now
+        counted with SQL `LIKE` (COUNT pushed into SQLite, no message bodies
+        pulled into Python). SQLite's `LIKE` only case-folds ASCII letters
+        (case-sensitive for anything else), so a text containing non-ASCII
+        characters (e.g. umlauts) falls back to the original full-scan Python
+        matching — otherwise a blocked German word would silently stop
+        matching differently-cased occurrences.
         """
         texts = await self.get_blocked_texts()
         if not texts:
             return {}
         since_ms = now_ms() - 24 * 3600 * 1000
-        rows = await self._query(
-            "SELECT msg FROM messages WHERE timestamp >= ? AND msg IS NOT NULL",
-            (since_ms,),
-        )
-        lowered = [(t, t.lower()) for t in texts]
         counts = dict.fromkeys(texts, 0)
-        for r in rows:
-            m = (r["msg"] or "").lower()
-            for orig, tl in lowered:
-                if tl in m:
-                    counts[orig] += 1
+
+        ascii_texts = [t for t in texts if t.isascii()]
+        unicode_texts = [t for t in texts if not t.isascii()]
+
+        for text in ascii_texts:
+            escaped = text.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+            rows = await self._query(
+                "SELECT COUNT(*) as c FROM messages"
+                " WHERE timestamp >= ? AND msg LIKE ? ESCAPE '\\'",
+                (since_ms, f"%{escaped}%"),
+            )
+            counts[text] = rows[0]["c"] if rows else 0
+
+        if unicode_texts:
+            rows = await self._query(
+                "SELECT msg FROM messages WHERE timestamp >= ? AND msg IS NOT NULL",
+                (since_ms,),
+            )
+            lowered = [(t, t.lower()) for t in unicode_texts]
+            for r in rows:
+                m = (r["msg"] or "").lower()
+                for orig, tl in lowered:
+                    if tl in m:
+                        counts[orig] += 1
+
         return counts
 
     async def get_top_beacon_templates(

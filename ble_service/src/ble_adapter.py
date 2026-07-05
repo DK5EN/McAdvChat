@@ -579,33 +579,43 @@ class BLEAdapter:
         )
 
     async def _find_gatt_characteristic(self, path: str, target_uuid: str):
-        """Recursively find GATT characteristic by UUID"""
+        """Find GATT characteristic by UUID under `path` (BLE-12).
+
+        One GetManagedObjects() D-Bus round-trip (the same call scan() already
+        uses) instead of recursively introspect()-ing every node under `path` —
+        introspection is O(nodes) D-Bus round-trips; GetManagedObjects() returns
+        the whole object tree's interfaces/properties in one call.
+        """
         try:
-            introspect = await self.bus.introspect(BLUEZ_SERVICE_NAME, path)
+            obj_mgr = self.bus.get_proxy_object(
+                BLUEZ_SERVICE_NAME, "/", await self.bus.introspect(BLUEZ_SERVICE_NAME, "/")
+            )
+            obj_mgr_iface = obj_mgr.get_interface(OBJECT_MANAGER_INTERFACE)
+            objects = await obj_mgr_iface.call_get_managed_objects()
         except Exception:
             return None, None
 
-        for node in introspect.nodes:
-            child_path = f"{path}/{node.name}"
+        target_uuid_lower = target_uuid.lower()
+        for obj_path, interfaces in objects.items():
+            if not obj_path.startswith(path + "/"):
+                continue
+            char_props = interfaces.get(GATT_CHARACTERISTIC_INTERFACE)
+            if not char_props:
+                continue
+            uuid_prop = char_props.get("UUID")
+            if uuid_prop is None or uuid_prop.value.lower() != target_uuid_lower:
+                continue
             try:
-                child_introspect = await self.bus.introspect(BLUEZ_SERVICE_NAME, child_path)
+                child_introspect = await self.bus.introspect(BLUEZ_SERVICE_NAME, obj_path)
                 child_obj = self.bus.get_proxy_object(
-                    BLUEZ_SERVICE_NAME, child_path, child_introspect
+                    BLUEZ_SERVICE_NAME, obj_path, child_introspect
                 )
-
-                props_iface = child_obj.get_interface(PROPERTIES_INTERFACE)
-                props = await props_iface.call_get_all(GATT_CHARACTERISTIC_INTERFACE)
-
-                uuid = props.get("UUID").value.lower()
-                if uuid == target_uuid.lower():
-                    char_iface = child_obj.get_interface(GATT_CHARACTERISTIC_INTERFACE)
-                    return child_obj, char_iface
-
             except Exception:
-                # Recursive search
-                obj, iface = await self._find_gatt_characteristic(child_path, target_uuid)
-                if iface:
-                    return obj, iface
+                logger.debug("Failed to build proxy object for %s", obj_path, exc_info=True)
+                continue
+            else:
+                char_iface = child_obj.get_interface(GATT_CHARACTERISTIC_INTERFACE)
+                return child_obj, char_iface
 
         return None, None
 
