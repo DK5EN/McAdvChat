@@ -1369,3 +1369,66 @@ def create_sse_manager(
         return None
 
     return SSEManager(host, port, message_router, weather_service)
+
+
+async def run_startup_tests() -> bool:
+    """UDP 2.0 Track U (U3) regression: UDP-lora signal reaches SSE clients live.
+
+    A lora `pos`/`msg` packet is published as a plain `mesh_message` (same as any
+    other transport) and `_get_event_type` has no BLE-specific branch for it, so it
+    already falls through to the generic `mesh:message` event — the same path BLE
+    MHeard signal relies on. This proves that path still fires for a UDP-lora packet
+    without needing a dedicated signal SSE event.
+    """
+    results: list[tuple[str, bool]] = []
+
+    manager = SSEManager(host="127.0.0.1", port=0, message_router=None)
+    client = SSEClient("test-client")
+    manager.clients[client.client_id] = client
+
+    lora_pos = {
+        "msg_id": "AAAA0100",
+        "src": "OE1XYZ-9",
+        "dst": "*",
+        "msg": "",
+        "type": "pos",
+        "src_type": "lora",
+        "timestamp": 1_770_000_000_000,
+        "rssi": -95,
+        "snr": 9,
+        "lat": 48.2,
+        "lon": 16.3,
+    }
+    routed_message = {
+        "source": "udp",
+        "type": "mesh_message",
+        "data": lora_pos,
+        "timestamp": 1_770_000_000_000,
+    }
+    await manager._broadcast_handler(routed_message)  # noqa: SLF001 - white-box startup test
+
+    queued = None if client.queue.empty() else client.queue.get_nowait()
+    results.append(("UDP-lora mesh_message reaches a connected SSE client", queued is not None))
+
+    if queued is not None:
+        lines = queued.strip("\n").split("\n")
+        event_line = next((line for line in lines if line.startswith("event: ")), "")
+        data_line = next((line for line in lines if line.startswith("data: ")), "")
+        event_type = event_line.removeprefix("event: ")
+        event_data = json.loads(data_line.removeprefix("data: "))
+
+        results.append(
+            ("broadcast SSE event uses the generic mesh:message type", event_type == "mesh:message")
+        )
+        results.append(
+            (
+                "broadcast SSE event carries the lora rssi/snr unchanged",
+                event_data.get("rssi") == lora_pos["rssi"]
+                and event_data.get("snr") == lora_pos["snr"],
+            )
+        )
+
+    for label, ok in results:
+        print(f"    {'✅ PASS' if ok else '❌ FAIL'} | {label}")
+
+    return all(ok for _, ok in results)

@@ -1543,6 +1543,15 @@ async def main() -> None:  # noqa: PLR0912, PLR0915 - complex handler kept intac
     # Reference lives for the app's lifetime (run() awaits until shutdown)
     backfill_task = asyncio.create_task(_maybe_backfill_classifier())  # noqa: F841, RUF006 - ref lives for app lifetime
 
+    # One-time signal_log backfill from historical UDP-lora messages (UDP 2.0 Track U, U3/D5).
+    async def _maybe_backfill_signal_log() -> None:
+        try:
+            await storage_handler.backfill_signal_log()
+        except Exception:
+            logger.exception("Signal backfill failed")
+
+    signal_backfill_task = asyncio.create_task(_maybe_backfill_signal_log())  # noqa: F841, RUF006 - ref lives for app lifetime
+
     # Classifier stats broadcaster — pushes proxy:classifier_stats every 60 s.
     async def _classifier_stats_broadcast() -> None:
         """Emit aggregate classifier stats every 60 seconds."""

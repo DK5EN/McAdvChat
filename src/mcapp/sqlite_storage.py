@@ -42,6 +42,8 @@ HOURLY_GAP_THRESHOLD = 6 * 3600  # 6 hours in seconds
 GAP_THRESHOLD_MULTIPLIER = 6
 MIN_DATAPOINTS_FOR_STATS = 10
 SQLITE_BUSY_TIMEOUT_S = 60  # tolerate nightly VACUUM holding the DB longer than the 5s default
+SIGNAL_BACKFILL_WINDOW_HOURS = 192  # 8 days — matches signal_log's own prune retention
+SIGNAL_BACKFILL_BATCH_SIZE = 500
 
 # Columns to SELECT when building message JSON (avoids fetching raw_json)
 _MSG_SELECT = (
@@ -1154,6 +1156,128 @@ class SQLiteStorage:
             await self._upsert_station_position(callsign, message, "signal")
 
         return is_mheard
+
+    async def backfill_signal_log(self) -> dict[str, Any]:
+        """One-time backfill: populate signal_log from historical UDP-lora `messages`.
+
+        UDP 2.0 Track U, Wave U3 (D5) — rows stored before U1 landed have valid
+        rssi/snr in `messages` but never reached `signal_log`. Guarded by a
+        `signal_backfill_done:v1` marker in the shared meta table (mirrors the
+        classifier backfill pattern in main.py); safe to re-run — it skips rows
+        that already have a matching signal_log entry and only ever recomputes
+        (never duplicates) signal_buckets.
+        """
+        marker_key = "signal_backfill_done:v1"
+        if await self.get_meta(marker_key):
+            logger.info("Signal backfill marker present (%s), skipping", marker_key)
+            return {"skipped": True, "scanned": 0, "inserted": 0}
+
+        cutoff_ms = int(time.time() * 1000) - SIGNAL_BACKFILL_WINDOW_HOURS * 3600 * 1000
+        rows_raw = await self._execute(
+            "SELECT src, timestamp, rssi, snr FROM messages"
+            " WHERE src_type = 'lora' AND rssi IS NOT NULL AND snr IS NOT NULL"
+            "   AND timestamp >= ?"
+            " ORDER BY timestamp",
+            (cutoff_ms,),
+        )
+        rows = cast(list[dict[str, Any]], rows_raw)
+        scanned = len(rows)
+
+        existing_raw = await self._execute(
+            "SELECT callsign, timestamp FROM signal_log WHERE timestamp >= ?", (cutoff_ms,)
+        )
+        existing_keys = {
+            (row["callsign"], row["timestamp"]) for row in cast(list[dict[str, Any]], existing_raw)
+        }
+
+        inserted = 0
+        skipped_out_of_range = 0
+        skipped_existing = 0
+        for batch_start in range(0, scanned, SIGNAL_BACKFILL_BATCH_SIZE):
+            batch = rows[batch_start : batch_start + SIGNAL_BACKFILL_BATCH_SIZE]
+            to_insert = []
+            for row in batch:
+                callsign = (row["src"] or "").split(",")[0].strip()
+                rssi, snr, ts = row["rssi"], row["snr"], row["timestamp"]
+                if not (
+                    VALID_RSSI_RANGE[0] <= rssi <= VALID_RSSI_RANGE[1]
+                    and VALID_SNR_RANGE[0] <= snr <= VALID_SNR_RANGE[1]
+                ):
+                    skipped_out_of_range += 1
+                    continue
+                if (callsign, ts) in existing_keys:
+                    skipped_existing += 1
+                    continue
+                to_insert.append((callsign, ts, rssi, snr, "lora"))
+            if to_insert:
+                await self._execute_many(
+                    "INSERT INTO signal_log (callsign, timestamp, rssi, snr, source)"
+                    " VALUES (?, ?, ?, ?, ?)",
+                    to_insert,
+                )
+                inserted += len(to_insert)
+            logger.info(
+                "Signal backfill progress: %d/%d scanned, %d inserted so far",
+                min(batch_start + SIGNAL_BACKFILL_BATCH_SIZE, scanned),
+                scanned,
+                inserted,
+            )
+
+        await self._rebuild_signal_buckets_since(cutoff_ms)
+        await self.set_meta(marker_key, datetime.now(UTC).isoformat())
+
+        summary = {
+            "skipped": False,
+            "scanned": scanned,
+            "inserted": inserted,
+            "skipped_out_of_range": skipped_out_of_range,
+            "skipped_existing": skipped_existing,
+        }
+        logger.info("Signal backfill complete: %s", summary)
+        return summary
+
+    async def _rebuild_signal_buckets_since(self, since_ms: int) -> None:
+        """Recompute 5-min signal_buckets rows from signal_log for the given window.
+
+        Recomputes (not just inserts) every touched bucket so a bucket that already
+        had BLE-sourced rows correctly folds in the newly backfilled lora rows too.
+        `INSERT OR REPLACE` makes this idempotent — re-running produces the same rows.
+        """
+        bucket_ms = BUCKET_SECONDS * 1000
+        rows_raw = await self._execute(
+            "SELECT callsign, (timestamp / ?) * ? AS bucket_ts,"
+            " AVG(rssi) AS rssi_avg, MIN(rssi) AS rssi_min, MAX(rssi) AS rssi_max,"
+            " AVG(snr) AS snr_avg, MIN(snr) AS snr_min, MAX(snr) AS snr_max,"
+            " COUNT(*) AS cnt"
+            " FROM signal_log WHERE timestamp >= ?"
+            " GROUP BY callsign, bucket_ts",
+            (bucket_ms, bucket_ms, since_ms),
+        )
+        rows = cast(list[dict[str, Any]], rows_raw)
+        if not rows:
+            return
+        params = [
+            (
+                row["callsign"],
+                row["bucket_ts"],
+                bucket_ms,
+                round(row["rssi_avg"], 2),
+                row["rssi_min"],
+                row["rssi_max"],
+                round(row["snr_avg"], 2),
+                round(row["snr_min"], 2),
+                round(row["snr_max"], 2),
+                row["cnt"],
+            )
+            for row in rows
+        ]
+        await self._execute_many(
+            "INSERT OR REPLACE INTO signal_buckets"
+            " (callsign, bucket_ts, bucket_size, rssi_avg, rssi_min, rssi_max,"
+            "  snr_avg, snr_min, snr_max, count) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            params,
+        )
+        logger.info("Signal backfill: rebuilt %d signal_buckets rows", len(params))
 
     async def _execute(
         self,
@@ -4052,6 +4176,93 @@ async def run_startup_tests() -> bool:  # noqa: PLR0915 - test suite lists one c
                     and row_c.get("lat") == pos_c["lat"]
                     and row_c.get("rssi") == signal_b["rssi"]
                     and row_c.get("signal_ts") == base_ts + 11,
+                )
+            )
+
+            # 8. In-memory 5-min accumulator: confirm lora signal shares the same
+            # _accumulate_signal/_flush_completed_buckets path BLE MHeard already used
+            # (Wave U3, change 2 — the nightly hourly rollup then works identically
+            # since it aggregates signal_buckets without regard to source).
+            bucket_ms = BUCKET_SECONDS * 1000
+            cs8b = "OE1XYZ-10"
+            msg_bucket_a = {
+                "msg_id": "AAAA0101",
+                "src": cs8b,
+                "dst": "*",
+                "msg": "",
+                "type": "pos",
+                "src_type": "lora",
+                "timestamp": base_ts + bucket_ms * 100,
+                "rssi": -90,
+                "snr": 4,
+                "lat": 1.0,
+                "lon": 1.0,
+            }
+            msg_bucket_b = {
+                "msg_id": "AAAA0102",
+                "src": cs8b,
+                "dst": "*",
+                "msg": "next bucket",
+                "type": "msg",
+                "src_type": "lora",
+                "timestamp": base_ts + bucket_ms * 102,
+                "rssi": -85,
+                "snr": 6,
+            }
+            await storage.store_message(msg_bucket_a, json.dumps(msg_bucket_a))
+            await storage.store_message(msg_bucket_b, json.dumps(msg_bucket_b))
+            live_bucket_rows = await storage._execute(  # noqa: SLF001 - white-box startup test
+                "SELECT COUNT(*) as c FROM signal_buckets WHERE callsign = ?", (cs8b,)
+            )
+            results.append(
+                (
+                    "live 5-min accumulator flushes a completed bucket for lora signal",
+                    cast(list[dict[str, Any]], live_bucket_rows)[0]["c"] >= 1,
+                )
+            )
+
+            # 9. D5 backfill: populate signal_log from historical `messages` rows that
+            # predate Track U (inserted directly, bypassing store_message/_ingest_signal).
+            cs9 = "OE1XYZ-11"
+            # Must be within backfill_signal_log's retention window, which is relative
+            # to real wall-clock time — the deterministic base_ts (fixed at an
+            # arbitrary past date) would fall outside it.
+            backfill_ts = int(time.time() * 1000) - 3600_000
+            await storage._execute(  # noqa: SLF001 - white-box startup test
+                "INSERT INTO messages"
+                " (msg_id, src, dst, msg, type, timestamp, rssi, snr, src_type, raw_json)"
+                " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                ("BBBB0001", cs9, "*", "", "pos", backfill_ts, -92, 6, "lora", "{}"),
+                fetch=False,
+            )
+            summary1 = await storage.backfill_signal_log()
+            results.append(
+                (
+                    "backfill: scans and inserts historical lora message",
+                    summary1["inserted"] == 1 and not summary1["skipped"],
+                )
+            )
+            results.append(
+                (
+                    "backfill: signal_log populated for historical row",
+                    await _signal_row_count(cs9) == 1,
+                )
+            )
+            backfill_bucket_rows = await storage._execute(  # noqa: SLF001 - white-box startup test
+                "SELECT COUNT(*) as c FROM signal_buckets WHERE callsign = ?", (cs9,)
+            )
+            results.append(
+                (
+                    "backfill: signal_buckets rebuilt for the backfilled callsign",
+                    cast(list[dict[str, Any]], backfill_bucket_rows)[0]["c"] >= 1,
+                )
+            )
+
+            summary2 = await storage.backfill_signal_log()
+            results.append(
+                (
+                    "backfill: idempotent re-run is a no-op (marker present)",
+                    summary2["skipped"] is True,
                 )
             )
         finally:
