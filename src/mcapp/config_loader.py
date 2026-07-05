@@ -14,8 +14,6 @@ from typing import Any
 
 from .logging_setup import get_logger
 
-VERSION = "v0.50.0"
-
 logger = get_logger(__name__)
 
 # ── Protocol constants (fixed by hardware / architecture) ─────────────
@@ -165,29 +163,6 @@ class Config:
             location=location,
             _raw=data,
         )
-
-    def to_dict(self) -> dict[str, Any]:
-        """Export config to dictionary for saving (minimal keys only)."""
-        return {
-            "CALL_SIGN": self.call_sign,
-            "USER_INFO_TEXT": self.user_info_text,
-            "MESHCOM_IOT_TARGET": self.udp.target,
-            "LAT": self.location.latitude,
-            "LONG": self.location.longitude,
-            "STAT_NAME": self.location.station_name,
-            "DB_PATH": self.storage.db_path,
-            "PRUNE_HOURS": self.storage.prune_hours,
-            "PRUNE_HOURS_POS": self.storage.prune_hours_pos,
-            "PRUNE_HOURS_ACK": self.storage.prune_hours_ack,
-            "BLE_API_KEY": self.ble.api_key,
-        }
-
-    def save(self, path: str | Path) -> None:
-        """Save config to file."""
-        path = Path(path)
-        with path.open("w", encoding="utf-8") as f:
-            json.dump(self.to_dict(), f, indent=2, ensure_ascii=False)
-        logger.info("Saved config to %s", path)
 
 
 def hours_to_dd_hhmm(hours: int) -> str:

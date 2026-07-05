@@ -14,7 +14,6 @@ This module provides:
 from __future__ import annotations
 
 import contextlib
-import json
 import logging
 import re
 from datetime import datetime
@@ -53,20 +52,6 @@ def ascii_char(val: int) -> str:
 def strip_prefix(msg: str, prefix: str = ":") -> str:
     """Strip prefix from message if present"""
     return msg[1:] if msg.startswith(prefix) else msg
-
-
-def decode_json_message(byte_msg: bytes) -> dict[str, Any] | None:
-    """Decode JSON message from BLE notification"""
-    try:
-        json_str = byte_msg.rstrip(b"\x00").decode("utf-8")[1:]
-        result: dict[str, Any] = json.loads(json_str)
-
-    except (json.JSONDecodeError, UnicodeDecodeError):
-        logger.exception("Error decoding JSON message")
-        return None
-
-    else:
-        return result
 
 
 def decode_binary_message(byte_msg: bytes) -> dict[str, Any] | str:

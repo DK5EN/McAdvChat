@@ -11,13 +11,7 @@ from typing import Any
 from ..logging_setup import get_logger
 from ..util import now_ms
 from ._base import CommandHandlerBase
-from .constants import (
-    CHUNK_SEND_DELAY_SECONDS,
-    CHUNK_SEPARATOR_RESERVE,
-    MAX_CHUNKS,
-    MAX_RESPONSE_LENGTH,
-    has_console,
-)
+from .constants import CHUNK_SEND_DELAY_SECONDS, MAX_CHUNKS, MAX_RESPONSE_LENGTH, has_console
 
 logger = get_logger(__name__)
 
@@ -178,25 +172,3 @@ class ResponseMixin(CommandHandlerBase):
             chunks = [response[i : i + max_bytes] for i in range(0, len(response), max_bytes)]
 
         return chunks[:MAX_CHUNKS]
-
-    def _pad_for_chunk_break(
-        self, text: str, target_length: int = MAX_RESPONSE_LENGTH - CHUNK_SEPARATOR_RESERVE
-    ) -> str:
-        """Pad text to force clean chunk boundary using byte-aware calculation"""
-        text_bytes = text.encode("utf-8")
-
-        if len(text_bytes) < target_length:
-            # Calculate padding needed in bytes
-            padding_needed = target_length - len(text_bytes)
-            # Use spaces for padding (1 byte each)
-            padded_text = text + " " * padding_needed + ", "
-        else:
-            # Text is already at or over target, just add separator
-            padded_text = text + ", "
-
-        if has_console:
-            original_bytes = len(text.encode("utf-8"))
-            padded_bytes = len(padded_text.encode("utf-8"))
-            print(f"🔍 Padding: '{text[:30]}...' {original_bytes}→{padded_bytes} bytes")
-
-        return padded_text

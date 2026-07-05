@@ -86,23 +86,6 @@ class CTCPingMixin(CommandHandlerBase):
         logger.debug("No matching test found for target '%s'", target)
         return None
 
-    def get_active_pings_info(self) -> str:
-        """Get info about currently active pings (for debugging)"""
-        if not self.active_pings:
-            return "No active pings"
-
-        ping_info = []
-        for msg_id, info in self.active_pings.items():
-            target = info["target"]
-            status = info["status"]
-            elapsed = time.time() - info["sent_time"]
-            seq_info = info.get("sequence_info", "")
-
-            seq_text = f" {seq_info}" if seq_info else ""
-            ping_info.append(f"ID:{msg_id}{seq_text} → {target} ({status}, {elapsed:.1f}s)")
-
-        return f"Active pings: {' | '.join(ping_info)}"
-
     async def _handle_echo_message(self, message_data: dict[str, Any]) -> None:
         """Handle echo message and start tracking for ACK"""
         try:
@@ -701,12 +684,3 @@ class CTCPingMixin(CommandHandlerBase):
 
         except Exception:
             logger.exception("Failed to send ping result")
-
-    async def cleanup_ping_tests(self) -> None:
-        """Clean up all active ping tests"""
-        logger.debug("Cleaning up %d active pings...", len(self.active_pings))
-
-        self.active_pings.clear()
-        self.ping_tests.clear()
-
-        logger.debug("All ping tests cleaned up")

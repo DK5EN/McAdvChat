@@ -1,8 +1,6 @@
 import re
 import sys
 
-VERSION = "v0.61.0"
-
 # Response chunking constants
 MAX_RESPONSE_LENGTH = 140  # Maximum characters per message chunk
 MAX_CHUNKS = 3  # Maximum number of response chunks

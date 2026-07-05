@@ -13,8 +13,6 @@ from .util import FEET_TO_METERS, now_ms
 
 logger = get_logger(__name__)
 
-VERSION = "v0.48.0"
-
 UDP_RECV_BUFFER_BYTES = 1024
 
 
@@ -107,14 +105,12 @@ class UDPHandler:
         listen_port: int,
         target_host: str,
         target_port: int,
-        message_callback: Any = None,
         message_router: Any = None,
     ) -> None:
         self.listen_port = listen_port
         self.target_host = target_host
         self.target_port = target_port
         self.target_address = (target_host, target_port)
-        self.message_callback = message_callback
         self.message_router = message_router
 
         self.listen_socket: socket.socket | None = None
@@ -168,7 +164,7 @@ class UDPHandler:
             if self.listen_socket:
                 self.listen_socket.close()
 
-    async def _process_received_message(self, data: bytes, addr: tuple[str, int]) -> None:  # noqa: PLR0912 - complex handler kept intact
+    async def _process_received_message(self, data: bytes, addr: tuple[str, int]) -> None:
         text = strip_invalid_utf8(data)
         message: dict[str, Any] = try_repair_json(text)
 
@@ -223,19 +219,19 @@ class UDPHandler:
 
         message["timestamp"] = now_ms()
         _normalize_altitude_to_meters(message)
-        if isinstance(message, dict) and isinstance(message.get("msg"), str):
-            if self.message_callback:
-                await self.message_callback(message)
-
-            if self.message_router:
-                await self.message_router.publish("udp", "mesh_message", message)
-                logger.debug(
-                    "UDP→mesh_message: src=%s dst=%s src_type=%s keys=%s",
-                    message.get("src"),
-                    message.get("dst"),
-                    message.get("src_type", "<MISSING>"),
-                    list(message.keys()),
-                )
+        if (
+            isinstance(message, dict)
+            and isinstance(message.get("msg"), str)
+            and self.message_router
+        ):
+            await self.message_router.publish("udp", "mesh_message", message)
+            logger.debug(
+                "UDP→mesh_message: src=%s dst=%s src_type=%s keys=%s",
+                message.get("src"),
+                message.get("dst"),
+                message.get("src_type", "<MISSING>"),
+                list(message.keys()),
+            )
 
     async def send_message(self, message_data: dict[str, Any]) -> None:
         try:

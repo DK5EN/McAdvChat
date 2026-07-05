@@ -24,9 +24,6 @@ from .util import FEET_TO_METERS, now_ms
 
 _MAX_FORENSIC_HOPS = 4  # log raw data for messages routed over more hops
 _MIN_PLAUSIBLE_HPA = 850  # pressure below this is a firmware mapping error
-_INITIAL_PER_KEY_LIMIT = 50  # initial-payload cap per dst/src
-
-VERSION = "v0.50.0"
 
 logger = get_logger(__name__)
 
@@ -64,8 +61,6 @@ PRUNE_TARGET_FRACTION = 0.9  # aim for 90% of MAX_DB_SIZE_MB to avoid re-trigger
 EST_BYTES_PER_ROW = 200  # conservative average across all tables
 MIN_PRUNE_ROWS = 1000
 
-INITIAL_MSG_LIMIT = 1000
-INITIAL_POS_LIMIT = 500
 INITIAL_ACK_LIMIT = 200
 DEFAULT_PAGE_SIZE = 20  # align with core's DEFAULT_PAGE_LIMIT
 
@@ -143,16 +138,6 @@ CREATE INDEX IF NOT EXISTS idx_messages_msgid_timestamp ON messages(msg_id, time
 CREATE TABLE IF NOT EXISTS schema_version (
     version INTEGER PRIMARY KEY
 );
-
--- Precomputed mheard statistics (optional caching)
-CREATE TABLE IF NOT EXISTS mheard_cache (
-    callsign TEXT PRIMARY KEY,
-    last_seen INTEGER,
-    message_count INTEGER,
-    avg_rssi REAL,
-    avg_snr REAL,
-    updated_at TEXT DEFAULT CURRENT_TIMESTAMP
-);
 """
 
 # New tables for separated position/signal architecture (schema v2)
@@ -228,9 +213,6 @@ class SQLiteStorage:
 
         # In-memory bucket accumulators: {(callsign, bucket_start_ms): {"rssi": [], "snr": []}}
         self._bucket_accumulators: dict[tuple[str, int], dict[str, list[float | int]]] = {}
-
-        # Persistent read-only connection (opened in initialize())
-        self._read_conn: sqlite3.Connection | None = None
 
         # Reference to message router (set via set_message_router after construction)
         self._message_router = None
@@ -555,16 +537,6 @@ class SQLiteStorage:
                     _set_schema_version(conn, 19)
 
         await asyncio.to_thread(_init_db)
-
-        # Open persistent read-only connection for query methods
-        def _open_read_conn() -> sqlite3.Connection:
-            conn = sqlite3.connect(self.db_path)
-            conn.row_factory = sqlite3.Row
-            conn.execute("PRAGMA journal_mode=WAL")
-            conn.execute("PRAGMA query_only=ON")
-            return conn
-
-        self._read_conn = await asyncio.to_thread(_open_read_conn)
 
         # Initialize bucket accumulators from existing signal_log
         await self._init_bucket_accumulators()
@@ -1337,16 +1309,6 @@ class SQLiteStorage:
                 conn.commit()
 
         await asyncio.to_thread(_run)
-
-    def _ensure_read_conn(self) -> sqlite3.Connection:
-        """Return the persistent read connection, reopening if necessary."""
-        if self._read_conn is None:
-            conn = sqlite3.connect(self.db_path)
-            conn.row_factory = sqlite3.Row
-            conn.execute("PRAGMA journal_mode=WAL")
-            conn.execute("PRAGMA query_only=ON")
-            self._read_conn = conn
-        return self._read_conn
 
     async def store_message(self, message: dict[str, Any], raw: str) -> None:  # noqa: PLR0912, PLR0915 - complex handler kept intact
         """Store a message with automatic filtering.
@@ -2162,51 +2124,6 @@ class SQLiteStorage:
         logger.info("Aggregated old 5-min buckets into hourly buckets")
         return 0
 
-    async def get_initial_payload(self) -> list[str]:
-        """Get initial payload for websocket clients."""
-        msgs_query = f"""
-            SELECT {_MSG_SELECT} FROM messages
-            WHERE type = 'msg' AND msg NOT LIKE '%:ack%'
-            ORDER BY timestamp DESC
-            LIMIT {INITIAL_MSG_LIMIT}
-        """  # noqa: S608 - identifiers from fixed set; values parameterized
-        msg_rows_raw = await self._execute(msgs_query)
-        msg_rows = cast(list[dict[str, Any]], msg_rows_raw)
-
-        pos_query = f"""
-            SELECT {_MSG_SELECT} FROM messages
-            WHERE type = 'pos'
-            ORDER BY timestamp DESC
-            LIMIT {INITIAL_POS_LIMIT}
-        """  # noqa: S608 - identifiers from fixed set; values parameterized
-        pos_rows_raw = await self._execute(pos_query)
-        pos_rows = cast(list[dict[str, Any]], pos_rows_raw)
-
-        msgs_per_dst: dict[str, list[str]] = defaultdict(list)
-        pos_per_src: dict[str, list[str]] = defaultdict(list)
-
-        for row in msg_rows:
-            data = self._build_message_dict(row)
-            dst = data.get("dst")
-            if dst and len(msgs_per_dst[dst]) < _INITIAL_PER_KEY_LIMIT:
-                msgs_per_dst[dst].append(json.dumps(data, ensure_ascii=False))
-
-        for row in pos_rows:
-            data = self._build_message_dict(row)
-            src = data.get("src")
-            if src and len(pos_per_src[src]) < _INITIAL_PER_KEY_LIMIT:
-                pos_per_src[src].append(json.dumps(data, ensure_ascii=False))
-
-        msg_msgs: list[str] = []
-        for msg_list in msgs_per_dst.values():
-            msg_msgs.extend(reversed(msg_list))
-
-        pos_msgs: list[str] = []
-        for pos_list in pos_per_src.values():
-            pos_msgs.extend(pos_list)
-
-        return msg_msgs + pos_msgs
-
     @staticmethod
     def _build_position_dict(row: dict[str, Any]) -> dict[str, Any]:  # noqa: PLR0912 - complex handler kept intact
         """Build a position dict from station_positions row."""
@@ -2271,8 +2188,7 @@ class SQLiteStorage:
 
         Uses a ROW_NUMBER() window function partitioned by conversation_key
         to fetch the last N messages per conversation in one query, instead
-        of N+1 queries (one per destination).  All queries share the
-        persistent read connection — zero connect/close overhead.
+        of N+1 queries (one per destination).
         """
         build_msg = self._build_message_dict
         build_pos = self._build_position_dict
@@ -3922,14 +3838,11 @@ class SQLiteStorage:
         return new_ver
 
     async def close(self) -> None:
-        """Close the persistent read connection."""
+        """No persistent connection to close; every query opens/closes its own.
 
-        def _close() -> None:
-            if self._read_conn is not None:
-                self._read_conn.close()
-                self._read_conn = None
-
-        await asyncio.to_thread(_close)
+        Kept as a no-op so callers (startup tests, future connection-pooling work)
+        have a stable teardown hook.
+        """
 
 
 async def create_sqlite_storage(db_path: str | Path) -> SQLiteStorage:

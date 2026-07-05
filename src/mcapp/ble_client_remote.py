@@ -26,7 +26,7 @@ from .ble_client import (
     BLEStatus,
     ConnectionState,
 )
-from .ble_protocol import decode_binary_message, decode_json_message, dispatcher
+from .ble_protocol import decode_binary_message, dispatcher
 from .util import now_ms
 
 logger = logging.getLogger(__name__)
@@ -491,7 +491,7 @@ class BLEClientRemote(BLEClientBase):
             await self._client.aclose()
             self._client = None
 
-    async def _sse_loop(self) -> None:  # noqa: PLR0912, PLR0915 - complex handler kept intact
+    async def _sse_loop(self) -> None:  # noqa: PLR0912 - complex handler kept intact
         """SSE notification listener loop"""
         url = urljoin(self.remote_url, "/api/ble/notifications")
         headers: dict[str, str] = {}
@@ -567,8 +567,6 @@ class BLEClientRemote(BLEClientBase):
                             await self._publish_status(
                                 "disconnect BLE", "lost", "BLE service connection lost"
                             )
-                    if not hasattr(self, "_sse_backoff"):
-                        self._sse_backoff = SSE_BACKOFF_INITIAL_S
                     logger.warning(
                         "SSE connection error: %s, reconnecting in %ds...", e, self._sse_backoff
                     )
@@ -625,7 +623,7 @@ class BLEClientRemote(BLEClientBase):
         """Get own callsign from message router if available."""
         return getattr(self.message_router, "my_callsign", "") if self.message_router else ""
 
-    def _transform_notification(self, notification: dict[str, Any]) -> dict[str, Any] | None:  # noqa: PLR0912 - complex handler kept intact
+    def _transform_notification(self, notification: dict[str, Any]) -> dict[str, Any] | None:
         """Transform SSE notification to match local BLE handler format"""
         own_call = self._get_own_callsign()
         if notification.get("format") == "json" and "parsed" in notification:
@@ -685,17 +683,6 @@ class BLEClientRemote(BLEClientBase):
                                 msg,
                             )
                         output = dispatcher(cast(dict[str, Any], decoded), own_call)
-                        if output:
-                            if output.get("transformer") not in ("generic_ble", "mh"):
-                                output["src_type"] = "ble_remote"
-                            output["timestamp"] = notification.get("timestamp", now_ms())
-                            return output
-                    elif raw_bytes.startswith(b"D{"):
-                        decoded_maybe = decode_json_message(raw_bytes)
-                        if isinstance(decoded_maybe, dict):
-                            output = dispatcher(decoded_maybe, own_call)
-                        else:
-                            output = None
                         if output:
                             if output.get("transformer") not in ("generic_ble", "mh"):
                                 output["src_type"] = "ble_remote"

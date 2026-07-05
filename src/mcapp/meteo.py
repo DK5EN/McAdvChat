@@ -57,8 +57,6 @@ def _messzeitpunkt_to_utc(timestamp_str: str) -> datetime:
     return parsed.replace(tzinfo=_BERLIN_TZ).astimezone(UTC)
 
 
-VERSION = "v0.46.0"
-
 # Logging Setup
 logging.basicConfig(
     level=logging.INFO,

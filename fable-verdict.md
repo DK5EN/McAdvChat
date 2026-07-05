@@ -978,3 +978,29 @@ Review checklist:
   defects**. X-05's three callsign patterns (`CALLSIGN_TARGET_RE`, `CALLSIGN_STRICT_RE`,
   `DST_CALLSIGN_RE`) confirmed distinct and correctly mapped to call sites, none merged.
   Gates green throughout (ruff check, ruff format --check, startup tests — 5 suites).
+
+- [2026-07-05] Wave 3 complete (ST-01, ST-16, ST-18's `mheard_cache` slice, CO-12, CO-13,
+  CMD-02 per decision D-1 default (delete), CMD-10's dead items, BLE-08's dead branch, BLE-16's
+  dead guard, SSE-07's `_get_installed_version`, X-01). 367 lines removed, 29 added, across 15
+  files — every deletion preceded by a caller-grep, independently re-derived by the Opus
+  reviewer (not just trusted from the implementation pass). Notable: `get_initial_payload`
+  (ST-16) had zero callers so it and its now-orphaned Wave-2 constants
+  (`INITIAL_MSG_LIMIT`/`INITIAL_POS_LIMIT`/`_INITIAL_PER_KEY_LIMIT`) were deleted outright, no
+  Wave 6 decision needed. `mheard_cache` removed from the base `CREATE_SCHEMA_SQL` only — no
+  migration block touched, schema stays at v19 (existing DBs keep the harmless empty table).
+  CMD-02's abuse-protection subsystem (~60 lines) reconfirmed unreachable (the coding agent's
+  trace and the Opus reviewer's independent trace agree: `execute_command` converts every
+  handler failure to a string return and never re-raises, so `_track_failed_attempt`'s one call
+  site can never fire) and deleted. BLE-08's dead branch removal cascaded into deleting
+  `ble_protocol.py`'s now-orphaned `decode_json_message` — re-verified safe (zero remaining
+  callers) rather than assumed. X-01: 6 of 7 divergent `VERSION` constants deleted outright
+  (zero external consumers); `sse_handler.py`'s was kept but fixed to `f"v{__version__}"` since
+  it's genuinely emitted externally (FastAPI app metadata + a status endpoint) — same emission
+  points, same format, now backed by the real package version instead of a stale hardcoded one.
+  Deliberately deferred (not a defect): SSE-07's `FASTAPI_AVAILABLE`/`UVICORN_AVAILABLE`
+  import-fallback + `create_sse_manager`'s None-return path — confirmed dead (fastapi/uvicorn
+  are hard deps, not optional) but removing it changes import-time/error-handling behavior
+  across three files, which exceeds a dead-code-only wave's scope; flagged for a future wave.
+  Opus review: **approved, zero defects** — every deletion's caller-grep independently
+  re-derived, migration blocks confirmed byte-identical, CMD-02 reachability re-traced from
+  scratch. Gates green (ruff check, ruff format --check, startup tests — 5 suites, 0 failures).

@@ -19,6 +19,7 @@ from contextlib import asynccontextmanager
 from datetime import UTC, datetime
 from typing import Any, ClassVar
 
+from . import __version__
 from .ble_client import ConnectionState
 from .logging_setup import get_logger
 from .util import now_ms
@@ -53,7 +54,7 @@ def _get_tz_finder() -> Any:
     return _tz_finder
 
 
-VERSION = "v0.50.0"
+VERSION = f"v{__version__}"  # emitted in the FastAPI app metadata and GET /api/status
 
 logger = get_logger(__name__)
 
@@ -1062,17 +1063,6 @@ class SSEManager:
         return app
 
     # ── Update / Deployment Helpers ─────────────────────────────
-
-    def _get_installed_version(self) -> str:
-        """Read installed version from version.html."""
-
-        for path in [
-            pathlib.Path("/var/www/html/webapp/version.html"),
-            pathlib.Path.home() / "mcapp-slots" / "current" / "webapp" / "version.html",
-        ]:
-            if path.exists():
-                return path.read_text().strip()
-        return "not_installed"
 
     async def _launch_update_runner(
         self,

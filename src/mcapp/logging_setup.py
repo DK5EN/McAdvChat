@@ -8,10 +8,7 @@ Keeps emoji prefixes for visual scanning in logs.
 
 import logging
 import sys
-from collections.abc import Callable
 from typing import ClassVar
-
-VERSION = "v0.50.0"
 
 # Default format with emoji support
 LOG_FORMAT = "%(asctime)s | %(levelname)-8s | %(name)-20s | %(message)s"
@@ -97,21 +94,6 @@ def has_console() -> bool:
     Useful for backward compatibility during migration.
     """
     return sys.stdout.isatty()
-
-
-# Convenience function for gradual migration
-def console_print(msg: str, level: str = "info", logger_name: str = "mcapp") -> None:
-    """
-    Bridge function for migrating from print() to logging.
-    Can be used during transition period.
-
-    Usage:
-        console_print("Server started", level="info")
-        # Instead of: if has_console: print("Server started")
-    """
-    logger = get_logger(logger_name)
-    log_func: Callable[..., None] = getattr(logger, level.lower(), logger.info)
-    log_func(msg)
 
 
 # Module-level logger for this module

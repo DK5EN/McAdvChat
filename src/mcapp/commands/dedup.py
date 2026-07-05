@@ -17,13 +17,11 @@ logger = get_logger(__name__)
 CLEANUP_INTERVAL_SECONDS = 3600
 
 MSG_ID_TIMEOUT_SECONDS = 5 * 60
-MAX_FAILED_ATTEMPTS = 3
-BLOCK_DURATION_SECONDS = 5 * DEFAULT_THROTTLE_TIMEOUT
 CONTENT_HASH_LENGTH = 8
 
 
 class DedupMixin(CommandHandlerBase):
-    """Mixin providing dedup/throttle/abuse protection methods."""
+    """Mixin providing dedup/throttle methods."""
 
     def _init_dedup(self) -> None:
         """Initialize dedup/throttle state. Called from CommandHandler.__init__."""
@@ -34,14 +32,6 @@ class DedupMixin(CommandHandlerBase):
         # Secondary throttling (content hash based)
         self.command_throttle = {}  # {content_hash: timestamp}
         self.throttle_timeout = DEFAULT_THROTTLE_TIMEOUT
-
-        # Abuse protection
-        self.failed_attempts = {}  # {src: [timestamp, timestamp, ...]}
-        self.max_failed_attempts = MAX_FAILED_ATTEMPTS
-        self.failed_attempt_window = DEFAULT_THROTTLE_TIMEOUT
-        self.block_duration = BLOCK_DURATION_SECONDS
-        self.blocked_users = {}  # {src: block_timestamp}
-        self.block_notifications_sent = set()
 
         self._dedup_cleanup_task: asyncio.Task[None] | None = None
 
@@ -68,25 +58,10 @@ class DedupMixin(CommandHandlerBase):
                 now = time.time()
                 self._cleanup_msg_id_cache(now)
                 self._cleanup_throttle_cache(now)
-                self._cleanup_blocked_users(now)
-                self._cleanup_failed_attempts(now)
             except asyncio.CancelledError:
                 raise
             except Exception as e:
                 logger.warning("Dedup cleanup sweep failed: %s", e)
-
-    def _cleanup_failed_attempts(self, current_time: float) -> None:
-        """Drop failed-attempt entries whose window has passed."""
-        cutoff = current_time - self.failed_attempt_window
-        empty_srcs = []
-        for src, timestamps in self.failed_attempts.items():
-            kept = [ts for ts in timestamps if ts > cutoff]
-            if kept:
-                self.failed_attempts[src] = kept
-            else:
-                empty_srcs.append(src)
-        for src in empty_srcs:
-            del self.failed_attempts[src]
 
     def _get_content_hash(self, src: str, msg_text: str, dst: str | None = None) -> str:
         """Create hash from source + command (without arguments for command-specific throttling)"""
@@ -126,12 +101,6 @@ class DedupMixin(CommandHandlerBase):
         self._cleanup_throttle_cache(current_time)
         return content_hash in self.command_throttle
 
-    def _is_user_blocked(self, src: str) -> bool:
-        """Check if user is blocked and cleanup expired blocks"""
-        current_time = time.time()
-        self._cleanup_blocked_users(current_time)
-        return src in self.blocked_users
-
     def _mark_msg_id_processed(self, msg_id: Any) -> None:
         """Mark msg_id as processed"""
         self.processed_msg_ids[msg_id] = time.time()
@@ -140,33 +109,6 @@ class DedupMixin(CommandHandlerBase):
         """Mark content hash as processed with command-aware timestamp"""
         self.command_throttle[content_hash] = {"timestamp": time.time(), "command": command}
 
-    def _track_failed_attempt(self, src: str) -> None:
-        """Track failed command attempt and block if necessary"""
-        current_time = time.time()
-
-        # Initialize or get existing attempts
-        if src not in self.failed_attempts:
-            self.failed_attempts[src] = []
-
-        # Add current attempt
-        self.failed_attempts[src].append(current_time)
-
-        # Clean old attempts outside the window
-        cutoff = current_time - self.failed_attempt_window
-        self.failed_attempts[src] = [
-            timestamp for timestamp in self.failed_attempts[src] if timestamp > cutoff
-        ]
-
-        # Check if user should be blocked
-        if len(self.failed_attempts[src]) >= self.max_failed_attempts:
-            self.blocked_users[src] = current_time
-            logger.info(
-                "BLOCKED user %s for %.1f minutes after %d failed attempts",
-                src,
-                self.block_duration / 60,
-                len(self.failed_attempts[src]),
-            )
-
     def _cleanup_msg_id_cache(self, current_time: float) -> None:
         """Remove old entries from msg_id cache"""
         cutoff = current_time - self.msg_id_timeout
@@ -174,27 +116,13 @@ class DedupMixin(CommandHandlerBase):
         for mid in expired:
             del self.processed_msg_ids[mid]
 
-    def _cleanup_blocked_users(self, current_time: float) -> None:
-        """Remove old entries from blocked users"""
-        cutoff = current_time - self.block_duration
-        expired = [src for src, timestamp in self.blocked_users.items() if timestamp < cutoff]
-        for src in expired:
-            del self.blocked_users[src]
-            self.block_notifications_sent.discard(src)
-            logger.info("UNBLOCKED user %s", src)
-
     def _cleanup_throttle_cache(self, current_time: float, _timeout: float | None = None) -> None:
         """Remove old entries from throttle cache with specific timeout"""
         expired = []
 
         for chash, data in self.command_throttle.items():
-            if isinstance(data, dict):
-                timestamp = data["timestamp"]
-                cmd = data.get("command")
-            else:
-                # Backward compatibility für alte float timestamps
-                timestamp = data
-                cmd = None
+            timestamp = data["timestamp"]
+            cmd = data.get("command")
 
             # Determine timeout for this entry
             if cmd and cmd in COMMAND_THROTTLING:

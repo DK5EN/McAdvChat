@@ -77,18 +77,6 @@ class RoutingMixin(CommandHandlerBase):
 
         response_target = self._resolve_response_target(src, dst, target_type)
 
-        # Blocked user
-        if self._is_user_blocked(src):
-            logger.debug("User %s is blocked", src)
-            if src not in self.block_notifications_sent:
-                self.block_notifications_sent.add(src)
-                await self.send_response(
-                    "🚫 Temporarily in timeout due to repeated invalid commands",
-                    response_target,
-                    src_type,
-                )
-            return
-
         # Content-level throttle
         content_hash = self._get_content_hash(src, msg_text, dst)
         if self._is_throttled(content_hash):
@@ -152,7 +140,6 @@ class RoutingMixin(CommandHandlerBase):
 
         except Exception as e:
             logger.warning("Command error (%s): %s", type(e).__name__, e)
-            self._track_failed_attempt(src)
             self._mark_msg_id_processed(msg_id)
             await self.send_response(
                 self._error_response_text(e),

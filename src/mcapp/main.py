@@ -7,7 +7,6 @@ import signal
 import socket
 import sys
 import time
-import traceback
 from collections import defaultdict
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -66,7 +65,6 @@ VERSION = f"v{__version__}"
 
 # Global state
 cfg: Config
-has_console: bool = False
 is_dev: bool = False
 
 # BLE Register Query Timing Constants (seconds)
@@ -77,15 +75,6 @@ BLE_RETRY_BASE_DELAY = 0.5  # Base delay for exponential backoff retries
 
 # Module logger
 logger = get_logger(__name__)
-
-
-def debug_signal_handler(_signum: int, frame: Any) -> None:
-    """Print stack trace when USR1 signal received"""
-    logger.info("=" * 60)
-    logger.info("DEBUG: Stack trace at hang point:")
-    logger.info("=" * 60)
-    traceback.print_stack(frame)
-    logger.info("=" * 60)
 
 
 block_list = [
@@ -1321,7 +1310,6 @@ async def main() -> None:  # noqa: PLR0912, PLR0915 - complex handler kept intac
         listen_port=MESHCOM_UDP_PORT,
         target_host=cfg.udp.target,
         target_port=MESHCOM_UDP_PORT,
-        message_callback=None,
         message_router=message_router,
     )
     message_router.register_protocol("udp", udp_handler)
@@ -1658,10 +1646,7 @@ async def main() -> None:  # noqa: PLR0912, PLR0915 - complex handler kept intac
 
 def run() -> None:
     """Entry point for mcapp CLI."""
-    global cfg, has_console, is_dev
-
-    # Determine if we have a console
-    has_console = sys.stdout.isatty()
+    global cfg, is_dev
 
     # Setup logging first
     is_dev = os.getenv("MCAPP_ENV") == "dev"
