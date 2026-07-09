@@ -26,6 +26,10 @@ HTTP_TIMEOUT_S = 10
 MAX_RETRIES = 2
 RETRY_DELAY_S = 1
 WEATHER_CACHE_TTL_S = 300  # SSE-06: 5 min — matches typical weather-update cadence
+# Negative cache: error results are cached briefly so an API outage doesn't make
+# every queued waiter run its own full ~96 s fetch serially under _cache_lock
+# (each parking a thread in the shared default executor).
+WEATHER_ERROR_CACHE_TTL_S = 60
 
 _MAGNUS_A = 17.27
 _MAGNUS_B = 237.7
@@ -125,22 +129,23 @@ class WeatherService:
         — a ham operator asking for weather over LoRa expects a live reading,
         not a REST-poll-driven cache. REST callers (sse_routes/weather.py's
         `/api/weather` and `/api/weather/preview`) use the default cached path.
-        Error responses (no GPS, all APIs down) are never cached, so a
-        transient failure can't outlive its actual cause by up to the TTL.
+        Error responses (no GPS, all APIs down) are cached too, but only for
+        WEATHER_ERROR_CACHE_TTL_S (negative caching): waiters queued behind the
+        first failing fetch get the cached error back immediately instead of
+        each running their own full fetch serially, while a transient failure
+        still can't outlive its cause by more than the short TTL.
         """
         if bypass_cache:
             return self._fetch_weather_data()
 
         with self._cache_lock:
-            if (
-                self._cache is not None
-                and (time.monotonic() - self._cache_time) < WEATHER_CACHE_TTL_S
-            ):
-                return self._cache
+            if self._cache is not None:
+                ttl = WEATHER_ERROR_CACHE_TTL_S if "error" in self._cache else WEATHER_CACHE_TTL_S
+                if (time.monotonic() - self._cache_time) < ttl:
+                    return self._cache
             data = self._fetch_weather_data()
-            if "error" not in data:
-                self._cache = data
-                self._cache_time = time.monotonic()
+            self._cache = data
+            self._cache_time = time.monotonic()
             return data
 
     def _fetch_weather_data(self) -> dict[str, Any]:  # noqa: PLR0912, PLR0915 - complex handler kept intact

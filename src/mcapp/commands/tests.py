@@ -86,6 +86,81 @@ def test_meteo_timezone_validators() -> bool:
     return all(ok for _, ok in results)
 
 
+def test_meteo_negative_cache() -> bool:
+    """Regression: error results are negative-cached with a short TTL.
+
+    During an API outage every waiter queued on _cache_lock used to run its own
+    full fetch serially (no cache entry was ever written on error). Network-free:
+    replaces _fetch_weather_data with a counting stub, so no weather API is hit.
+    """
+    from ..meteo import WEATHER_ERROR_CACHE_TTL_S, WeatherService
+
+    results: list[tuple[str, bool]] = []
+    weather = WeatherService(lat=48.15, lon=11.58, stat_name="TestStation")
+    fetch_count = 0
+
+    def fetch_error() -> dict[str, Any]:
+        nonlocal fetch_count
+        fetch_count += 1
+        return {"error": "Alle Wetter-APIs nicht verfügbar", "timestamp": "test"}
+
+    weather._fetch_weather_data = fetch_error  # type: ignore[method-assign]
+
+    first = weather.get_weather_data()
+    results.append(
+        (
+            "First call fetches and returns the error dict unchanged",
+            "error" in first and fetch_count == 1,
+        )
+    )
+
+    second = weather.get_weather_data()
+    results.append(
+        (
+            "Second call within error TTL is served from cache (no refetch)",
+            second is first and fetch_count == 1,
+        )
+    )
+
+    # Age the cached error past its short TTL → must refetch.
+    weather._cache_time -= WEATHER_ERROR_CACHE_TTL_S + 1
+    weather.get_weather_data()
+    results.append(("Expired error entry triggers a refetch", fetch_count == 2))
+
+    # Recovery: a successful fetch replaces the cached error...
+    def fetch_ok() -> dict[str, Any]:
+        nonlocal fetch_count
+        fetch_count += 1
+        return {"temperatur_celsius": 21.5, "timestamp": "test"}
+
+    weather._fetch_weather_data = fetch_ok  # type: ignore[method-assign]
+    weather._cache_time -= WEATHER_ERROR_CACHE_TTL_S + 1
+    fourth = weather.get_weather_data()
+    results.append(
+        (
+            "Recovered fetch replaces the cached error",
+            "error" not in fourth and fetch_count == 3,
+        )
+    )
+
+    # ...and the success entry outlives the short error TTL (long TTL applies).
+    weather._cache_time -= WEATHER_ERROR_CACHE_TTL_S + 1
+    fifth = weather.get_weather_data()
+    results.append(
+        (
+            "Cached success outlives the error TTL (success TTL applies)",
+            fifth is fourth and fetch_count == 3,
+        )
+    )
+
+    for label, ok in results:
+        status = "✅ PASS" if ok else "❌ FAIL"
+        if has_console:
+            print(f"    {status} | {label}")
+
+    return all(ok for _, ok in results)
+
+
 async def run_all_tests(handler: Any) -> bool:
     """Run complete test suite for CommandHandler"""
     if has_console:
@@ -96,6 +171,7 @@ async def run_all_tests(handler: Any) -> bool:
     await _ensure_storage(handler)
 
     meteo_tz_passed = test_meteo_timezone_validators()
+    meteo_cache_passed = test_meteo_negative_cache()
     basic_passed = test_reception_logic(handler)
     intent_passed = test_intent_based_reception_logic(handler)
     edge_passed = await test_reception_edge_cases(handler)
@@ -110,6 +186,7 @@ async def run_all_tests(handler: Any) -> bool:
     total_passed = all(
         [
             meteo_tz_passed,
+            meteo_cache_passed,
             basic_passed,
             intent_passed,
             edge_passed,

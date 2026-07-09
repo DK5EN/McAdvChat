@@ -1,5 +1,6 @@
 """WeatherCommandMixin: weather command handler."""
 
+import asyncio
 from typing import Any
 
 from ..logging_setup import get_logger
@@ -37,7 +38,11 @@ class WeatherCommandMixin(CommandHandlerBase):
 
             # SSE-06: bypass the REST-facing cache — a ham operator asking !wx
             # over the mesh expects a live reading, not a stale cached one.
-            weather_data = self.weather_service.get_weather_data(bypass_cache=True)
+            # to_thread: the fetch is synchronous httpx with retries (up to ~96 s
+            # worst case) and must not block the event loop.
+            weather_data = await asyncio.to_thread(
+                self.weather_service.get_weather_data, bypass_cache=True
+            )
 
             if "error" in weather_data:
                 logger.warning("Weather error: %s", weather_data["error"])
