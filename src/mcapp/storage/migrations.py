@@ -14,6 +14,7 @@ from .constants import (
     BUCKET_SECONDS,
     CREATE_SCHEMA_SQL,
     CREATE_SCHEMA_V2_SQL,
+    SQLITE_BUSY_TIMEOUT_S,
     VALID_RSSI_RANGE,
     VALID_SNR_RANGE,
     compute_conversation_key,
@@ -35,7 +36,7 @@ class MigrationsMixin(StorageBase):
             conn.commit()
 
         def _init_db() -> None:  # noqa: PLR0912, PLR0915 - complex handler kept intact
-            with sqlite3.connect(self.db_path) as conn:
+            with sqlite3.connect(self.db_path, timeout=SQLITE_BUSY_TIMEOUT_S) as conn:
                 # Enable WAL mode for better concurrent read/write performance
                 conn.execute("PRAGMA journal_mode=WAL")
 
@@ -317,7 +318,10 @@ class MigrationsMixin(StorageBase):
                     # UDP 2.0 Track U (Wave U2): tag each signal_log row with its
                     # transport ('mheard' = BLE MHeard, 'lora' = UDP Extern-UDP) so
                     # overlapping BLE+UDP signal sources on one node are distinguishable.
-                    conn.execute("ALTER TABLE signal_log ADD COLUMN source TEXT")
+                    try:
+                        conn.execute("ALTER TABLE signal_log ADD COLUMN source TEXT")
+                    except sqlite3.OperationalError:
+                        logger.debug("Column source already exists in signal_log, skipping")
                     conn.execute("UPDATE signal_log SET source = 'mheard' WHERE source IS NULL")
                     logger.info(
                         "Migration v%d → v19: added signal_log.source column"

@@ -11,7 +11,7 @@ from typing import Any, cast
 
 from ..logging_setup import get_logger
 from ._base import StorageBase
-from .constants import compute_conversation_key
+from .constants import SQLITE_BUSY_TIMEOUT_S, compute_conversation_key
 
 logger = get_logger(__name__)
 
@@ -54,7 +54,7 @@ class PrefsMixin(StorageBase):
         """
 
         def _run() -> int:
-            with sqlite3.connect(self.db_path) as conn:
+            with sqlite3.connect(self.db_path, timeout=SQLITE_BUSY_TIMEOUT_S) as conn:
                 if dst == "Time":
                     cursor = conn.execute(
                         "DELETE FROM messages WHERE conversation_key = '*'"
@@ -102,7 +102,7 @@ class PrefsMixin(StorageBase):
         """Bulk replace all rows in a flat identifier-list table."""
 
         def _run() -> None:
-            with sqlite3.connect(self.db_path) as conn:
+            with sqlite3.connect(self.db_path, timeout=SQLITE_BUSY_TIMEOUT_S) as conn:
                 conn.execute(f"DELETE FROM {table}")  # noqa: S608 - table from fixed whitelist
                 if values:
                     conn.executemany(

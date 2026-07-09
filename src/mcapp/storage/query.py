@@ -42,6 +42,7 @@ from .constants import (
     PRUNE_TARGET_FRACTION,
     SECONDS_PER_DAY,
     SEVEN_DAYS_MS,
+    SQLITE_BUSY_TIMEOUT_S,
     STATION_RETENTION_DAYS,
     TELEMETRY_BUCKET_MS,
     VALID_RSSI_RANGE,
@@ -319,7 +320,7 @@ class QueryMixin(StorageBase):
         window_cutoff_ms = now_ms() - LONG_RETENTION_DAYS * SECONDS_PER_DAY * 1000
 
         def _run() -> tuple[dict[str, Any], dict[str, Any]]:
-            conn = sqlite3.connect(self.db_path)
+            conn = sqlite3.connect(self.db_path, timeout=SQLITE_BUSY_TIMEOUT_S)
             conn.row_factory = sqlite3.Row
             conn.execute("PRAGMA journal_mode=WAL")
             conn.execute("PRAGMA query_only=ON")

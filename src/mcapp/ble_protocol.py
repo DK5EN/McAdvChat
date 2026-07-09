@@ -133,9 +133,14 @@ def _decode_data_frame(  # noqa: PLR0913 - all fields are needed from the shared
     if payload_type == PAYLOAD_TYPE_MSG:
         split_idx = remaining_msg.find(b":")
     elif payload_type == PAYLOAD_TYPE_POS:
-        split_idx = remaining_msg.find(b"*") + 1
+        star_idx = remaining_msg.find(b"*")
+        if star_idx == -1:
+            logger.warning("Invalid binary frame: destination separator not found")
+            return None
+        split_idx = star_idx + 1
     else:
         logger.warning("Payload type not matched! %d", payload_type)
+        return None
 
     if split_idx == -1:
         logger.warning("Invalid binary frame: destination separator not found")
