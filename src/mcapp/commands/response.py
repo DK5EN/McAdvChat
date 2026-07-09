@@ -15,6 +15,14 @@ from .constants import CHUNK_SEND_DELAY_SECONDS, MAX_CHUNKS, MAX_RESPONSE_LENGTH
 
 logger = get_logger(__name__)
 
+# Shutdown drain budget for in-flight chunk sends: one inter-chunk gap
+# (CHUNK_SEND_DELAY_SECONDS = 12 s) plus margin for the final publish, so a
+# response caught mid-gap can still deliver its next chunk. main.py's shutdown
+# ladder budgets ~16 s across its other steps and mcapp.service relies on
+# systemd's default TimeoutStopSec of 90 s, so 15 s here keeps the worst-case
+# shutdown around 31 s — comfortably inside the SIGKILL deadline.
+RESPONSE_DRAIN_TIMEOUT_S = 15.0
+
 
 class ResponseMixin(CommandHandlerBase):
     """Mixin providing response sending and chunking methods."""
@@ -22,15 +30,33 @@ class ResponseMixin(CommandHandlerBase):
     def _init_response(self) -> None:
         """Initialize response background-task tracking. Called from CommandHandler.__init__."""
         self._response_bg_tasks: set[asyncio.Task[Any]] = set()
+        # Per-recipient serialization so two multi-chunk replies to the same
+        # station queue instead of interleaving their "(n/m)" sequences on air.
+        # Refcounted so entries are removed once no task holds or waits on them.
+        self._response_locks: dict[str, asyncio.Lock] = {}
+        self._response_lock_refs: dict[str, int] = {}
 
     async def stop_pending_responses(self) -> None:
-        """Cancel in-flight background chunk-sends. Call during shutdown."""
+        """Drain in-flight background chunk-sends, cancelling stragglers. Call during shutdown."""
         pending = [task for task in self._response_bg_tasks if not task.done()]
-        for task in pending:
-            task.cancel()
         if pending:
-            with contextlib.suppress(Exception):
-                await asyncio.gather(*pending, return_exceptions=True)
+            # Let multi-chunk replies finish naturally — a user who already saw
+            # "(1/3)" should still receive chunks 2-3. Transports (BLE/UDP) are
+            # stopped after this in main.py's _shutdown_services, so sends still work.
+            _done, still_pending = await asyncio.wait(pending, timeout=RESPONSE_DRAIN_TIMEOUT_S)
+            if still_pending:
+                recipients = sorted(
+                    {task.get_name().partition(":")[2] or "?" for task in still_pending}
+                )
+                logger.warning(
+                    "Shutdown cut off %d response(s) mid-transmission (recipients: %s)",
+                    len(still_pending),
+                    ", ".join(recipients),
+                )
+                for task in still_pending:
+                    task.cancel()
+                with contextlib.suppress(Exception):
+                    await asyncio.gather(*still_pending, return_exceptions=True)
         self._response_bg_tasks.clear()
 
     async def send_response(self, response: str, recipient: str, src_type: str = "udp") -> None:
@@ -44,11 +70,36 @@ class ResponseMixin(CommandHandlerBase):
             return
 
         chunks = self._chunk_response(response)
-        task = asyncio.create_task(self._send_chunks(chunks, recipient, src_type))
+        # Task name carries the recipient so stop_pending_responses can report
+        # who was cut off without keeping a parallel task→recipient map.
+        task = asyncio.create_task(
+            self._send_chunks(chunks, recipient, src_type), name=f"send_chunks:{recipient}"
+        )
         self._response_bg_tasks.add(task)
         task.add_done_callback(self._response_bg_tasks.discard)
 
     async def _send_chunks(self, chunks: list[str], recipient: str, src_type: str) -> None:
+        """Serialize chunk sends per recipient, then transmit.
+
+        Holding the recipient's lock for the full multi-chunk run means a second
+        reply to the same station queues behind the first instead of interleaving
+        its "(n/m)" sequence on air. Different recipients stay concurrent.
+        """
+        key = recipient.upper()
+        lock = self._response_locks.setdefault(key, asyncio.Lock())
+        self._response_lock_refs[key] = self._response_lock_refs.get(key, 0) + 1
+        try:
+            async with lock:
+                await self._transmit_chunks(chunks, recipient, src_type)
+        finally:
+            remaining = self._response_lock_refs[key] - 1
+            if remaining:
+                self._response_lock_refs[key] = remaining
+            else:
+                del self._response_lock_refs[key]
+                del self._response_locks[key]
+
+    async def _transmit_chunks(self, chunks: list[str], recipient: str, src_type: str) -> None:
         """Send response chunks in order, preserving the 12 s LoRa airtime spacing."""
         logger.debug(
             "send_response: recipient='%s', my_callsign='%s', equal=%s",

@@ -161,6 +161,108 @@ def test_meteo_negative_cache() -> bool:
     return all(ok for _, ok in results)
 
 
+async def test_response_serialization_and_drain() -> bool:
+    """C-06 follow-up: per-recipient chunk serialization + graceful shutdown drain.
+
+    Network-free: uses a standalone ResponseMixin harness with a recording
+    router, and shrinks the module delay/drain constants so no real 12 s
+    inter-chunk sleeps happen.
+    """
+    from . import response as response_module
+
+    class _RecordingRouter:
+        def __init__(self) -> None:
+            self.sent: list[str] = []
+
+        async def publish(self, _source: str, _topic: str, data: dict[str, Any]) -> None:
+            self.sent.append(data["msg"])
+
+    class _Harness(response_module.ResponseMixin):
+        def __init__(self) -> None:
+            self._init_response()
+            self.message_router = _RecordingRouter()
+            self.storage_handler = None
+            self.my_callsign = "DK5EN-99"
+
+    def _content_letter(msg: str) -> str:
+        # Strip the "(n/m) " chunk header and return the first payload char.
+        return msg.split(") ", 1)[1][0] if msg.startswith("(") else msg[0]
+
+    # Two-part responses that _chunk_response splits on ", " into 2 chunks each.
+    resp_ab = ("A" * 100) + ", " + ("B" * 100)
+    resp_cd = ("C" * 100) + ", " + ("D" * 100)
+
+    results: list[tuple[str, bool]] = []
+    orig_delay = response_module.CHUNK_SEND_DELAY_SECONDS
+    orig_drain = response_module.RESPONSE_DRAIN_TIMEOUT_S
+    try:
+        response_module.CHUNK_SEND_DELAY_SECONDS = 0.01
+
+        # Scenario 1: two replies to the SAME recipient must not interleave.
+        handler1 = _Harness()
+        await handler1.send_response(resp_ab, "OE1AAA-1")
+        await handler1.send_response(resp_cd, "OE1AAA-1")
+        await asyncio.gather(*list(handler1._response_bg_tasks))
+        order = "".join(_content_letter(m) for m in handler1.message_router.sent)
+        results.append((f"Same-recipient replies stay in order (got '{order}')", order == "ABCD"))
+        results.append(
+            (
+                "Per-recipient lock dict is cleaned up after completion",
+                not handler1._response_locks and not handler1._response_lock_refs,
+            )
+        )
+
+        # Scenario 2: a different recipient is NOT blocked by an in-flight reply.
+        handler2 = _Harness()
+        response_module.CHUNK_SEND_DELAY_SECONDS = 0.05
+        await handler2.send_response(resp_ab, "OE1AAA-1")  # 2 chunks, sleeps between
+        await handler2.send_response("E" * 20, "OE2BBB-2")  # 1 chunk, no sleep
+        await asyncio.gather(*list(handler2._response_bg_tasks))
+        order2 = "".join(_content_letter(m) for m in handler2.message_router.sent)
+        results.append(
+            (
+                f"Other recipient's chunk goes out during the gap (got '{order2}')",
+                order2 == "AEB",
+            )
+        )
+
+        # Scenario 3: shutdown drains a nearly-done send instead of cancelling it.
+        handler3 = _Harness()
+        await handler3.send_response(resp_ab, "OE3CCC-3")
+        await asyncio.sleep(0)  # let chunk 1 go out, task now sleeping before chunk 2
+        await handler3.stop_pending_responses()
+        results.append(
+            (
+                "stop_pending_responses drains both chunks of an in-flight reply",
+                len(handler3.message_router.sent) == 2,  # both chunks of the two-chunk reply
+            )
+        )
+
+        # Scenario 4: after the drain timeout, stragglers are cancelled and tracked set cleared.
+        handler4 = _Harness()
+        response_module.CHUNK_SEND_DELAY_SECONDS = 5.0
+        response_module.RESPONSE_DRAIN_TIMEOUT_S = 0.02
+        await handler4.send_response(resp_ab, "OE4DDD-4")
+        await asyncio.sleep(0)  # chunk 1 out, task sleeping 5 s before chunk 2
+        await handler4.stop_pending_responses()
+        results.append(
+            (
+                "Drain timeout cancels the straggler (only chunk 1 sent)",
+                len(handler4.message_router.sent) == 1 and not handler4._response_bg_tasks,
+            )
+        )
+    finally:
+        response_module.CHUNK_SEND_DELAY_SECONDS = orig_delay
+        response_module.RESPONSE_DRAIN_TIMEOUT_S = orig_drain
+
+    for label, ok in results:
+        status = "✅ PASS" if ok else "❌ FAIL"
+        if has_console:
+            print(f"    {status} | {label}")
+
+    return all(ok for _, ok in results)
+
+
 async def run_all_tests(handler: Any) -> bool:
     """Run complete test suite for CommandHandler"""
     if has_console:
@@ -172,6 +274,7 @@ async def run_all_tests(handler: Any) -> bool:
 
     meteo_tz_passed = test_meteo_timezone_validators()
     meteo_cache_passed = test_meteo_negative_cache()
+    response_passed = await test_response_serialization_and_drain()
     basic_passed = test_reception_logic(handler)
     intent_passed = test_intent_based_reception_logic(handler)
     edge_passed = await test_reception_edge_cases(handler)
@@ -187,6 +290,7 @@ async def run_all_tests(handler: Any) -> bool:
         [
             meteo_tz_passed,
             meteo_cache_passed,
+            response_passed,
             basic_passed,
             intent_passed,
             edge_passed,
