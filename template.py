@@ -5,6 +5,7 @@ Public API:
     fingerprint(text)     -- 12-hex-char SHA-1 of the normalised text
     is_exempt(tokens, category, dst)  -- auto-beacon exemption from precomputed parts
     check_only(msg, category)         -- convenience: tokenizes msg and checks exemption
+    is_short_token_exempt(text, min_tokens) -- short-token-only check on raw text
     update_and_check(storage, msg, now_ms) -> BeaconResult
 """
 
@@ -114,6 +115,18 @@ def is_exempt(tokens: list[str], category: str, dst: str) -> bool:
     is_human_category = category in _HUMAN_CATEGORIES
     is_directed = _DIRECTED_DST_RE.match(dst.strip().upper()) is not None
     return is_short or is_human_category or is_directed
+
+
+def is_short_token_exempt(text: str, min_tokens: int) -> bool:
+    """True if ``text`` normalizes to <= ``min_tokens`` tokens.
+
+    Public wrapper around ``_tokenize_normalized()`` for callers that only
+    need the short-token half of ``is_exempt()``'s exemption check (e.g.
+    ``Storage.clear_stale_auto_beacons``'s periodic sweep re-evaluating
+    stored ``example_msg`` text against the current ``min_tokens``
+    threshold), not the full category/directedness decision.
+    """
+    return len(_tokenize_normalized(text)) <= min_tokens
 
 
 def check_only(msg: dict[str, Any], category: str = "") -> bool:
