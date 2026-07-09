@@ -74,11 +74,17 @@ def build_prefs_router(manager: SSEManager) -> APIRouter:
     # Delete messages by destination
     @router.post("/api/delete_messages")
     async def delete_messages(body: DeleteMessagesRequest) -> dict[str, int | str]:
-        """Delete all messages for a destination from the database."""
+        """Delete all messages for a destination from the database.
+
+        Clients may omit own_call; for a DM dst an empty own_call would
+        degenerate the conversation key to 'X<>X' (matching no rows), so
+        fall back to the proxy's configured callsign server-side.
+        """
         storage = manager.require_storage()
-        deleted = await storage.delete_messages_by_dst(
-            body.dst, body.own_call, read_key=body.read_key
+        own_call = body.own_call or (
+            (manager.message_router.my_callsign or "") if manager.message_router else ""
         )
+        deleted = await storage.delete_messages_by_dst(body.dst, own_call, read_key=body.read_key)
         return {"status": "ok", "deleted": deleted}
 
     # mHeard sidebar endpoints (persist station order + hidden)

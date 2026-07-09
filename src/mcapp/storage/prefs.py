@@ -74,6 +74,16 @@ class PrefsMixin(StorageBase):
                         (dst,),
                     )
                 else:
+                    if not own_call:
+                        # Client bug: personal deletes need own_call (the route
+                        # layer falls back to the configured callsign, so this
+                        # means neither was available). The key below degenerates
+                        # to 'dst<>dst' and will match no rows.
+                        logger.warning(
+                            "delete_messages_by_dst: empty own_call for personal dst=%s;"
+                            " conversation key degenerates, nothing will be deleted",
+                            dst,
+                        )
                     conv_key = compute_conversation_key(own_call or dst, dst)
                     cursor = conn.execute(
                         "DELETE FROM messages WHERE conversation_key = ?"

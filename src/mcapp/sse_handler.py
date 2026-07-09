@@ -18,6 +18,7 @@ import asyncio
 import contextlib
 import json
 import pathlib
+import tempfile
 import time
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
@@ -27,7 +28,8 @@ from . import __version__
 from .ble_client import ConnectionState
 from .classifier import Classifier
 from .logging_setup import get_logger
-from .sqlite_storage import SQLiteStorage
+from .schemas import DeleteMessagesRequest
+from .sqlite_storage import SQLiteStorage, create_sqlite_storage
 from .util import now_ms
 
 SSE_CLIENT_QUEUE_SIZE = 256
@@ -686,13 +688,19 @@ def create_sse_manager(
 
 
 async def run_startup_tests() -> bool:
-    """UDP 2.0 Track U (U3) regression: UDP-lora signal reaches SSE clients live.
+    """SSE-layer regression suite.
 
-    A lora `pos`/`msg` packet is published as a plain `mesh_message` (same as any
-    other transport) and `_get_event_type` has no BLE-specific branch for it, so it
-    already falls through to the generic `mesh:message` event — the same path BLE
-    MHeard signal relies on. This proves that path still fires for a UDP-lora packet
-    without needing a dedicated signal SSE event.
+    1. UDP 2.0 Track U (U3): UDP-lora signal reaches SSE clients live.
+       A lora `pos`/`msg` packet is published as a plain `mesh_message` (same as any
+       other transport) and `_get_event_type` has no BLE-specific branch for it, so it
+       already falls through to the generic `mesh:message` event — the same path BLE
+       MHeard signal relies on. This proves that path still fires for a UDP-lora packet
+       without needing a dedicated signal SSE event.
+    2. DM delete own_call fallback: POST /api/delete_messages with an empty
+       own_call must resolve the proxy's configured callsign server-side —
+       an empty own_call used to degenerate the conversation key to 'X<>X',
+       silently deleting nothing. Ephemeral tempfile SQLite DB, mirroring the
+       storage test-suite pattern (never touches the live DB).
     """
     results: list[tuple[str, bool]] = []
 
@@ -741,6 +749,87 @@ async def run_startup_tests() -> bool:
                 and event_data.get("snr") == lora_pos["snr"],
             )
         )
+
+    # 2. DM delete own_call fallback via the real prefs route.
+    class _StubMessageRouter:
+        """Minimal MessageRouter stand-in: storage + configured callsign."""
+
+        def __init__(self, storage: SQLiteStorage, callsign: str) -> None:
+            self.storage_handler = storage
+            self.my_callsign = callsign
+
+        def subscribe(self, _topic: str, _handler: Any) -> None:
+            return
+
+    base_ts = 1_770_000_000_000
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        storage = await create_sqlite_storage(pathlib.Path(tmp_dir) / "sse_delete_test.db")
+        try:
+            dm_in = {
+                "msg_id": "BBBB0001",
+                "src": "OE5ABC-1",
+                "dst": "DK5EN-15",
+                "msg": "hi",
+                "type": "msg",
+                "src_type": "node",
+                "timestamp": base_ts + 1,
+            }
+            dm_out = {
+                "msg_id": "BBBB0002",
+                "src": "DK5EN-15",
+                "dst": "OE5ABC-1",
+                "msg": "hello back",
+                "type": "msg",
+                "src_type": "node",
+                "timestamp": base_ts + 2,
+            }
+            other_dm = {
+                "msg_id": "BBBB0003",
+                "src": "OE7FOO-1",
+                "dst": "OE9BAR-2",
+                "msg": "unrelated",
+                "type": "msg",
+                "src_type": "node",
+                "timestamp": base_ts + 3,
+            }
+            conversation_rows = (dm_in, dm_out)
+            for m in (*conversation_rows, other_dm):
+                await storage.store_message(m, json.dumps(m))
+
+            delete_manager = SSEManager(
+                host="127.0.0.1", port=0, message_router=_StubMessageRouter(storage, "DK5EN")
+            )
+            prefs_router = build_prefs_router(delete_manager)
+            delete_endpoint = next(
+                route.endpoint
+                for route in prefs_router.routes
+                if getattr(route, "path", "") == "/api/delete_messages"
+            )
+
+            # Client omits own_call (old webapp): key used to degenerate to
+            # 'OE5ABC<>OE5ABC' and delete nothing.
+            response = await delete_endpoint(
+                DeleteMessagesRequest(dst="OE5ABC-1", own_call="", read_key="OE5ABC")
+            )
+            results.append(
+                (
+                    "delete_messages with empty own_call deletes the DM conversation",
+                    response.get("deleted") == len(conversation_rows),
+                )
+            )
+
+            remaining = await storage._query(  # noqa: SLF001 - white-box startup test
+                "SELECT conversation_key FROM messages WHERE type = 'msg'"
+            )
+            keys = [row["conversation_key"] for row in remaining]
+            results.append(
+                (
+                    "fallback delete removes only the targeted conversation",
+                    keys == ["OE7FOO<>OE9BAR"],
+                )
+            )
+        finally:
+            await storage.close()
 
     for label, ok in results:
         print(f"    {'✅ PASS' if ok else '❌ FAIL'} | {label}")
