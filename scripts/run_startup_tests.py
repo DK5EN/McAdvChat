@@ -31,6 +31,7 @@ from mcapp.storage.conversation_key_tests import run_conversation_key_tests
 from mcapp.storage.migration_chain_tests import run_migration_chain_tests
 from mcapp.storage.query_tests import run_query_tests
 from mcapp.udp_handler import run_startup_tests as run_udp_handler_tests
+from mcapp.udp_parsing_tests import run_udp_parsing_tests
 
 
 async def main() -> int:
@@ -41,6 +42,9 @@ async def main() -> int:
 
     udp_ok = await run_udp_handler_tests()
     print(f"udp_handler: {'PASS' if udp_ok else 'FAIL'}")
+
+    udp_parsing_ok = await run_udp_parsing_tests()
+    print(f"udp_parsing: {'PASS' if udp_parsing_ok else 'FAIL'}")
 
     storage_ok = await run_storage_tests()
     print(f"storage: {'PASS' if storage_ok else 'FAIL'}")
@@ -85,6 +89,7 @@ async def main() -> int:
     all_ok = (
         suppression_ok
         and udp_ok
+        and udp_parsing_ok
         and storage_ok
         and sse_ok
         and classifier_ok
