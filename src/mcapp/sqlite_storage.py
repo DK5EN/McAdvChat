@@ -392,81 +392,140 @@ async def run_startup_tests() -> bool:  # noqa: PLR0915 - test suite lists one c
                 )
             )
 
-            # 8. In-memory 5-min accumulator: confirm lora signal shares the same
-            # _accumulate_signal/_flush_completed_buckets path BLE MHeard already used
-            # (Wave U3, change 2 — the nightly hourly rollup then works identically
-            # since it aggregates signal_buckets without regard to source).
+            # 8. In-memory 5-min accumulator (C2): the lora signal path shares
+            # _accumulate_signal/_flush_completed_buckets with BLE MHeard. Seed a
+            # deterministic MULTI-measurement bucket, force it to flush by writing a
+            # later bucket, then assert the EXACT flushed row — count AND the
+            # count-weighted rssi/snr averages — so rollup-math regressions are caught,
+            # not just row existence.
             bucket_ms = BUCKET_SECONDS * 1000
+            float_tol = 0.01  # local so the tolerance isn't a magic-value comparison
+            template_hash_len = 12  # ditto — used by the D4 classifier case below
+
+            def _approx(actual: float | None, expected: float) -> bool:
+                return actual is not None and abs(actual - expected) < float_tol
+
+            async def _bucket_rows(callsign: str) -> list[dict[str, Any]]:
+                return await storage._query(  # noqa: SLF001 - white-box startup test
+                    "SELECT bucket_ts, rssi_avg, rssi_min, rssi_max, snr_avg, snr_min,"
+                    " snr_max, count FROM signal_buckets WHERE callsign = ? ORDER BY bucket_ts",
+                    (callsign,),
+                )
+
             cs8b = "OE1XYZ-10"
-            msg_bucket_a = {
-                "msg_id": "AAAA0101",
+            b0 = base_ts + bucket_ms * 100  # base_ts is an exact multiple of bucket_ms
+            seed_rssi = [-90, -80, -70]  # by hand: mean = -240/3 = -80.0
+            seed_snr = [3, 5, 7]  # by hand: mean = 15/3 = 5.0
+            for i, (r, s) in enumerate(zip(seed_rssi, seed_snr, strict=True)):
+                m = {
+                    "msg_id": f"AAAA02{i:02d}",
+                    "src": cs8b,
+                    "dst": "*",
+                    "msg": f"bucket seed {i}",
+                    "type": "msg",
+                    "src_type": "lora",
+                    "timestamp": b0 + 1000 * (i + 1),  # same bucket, distinct timestamps
+                    "rssi": r,
+                    "snr": s,
+                }
+                await storage.store_message(m, json.dumps(m))
+            # A measurement two buckets later evicts + flushes the completed b0 bucket
+            # (the later bucket stays in the in-memory accumulator, unflushed).
+            m_flush = {
+                "msg_id": "AAAA0299",
                 "src": cs8b,
                 "dst": "*",
-                "msg": "",
-                "type": "pos",
-                "src_type": "lora",
-                "timestamp": base_ts + bucket_ms * 100,
-                "rssi": -90,
-                "snr": 4,
-                "lat": 1.0,
-                "lon": 1.0,
-            }
-            msg_bucket_b = {
-                "msg_id": "AAAA0102",
-                "src": cs8b,
-                "dst": "*",
-                "msg": "next bucket",
+                "msg": "flush trigger",
                 "type": "msg",
                 "src_type": "lora",
-                "timestamp": base_ts + bucket_ms * 102,
+                "timestamp": b0 + bucket_ms * 2,
                 "rssi": -85,
                 "snr": 6,
             }
-            await storage.store_message(msg_bucket_a, json.dumps(msg_bucket_a))
-            await storage.store_message(msg_bucket_b, json.dumps(msg_bucket_b))
-            live_bucket_rows = await storage._query(  # noqa: SLF001 - white-box startup test
-                "SELECT COUNT(*) as c FROM signal_buckets WHERE callsign = ?", (cs8b,)
-            )
+            await storage.store_message(m_flush, json.dumps(m_flush))
+
+            live_buckets = await _bucket_rows(cs8b)
+            exp_rssi_avg = sum(seed_rssi) / len(seed_rssi)  # -80.0
+            exp_snr_avg = sum(seed_snr) / len(seed_snr)  # 5.0
             results.append(
                 (
-                    "live 5-min accumulator flushes a completed bucket for lora signal",
-                    live_bucket_rows[0]["c"] >= 1,
+                    "live accumulator: exactly one completed bucket flushed",
+                    len(live_buckets) == 1,
+                )
+            )
+            lb = live_buckets[0] if live_buckets else {}
+            results.append(
+                (
+                    "live accumulator: flushed bucket has exact count + count-weighted "
+                    "rssi/snr averages (min/max too)",
+                    lb.get("bucket_ts") == b0
+                    and lb.get("count") == len(seed_rssi)
+                    and _approx(lb.get("rssi_avg"), exp_rssi_avg)
+                    and _approx(lb.get("snr_avg"), exp_snr_avg)
+                    and lb.get("rssi_min") == min(seed_rssi)
+                    and lb.get("rssi_max") == max(seed_rssi)
+                    and _approx(lb.get("snr_min"), min(seed_snr))
+                    and _approx(lb.get("snr_max"), max(seed_snr)),
                 )
             )
 
-            # 9. D5 backfill: populate signal_log from historical `messages` rows that
-            # predate Track U (inserted directly, bypassing store_message/_ingest_signal).
+            # 9. D5 backfill (C2): seed SEVERAL historical lora rows in ONE bucket with
+            # known rssi/snr (inserted directly, bypassing store_message/_ingest_signal),
+            # then assert the rebuilt signal_buckets row carries the exact count AND the
+            # count-weighted averages produced by the SQL AVG() rollup — not just existence.
             cs9 = "OE1XYZ-11"
-            # Must be within backfill_signal_log's retention window, which is relative
-            # to real wall-clock time — the deterministic base_ts (fixed at an
-            # arbitrary past date) would fall outside it.
-            backfill_ts = now_ms() - 3600_000
-            await storage._mutate(  # noqa: SLF001 - white-box startup test
-                "INSERT INTO messages"
-                " (msg_id, src, dst, msg, type, timestamp, rssi, snr, src_type, raw_json)"
-                " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                ("BBBB0001", cs9, "*", "", "pos", backfill_ts, -92, 6, "lora", "{}"),
-            )
+            # backfill_signal_log's retention window is relative to real wall-clock time,
+            # so the deterministic base_ts (a fixed past date) would fall outside it —
+            # anchor the seed rows to a bucket ~1h ago instead.
+            bf_bucket = ((now_ms() - 3600_000) // bucket_ms) * bucket_ms
+            bf_rssi = [-100, -90, -80]  # by hand: AVG = -270/3 = -90.0
+            bf_snr = [2, 4, 6]  # by hand: AVG = 12/3 = 4.0
+            for i, (r, s) in enumerate(zip(bf_rssi, bf_snr, strict=True)):
+                await storage._mutate(  # noqa: SLF001 - white-box startup test
+                    "INSERT INTO messages"
+                    " (msg_id, src, dst, msg, type, timestamp, rssi, snr, src_type, raw_json)"
+                    " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    (
+                        f"BBBB000{i}",
+                        cs9,
+                        "*",
+                        "",
+                        "pos",
+                        bf_bucket + 1000 * (i + 1),  # same bucket, distinct timestamps
+                        r,
+                        s,
+                        "lora",
+                        "{}",
+                    ),
+                )
             summary1 = await storage.backfill_signal_log()
             results.append(
                 (
-                    "backfill: scans and inserts historical lora message",
-                    summary1["inserted"] == 1 and not summary1["skipped"],
+                    "backfill: scans and inserts every historical lora row",
+                    summary1["inserted"] == len(bf_rssi) and not summary1["skipped"],
                 )
             )
             results.append(
                 (
-                    "backfill: signal_log populated for historical row",
-                    await _signal_row_count(cs9) == 1,
+                    "backfill: signal_log populated for every historical row",
+                    await _signal_row_count(cs9) == len(bf_rssi),
                 )
             )
-            backfill_bucket_rows = await storage._query(  # noqa: SLF001 - white-box startup test
-                "SELECT COUNT(*) as c FROM signal_buckets WHERE callsign = ?", (cs9,)
-            )
+            bf_buckets = await _bucket_rows(cs9)
+            bf = bf_buckets[0] if bf_buckets else {}
             results.append(
                 (
-                    "backfill: signal_buckets rebuilt for the backfilled callsign",
-                    backfill_bucket_rows[0]["c"] >= 1,
+                    "backfill: signal_buckets rebuilt as one bucket with exact count + "
+                    "count-weighted averages (min/max too)",
+                    len(bf_buckets) == 1
+                    and bf.get("bucket_ts") == bf_bucket
+                    and bf.get("count") == len(bf_rssi)
+                    and _approx(bf.get("rssi_avg"), sum(bf_rssi) / len(bf_rssi))
+                    and _approx(bf.get("snr_avg"), sum(bf_snr) / len(bf_snr))
+                    and bf.get("rssi_min") == min(bf_rssi)
+                    and bf.get("rssi_max") == max(bf_rssi)
+                    and _approx(bf.get("snr_min"), min(bf_snr))
+                    and _approx(bf.get("snr_max"), max(bf_snr)),
                 )
             )
 
@@ -475,6 +534,96 @@ async def run_startup_tests() -> bool:  # noqa: PLR0915 - test suite lists one c
                 (
                     "backfill: idempotent re-run is a no-op (marker present)",
                     summary2["skipped"] is True,
+                )
+            )
+
+            # D4(a): store_message()'s inline classifier-annotation path with a REAL
+            # Classifier — every classifier column on the stored row must be populated.
+            from .classifier.classify import Classifier  # noqa: PLC0415 - local subtree import
+
+            await storage.bump_classifier_version()  # 0 → 1 so classifier_ver is meaningful
+            await storage.insert_classifier_rule(
+                name="test-weather",
+                pattern=r"wetter",
+                category="weather",
+                scope="msg",
+                extra_tags=["wx"],
+                priority=10,
+            )
+            real_classifier = Classifier(storage)
+            await real_classifier.load()
+            storage.set_classifier(real_classifier)
+
+            msg_d4a = {
+                "msg_id": "D4A00001",
+                "src": "OE1XYZ-20",
+                "dst": "20",
+                "msg": "wetter aktuell sonnig",
+                "type": "msg",
+                "src_type": "node",
+                "timestamp": now_ms(),
+            }
+            await storage.store_message(msg_d4a, json.dumps(msg_d4a))
+            d4a_rows = await storage._query(  # noqa: SLF001 - white-box startup test
+                "SELECT category, tags, info_score, template_hash, classifier_ver"
+                " FROM messages WHERE msg_id = ?",
+                ("D4A00001",),
+            )
+            d4a = d4a_rows[0] if d4a_rows else {}
+            d4a_tags = json.loads(d4a["tags"]) if d4a.get("tags") else []
+            results.append(
+                (
+                    "store_message + real classifier: category populated from a matching rule",
+                    d4a.get("category") == "weather",
+                )
+            )
+            results.append(
+                (
+                    "store_message + real classifier: tags populated (non-empty JSON array)",
+                    bool(d4a_tags) and "wx" in d4a_tags,
+                )
+            )
+            results.append(
+                (
+                    "store_message + real classifier: info_score/template_hash/classifier_ver "
+                    "all populated (non-NULL)",
+                    d4a.get("info_score") is not None
+                    and d4a.get("template_hash") is not None
+                    and len(d4a["template_hash"]) == template_hash_len
+                    and d4a.get("classifier_ver") == 1,
+                )
+            )
+
+            # D4(b): a classifier whose classify() RAISES must NOT block ingestion — the
+            # row is still stored. Design invariant: "the pipeline never blocks on
+            # classifier bugs" (doc/spam-filter-BE.md §5 — store_message() is meant to
+            # fall back to category='other' rather than propagate the exception).
+            class _RaisingClassifier:
+                async def classify(self, _message: dict[str, Any]) -> Any:
+                    raise RuntimeError("classifier boom")
+
+            storage.set_classifier(_RaisingClassifier())
+            msg_d4b = {
+                "msg_id": "D4B00001",
+                "src": "OE1XYZ-21",
+                "dst": "20",
+                "msg": "ingestion must survive a classifier failure",
+                "type": "msg",
+                "src_type": "node",
+                "timestamp": now_ms(),
+            }
+            try:
+                await storage.store_message(msg_d4b, json.dumps(msg_d4b))
+            except Exception:
+                logger.exception("D4(b): store_message propagated a classifier exception")
+            d4b_rows = await storage._query(  # noqa: SLF001 - white-box startup test
+                "SELECT COUNT(*) as c FROM messages WHERE msg_id = ?", ("D4B00001",)
+            )
+            results.append(
+                (
+                    "store_message: classifier exception does not block ingestion "
+                    "(row still stored)",
+                    d4b_rows[0]["c"] == 1,
                 )
             )
         finally:

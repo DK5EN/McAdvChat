@@ -57,6 +57,37 @@ def run_suppression_tests(router: "MessageRouter") -> bool:
         (router.my_callsign, "*", "!WX", True, "Ungültiges Ziel → suppress"),
         (router.my_callsign, "ALL", "!WX", True, "Ungültiges Ziel → suppress"),
         ("OE5HWN-12", "20", "!WX", False, "Nicht unsere Message → nicht suppessen"),
+        (
+            router.my_callsign.lower(),
+            "test",
+            "!wx",
+            True,
+            "Kleinschreibung src/dst wird normalisiert (upper) → wie Test-Gruppe ohne Target, "
+            "lokal",
+        ),
+        (
+            router.my_callsign,
+            "20",
+            "!WX OE5HWN-12{045",
+            False,
+            "Message-ID-Suffix {NNN} wird vor Routing-Entscheidung entfernt → Ziel bleibt "
+            "OE5HWN-12, senden",
+        ),
+        (
+            router.my_callsign,
+            "20",
+            "Hallo Gruppe, alles klar?",
+            False,
+            "Nicht-Kommando Text (kein '!') an Gruppe → immer weiterleiten, nie lokal unterdrücken",
+        ),
+        (
+            router.my_callsign,
+            "20,OE5ABC-1*",
+            "!WX",
+            True,
+            "Via-Pfad im dst (Komma) wird NICHT gestrippt (strip_relay_path gilt nur für src) "
+            "→ ungültiges Ziel, lokal unterdrückt",
+        ),
     ]
 
     results: list[tuple[str, str, bool, bool, str]] = []

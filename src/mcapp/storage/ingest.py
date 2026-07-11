@@ -711,27 +711,31 @@ class IngestMixin(StorageBase):
             return
 
         # Inline classification (before INSERT so columns land in the same row).
-        # Classifier.classify() has its own fallback; NULL columns mean "no
-        # classifier wired yet" and will be picked up by a later reclassify run.
+        # Classification must NEVER block ingestion (ADR invariant): any classifier
+        # failure falls back to NULL columns, which a later reclassify run picks up.
+        # Classifier.classify() has its own fallback, but we do not rely on that —
+        # a misbehaving classifier must not drop the message.
+        cls_cols = (None, None, None, None, None)
         if self._classifier is not None:
-            cls = await self._classifier.classify(
-                {
-                    "msg": msg,
-                    "src": callsign,
-                    "dst": dst,
-                    "type": msg_type,
-                    "timestamp": timestamp,
-                }
-            )
-            cls_cols = (
-                cls.category,
-                json.dumps(list(cls.tags)),
-                cls.info_score,
-                cls.template_hash,
-                cls.classifier_version,
-            )
-        else:
-            cls_cols = (None, None, None, None, None)
+            try:
+                cls = await self._classifier.classify(
+                    {
+                        "msg": msg,
+                        "src": callsign,
+                        "dst": dst,
+                        "type": msg_type,
+                        "timestamp": timestamp,
+                    }
+                )
+                cls_cols = (
+                    cls.category,
+                    json.dumps(list(cls.tags)),
+                    cls.info_score,
+                    cls.template_hash,
+                    cls.classifier_version,
+                )
+            except Exception:
+                logger.exception("Classifier failed for msg from %s; storing unclassified", src)
 
         params = (
             msg_id,
