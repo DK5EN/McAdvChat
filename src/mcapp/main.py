@@ -1488,6 +1488,7 @@ class _BackgroundTasks:
     classifier_stats_task: asyncio.Task[None]
     backfill_task: asyncio.Task[None]
     signal_backfill_task: asyncio.Task[None]
+    sperrliste_task: asyncio.Task[None]
 
 
 def _start_background_tasks(
@@ -1506,11 +1507,16 @@ def _start_background_tasks(
             ctx.classifier, ctx.storage_handler, ctx.sse_manager, stop_event
         )
     )
+    # V9.4: one-shot — fetch the curated global blocklist (sperrliste.json) and
+    # merge it into blocked_callsigns, then broadcast. Non-blocking; a failed fetch
+    # just leaves admin kickbans in place.
+    sperrliste_task = asyncio.create_task(ctx.command_handler.load_sperrliste())
     return _BackgroundTasks(
         prune_task=prune_task,
         classifier_stats_task=classifier_stats_task,
         backfill_task=backfill_task,
         signal_backfill_task=signal_backfill_task,
+        sperrliste_task=sperrliste_task,
     )
 
 

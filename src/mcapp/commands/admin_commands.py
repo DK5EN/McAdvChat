@@ -53,6 +53,7 @@ class AdminCommandsMixin(CommandHandlerBase):
         if kwargs.get("callsign") == "delall":
             count = len(self.blocked_callsigns)
             self.blocked_callsigns.clear()
+            await self._broadcast_blocked_callsigns()  # V9.4: push the update to SSE clients
             return f"✅ Cleared {count} blocked callsign(s)"
 
         callsign = kwargs.get("callsign", "").upper()
@@ -70,6 +71,7 @@ class AdminCommandsMixin(CommandHandlerBase):
         if action == "del":
             if callsign in self.blocked_callsigns:
                 self.blocked_callsigns.remove(callsign)
+                await self._broadcast_blocked_callsigns()  # V9.4
                 return f"✅ {callsign} unblocked"
             return f"ℹ️ {callsign} was not blocked"
 
@@ -78,4 +80,5 @@ class AdminCommandsMixin(CommandHandlerBase):
             return f"ℹ️ {callsign} already blocked"
 
         self.blocked_callsigns.add(callsign)
+        await self._broadcast_blocked_callsigns()  # V9.4
         return f"🚫 {callsign} blocked"

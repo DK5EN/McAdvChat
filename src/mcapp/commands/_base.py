@@ -58,6 +58,11 @@ class CommandHandlerBase(Protocol):
     async def stop_pending_responses(self) -> None:
         raise NotImplementedError
 
+    # CommandHandler → called by AdminCommandsMixin after a kickban/unblock mutation
+    # to push the updated blocklist to SSE clients (V9.4).
+    async def _broadcast_blocked_callsigns(self) -> None:
+        raise NotImplementedError
+
     # RoutingMixin → called by AdminCommandsMixin, TopicBeaconMixin, CTCPingMixin
     def _is_admin(self, callsign: str) -> bool:
         raise NotImplementedError

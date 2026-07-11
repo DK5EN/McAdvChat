@@ -248,6 +248,21 @@ class SSEManager:
                     },
                     SSEManager._RESPONSE_EVENT_MAP["blocked_texts"],
                 )
+            # V9.4: blocked callsigns (sperrliste loaded server-side + admin kickbans),
+            # owned by the CommandHandler. Non-empty only, mirroring blocked_texts.
+            command_handler = (
+                self.message_router.get_protocol("commands") if self.message_router else None
+            )
+            blocked_callsigns = sorted(getattr(command_handler, "blocked_callsigns", set()))
+            if blocked_callsigns:
+                yield self.format_sse_event(
+                    {
+                        "type": "response",
+                        "msg": "blocked_callsigns",
+                        "data": blocked_callsigns,
+                    },
+                    SSEManager._RESPONSE_EVENT_MAP["blocked_callsigns"],
+                )
             sidebar = await storage.get_mheard_sidebar()
             if sidebar:
                 yield self.format_sse_event(
@@ -488,6 +503,7 @@ class SSEManager:
         "read_counts": "proxy:read_counts",
         "hidden_destinations": "proxy:hidden_destinations",
         "blocked_texts": "proxy:blocked_texts",
+        "blocked_callsigns": "proxy:blocked_callsigns",
         "mheard_sidebar": "proxy:mheard_sidebar",
         "wx_sidebar": "proxy:wx_sidebar",
         "messages_page": "proxy:messages_page",

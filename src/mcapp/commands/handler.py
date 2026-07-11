@@ -4,6 +4,8 @@ from __future__ import annotations
 
 from typing import Any
 
+import httpx
+
 from ..logging_setup import get_logger
 from .admin_commands import AdminCommandsMixin
 from .ctcping import CTCPingMixin
@@ -14,6 +16,12 @@ from .routing import RoutingMixin
 from .simple_commands import SimpleCommandsMixin
 from .topic_beacon import TopicBeaconMixin
 from .weather_command import WeatherCommandMixin
+
+# Curated global blocklist, maintained in the McApp repo. Loaded server-side on
+# startup (V9.4) so the whole deployment shares one list — the webapp used to
+# fetch this directly from the browser, which failed silently on a LAN-only Pi
+# and never covered the oevsv.at internet firehose.
+SPERRLISTE_URL = "https://raw.githubusercontent.com/DK5EN/McApp/main/sperrliste.json"
 
 # Command registry with handler functions and metadata
 COMMANDS = {
@@ -176,6 +184,54 @@ class CommandHandler(
         from .tests import run_all_tests  # noqa: PLC0415 - test suite loaded on demand
 
         return await run_all_tests(self)
+
+    async def load_sperrliste(self, url: str = SPERRLISTE_URL) -> None:
+        """Fetch the curated global blocklist and merge it into blocked_callsigns
+        (V9.4). Called once at startup. Best-effort: a fetch/parse failure logs and
+        leaves the current set (admin kickbans) untouched — the deployment simply
+        runs with whatever is already blocked. Merges (union) rather than replaces so
+        it never clobbers live admin kickbans. Broadcasts the resulting set so clients
+        that connected before the fetch completed pick it up.
+        """
+        try:
+            async with httpx.AsyncClient(timeout=httpx.Timeout(10.0)) as client:
+                response = await client.get(url)
+            response.raise_for_status()
+            data: Any = response.json()
+        except (httpx.HTTPError, ValueError) as exc:
+            logger.warning("Could not load sperrliste from %s: %s", url, exc)
+            return
+
+        if not isinstance(data, list) or not all(isinstance(item, str) for item in data):
+            logger.warning("Sperrliste from %s has an unexpected format; ignoring", url)
+            return
+
+        added = {item.upper() for item in data} - self.blocked_callsigns
+        self.blocked_callsigns.update(item.upper() for item in data)
+        logger.info(
+            "Loaded sperrliste: %d entries (%d new); blocklist now %d callsign(s)",
+            len(data),
+            len(added),
+            len(self.blocked_callsigns),
+        )
+        await self._broadcast_blocked_callsigns()
+
+    async def _broadcast_blocked_callsigns(self) -> None:
+        """Push the current blocked_callsigns set to all SSE clients as
+        proxy:blocked_callsigns (V9.4). No-op if the SSE transport isn't wired.
+        Called on startup load and after every admin kickban/unblock mutation.
+        """
+        sse = self.message_router.get_protocol("sse") if self.message_router else None
+        if sse is None or not hasattr(sse, "broadcast_event"):
+            return
+        await sse.broadcast_event(
+            "proxy:blocked_callsigns",
+            {
+                "type": "response",
+                "msg": "blocked_callsigns",
+                "data": sorted(self.blocked_callsigns),
+            },
+        )
 
 
 def create_command_handler(  # noqa: PLR0913 - signature fixed by call sites
