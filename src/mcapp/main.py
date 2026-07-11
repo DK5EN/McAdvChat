@@ -1582,20 +1582,35 @@ async def main() -> None:
     else:
         logger.info("BLE: disabled")
 
-    suppression_passed = True  # Default values
-    command_handler_passed = True
-
+    # Startup smoke check — NON-FATAL by design.
+    #
+    # This service is a resilient always-on proxy: it intentionally proceeds even
+    # if the smoke check below fails, so a transient/environmental test hiccup can
+    # never keep the mesh bridge offline. It is NOT an authoritative test gate.
+    #
+    # The AUTHORITATIVE, exit-code-gated runner is `scripts/run_startup_tests.py`
+    # (all 6 suites: suppression, commands, storage, udp, sse, classifier). That
+    # runner uses ephemeral/isolated state and is the thing CI/release must trust.
+    #
+    # We deliberately run ONLY the suppression suite here. It is read-only: it
+    # exercises `router.validator` pure logic against throwaway dicts and never
+    # mutates live transport/handler state. The command suite is NOT run in-app —
+    # `command_handler.run_all_tests()` mutates the LIVE handler (blocked_callsigns,
+    # group_responses_enabled, active_pings, beacons) while UDP/BLE are already
+    # listening, which would corrupt real mesh traffic and ping/beacon state during
+    # the test window. Run it (and the storage/udp/sse/classifier suites) via
+    # `scripts/run_startup_tests.py` instead.
     if check_console():
-        logger.info("Running suppression logic tests...")
+        logger.info("Running suppression logic smoke check...")
         suppression_passed = ctx.message_router.test_suppression_logic()
 
-        logger.info("Running command handler test suite...")
-        command_handler_passed = await ctx.command_handler.run_all_tests()
-
-        if suppression_passed and command_handler_passed:
-            logger.info("All tests passed! System ready.")
+        if suppression_passed:
+            logger.info("Suppression smoke check passed. System ready.")
         else:
-            logger.warning("Some tests failed. Check implementation.")
+            logger.warning(
+                "Suppression smoke check failed — proceeding anyway (non-fatal). "
+                "Run scripts/run_startup_tests.py for the authoritative gate."
+            )
 
     ### unit tests
 

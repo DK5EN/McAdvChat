@@ -1,31 +1,97 @@
 """Extracted test suite for CommandHandler."""
 
 import asyncio
+import json
 import re
+import tempfile
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 
+from ..util import now_ms
 from .constants import has_console
 from .parsing import parse_command
 
-# Test fixture DB: copy from production via
-#   scp mcapp.local:/var/lib/mcapp/messages.db tests/fixtures/messages.db
-_TEST_DB_PATH = Path(__file__).resolve().parents[3] / "tests" / "fixtures" / "messages.db"
+# --- Hermetic storage fixture (B1) ------------------------------------------
+# The storage-backed self-commands (!STATS / !MHEARD / !SEARCH / !POS) used to
+# depend on a gitignored 32 MB production DB scp'd into tests/fixtures. That made
+# the suite non-hermetic (fails on a fresh clone). Instead we build an ephemeral
+# tempfile SQLite DB at suite start and seed it with a deterministic handful of
+# messages/positions through the real store_message() path, so every count below
+# is exact and reproducible offline.
+_SEED_POS_LAT = 48.1234
+_SEED_POS_LON = 11.5678
+# Expected aggregates over the seed set (see _seed_test_storage):
+_SEED_MSG_COUNT = 3  # type='msg' rows
+_SEED_POS_COUNT = 2  # type='pos' rows
+_SEED_TOTAL = _SEED_MSG_COUNT + _SEED_POS_COUNT
+_SEED_STATIONS = 2  # distinct msg src: OE1AAA-1, OE1BBB-2
+_SEED_AAA_MSG = 2  # OE1AAA-1 message rows
+_SEED_AAA_POS = 1  # OE1AAA-1 position rows
 
 
-async def _ensure_storage(handler: Any) -> None:
-    """Attach a read-only test storage if handler has none and fixture DB exists."""
-    if handler.storage_handler:
-        return
-    if not _TEST_DB_PATH.exists():
-        if has_console:
-            print(f"    (no test DB at {_TEST_DB_PATH}, storage tests will show errors)")
-        return
-    from ..sqlite_storage import create_sqlite_storage
+async def _seed_test_storage(storage: Any) -> None:
+    """Seed the ephemeral DB with a deterministic dataset via real store_message().
 
-    handler.storage_handler = await create_sqlite_storage(str(_TEST_DB_PATH))
-    if has_console:
-        print(f"    Loaded test DB: {_TEST_DB_PATH}")
+    Timestamps are ``now_ms()`` minus small offsets so every row lands inside the
+    default lookback window of each command (24 h stats, 1 day search, 7 day pos).
+    ``src_type='udp'`` keeps rows out of the MHeard/BLE-beacon fast path and out of
+    ``_should_filter_message``.
+    """
+    base = now_ms()
+    rows = [
+        {
+            "msg_id": "SEEDM001",
+            "src": "OE1AAA-1",
+            "dst": "20",
+            "msg": "Hello one",
+            "type": "msg",
+            "src_type": "udp",
+            "timestamp": base - 1_000,
+        },
+        {
+            "msg_id": "SEEDM002",
+            "src": "OE1AAA-1",
+            "dst": "20",
+            "msg": "Hello two",
+            "type": "msg",
+            "src_type": "udp",
+            "timestamp": base - 2_000,
+        },
+        {
+            "msg_id": "SEEDM003",
+            "src": "OE1BBB-2",
+            "dst": "20",
+            "msg": "Hi there",
+            "type": "msg",
+            "src_type": "udp",
+            "timestamp": base - 3_000,
+        },
+        {
+            "msg_id": "SEEDP001",
+            "src": "OE1CCC-3",
+            "dst": "*",
+            "msg": "",
+            "type": "pos",
+            "src_type": "udp",
+            "timestamp": base - 4_000,
+            "lat": 48.3000,
+            "lon": 16.4000,
+        },
+        {
+            "msg_id": "SEEDP002",
+            "src": "OE1AAA-1",
+            "dst": "*",
+            "msg": "",
+            "type": "pos",
+            "src_type": "udp",
+            "timestamp": base - 5_000,
+            "lat": _SEED_POS_LAT,
+            "lon": _SEED_POS_LON,
+        },
+    ]
+    for row in rows:
+        await storage.store_message(row, json.dumps(row))
 
 
 def test_meteo_timezone_validators() -> bool:
@@ -161,7 +227,7 @@ def test_meteo_negative_cache() -> bool:
     return all(ok for _, ok in results)
 
 
-async def test_response_serialization_and_drain() -> bool:
+async def test_response_serialization_and_drain() -> bool:  # noqa: PLR0915 - one assertion per scenario
     """C-06 follow-up: per-recipient chunk serialization + graceful shutdown drain.
 
     Network-free: uses a standalone ResponseMixin harness with a recording
@@ -192,6 +258,21 @@ async def test_response_serialization_and_drain() -> bool:
     resp_ab = ("A" * 100) + ", " + ("B" * 100)
     resp_cd = ("C" * 100) + ", " + ("D" * 100)
 
+    async def _wait_until(pred: Any, max_wait: float = 5.0) -> bool:
+        """Poll observed state instead of relying on an elapsed-time cliff (B4).
+
+        Returns True as soon as ``pred()`` holds; False if it never holds within
+        ``max_wait`` seconds. Yields control each iteration so background
+        chunk-send tasks make progress.
+        """
+        loop = asyncio.get_event_loop()
+        deadline = loop.time() + max_wait
+        while not pred():
+            if loop.time() >= deadline:
+                return False
+            await asyncio.sleep(0)
+        return True
+
     results: list[tuple[str, bool]] = []
     orig_delay = response_module.CHUNK_SEND_DELAY_SECONDS
     orig_drain = response_module.RESPONSE_DRAIN_TIMEOUT_S
@@ -213,8 +294,10 @@ async def test_response_serialization_and_drain() -> bool:
         )
 
         # Scenario 2: a different recipient is NOT blocked by an in-flight reply.
+        # A ≥0.5 s inter-chunk gap removes the timing cliff: OE2BBB-2's single chunk
+        # reliably lands in the gap between OE1AAA-1's two chunks (order A, E, B).
         handler2 = _Harness()
-        response_module.CHUNK_SEND_DELAY_SECONDS = 0.05
+        response_module.CHUNK_SEND_DELAY_SECONDS = 0.5
         await handler2.send_response(resp_ab, "OE1AAA-1")  # 2 chunks, sleeps between
         await handler2.send_response("E" * 20, "OE2BBB-2")  # 1 chunk, no sleep
         await asyncio.gather(*list(handler2._response_bg_tasks))
@@ -227,9 +310,13 @@ async def test_response_serialization_and_drain() -> bool:
         )
 
         # Scenario 3: shutdown drains a nearly-done send instead of cancelling it.
+        # Poll until chunk 1 is observed on the wire (task now sleeping before
+        # chunk 2) rather than trusting a bare `sleep(0)` to have advanced it.
         handler3 = _Harness()
+        response_module.CHUNK_SEND_DELAY_SECONDS = 0.05
         await handler3.send_response(resp_ab, "OE3CCC-3")
-        await asyncio.sleep(0)  # let chunk 1 go out, task now sleeping before chunk 2
+        chunk1_out = await _wait_until(lambda: len(handler3.message_router.sent) == 1)
+        results.append(("Chunk 1 observed before drain (scenario 3 setup)", chunk1_out))
         await handler3.stop_pending_responses()
         results.append(
             (
@@ -243,7 +330,8 @@ async def test_response_serialization_and_drain() -> bool:
         response_module.CHUNK_SEND_DELAY_SECONDS = 5.0
         response_module.RESPONSE_DRAIN_TIMEOUT_S = 0.02
         await handler4.send_response(resp_ab, "OE4DDD-4")
-        await asyncio.sleep(0)  # chunk 1 out, task sleeping 5 s before chunk 2
+        # Poll until chunk 1 is out (task now sleeping 5 s before chunk 2).
+        await _wait_until(lambda: len(handler4.message_router.sent) == 1)
         await handler4.stop_pending_responses()
         results.append(
             (
@@ -264,28 +352,57 @@ async def test_response_serialization_and_drain() -> bool:
 
 
 async def run_all_tests(handler: Any) -> bool:
-    """Run complete test suite for CommandHandler"""
+    """Run complete test suite for CommandHandler.
+
+    Builds an ephemeral, hermetic tempfile SQLite DB (B1), attaches it to both the
+    handler and its MessageRouter (so the real inbound blocklist path can be
+    exercised), seeds a deterministic dataset, runs every suite, then tears the DB
+    down again.
+    """
+    from ..sqlite_storage import create_sqlite_storage
+
     if has_console:
         print("\n" + "=" * 60)
         print("🧪 COMMAND HANDLER TEST SUITE")
         print("=" * 60)
 
-    await _ensure_storage(handler)
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        db_path = Path(tmp_dir) / "commands_test.db"
+        storage = await create_sqlite_storage(db_path)
+        await _seed_test_storage(storage)
 
-    meteo_tz_passed = test_meteo_timezone_validators()
-    meteo_cache_passed = test_meteo_negative_cache()
-    response_passed = await test_response_serialization_and_drain()
-    basic_passed = test_reception_logic(handler)
-    intent_passed = test_intent_based_reception_logic(handler)
-    edge_passed = await test_reception_edge_cases(handler)
-    kickban_passed = await test_kickban_logic(handler)
-    blocking_passed = test_message_blocking_integration(handler)
-    topic_passed = await test_topic_logic(handler)
-    ctcping_passed = await test_ctcping_logic(handler)
-    self_exec_passed = await test_self_command_execution(handler)
-    self_suppress_passed = await test_self_command_suppression_logic(handler)
-    remote_exec_passed = await test_remote_command_execution(handler)
-    incoming_personal_passed = await test_incoming_personal_commands(handler)
+        prev_handler_storage = handler.storage_handler
+        prev_router_storage = (
+            handler.message_router.storage_handler if handler.message_router else None
+        )
+        handler.storage_handler = storage
+        if handler.message_router is not None:
+            handler.message_router.storage_handler = storage
+
+        try:
+            meteo_tz_passed = test_meteo_timezone_validators()
+            meteo_cache_passed = test_meteo_negative_cache()
+            response_passed = await test_response_serialization_and_drain()
+            basic_passed = test_reception_logic(handler)
+            intent_passed = test_intent_based_reception_logic(handler)
+            edge_passed = await test_reception_edge_cases(handler)
+            kickban_passed = await test_kickban_logic(handler)
+            topic_passed = await test_topic_logic(handler)
+            ctcping_passed = await test_ctcping_logic(handler)
+            self_exec_passed = await test_self_command_execution(handler)
+            self_suppress_passed = await test_self_command_suppression_logic(handler)
+            remote_exec_passed = await test_remote_command_execution(handler)
+            incoming_personal_passed = await test_incoming_personal_commands(handler)
+            # Run last: this test writes a couple of rows into the shared ephemeral
+            # DB via the real ingestion path, which would otherwise perturb the
+            # exact-count assertions in test_self_command_execution above.
+            blocking_passed = await test_message_blocking_integration(handler)
+        finally:
+            await storage.close()
+            handler.storage_handler = prev_handler_storage
+            if handler.message_router is not None:
+                handler.message_router.storage_handler = prev_router_storage
+
     total_passed = all(
         [
             meteo_tz_passed,
@@ -466,7 +583,7 @@ def test_reception_logic(handler: Any) -> bool:
             True,
             True,
             "direct",
-            "Direkt ohne Target (User) → keine Ausführung",
+            "Direkt an uns ohne Target (User) → direkte Ausführung",
         ),
         (
             handler.admin_callsign_base,
@@ -1264,65 +1381,89 @@ async def test_kickban_logic(handler: Any) -> bool:  # noqa: PLR0912 - complex h
     return passed == total
 
 
-def test_message_blocking_integration(handler: Any) -> bool:
-    """Test message blocking integration logic"""
+async def test_message_blocking_integration(handler: Any) -> bool:
+    """Drive the REAL inbound blocklist path (A1).
+
+    Rather than re-implementing ``callsign in blocked_callsigns`` and asserting
+    against the test's own table (a tautology that never exercised production
+    code), this feeds message dicts through ``MessageRouter._storage_handler`` —
+    the actual ingestion hook that calls ``_is_callsign_blocked`` — and verifies a
+    blocked src is dropped (never stored) while a non-blocked src is stored. The
+    production predicate ``_is_callsign_blocked`` is asserted directly too.
+
+    Own-callsign behavior is verified against real code: there is no special
+    "own callsign always passes" branch — it passes solely because the callsign
+    is never in ``blocked_callsigns`` (handle_kickban refuses to add it).
+    """
     if has_console:
-        print("\n🧪 Testing Message Blocking Integration:")
+        print("\n🧪 Testing Message Blocking Integration (real inbound path):")
         print("=" * 45)
 
-    test_callsigns = [
-        ("OE1ABC-5", False, "Blocked callsign should be filtered"),
-        ("W1XYZ-1", True, "Non-blocked callsign should pass"),
-        ("DK5EN-1", True, "Own callsign should always pass"),
-        ("oe1abc-5", False, "Blocked callsign (lowercase) should be filtered"),
-    ]
+    router = handler.message_router
+    results: list[tuple[str, str, bool]] = []
 
-    results = []
+    if router is None or handler.storage_handler is None:
+        if has_console:
+            print("⏭️  Skipped: no MessageRouter/storage in this test context")
+        return True
+
+    storage = handler.storage_handler
+
+    async def _row_exists(msg_id: str) -> bool:
+        rows = await storage._query("SELECT 1 FROM messages WHERE msg_id = ? LIMIT 1", (msg_id,))
+        return bool(rows)
+
+    async def _route(src: str, msg_id: str) -> None:
+        message_data = {
+            "src": src,
+            "dst": "20",
+            "msg": f"blocking probe {msg_id}",
+            "type": "msg",
+            "src_type": "udp",
+            "msg_id": msg_id,
+            "timestamp": now_ms(),
+        }
+        await router._storage_handler({"data": message_data})
 
     old_blocked: Any = getattr(handler, "blocked_callsigns", set())
     handler.blocked_callsigns = {"OE1ABC-5"}
 
+    # Each case: source callsign, msg_id, whether it should end up stored, label.
+    cases = [
+        ("OE1ABC-5", "BLK00001", False, "Blocked src is dropped (not stored)"),
+        ("W1XYZ-1", "BLK00002", True, "Non-blocked src is stored"),
+        ("oe1abc-5", "BLK00003", False, "Blocked src (lowercase) is normalized and dropped"),
+        (handler.my_callsign, "BLK00004", True, "Own callsign passes (never in blocklist)"),
+    ]
+
     try:
-        for callsign, should_pass, description in test_callsigns:
-            callsign_upper = callsign.upper()
-            is_blocked = callsign_upper in handler.blocked_callsigns
-            result_correct = (not is_blocked) == should_pass
-
-            status = "✅ PASS" if result_correct else "❌ FAIL"
-            results.append((status, description, result_correct))
-
-            if has_console:
-                print(f"{status} | {description}")
-                print(
-                    f"     Callsign:"
-                    f" {callsign} ->"
-                    f" {callsign_upper},"
-                    f" Blocked: {is_blocked},"
-                    f" Should pass: {should_pass}"
-                )
-
-        edge_cases = [
-            ("", False, "Empty callsign should be blocked"),
-            ("INVALID_FORMAT", True, "Invalid format should pass (handled elsewhere)"),
+        # Assert the production predicate directly (not a re-implemented `in`).
+        pred_checks = [
+            ("_is_callsign_blocked('OE1ABC-5') is True", router._is_callsign_blocked("OE1ABC-5")),
+            (
+                "_is_callsign_blocked('W1XYZ-1') is False",
+                not router._is_callsign_blocked("W1XYZ-1"),
+            ),
+            (
+                "_is_callsign_blocked(own) is False",
+                not router._is_callsign_blocked(handler.my_callsign),
+            ),
         ]
+        for label, ok in pred_checks:
+            status = "✅ PASS" if ok else "❌ FAIL"
+            results.append((status, label, ok))
+            if has_console:
+                print(f"{status} | {label}")
 
-        for callsign, should_pass, description in edge_cases:
-            callsign_upper = callsign.upper()
-            is_blocked = callsign_upper in handler.blocked_callsigns if callsign_upper else True
-            result_correct = (not is_blocked) == should_pass
-
-            status = "✅ PASS" if result_correct else "❌ FAIL"
-            results.append((status, description, result_correct))
-
+        for src, msg_id, should_store, description in cases:
+            await _route(src, msg_id)
+            stored = await _row_exists(msg_id)
+            ok = stored == should_store
+            status = "✅ PASS" if ok else "❌ FAIL"
+            results.append((status, description, ok))
             if has_console:
                 print(f"{status} | {description}")
-                print(
-                    f"     Callsign:"
-                    f" '{callsign}' ->"
-                    f" '{callsign_upper}',"
-                    f" Blocked: {is_blocked},"
-                    f" Should pass: {should_pass}"
-                )
+                print(f"     src={src} stored={stored} (expected {should_store})")
 
     finally:
         handler.blocked_callsigns = old_blocked
@@ -1461,6 +1602,46 @@ async def test_topic_logic(handler: Any) -> bool:  # noqa: PLR0912, PLR0915 - co
                 print(f"{status} | {description}")
                 print(f"     Exception: {e}")
                 print()
+
+    # C3: assert active_topics STATE (not just the response substring) around a
+    # create/delete cycle — key present with the stored interval and a live task
+    # after create, key absent after delete.
+    try:
+        create_res = await handler.handle_topic(
+            {"group": "52", "text": "State check", "interval": 45}, handler.admin_callsign_base
+        )
+        entry = handler.active_topics.get("52")
+        create_state_ok = (
+            "✅ beacon started" in create_res.lower()
+            and entry is not None
+            and entry["interval"] == 45
+            and not entry["task"].done()
+        )
+        status = "✅ PASS" if create_state_ok else "❌ FAIL"
+        results.append((status, "Create beacon updates active_topics state", create_state_ok))
+        if has_console:
+            print(f"{status} | Create beacon updates active_topics state")
+            if not create_state_ok:
+                print(f"     Result: '{create_res}' | entry: {entry}")
+
+        delete_res = await handler.handle_topic(
+            {"action": "delete", "group": "52"}, handler.admin_callsign_base
+        )
+        delete_state_ok = (
+            "✅ beacon stopped" in delete_res.lower() and "52" not in handler.active_topics
+        )
+        status = "✅ PASS" if delete_state_ok else "❌ FAIL"
+        results.append((status, "Delete beacon clears active_topics state", delete_state_ok))
+        if has_console:
+            print(f"{status} | Delete beacon clears active_topics state")
+            if not delete_state_ok:
+                print(
+                    f"     Result: '{delete_res}' | still present: {'52' in handler.active_topics}"
+                )
+    except Exception as e:
+        results.append(("❌ ERROR", "active_topics state checks", False))
+        if has_console:
+            print(f"❌ ERROR | active_topics state checks - Exception: {e}")
 
     # Test beacon listing with active beacons
     try:
@@ -1679,10 +1860,19 @@ async def test_ctcping_logic(handler: Any) -> bool:  # noqa: PLR0912, PLR0915 - 
         finally:
             handler.blocked_callsigns = old_blocked
 
-    # Cleanup
+    # Cleanup. B5: the simulated echo flows spawn a 30 s `_ping_timeout_task` per
+    # echo; clearing active_pings alone leaves those tasks alive until the whole
+    # process exits. Cancel and drain everything tracked in `_ping_bg_tasks` so no
+    # timeout task outlives the suite.
     handler.active_pings.clear()
     if hasattr(handler, "ping_tests"):
         handler.ping_tests.clear()
+    if hasattr(handler, "_ping_bg_tasks") and handler._ping_bg_tasks:
+        leaked = list(handler._ping_bg_tasks)
+        for task in leaked:
+            task.cancel()
+        await asyncio.gather(*leaked, return_exceptions=True)
+        handler._ping_bg_tasks.clear()
 
     passed = sum(1 for r in results if r[2])
     total = len(results)
@@ -1703,7 +1893,7 @@ async def test_ctcping_logic(handler: Any) -> bool:  # noqa: PLR0912, PLR0915 - 
     return passed == total
 
 
-async def _test_simulated_ping_flows(handler: Any, results: list[Any]) -> None:  # noqa: PLR0915 - complex handler kept intact
+async def _test_simulated_ping_flows(handler: Any, results: list[Any]) -> None:  # noqa: PLR0912, PLR0915 - complex handler kept intact
     """Test simulated ping flows with mock echo/ACK responses"""
     if has_console:
         print("\n🔄 Testing Simulated Ping Flows:")
@@ -1805,13 +1995,23 @@ async def _test_simulated_ping_flows(handler: Any, results: list[Any]) -> None: 
             await handler._handle_ack_message(ack_data)
 
             pings_after = len(handler.active_pings)
-            ack_ignored = (pings_before == pings_after) == should_ignore
+            count_unchanged = (pings_before == pings_after) == should_ignore
+            # C6: an invalid ACK must not just leave the *count* unchanged — the
+            # specific tracked ping "456" must still be present. A bug that dropped
+            # ALL pings on any ACK would keep two of three counts equal and slip
+            # through; asserting the key survives catches it.
+            ping_survives = "456" in handler.active_pings
+            ack_ignored = count_unchanged and ping_survives
 
             status = "✅ PASS" if ack_ignored else "❌ FAIL"
             results.append((status, description, ack_ignored))
 
             if has_console:
                 print(f"{status} | {description}")
+                if not ack_ignored:
+                    print(
+                        f"     ❌ count_unchanged={count_unchanged}, '456' present={ping_survives}"
+                    )
 
         except Exception as e:
             status = "❌ ERROR"
@@ -1819,84 +2019,227 @@ async def _test_simulated_ping_flows(handler: Any, results: list[Any]) -> None: 
             if has_console:
                 print(f"{status} | {description} - Exception: {e}")
 
+    # A5: real timeout test. The "Timeout Scenario" above only asserted the ping
+    # was *tracked*; here we inject a short timeout and verify the ping actually
+    # leaves active_pings AND the timeout is recorded on its PingTest.
+    await _test_real_ping_timeout(handler, results)
 
-async def test_self_command_execution(handler: Any) -> bool:  # noqa: PLR0912, PLR0915 - complex handler kept intact
-    """Test that all self-commands (src=dst=my_callsign) execute locally"""
+
+async def _test_real_ping_timeout(handler: Any, results: list[Any]) -> None:
+    """A5: inject a ~0.05 s ACK timeout and assert the ping really times out.
+
+    Registers a RUNNING PingTest (total_pings=2 so a single timeout doesn't
+    trigger the completion cascade), tracks an echo, awaits the spawned timeout
+    task, then asserts the ping left active_pings and the timeout was recorded on
+    the PingTest (see ctcping.py `_ping_timeout_task` / `_record_ping_result`).
+    """
+    import time
+
+    from .ctcping import PingTest
+
+    orig_timeout = handler.ping_timeout
+    test_id = "a5-timeout-test"
+    dst = "TN789"
+    echo_id = "789"
+
+    handler.ping_tests[test_id] = PingTest(
+        test_id=test_id,
+        target=dst,
+        requester=handler.my_callsign,
+        total_pings=2,
+        payload_size=25,
+        start_time=time.time(),
+    )
+    handler.ping_timeout = 0.05
+    tasks_before = set(handler._ping_bg_tasks)
+
+    try:
+        echo_data = {
+            "src": handler.my_callsign,
+            "dst": dst,
+            "msg": "[CTC] Ping test 1/1 to measure roundtrip{" + echo_id,
+        }
+        await handler._handle_echo_message(echo_data)
+
+        tracked = echo_id in handler.active_pings
+        status = "✅ PASS" if tracked else "❌ FAIL"
+        results.append((status, "Real timeout: ping tracked before deadline", tracked))
+        if has_console:
+            print(f"{status} | Real timeout: ping tracked before deadline")
+
+        # Await exactly the timeout task this echo spawned (not the leaked 30 s
+        # tasks from earlier scenarios, which stay in tasks_before).
+        new_tasks = handler._ping_bg_tasks - tasks_before
+        if new_tasks:
+            await asyncio.gather(*new_tasks, return_exceptions=True)
+
+        left = echo_id not in handler.active_pings
+        test_summary = handler.ping_tests.get(test_id)
+        recorded = (
+            test_summary is not None
+            and test_summary.timeouts == 1
+            and any(r.get("status") == "timeout" for r in test_summary.results)
+        )
+        ok = left and recorded
+        status = "✅ PASS" if ok else "❌ FAIL"
+        results.append((status, "Real timeout: ping left active_pings + recorded", ok))
+        if has_console:
+            print(f"{status} | Real timeout: ping left active_pings + recorded")
+            if not ok:
+                print(f"     left={left} recorded={recorded}")
+
+    except Exception as e:
+        results.append(("❌ ERROR", "Real timeout test", False))
+        if has_console:
+            print(f"❌ ERROR | Real timeout test - Exception: {e}")
+
+    finally:
+        handler.ping_timeout = orig_timeout
+        handler.ping_tests.pop(test_id, None)
+
+
+async def test_self_command_execution(handler: Any) -> bool:  # noqa: PLR0915 - one assertion per command
+    """Test that self-commands (src=dst=my_callsign) execute locally AND return the
+    right thing.
+
+    Rewritten (A3/C1/B1/B2/B6): the old version accepted a response if ANY ONE of
+    several loosely-related substrings appeared — so `!WX` "passed" on the API-down
+    error string (it contains "weather"), `!TIME` checked a hard-coded stale year,
+    and `!DICE` matched an SSID that the headless bare callsign never produces. Each
+    command now has a structural assertion (ALL required parts) plus an explicit
+    "response does NOT start with ❌" guard. Storage-backed commands assert EXACT
+    counts against the hermetic seed set; `!WX` runs against a stubbed fetch (no
+    network).
+    """
     if has_console:
         print("\n🧪 Testing Self-Command Execution:")
         print("=" * 50)
 
-    test_cases = [
-        ("!WX", ["🌤️", "weather", "°C", "hPa"], "Weather command should return weather data"),
-        ("!TIME", ["🕐", "Uhr", "2025"], "Time command should return current time"),
-        ("!DICE", ["🎲", "DK5EN-1:", "[", "]", "→"], "Dice command should return dice roll"),
-        (
-            "!STATS",
-            ["📊", "Stats", "Messages:", "Positions:"],
-            "Stats command should return message statistics",
-        ),
-        ("!MHEARD LIMIT:5", ["📻", "MH:"], "MHeard command should return heard stations"),
-        ("!SEARCH CALL:DK5EN-1 DAYS:1", ["🔍"], "Search command should return search results"),
-        ("!POS CALL:DK5EN-1", ["🔍"], "Position search should return position data"),
-        ("!HELP", ["📋", "Available commands"], "Help command should return command list"),
-        ("!USERINFO", ["Node"], "User info should return node information"),
-    ]
+    results: list[tuple[str, str, bool]] = []
+    src = handler.my_callsign
+    current_year = str(datetime.now().astimezone().year)
 
-    results = []
+    async def _run(command: str) -> str:
+        should_execute, _ = handler._should_execute_command(src, src, command)
+        if not should_execute:
+            raise AssertionError(f"{command} should execute locally but routing denied it")
+        cmd_result = parse_command(command)
+        if not cmd_result:
+            raise AssertionError(f"{command} failed to parse")
+        cmd, kwargs = cmd_result
+        return await handler.execute_command(cmd, kwargs, src)
 
-    for command, expected_parts, description in test_cases:
+    def _record(label: str, ok: bool, response: str = "") -> None:
+        status = "✅ PASS" if ok else "❌ FAIL"
+        results.append((status, label, ok))
+        if has_console:
+            print(f"{status} | {label}")
+            if response:
+                print(f"     Response: {response[:120]}{'...' if len(response) > 120 else ''}")
+
+    async def _assert_cmd(label: str, command: str, check: Any) -> None:
         try:
-            if has_console:
-                print(f"\n🔄 Testing: {command}")
-
-            src = handler.my_callsign
-            dst = handler.my_callsign
-
-            should_execute, _target_type = handler._should_execute_command(src, dst, command)
-
-            if not should_execute:
-                status = "❌ FAIL"
-                results.append((status, description, False))
-                if has_console:
-                    print(f"❌ Command {command} should execute but doesn't")
-                continue
-
-            cmd_result = parse_command(command)
-            if not cmd_result:
-                status = "❌ FAIL"
-                results.append((status, description, False))
-                if has_console:
-                    print(f"❌ Command {command} failed to parse")
-                continue
-
-            cmd, kwargs = cmd_result
-            response = await handler.execute_command(cmd, kwargs, src)
-
-            response_lower = response.lower()
-            matches = [exp for exp in expected_parts if exp.lower() in response_lower]
-
-            success = len(matches) > 0
-            status = "✅ PASS" if success else "❌ FAIL"
-            results.append((status, description, success))
-
-            if has_console:
-                print(f"{status} | {description}")
-                print(f"     Command: {command}")
-                print(f"     Response: {response[:100]}{'...' if len(response) > 100 else ''}")
-                print(f"     Expected elements: {expected_parts}")
-                print(f"     Found elements: {matches}")
-                if not success:
-                    print(f"     ❌ Response should contain at least one of: {expected_parts}")
-                print()
-
+            response = await _run(command)
+            ok = not response.startswith("❌") and check(response)
+            _record(label, ok, response)
         except Exception as e:
-            status = "❌ ERROR"
-            results.append((status, description, False))
+            results.append(("❌ ERROR", label, False))
             if has_console:
-                print(f"❌ ERROR | {description}")
-                print(f"     Command: {command}")
-                print(f"     Exception: {e}")
-                print()
+                print(f"❌ ERROR | {label} - Exception: {e}")
+
+    # --- !WX: stub the fetch so no weather API is hit (B2); assert exact format ---
+    weather = handler.weather_service
+    if weather is None:
+        _record("!WX self-command returns formatted weather", False)
+    else:
+        canned: dict[str, Any] = {
+            "temperatur_celsius": 21.5,
+            "luftfeuchtigkeit_prozent": 55,
+            "luftdruck_hpa": 1013.2,
+            "windgeschwindigkeit_kmh": 0,  # < calm threshold → "windstill"
+            "timestamp": "test",
+        }
+        orig_fetch = weather._fetch_weather_data
+        weather._fetch_weather_data = lambda: canned  # type: ignore[method-assign]
+        try:
+            expected_wx = weather.format_for_lora(canned)
+            wx_response = await _run("!WX")
+            wx_ok = (
+                wx_response == expected_wx
+                and wx_response.startswith("🌤️")
+                and "21.5C" in wx_response
+                and "55%" in wx_response
+                and "1013.2hPa" in wx_response
+            )
+            _record(
+                "!WX self-command returns exact formatted weather (offline)", wx_ok, wx_response
+            )
+        finally:
+            weather._fetch_weather_data = orig_fetch  # type: ignore[method-assign]
+
+    # --- !TIME: structural, current (TZ-aware) year, not an error ---
+    await _assert_cmd(
+        "!TIME returns clock with current year",
+        "!TIME",
+        lambda r: "🕐" in r and "Uhr" in r and current_year in r,
+    )
+
+    # --- !DICE: dice-roll shape; requester prefix is the configured callsign ---
+    await _assert_cmd(
+        "!DICE returns a dice roll for our callsign",
+        "!DICE",
+        lambda r: all(part in r for part in ("🎲", f"{handler.my_callsign}:", "[", "]", "→")),
+    )
+
+    # --- Storage-backed commands: EXACT counts against the hermetic seed set (B1) ---
+    await _assert_cmd(
+        "!STATS returns exact seed aggregates",
+        "!STATS",
+        lambda r: all(
+            part in r
+            for part in (
+                "📊",
+                f"Messages: {_SEED_MSG_COUNT}",
+                f"Positions: {_SEED_POS_COUNT}",
+                f"Total: {_SEED_TOTAL}",
+                f"Active stations: {_SEED_STATIONS}",
+            )
+        ),
+    )
+    await _assert_cmd(
+        "!MHEARD lists exact seed stations/counts",
+        "!MHEARD LIMIT:5",
+        lambda r: all(
+            part in r
+            for part in ("📻 MH:", "OE1AAA-1", f"({_SEED_AAA_MSG})", "OE1BBB-2", "OE1CCC-3")
+        ),
+    )
+    await _assert_cmd(
+        "!SEARCH returns exact seed hit counts",
+        "!SEARCH CALL:OE1AAA-1 DAYS:1",
+        lambda r: all(
+            part in r for part in ("🔍", "OE1AAA-1", f"{_SEED_AAA_MSG} msg", f"{_SEED_AAA_POS} pos")
+        ),
+    )
+    await _assert_cmd(
+        "!POS returns the seeded latest position",
+        "!POS CALL:OE1AAA-1",
+        lambda r: "OE1AAA-1" in r and f"{_SEED_POS_LAT:.4f},{_SEED_POS_LON:.4f}" in r,
+    )
+
+    # --- !HELP: both structural markers required ---
+    await _assert_cmd(
+        "!HELP lists available commands",
+        "!HELP",
+        lambda r: "📋" in r and "Available commands" in r,
+    )
+
+    # --- !USERINFO: must echo the actual configured user_info_text (B6) ---
+    await _assert_cmd(
+        "!USERINFO echoes configured user_info_text",
+        "!USERINFO",
+        lambda r: r == handler.user_info_text,
+    )
 
     passed = sum(1 for r in results if r[2])
     total = len(results)
@@ -2024,7 +2367,7 @@ async def test_self_command_suppression_logic(handler: Any) -> bool:  # noqa: PL
     return passed == total
 
 
-async def test_remote_command_execution(handler: Any) -> bool:  # noqa: PLR0912 - complex handler kept intact
+async def test_remote_command_execution(handler: Any) -> bool:
     """Test that remote commands are properly forwarded to mesh"""
     if has_console:
         print("\n🧪 Testing Remote Command Execution:")
@@ -2041,25 +2384,18 @@ async def test_remote_command_execution(handler: Any) -> bool:  # noqa: PLR0912 
             "Weather command execute locally,forward result to mesh",
         ),
         (
-            "!TIME DK5EN-99",
-            "DK5EN-99",
-            False,
-            "mesh",
-            "Time command with matching target should execute locally",
-        ),
-        (
             "!WX DK5EN-99",
             "DK5EN-99",
             False,
             "mesh",
-            "Weather command with matching target should execute locally",
+            "Weather command with SSID-mismatch target (DK5EN-99 != DK5EN) forwards to mesh",
         ),
         (
             "!TIME DK5EN-99",
             "DK5EN-99",
             False,
             "mesh",
-            "Time command with non-matching target should forward to mesh",
+            "Time command with SSID-mismatch target (DK5EN-99 != DK5EN) forwards to mesh",
         ),
         (
             "!CTCPING TARGET:DK5EN-99 CALL:DK5EN-1",
@@ -2118,11 +2454,12 @@ async def test_remote_command_execution(handler: Any) -> bool:  # noqa: PLR0912 
 
             expected_execute = should_execute_locally
 
-            exec_match = should_execute == expected_execute
-
-            routing_correct = not should_execute if expected_routing == "mesh" else should_execute
-
-            overall_pass = exec_match and routing_correct
+            # A4: routing (local vs mesh) is fully determined by whether the command
+            # executes locally — `expected_routing` is the same bit as
+            # `should_execute_locally`. The old `routing_correct` recomputed that from
+            # the same column, so it could never disagree with this. Assert execution
+            # only; `expected_routing` remains for readable output.
+            overall_pass = should_execute == expected_execute
             status = "✅ PASS" if overall_pass else "❌ FAIL"
 
             results.append((status, description, overall_pass))
@@ -2134,16 +2471,10 @@ async def test_remote_command_execution(handler: Any) -> bool:  # noqa: PLR0912 
                 print(f"     Expected: {expected_routing}, Execute: {expected_execute}")
                 print(f"     Actual: Execute: {should_execute}, Type: {target_type}")
                 if not overall_pass:
-                    if not exec_match:
-                        print(
-                            f"     ❌ Execution"
-                            f" mismatch: got"
-                            f" {should_execute},"
-                            f" expected"
-                            f" {expected_execute}"
-                        )
-                    if not routing_correct:
-                        print(f"     ❌ Routing mismatch: expected {expected_routing}")
+                    print(
+                        f"     ❌ Execution mismatch: got {should_execute}, "
+                        f"expected {expected_execute}"
+                    )
                 print()
 
         except Exception as e:
@@ -2288,7 +2619,7 @@ async def test_incoming_personal_commands(handler: Any) -> bool:  # noqa: PLR091
             True,
             "direct",
             "OE5HWN-12",
-            "Stats request without target should not execute",
+            "Stats request direct to us without target should execute (reply to sender)",
         ),
         (
             "DK5EN-99",
@@ -2501,10 +2832,10 @@ async def test_incoming_personal_commands(handler: Any) -> bool:  # noqa: PLR091
             exec_match = should_execute_actual == should_execute
             type_match = target_type == expected_type
 
-            if should_execute and target_type == "direct":
-                actual_response_target = dst if src == handler.my_callsign else src
-            elif should_execute and target_type == "group":
-                actual_response_target = dst
+            # A2: call the real production resolver instead of re-deriving routing
+            # in the test. Only meaningful when the command actually executes.
+            if should_execute_actual and target_type is not None:
+                actual_response_target = handler._resolve_response_target(src, dst, target_type)
             else:
                 actual_response_target = None
 

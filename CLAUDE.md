@@ -40,12 +40,17 @@ uvx ruff format            # Format (must be clean before committing)
 
 ## Testing
 
-No pytest — tests are built into the app and run at startup when `has_console()` is true.
-Headless (no TTY, no `/etc/mcapp` needed): `uv run python scripts/run_startup_tests.py` — exit 0 = all passed (needs network for weather APIs).
-Suites:
-- `message_router.test_suppression_logic()`
-- `command_handler.run_all_tests()` (in `src/mcapp/commands/tests.py`)
+No pytest. **The canonical, authoritative test runner is `scripts/run_startup_tests.py`** — it runs all 6 suites with isolated/ephemeral state and is exit-code gated (exit 0 = all passed; needs network for weather APIs). CI and releases must trust this runner, not the in-app run.
+
+Headless (no TTY, no `/etc/mcapp` needed): `uv run python scripts/run_startup_tests.py`.
+
+The in-app startup path (when `has_console()` is true) runs only a **non-fatal smoke check**: the suppression suite (read-only, pure `router.validator` logic). It intentionally proceeds on failure because the service is a resilient always-on proxy. The command suite is deliberately **not** run in-app — `run_all_tests()` mutates the live handler (blocked_callsigns, group responses, active pings, beacons) while UDP/BLE are already listening, so it belongs only in the isolated headless runner.
+
+Suites (all run by `scripts/run_startup_tests.py`):
+- `message_router.test_suppression_logic()` — also the in-app smoke check
+- `command_handler.run_all_tests()` (in `src/mcapp/commands/tests.py`) — headless runner only
 - `classifier.run_all_tests()` (in `src/mcapp/classifier/tests.py`) — uses an ephemeral tempfile SQLite so the live DB is untouched
+- plus storage, udp, and sse suites
 
 ## Classifier Subtree
 

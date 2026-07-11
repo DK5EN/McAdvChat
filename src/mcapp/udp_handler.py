@@ -6,6 +6,7 @@ import contextlib
 import json
 import socket
 import unicodedata
+from collections.abc import Callable
 from typing import Any
 
 from .logging_setup import get_logger
@@ -287,13 +288,22 @@ async def run_startup_tests() -> bool:
 
     handler._process_received_message = _flaky  # type: ignore[method-assign]  # noqa: SLF001 - white-box test
 
+    async def _wait_until(predicate: Callable[[], bool], max_wait_s: float = 2.0) -> None:
+        # Polling a plain counter mutated by the _flaky callback above, not an
+        # internal coroutine handoff — there's no asyncio.Event to await here,
+        # so a deadline poll (rather than ASYNC110's suggested Event) is the fit.
+        loop = asyncio.get_event_loop()
+        deadline = loop.time() + max_wait_s
+        while not predicate() and loop.time() < deadline:  # noqa: ASYNC110 - see comment above
+            await asyncio.sleep(0.02)
+
     task = asyncio.create_task(handler._listen_loop())  # noqa: SLF001 - white-box test
     sender = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     try:
         sender.sendto(b"{}", ("127.0.0.1", port))
-        await asyncio.sleep(0.2)
+        await _wait_until(lambda: call_count >= 1)
         sender.sendto(b"{}", ("127.0.0.1", port))
-        await asyncio.sleep(0.2)
+        await _wait_until(lambda: call_count >= _MIN_CALLS_TO_PROVE_RECOVERY)
     finally:
         sender.close()
         handler._running = False  # noqa: SLF001 - white-box test
