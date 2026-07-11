@@ -23,6 +23,8 @@ Host repos wire this into their own startup-test driver:
 
 from __future__ import annotations
 
+import inspect
+import json
 import tempfile
 from pathlib import Path
 from typing import Any
@@ -49,6 +51,17 @@ async def _make_storage(db_path: str) -> StorageProtocol:
         storage = Storage(db_path)
         await storage.initialize()
         return storage  # type: ignore[return-value]
+
+
+async def _store_unclassified(storage: StorageProtocol, msg: dict[str, Any]) -> None:
+    """Insert a row via the host's real ingestion path, portably across the two
+    ``store_message`` signatures: MCProxy's requires a ``raw`` positional arg,
+    mc-chat's does not. Introspect and adapt so this suite runs in both repos."""
+    params = inspect.signature(storage.store_message).parameters  # type: ignore[attr-defined]
+    if "raw" in params:
+        await storage.store_message(msg, json.dumps(msg))  # type: ignore[attr-defined]
+    else:
+        await storage.store_message(msg)  # type: ignore[attr-defined]
 
 
 def _msg(
@@ -460,14 +473,15 @@ async def _suite_orchestrator(storage: StorageProtocol, results: list[tuple[str,
     # then force a reclassify and assert every row is re-annotated.
     base_ts = 1_770_300_000_000
     for i in range(3):
-        await storage.store_message(  # type: ignore[attr-defined]
+        await _store_unclassified(
+            storage,
             {
                 "msg_id": f"RCL{i:05d}",
                 "src": "OE7RCL-1",
                 "dst": "20",
                 "msg": f"conversational reclassify sample message number {i}",
                 "timestamp": base_ts + i,
-            }
+            },
         )
 
     reclassify_job = await classifier.reclassify(force=True)
