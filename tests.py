@@ -30,8 +30,9 @@ from typing import Any
 from .classify import Classifier
 from .rules import load_rules, match_rules
 from .score import compute as score_compute
+from .seed import DEFAULT_RULES
 from .template import check_only, fingerprint, is_exempt, update_and_check
-from .types import StorageProtocol
+from .types import CATEGORIES, StorageProtocol
 
 
 async def _make_storage(db_path: str) -> StorageProtocol:
@@ -59,6 +60,57 @@ def _msg(
     return {"msg_id": msg_id, "src": src, "dst": dst, "msg": text}
 
 
+class _OccurrenceStorage:
+    """Test shim wrapping a real storage.
+
+    Answers ``count_recent_messages_by_template_src`` from an injected list of
+    ``(template_hash, src, ts_ms)`` occurrences so the auto-beacon 24 h/72 h
+    *window* branches of ``update_and_check`` can be exercised at controlled
+    timestamps without populating the messages table. Every other call
+    (upsert/get/set on the template row) delegates to the wrapped, real
+    tempfile-backed storage. This is the only way to isolate the 24 h branch as
+    the deciding rule: in a live burst the 3-in-72 h rule (evaluated later but
+    more permissive) always promotes first, so the 24 h branch is otherwise
+    unreachable.
+    """
+
+    def __init__(self, inner: Any, occurrences: list[tuple[str, str, int]]) -> None:
+        self._inner = inner
+        self._occurrences = occurrences
+
+    async def count_recent_messages_by_template_src(
+        self, template_hash: str, src: str, since_ms: int
+    ) -> int:
+        return sum(
+            1
+            for h, s, ts in self._occurrences
+            if h == template_hash and s == src and ts >= since_ms
+        )
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._inner, name)
+
+
+class _UserActionStorage:
+    """Test shim: forces ``upsert_beacon_template`` to report a given
+    ``user_action`` ('promote'/'demote') so ``update_and_check``'s override
+    branches can be exercised without persisting the override. All other calls
+    delegate to the wrapped real storage.
+    """
+
+    def __init__(self, inner: Any, action: str) -> None:
+        self._inner = inner
+        self._action = action
+
+    async def upsert_beacon_template(self, *args: Any, **kwargs: Any) -> dict[str, Any]:
+        row = dict(await self._inner.upsert_beacon_template(*args, **kwargs))
+        row["user_action"] = self._action
+        return row
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._inner, name)
+
+
 async def run_all_tests() -> bool:
     """Run the classifier startup regression suite. Returns True iff all pass."""
     results: list[tuple[str, bool]] = []
@@ -82,7 +134,19 @@ async def run_all_tests() -> bool:
 
 
 async def _run_suite(storage: StorageProtocol, results: list[tuple[str, bool]]) -> None:
-    """The actual test body, run inside run_all_tests()'s try/finally."""
+    """The actual test body, run inside run_all_tests()'s try/finally.
+
+    Split into per-layer coroutines so each stays within the statement-count
+    lint budget; they all share the single tempfile-backed ``storage``.
+    """
+    await _suite_rules(storage, results)
+    await _suite_template(storage, results)
+    await _suite_score(results)
+    await _suite_orchestrator(storage, results)
+
+
+async def _suite_rules(storage: StorageProtocol, results: list[tuple[str, bool]]) -> None:
+    """Layer 1 rule matching, invalid-regex skip path, and seed consistency."""
     # ── Layer 1: rules ────────────────────────────────────────────────────
     await storage.insert_classifier_rule(
         name="test-greeting",
@@ -109,6 +173,53 @@ async def _run_suite(storage: StorageProtocol, results: list[tuple[str, bool]]) 
     category_nomatch, _ = match_rules(_msg(text="xyz nonmatching"), rules)
     results.append(("rules: no match falls back to 'other'", category_nomatch == "other"))
 
+    # ── Layer 1: invalid-regex skip path (load_rules must not crash) ───────
+    await storage.insert_classifier_rule(
+        name="test-broken-regex",
+        pattern=r"(unclosed[a-z",  # invalid: unterminated group + class
+        category="other",
+        scope="msg",
+        priority=15,
+    )
+    await storage.insert_classifier_rule(
+        name="test-valid-after-broken",
+        pattern=r"validmarkerword",
+        category="alert",
+        scope="msg",
+        priority=16,
+    )
+    rules_mixed = await load_rules(storage)
+    loaded_names = {r.name for r in rules_mixed}
+    results.append(
+        (
+            "rules: invalid-regex rule is skipped by load_rules (no crash)",
+            "test-broken-regex" not in loaded_names,
+        )
+    )
+    results.append(
+        (
+            "rules: valid rules still load alongside a skipped invalid one",
+            "test-valid-after-broken" in loaded_names,
+        )
+    )
+    cat_valid, _ = match_rules(_msg(text="a validmarkerword appears here"), rules_mixed)
+    results.append(
+        ("rules: valid rule loaded past a skipped invalid one still matches", cat_valid == "alert")
+    )
+
+    # ── Seed consistency: every seeded category must be a known CATEGORY ────
+    seed_categories = {rule["category"] for rule in DEFAULT_RULES}
+    unknown_categories = sorted(seed_categories - set(CATEGORIES))
+    results.append(
+        (
+            "seed: every seed.py rule category is a member of types.CATEGORIES",
+            unknown_categories == [],
+        )
+    )
+
+
+async def _suite_template(storage: StorageProtocol, results: list[tuple[str, bool]]) -> None:
+    """Layer 2 fingerprint/exemption, auto-beacon thresholds, and overrides."""
     # ── Layer 2: fingerprint + tokenize + exemption ────────────────────────
     fp1 = fingerprint("Hello World! 123")
     fp2 = fingerprint("hello   world!  456")  # different digits, same shape
@@ -178,6 +289,103 @@ async def _run_suite(storage: StorageProtocol, results: list[tuple[str, bool]]) 
         ("template: template stays flagged as beacon after transitioning", final_check.is_beacon)
     )
 
+    # ── Layer 2: windowed auto-beacon thresholds (5-in-24h, 3-in-72h) ───────
+    # These use _OccurrenceStorage to inject the windowed message counts at
+    # controlled timestamps (see the shim's docstring for why isolating the
+    # 24 h branch requires a shim). The template row itself is real: each
+    # update_and_check upserts it once (lifetime count == 1 << 8), so the
+    # lifetime rule provably cannot fire — only the window branch under test.
+
+    # 5-in-24h: four prior occurrences within 24 h + the current message == 5.
+    now_24h = 1_770_100_000_000
+    text_24h = "fast beacon window status cycle marker alpha"
+    fp_24h = fingerprint(text_24h)
+    occ_24h = [(fp_24h, "OE24H-1", now_24h - h * 3600 * 1000) for h in (1, 2, 3, 4)]
+    res_24h = await update_and_check(
+        _OccurrenceStorage(storage, occ_24h),
+        _msg(src="OE24H-1", dst="20", text=text_24h, msg_id="W24H0001"),
+        now_24h,
+        category="other",
+    )
+    results.append(
+        (
+            "template: auto-beacon transitions on the 5-in-24h threshold",
+            res_24h.transitioned and res_24h.is_beacon,
+        )
+    )
+
+    # 3-in-72h: two prior occurrences 48 h old (inside 72 h, OUTSIDE 24 h, so
+    # the 24 h rule cannot fire) + the current message == 3.
+    now_72h = 1_770_200_000_000
+    text_72h = "slow beacon window status cycle marker bravo"
+    fp_72h = fingerprint(text_72h)
+    occ_72h = [(fp_72h, "OE72H-1", now_72h - 48 * 3600 * 1000) for _ in range(2)]
+    res_72h = await update_and_check(
+        _OccurrenceStorage(storage, occ_72h),
+        _msg(src="OE72H-1", dst="20", text=text_72h, msg_id="W72H0001"),
+        now_72h,
+        category="other",
+    )
+    results.append(
+        (
+            "template: auto-beacon transitions on the 3-in-72h threshold (24h rule idle)",
+            res_72h.transitioned and res_72h.is_beacon,
+        )
+    )
+
+    # Below every threshold: a single prior occurrence must NOT promote.
+    text_below = "lonely beacon window marker charlie ping"
+    fp_below = fingerprint(text_below)
+    res_below = await update_and_check(
+        _OccurrenceStorage(storage, [(fp_below, "OEBLW-1", now_72h - 10 * 3600 * 1000)]),
+        _msg(src="OEBLW-1", dst="20", text=text_below, msg_id="WBLW0001"),
+        now_72h,
+        category="other",
+    )
+    results.append(
+        (
+            "template: no auto-beacon below all thresholds",
+            not res_below.transitioned and not res_below.is_beacon,
+        )
+    )
+
+    # ── Layer 2: user_action promote/demote overrides ───────────────────────
+    # promote forces beacon despite a fresh (count == 1) template.
+    promo_text = "promoted template body marker delta echo"
+    res_promote = await update_and_check(
+        _UserActionStorage(storage, "promote"),
+        _msg(src="OEPRM-1", dst="20", text=promo_text, msg_id="PRM00001"),
+        now_24h,
+        category="other",
+    )
+    results.append(
+        (
+            "template: user_action='promote' is a beacon regardless of count",
+            res_promote.is_beacon and not res_promote.transitioned,
+        )
+    )
+
+    # demote suppresses even a template that is already auto_beacon=1.
+    demo_text = "demoted template body marker foxtrot golf"
+    demo_hash = fingerprint(demo_text)
+    await storage.upsert_beacon_template(demo_hash, demo_text, "OEDEM-1", now_24h)
+    await storage.set_template_auto_beacon(demo_hash, True)
+    res_demote = await update_and_check(
+        _UserActionStorage(storage, "demote"),
+        _msg(src="OEDEM-1", dst="20", text=demo_text, msg_id="DEM00001"),
+        now_24h,
+        category="other",
+    )
+    results.append(
+        (
+            "template: user_action='demote' suppresses beacon despite auto_beacon flag",
+            not res_demote.is_beacon and not res_demote.transitioned,
+        )
+    )
+
+
+async def _suite_score(results: list[tuple[str, bool]]) -> None:
+    """Layer 3 info-score value range, low-content clamp, and ordering."""
     # ── Layer 3: score ──────────────────────────────────────────────────────
     score = score_compute(_msg(text="a normal conversational reply here"), "qso", set(), 0)
     results.append(("score: compute() returns a value in [0, 1]", 0.0 <= score <= 1.0))
@@ -185,6 +393,34 @@ async def _run_suite(storage: StorageProtocol, results: list[tuple[str, bool]]) 
     bot_score = score_compute(_msg(text="!wx"), "bot_command", set(), 0)
     results.append(("score: bot_command is clamped low", bot_score <= 0.25))
 
+    # Ordering property: an informative multi-token sentence must outscore a
+    # low-information emoji-only or URL-only body.
+    informative_score = score_compute(
+        _msg(text="the repeater on the hill is back online after maintenance today"),
+        "qso",
+        set(),
+        0,
+    )
+    emoji_only_score = score_compute(_msg(text="😀😀😀😀😀😀"), "other", set(), 0)
+    url_only_score = score_compute(
+        _msg(text="https://example.com/a/very/long/path"), "other", {"has_url"}, 0
+    )
+    results.append(
+        (
+            "score: informative sentence outscores an emoji-only body",
+            informative_score > emoji_only_score,
+        )
+    )
+    results.append(
+        (
+            "score: informative sentence outscores a URL-only body",
+            informative_score > url_only_score,
+        )
+    )
+
+
+async def _suite_orchestrator(storage: StorageProtocol, results: list[tuple[str, bool]]) -> None:
+    """Orchestrator classify() live/reclassify paths and reclassify jobs."""
     # ── Orchestrator: Classifier.classify() ──────────────────────────────────
     classifier = Classifier(storage)
     await classifier.load()
@@ -217,3 +453,47 @@ async def _run_suite(storage: StorageProtocol, results: list[tuple[str, bool]]) 
         await job._task
     results.append(("reclassify: job completes", job.done))
     results.append(("reclassify: job reports no fatal error", job.error is None))
+
+    # ── Orchestrator: reclassify() over a NON-empty batch ────────────────────
+    # Persist a few unclassified rows via the real ingestion path (no classifier
+    # attached to storage, so they land with classifier_ver=NULL / category=NULL),
+    # then force a reclassify and assert every row is re-annotated.
+    base_ts = 1_770_300_000_000
+    for i in range(3):
+        await storage.store_message(  # type: ignore[attr-defined]
+            {
+                "msg_id": f"RCL{i:05d}",
+                "src": "OE7RCL-1",
+                "dst": "20",
+                "msg": f"conversational reclassify sample message number {i}",
+                "timestamp": base_ts + i,
+            }
+        )
+
+    reclassify_job = await classifier.reclassify(force=True)
+    if reclassify_job._task is not None:
+        await reclassify_job._task
+    results.append(
+        (
+            "reclassify: non-empty batch processes every row without error",
+            reclassify_job.done
+            and reclassify_job.error is None
+            and reclassify_job.total >= 3
+            and reclassify_job.processed == reclassify_job.total,
+        )
+    )
+    remaining = await storage.count_messages_to_classify(classifier_ver_below=classifier.version)
+    results.append(("reclassify: no rows remain below the current version", remaining == 0))
+
+    annotated = await storage.get_messages_to_classify(limit=100)
+    rcl_rows = [r for r in annotated if str(r.get("msg_id", "")).startswith("RCL")]
+    results.append(
+        (
+            "reclassify: inserted rows are re-annotated (category + version populated)",
+            len(rcl_rows) == 3
+            and all(
+                r.get("category") is not None and r.get("classifier_ver") == classifier.version
+                for r in rcl_rows
+            ),
+        )
+    )

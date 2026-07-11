@@ -47,6 +47,10 @@ MessageCategory = Literal[
     "alert",
     "directed",
     "bot_command",
+    # Test/probe messages ("test", "prova", "probe", "essai", ...). Emitted by
+    # seed.py's "Test message" rule and consumed as automated-noise by
+    # profile/corpus.py's DROP_CATEGORIES -- it must be a first-class category.
+    "test_msg",
     "other",
 ]
 
