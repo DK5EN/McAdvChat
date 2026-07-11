@@ -687,7 +687,7 @@ def create_sse_manager(
     return SSEManager(host, port, message_router, weather_service)
 
 
-async def run_startup_tests() -> bool:
+async def run_startup_tests() -> bool:  # noqa: PLR0915 - regression suite kept as one flat sequence
     """SSE-layer regression suite.
 
     1. UDP 2.0 Track U (U3): UDP-lora signal reaches SSE clients live.
@@ -701,6 +701,18 @@ async def run_startup_tests() -> bool:
        an empty own_call used to degenerate the conversation key to 'X<>X',
        silently deleting nothing. Ephemeral tempfile SQLite DB, mirroring the
        storage test-suite pattern (never touches the live DB).
+    3. D10a: `_get_event_type` mapping-table coverage. Every entry in
+       `_SIMPLE_TYPE_MAP`, `_MHEARD_MSG_MAP`, and `_RESPONSE_EVENT_MAP` is
+       asserted to map to its exact SSE event name, plus the BLE/resolve-ip
+       branches, the "response with unknown msg" fallback, and the final
+       default fallback — so a mis-map that silently mis-routes a frontend
+       event is caught immediately.
+    4. D10b: bounded per-client queue overflow. `SSEClient.send()` must raise
+       `asyncio.QueueFull` and disconnect the client once its queue (maxsize
+       `SSE_CLIENT_QUEUE_SIZE`) is full, without growing past maxsize; and
+       `SSEManager.broadcast_event()` must not be blocked/raise when one
+       client's queue is full — it disconnects the slow client and still
+       delivers to healthy clients.
     """
     results: list[tuple[str, bool]] = []
 
@@ -830,6 +842,178 @@ async def run_startup_tests() -> bool:
             )
         finally:
             await storage.close()
+
+    # 3. D10a: _get_event_type mapping-table coverage — every entry in every
+    # mapping table, plus the BLE/resolve-ip branches, the response-fallback,
+    # and the final default fallback.
+    event_type_cases: list[tuple[str, dict[str, Any], str]] = [
+        # _SIMPLE_TYPE_MAP
+        ("type=connected -> system:connected", {"type": "connected"}, "system:connected"),
+        ("type=ping -> system:ping", {"type": "ping"}, "system:ping"),
+        ("type=msg_status -> msg:status", {"type": "msg_status"}, "msg:status"),
+        # _MHEARD_MSG_MAP (checked ahead of the response branch so type=response
+        # doesn't swallow these as mesh:message)
+        (
+            "msg='mheard progress' (type=response) -> mheard:progress",
+            {"type": "response", "msg": "mheard progress"},
+            "mheard:progress",
+        ),
+        (
+            "msg='mheard stats' (type=progress) -> mheard:stats",
+            {"type": "progress", "msg": "mheard stats"},
+            "mheard:stats",
+        ),
+        (
+            "msg='mheard progress monthly' -> mheard:progress-monthly",
+            {"type": "response", "msg": "mheard progress monthly"},
+            "mheard:progress-monthly",
+        ),
+        (
+            "msg='mheard stats monthly' -> mheard:stats-monthly",
+            {"type": "response", "msg": "mheard stats monthly"},
+            "mheard:stats-monthly",
+        ),
+        (
+            "msg='mheard progress yearly' -> mheard:progress-yearly",
+            {"type": "response", "msg": "mheard progress yearly"},
+            "mheard:progress-yearly",
+        ),
+        (
+            "msg='mheard stats yearly' -> mheard:stats-yearly",
+            {"type": "response", "msg": "mheard stats yearly"},
+            "mheard:stats-yearly",
+        ),
+        # response-map entries: type=response
+        (
+            "msg=smart_initial -> proxy:initial",
+            {"type": "response", "msg": "smart_initial"},
+            "proxy:initial",
+        ),
+        (
+            "msg=summary -> proxy:summary",
+            {"type": "response", "msg": "summary"},
+            "proxy:summary",
+        ),
+        (
+            "msg=read_counts -> proxy:read_counts",
+            {"type": "response", "msg": "read_counts"},
+            "proxy:read_counts",
+        ),
+        (
+            "msg=hidden_destinations -> proxy:hidden_destinations",
+            {"type": "response", "msg": "hidden_destinations"},
+            "proxy:hidden_destinations",
+        ),
+        (
+            "msg=blocked_texts -> proxy:blocked_texts",
+            {"type": "response", "msg": "blocked_texts"},
+            "proxy:blocked_texts",
+        ),
+        (
+            "msg=mheard_sidebar -> proxy:mheard_sidebar",
+            {"type": "response", "msg": "mheard_sidebar"},
+            "proxy:mheard_sidebar",
+        ),
+        (
+            "msg=wx_sidebar -> proxy:wx_sidebar",
+            {"type": "response", "msg": "wx_sidebar"},
+            "proxy:wx_sidebar",
+        ),
+        (
+            "msg=messages_page -> proxy:messages_page",
+            {"type": "response", "msg": "messages_page"},
+            "proxy:messages_page",
+        ),
+        # response branch fallback: unmapped msg -> mesh:message
+        (
+            "type=response with unmapped msg -> mesh:message (response fallback)",
+            {"type": "response", "msg": "something_unmapped"},
+            "mesh:message",
+        ),
+        # BLE branch: requires src_type in (BLE, ble_remote) AND a TYP key
+        (
+            "src_type=BLE with TYP -> ble:status",
+            {"src_type": "BLE", "TYP": "blueZ"},
+            "ble:status",
+        ),
+        (
+            "src_type=ble_remote with TYP -> ble:status",
+            {"src_type": "ble_remote", "TYP": "blueZ"},
+            "ble:status",
+        ),
+        (
+            "src_type=BLE without TYP falls through to default mesh:message",
+            {"src_type": "BLE"},
+            "mesh:message",
+        ),
+        # resolve-ip branch
+        (
+            "command=resolve-ip -> proxy:resolve_ip",
+            {"command": "resolve-ip"},
+            "proxy:resolve_ip",
+        ),
+        # final default fallback
+        ("unrecognized payload -> mesh:message (default fallback)", {}, "mesh:message"),
+    ]
+    for label, data, expected in event_type_cases:
+        actual = SSEManager._get_event_type(data)  # noqa: SLF001 - white-box startup test
+        results.append((f"_get_event_type: {label}", actual == expected))
+
+    # 4. D10b: bounded per-client queue overflow (real enqueue path).
+    overflow_client = SSEClient("overflow-client")
+    for i in range(SSE_CLIENT_QUEUE_SIZE):
+        overflow_client.queue.put_nowait(f"filler-{i}\n\n")
+
+    raised_queue_full = False
+    try:
+        await overflow_client.send("one-too-many\n\n")
+    except asyncio.QueueFull:
+        raised_queue_full = True
+    results.append(
+        (
+            "SSEClient.send raises QueueFull and disconnects the client on overflow",
+            raised_queue_full and not overflow_client.connected,
+        )
+    )
+    results.append(
+        (
+            "overflow does not grow the queue past SSE_CLIENT_QUEUE_SIZE",
+            overflow_client.queue.qsize() == SSE_CLIENT_QUEUE_SIZE,
+        )
+    )
+
+    # broadcaster must not be blocked/raise when fanning out to a full client,
+    # and must still deliver to a healthy client alongside it.
+    broadcast_manager = SSEManager(host="127.0.0.1", port=0, message_router=None)
+    full_client = SSEClient("full-client")
+    for i in range(SSE_CLIENT_QUEUE_SIZE):
+        full_client.queue.put_nowait(f"filler-{i}\n\n")
+    healthy_client = SSEClient("healthy-client")
+    broadcast_manager.clients[full_client.client_id] = full_client
+    broadcast_manager.clients[healthy_client.client_id] = healthy_client
+
+    await broadcast_manager.broadcast_event("test:overflow", {"n": 1})
+
+    results.append(
+        (
+            "broadcast_event disconnects the full/slow client instead of blocking",
+            not full_client.connected,
+        )
+    )
+    results.append(
+        (
+            "broadcast_event still delivers to a healthy client alongside a full one",
+            not healthy_client.queue.empty(),
+        )
+    )
+    if not healthy_client.queue.empty():
+        delivered = healthy_client.queue.get_nowait()
+        results.append(
+            (
+                "healthy client's delivered event carries the correct SSE event type",
+                "event: test:overflow" in delivered,
+            )
+        )
 
     for label, ok in results:
         print(f"    {'✅ PASS' if ok else '❌ FAIL'} | {label}")

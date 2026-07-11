@@ -17,15 +17,19 @@ user info text must contain "Node" — the built-in test cases assume both.
 import asyncio
 import sys
 
+from mcapp.ble_protocol_tests import run_ble_protocol_tests
 from mcapp.classifier.tests import run_all_tests as run_classifier_tests
 from mcapp.commands.dedup_tests import run_dedup_tests
 from mcapp.commands.handler import create_command_handler
 from mcapp.commands.parsing_tests import run_parsing_tests
 from mcapp.commands.routing_tests import run_routing_tests
 from mcapp.main import MessageRouter
+from mcapp.meteo_tests import run_meteo_tests
 from mcapp.sqlite_storage import run_startup_tests as run_storage_tests
 from mcapp.sse_handler import run_startup_tests as run_sse_tests
 from mcapp.storage.conversation_key_tests import run_conversation_key_tests
+from mcapp.storage.migration_chain_tests import run_migration_chain_tests
+from mcapp.storage.query_tests import run_query_tests
 from mcapp.udp_handler import run_startup_tests as run_udp_handler_tests
 
 
@@ -59,6 +63,18 @@ async def main() -> int:
     conversation_key_ok = run_conversation_key_tests()
     print(f"conversation_key: {'PASS' if conversation_key_ok else 'FAIL'}")
 
+    query_ok = await run_query_tests()
+    print(f"query: {'PASS' if query_ok else 'FAIL'}")
+
+    migration_chain_ok = await run_migration_chain_tests()
+    print(f"migration_chain: {'PASS' if migration_chain_ok else 'FAIL'}")
+
+    meteo_ok = run_meteo_tests()
+    print(f"meteo: {'PASS' if meteo_ok else 'FAIL'}")
+
+    ble_protocol_ok = run_ble_protocol_tests()
+    print(f"ble_protocol: {'PASS' if ble_protocol_ok else 'FAIL'}")
+
     handler = create_command_handler(
         router, None, "DK5EN", 48.15, 11.58, "TestStation", "MeshCom Test Node"
     )
@@ -76,6 +92,10 @@ async def main() -> int:
         and dedup_ok
         and routing_ok
         and conversation_key_ok
+        and query_ok
+        and migration_chain_ok
+        and meteo_ok
+        and ble_protocol_ok
         and commands_ok
     )
     return 0 if all_ok else 1
