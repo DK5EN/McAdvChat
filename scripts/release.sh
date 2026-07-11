@@ -454,8 +454,8 @@ build_webapp() {
     (cd "$WEBAPP_DIR" && npm install)
   fi
 
-  # Build
-  (cd "$WEBAPP_DIR" && npm run build)
+  # Build (webapp standardized on build:strict — type-checks then vite build)
+  (cd "$WEBAPP_DIR" && npm run build:strict)
 
   # Validate output
   if [[ ! -d "${WEBAPP_DIR}/dist" ]] || [[ ! -f "${WEBAPP_DIR}/dist/index.html" ]]; then
