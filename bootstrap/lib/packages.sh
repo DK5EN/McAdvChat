@@ -231,8 +231,9 @@ configure_lighttpd() {
     log_info "  Replaced customized lighttpd.conf (backup: $backup)"
   fi
 
-  # Check if already configured (must include mod_proxy for API/SSE reverse proxy)
-  if [[ -f "$conf_file" ]] && grep -q "mod_proxy" "$conf_file" 2>/dev/null; then
+  # Check if already configured (must include the Cache-Control directive — re-keyed from
+  # mod_proxy so pre-existing installs that predate the cache headers get regenerated)
+  if [[ -f "$conf_file" ]] && grep -q "Cache-Control" "$conf_file" 2>/dev/null; then
     log_info "  lighttpd already configured"
     return 0
   fi
@@ -257,6 +258,15 @@ $HTTP["url"] =~ "^/webapp/" {
     url.rewrite-if-not-file = (
         "^/webapp/(.*)$" => "/webapp/index.html"
     )
+}
+
+# index.html + sw.js must always revalidate so new hashed bundles are picked up
+$HTTP["url"] =~ "/webapp/(index\.html|sw\.js)$" {
+    setenv.add-response-header += ( "Cache-Control" => "no-cache" )
+}
+# content-hashed assets are safe to cache hard
+$HTTP["url"] =~ "/webapp/assets/" {
+    setenv.add-response-header += ( "Cache-Control" => "public, max-age=31536000, immutable" )
 }
 
 # Reverse proxy: SSE event stream + REST API → FastAPI on port 2981
