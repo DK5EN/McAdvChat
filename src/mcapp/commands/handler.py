@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from typing import Any
 
 import httpx
@@ -22,6 +23,11 @@ from .weather_command import WeatherCommandMixin
 # fetch this directly from the browser, which failed silently on a LAN-only Pi
 # and never covered the oevsv.at internet firehose.
 SPERRLISTE_URL = "https://raw.githubusercontent.com/DK5EN/McApp/main/sperrliste.json"
+
+# V9.5: retry ladder for the sperrliste background loop while offline-at-boot
+# (30s → 5min, capped), and the refresh cadence once the first fetch succeeds.
+SPERRLISTE_RETRY_LADDER_S: tuple[float, ...] = (30.0, 60.0, 120.0, 300.0)
+SPERRLISTE_REFRESH_INTERVAL_S = 24 * 60 * 60  # 24h
 
 # Command registry with handler functions and metadata
 COMMANDS = {
@@ -185,13 +191,30 @@ class CommandHandler(
 
         return await run_all_tests(self)
 
-    async def load_sperrliste(self, url: str = SPERRLISTE_URL) -> None:
-        """Fetch the curated global blocklist and merge it into blocked_callsigns
-        (V9.4). Called once at startup. Best-effort: a fetch/parse failure logs and
-        leaves the current set (admin kickbans) untouched — the deployment simply
-        runs with whatever is already blocked. Merges (union) rather than replaces so
-        it never clobbers live admin kickbans. Broadcasts the resulting set so clients
-        that connected before the fetch completed pick it up.
+    async def load_persisted_kickbans(self) -> None:
+        """Load admin-originated kickbans persisted in SQLite (V9.5) into
+        blocked_callsigns. Called once at startup, before (or independent of)
+        load_sperrliste — main.py calls this synchronously while wiring up the
+        app, well before the SSE server starts accepting connections, so the
+        very first connect burst already reflects restart-surviving kickbans.
+        Best-effort: no storage_handler, or a query failure, just leaves this
+        source empty for the run (admins can always re-kickban).
+        """
+        if self.storage_handler is None:
+            return
+        try:
+            persisted = await self.storage_handler.get_kickban_callsigns()
+        except Exception:
+            logger.exception("Could not load persisted admin kickbans")
+            return
+        if persisted:
+            self.blocked_callsigns.update(persisted)
+            logger.info("Loaded %d persisted admin kickban(s)", len(persisted))
+
+    async def _fetch_sperrliste(self, url: str) -> set[str] | None:
+        """One HTTP round-trip: fetch + validate the curated sperrliste. Returns
+        the uppercased callsign set on success, or None on any failure (already
+        logged as a warning) — never raises.
         """
         try:
             async with httpx.AsyncClient(timeout=httpx.Timeout(10.0)) as client:
@@ -200,21 +223,90 @@ class CommandHandler(
             data: Any = response.json()
         except (httpx.HTTPError, ValueError) as exc:
             logger.warning("Could not load sperrliste from %s: %s", url, exc)
-            return
+            return None
 
         if not isinstance(data, list) or not all(isinstance(item, str) for item in data):
             logger.warning("Sperrliste from %s has an unexpected format; ignoring", url)
-            return
+            return None
 
-        added = {item.upper() for item in data} - self.blocked_callsigns
-        self.blocked_callsigns.update(item.upper() for item in data)
+        return {item.upper() for item in data}
+
+    async def _merge_sperrliste(self, data: set[str], log_prefix: str) -> None:
+        """Union-merge a fetched sperrliste into blocked_callsigns and broadcast
+        only if it actually changed the set (avoids a pointless SSE push on an
+        unchanged daily refresh).
+        """
+        added = data - self.blocked_callsigns
+        self.blocked_callsigns.update(data)
         logger.info(
-            "Loaded sperrliste: %d entries (%d new); blocklist now %d callsign(s)",
+            "%s: %d entries (%d new); blocklist now %d callsign(s)",
+            log_prefix,
             len(data),
             len(added),
             len(self.blocked_callsigns),
         )
-        await self._broadcast_blocked_callsigns()
+        if added:
+            await self._broadcast_blocked_callsigns()
+
+    async def load_sperrliste(
+        self, url: str = SPERRLISTE_URL, stop_event: asyncio.Event | None = None
+    ) -> None:
+        """Background loop (V9.4/V9.5): fetch the curated global blocklist and
+        merge it into blocked_callsigns. Started once from main.py's
+        `_start_background_tasks` via a single `asyncio.create_task`; this
+        method owns its own retry/refresh scheduling.
+
+        Resilient to an offline-at-boot Pi: retries with a capped backoff
+        ladder (SPERRLISTE_RETRY_LADDER_S, 30s → 5min) until the first
+        successful fetch, then refreshes every SPERRLISTE_REFRESH_INTERVAL_S
+        (24h). Always union-merge, same as before — an entry removed from the
+        upstream sperrliste is never un-blocked here; that only takes effect
+        after a restart re-fetches and rebuilds the set from scratch (full
+        reconciliation is out of scope). Best-effort throughout: a fetch/parse
+        failure just logs a warning and leaves the current set untouched.
+
+        `stop_event`, when given, lets shutdown exit this loop promptly
+        (mirrors `_nightly_prune`/`_classifier_stats_broadcast` in main.py). A
+        bare `load_sperrliste()` call with no stop_event still works — it just
+        never gets an early-exit signal.
+        """
+        wait_event = stop_event or asyncio.Event()
+
+        # Phase 1: retry with backoff until the first successful fetch.
+        retry_idx = 0
+        fetched = False
+        while not wait_event.is_set() and not fetched:
+            data = await self._fetch_sperrliste(url)
+            if data is not None:
+                await self._merge_sperrliste(data, log_prefix="Loaded sperrliste")
+                fetched = True
+                break
+            delay = SPERRLISTE_RETRY_LADDER_S[min(retry_idx, len(SPERRLISTE_RETRY_LADDER_S) - 1)]
+            retry_idx += 1
+            logger.warning("Sperrliste fetch failed; retrying in %.0fs", delay)
+            try:
+                await asyncio.wait_for(wait_event.wait(), timeout=delay)
+                break  # stop_event was set during the retry wait
+            except TimeoutError:
+                pass  # backoff elapsed — retry
+
+        if not fetched:
+            return  # stop_event was set before any fetch succeeded
+
+        # Phase 2: refresh every 24h for as long as the app runs.
+        while not wait_event.is_set():
+            try:
+                await asyncio.wait_for(wait_event.wait(), timeout=SPERRLISTE_REFRESH_INTERVAL_S)
+                break  # stop_event was set
+            except TimeoutError:
+                pass  # 24h elapsed — refresh
+
+            if wait_event.is_set():
+                break
+
+            data = await self._fetch_sperrliste(url)
+            if data is not None:
+                await self._merge_sperrliste(data, log_prefix="Refreshed sperrliste")
 
     async def _broadcast_blocked_callsigns(self) -> None:
         """Push the current blocked_callsigns set to all SSE clients as

@@ -1218,6 +1218,11 @@ async def build_app(cfg: Config) -> AppContext:  # noqa: PLR0915 - sequential wi
     )
     message_router.register_protocol("commands", command_handler)
     command_handler.start_dedup_cleanup()
+    # V9.5: load persisted admin kickbans before the SSE server starts accepting
+    # connections (below), so the very first connect burst already reflects
+    # restart-surviving kickbans. load_sperrliste (a background task, started
+    # later) unions the curated sperrliste in on top of this.
+    await command_handler.load_persisted_kickbans()
 
     # UDP Handler
     udp_handler = UDPHandler(
@@ -1481,8 +1486,8 @@ async def _classifier_stats_broadcast(
 @dataclass
 class _BackgroundTasks:
     """Handles kept alive for the app's lifetime (main() holds the only
-    reference). Only prune/stats are cancelled at shutdown — the backfill
-    tasks are one-shots left to finish or be reaped by process exit."""
+    reference). Only prune/stats/sperrliste are cancelled at shutdown — the
+    backfill tasks are one-shots left to finish or be reaped by process exit."""
 
     prune_task: asyncio.Task[None]
     classifier_stats_task: asyncio.Task[None]
@@ -1494,8 +1499,8 @@ class _BackgroundTasks:
 def _start_background_tasks(
     ctx: AppContext, cfg: Config, stop_event: asyncio.Event
 ) -> _BackgroundTasks:
-    """Start the nightly-prune, classifier-backfill, signal-backfill, and
-    classifier-stats-broadcast background tasks."""
+    """Start the nightly-prune, classifier-backfill, signal-backfill,
+    classifier-stats-broadcast, and sperrliste-refresh background tasks."""
     prune_task = asyncio.create_task(_nightly_prune(ctx.storage_handler, cfg, stop_event))
     # Reference lives for the app's lifetime (run() awaits until shutdown)
     backfill_task = asyncio.create_task(
@@ -1507,10 +1512,13 @@ def _start_background_tasks(
             ctx.classifier, ctx.storage_handler, ctx.sse_manager, stop_event
         )
     )
-    # V9.4: one-shot — fetch the curated global blocklist (sperrliste.json) and
-    # merge it into blocked_callsigns, then broadcast. Non-blocking; a failed fetch
-    # just leaves admin kickbans in place.
-    sperrliste_task = asyncio.create_task(ctx.command_handler.load_sperrliste())
+    # V9.4/V9.5: fetch the curated global blocklist (sperrliste.json) and merge it
+    # into blocked_callsigns, then broadcast. Now a long-running loop (V9.5): retries
+    # with backoff until the first success, then refreshes every 24h — stop_event
+    # lets it exit promptly at shutdown, same as prune_task/classifier_stats_task.
+    sperrliste_task = asyncio.create_task(
+        ctx.command_handler.load_sperrliste(stop_event=stop_event)
+    )
     return _BackgroundTasks(
         prune_task=prune_task,
         classifier_stats_task=classifier_stats_task,
@@ -1521,13 +1529,16 @@ def _start_background_tasks(
 
 
 async def _cancel_background_tasks(tasks: _BackgroundTasks) -> None:
-    """Cancel the two long-running loops; backfill tasks are one-shots, left alone."""
+    """Cancel the three long-running loops; backfill tasks are one-shots, left alone."""
     tasks.prune_task.cancel()
     tasks.classifier_stats_task.cancel()
+    tasks.sperrliste_task.cancel()
     with contextlib.suppress(asyncio.CancelledError):
         await tasks.prune_task
     with contextlib.suppress(asyncio.CancelledError):
         await tasks.classifier_stats_task
+    with contextlib.suppress(asyncio.CancelledError):
+        await tasks.sperrliste_task
 
 
 async def _shutdown_services(ctx: AppContext) -> None:

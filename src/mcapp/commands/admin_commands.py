@@ -53,6 +53,12 @@ class AdminCommandsMixin(CommandHandlerBase):
         if kwargs.get("callsign") == "delall":
             count = len(self.blocked_callsigns)
             self.blocked_callsigns.clear()
+            # V9.5: only the persisted admin-kickban set is cleared here — the
+            # in-memory set (which may also carry sperrliste-derived entries)
+            # keeps today's behaviour of wiping everything. A restart (or the
+            # next sperrliste refresh) re-merges the curated sperrliste back in.
+            if self.storage_handler:
+                await self.storage_handler.set_kickban_callsigns([])
             await self._broadcast_blocked_callsigns()  # V9.4: push the update to SSE clients
             return f"✅ Cleared {count} blocked callsign(s)"
 
@@ -71,6 +77,9 @@ class AdminCommandsMixin(CommandHandlerBase):
         if action == "del":
             if callsign in self.blocked_callsigns:
                 self.blocked_callsigns.remove(callsign)
+                if self.storage_handler:
+                    # V9.5: no-op if it was only sperrliste-derived (never persisted).
+                    await self.storage_handler.update_kickban_callsign(callsign, blocked=False)
                 await self._broadcast_blocked_callsigns()  # V9.4
                 return f"✅ {callsign} unblocked"
             return f"ℹ️ {callsign} was not blocked"
@@ -80,5 +89,7 @@ class AdminCommandsMixin(CommandHandlerBase):
             return f"ℹ️ {callsign} already blocked"
 
         self.blocked_callsigns.add(callsign)
+        if self.storage_handler:
+            await self.storage_handler.update_kickban_callsign(callsign, blocked=True)  # V9.5
         await self._broadcast_blocked_callsigns()  # V9.4
         return f"🚫 {callsign} blocked"

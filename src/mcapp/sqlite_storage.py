@@ -629,8 +629,10 @@ async def run_startup_tests() -> bool:  # noqa: PLR0915 - test suite lists one c
         finally:
             await storage.close()
 
-    # 8. Migration v18 → v19: an existing v18 DB (signal_log without `source`) must migrate
-    # cleanly and idempotently — startup on an old DB succeeds (UDP 2.0 Track U, Wave U2).
+    # 8. Migration v18 → HEAD (currently v20): an existing v18 DB (signal_log without
+    # `source`) must migrate cleanly and idempotently — startup on an old DB succeeds
+    # (UDP 2.0 Track U, Wave U2). The v19 source-column backfill is spot-checked
+    # explicitly; the final version assertion tracks whatever the latest migration is.
     with tempfile.TemporaryDirectory() as tmp_dir:
         v18_db_path = Path(tmp_dir) / "udp2_v18_test.db"
 
@@ -664,14 +666,14 @@ async def run_startup_tests() -> bool:  # noqa: PLR0915 - test suite lists one c
                 schema_version = version_rows[0]["version"]
                 results.append(
                     (
-                        "v18→v19 migration: pre-existing signal_log row backfilled as 'mheard'",
+                        "v18→HEAD migration: pre-existing signal_log row backfilled as 'mheard'",
                         pre_existing_source == "mheard",
                     )
                 )
                 results.append(
                     (
-                        "v18→v19 migration: schema at v19",
-                        schema_version == 19,  # noqa: PLR2004 - expected schema version
+                        "v18→HEAD migration: schema at v20",
+                        schema_version == 20,  # noqa: PLR2004 - expected schema version
                     )
                 )
             finally:
@@ -681,9 +683,9 @@ async def run_startup_tests() -> bool:  # noqa: PLR0915 - test suite lists one c
             reopened_storage = await create_sqlite_storage(v18_db_path)
             await reopened_storage.close()
         except Exception:
-            logger.exception("v18→v19 migration test raised")
+            logger.exception("v18→HEAD migration test raised")
             migration_ok = False
-        results.append(("v18→v19 migration: idempotent re-open succeeds", migration_ok))
+        results.append(("v18→HEAD migration: idempotent re-open succeeds", migration_ok))
 
     for label, ok in results:
         print(f"    {'✅ PASS' if ok else '❌ FAIL'} | {label}")

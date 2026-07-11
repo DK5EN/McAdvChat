@@ -387,6 +387,7 @@ async def run_all_tests(handler: Any) -> bool:
             intent_passed = test_intent_based_reception_logic(handler)
             edge_passed = await test_reception_edge_cases(handler)
             kickban_passed = await test_kickban_logic(handler)
+            kickban_persistence_passed = await test_kickban_persistence(handler)
             topic_passed = await test_topic_logic(handler)
             ctcping_passed = await test_ctcping_logic(handler)
             self_exec_passed = await test_self_command_execution(handler)
@@ -412,6 +413,7 @@ async def run_all_tests(handler: Any) -> bool:
             intent_passed,
             edge_passed,
             kickban_passed,
+            kickban_persistence_passed,
             blocking_passed,
             topic_passed,
             ctcping_passed,
@@ -1376,6 +1378,83 @@ async def test_kickban_logic(handler: Any) -> bool:  # noqa: PLR0912 - complex h
                 print("\n❌ Failed Tests:")
                 for _status, description, _ in failed_tests:
                     print(f"   • {description}")
+        print("=" * 40)
+
+    return passed == total
+
+
+async def test_kickban_persistence(handler: Any) -> bool:
+    """Drive the REAL persistence path (V9.5): `!kb` add/del/delall must mirror
+    into storage_handler's kickban_callsigns table, independent from the
+    in-memory blocked_callsigns set (which may also carry sperrliste-derived
+    entries never persisted here). Also exercises load_persisted_kickbans()
+    restoring the set from storage, simulating a restart.
+    """
+    if has_console:
+        print("\n🧪 Testing Kick-Ban Persistence (V9.5):")
+        print("=" * 40)
+
+    storage = handler.storage_handler
+    results: list[tuple[str, bool]] = []
+
+    if storage is None:
+        if has_console:
+            print("⏭️  Skipped: no storage in this test context")
+        return True
+
+    old_blocked = handler.blocked_callsigns.copy()
+    handler.blocked_callsigns = set()
+    await storage.set_kickban_callsigns([])  # start from a clean slate
+
+    try:
+        # Add persists.
+        await handler.handle_kickban({"callsign": "OE9PER-1"}, handler.admin_callsign_base)
+        persisted = await storage.get_kickban_callsigns()
+        results.append(("add: persisted to kickban_callsigns", persisted == ["OE9PER-1"]))
+
+        # A second admin kickban accumulates (not a replace).
+        await handler.handle_kickban({"callsign": "OE9PER-2"}, handler.admin_callsign_base)
+        persisted = await storage.get_kickban_callsigns()
+        results.append(
+            ("add: second kickban accumulates", sorted(persisted) == ["OE9PER-1", "OE9PER-2"])
+        )
+
+        # del removes just that one from storage.
+        await handler.handle_kickban(
+            {"callsign": "OE9PER-1", "action": "del"}, handler.admin_callsign_base
+        )
+        persisted = await storage.get_kickban_callsigns()
+        results.append(("del: removed from kickban_callsigns", persisted == ["OE9PER-2"]))
+
+        # Simulate a restart: a fresh in-memory set + load_persisted_kickbans()
+        # must recover exactly the persisted admin kickbans.
+        handler.blocked_callsigns = set()
+        await handler.load_persisted_kickbans()
+        results.append(
+            (
+                "load_persisted_kickbans: restores admin kickbans after restart",
+                handler.blocked_callsigns == {"OE9PER-2"},
+            )
+        )
+
+        # delall clears the persisted set too (in-memory clear is covered by
+        # test_kickban_logic; here we only assert the storage side).
+        await handler.handle_kickban({"callsign": "delall"}, handler.admin_callsign_base)
+        persisted = await storage.get_kickban_callsigns()
+        results.append(("delall: persisted kickbans cleared", persisted == []))
+    finally:
+        handler.blocked_callsigns = old_blocked
+        await storage.set_kickban_callsigns([])
+
+    for label, ok in results:
+        status = "✅ PASS" if ok else "❌ FAIL"
+        if has_console:
+            print(f"{status} | {label}")
+
+    passed = sum(1 for _, ok in results if ok)
+    total = len(results)
+    if has_console:
+        print(f"🧪 Kick-Ban Persistence Summary: {passed}/{total} tests passed")
         print("=" * 40)
 
     return passed == total

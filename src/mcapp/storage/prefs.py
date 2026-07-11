@@ -160,6 +160,25 @@ class PrefsMixin(StorageBase):
         """Add or remove a single blocked text pattern."""
         await self._update_identifier("blocked_texts", "text", text, blocked)
 
+    async def get_kickban_callsigns(self) -> list[str]:
+        """Get all admin-originated kickban callsigns (V9.5).
+
+        Deliberately separate from the curated sperrliste — only callsigns an
+        admin blocked via `!kb` live here, so an upstream sperrliste removal
+        is never pinned locally forever. CommandHandler.blocked_callsigns
+        (the live, in-memory set actually consulted for filtering) is the
+        UNION of this persisted set and whatever the sperrliste fetch loaded.
+        """
+        return await self._get_identifier_list("kickban_callsigns", "callsign")
+
+    async def set_kickban_callsigns(self, callsigns: list[str]) -> None:
+        """Bulk replace all persisted admin kickbans (used by `!kb delall`)."""
+        await self._set_identifier_list("kickban_callsigns", "callsign", callsigns)
+
+    async def update_kickban_callsign(self, callsign: str, blocked: bool) -> None:
+        """Add or remove a single persisted admin kickban."""
+        await self._update_identifier("kickban_callsigns", "callsign", callsign, blocked)
+
     async def _get_sidebar(self, table: str) -> dict[str, Any] | None:
         """Shared getter for mheard_sidebar/wx_sidebar (station order + hidden stations).
         `table` is always a literal from call sites in this file, never user input.

@@ -330,6 +330,22 @@ class MigrationsMixin(StorageBase):
                     )
                     _set_schema_version(conn, 19)
 
+                if current_version < 20:  # noqa: PLR2004 - schema migration step
+                    conn.execute("""
+                        CREATE TABLE IF NOT EXISTS kickban_callsigns (
+                            callsign TEXT PRIMARY KEY,
+                            created_at TEXT DEFAULT CURRENT_TIMESTAMP
+                        );
+                    """)
+                    logger.info(
+                        "Migration v%d → v20: created kickban_callsigns table"
+                        " (persists admin !kb kickbans across restarts, V9.5;"
+                        " the curated sperrliste is re-fetched separately and"
+                        " never persisted here)",
+                        current_version,
+                    )
+                    _set_schema_version(conn, 20)
+
         await asyncio.to_thread(_init_db)
 
         # Initialize bucket accumulators from existing signal_log
