@@ -288,7 +288,13 @@ class QueryMixin(StorageBase):
         if row["lora_mod"] is not None:
             pos_data["lora_mod"] = row["lora_mod"]
         if row["mesh"] is not None:
-            pos_data["mesh"] = row["mesh"]
+            # Wire key is "mesh_info" (not "mesh", the station_positions column
+            # name) to match the live msg/pos path — ble_protocol.py's
+            # transform_common_fields() emits "mesh_info" for live frames, and
+            # the FE (messageProcessor.ts) only reads raw.mesh_info. Before this
+            # fix, replayed positions (smart_initial/messages_page) silently lost
+            # this field on initial load since the FE never looked for "mesh".
+            pos_data["mesh_info"] = row["mesh"]
         # Via paths for relay line drawing
         if row["via_paths"] and row["via_paths"] != "[]":
             pos_data["via_paths"] = row["via_paths"]

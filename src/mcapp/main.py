@@ -423,14 +423,27 @@ class MessageRouter:
             }
             await self._send_response(websocket, bt_payload, client_id)
 
-        # Send persisted spam filter preferences
-        fp = await self.storage_handler.get_filter_prefs()
-        fp_payload = {
-            "type": "response",
-            "msg": "filter_prefs",
-            "data": fp,
-        }
-        await self._send_response(websocket, fp_payload, client_id)
+        # Send persisted spam filter preferences.
+        #
+        # SSE clients already receive this via SSEManager.initial_events() on
+        # stream connect (sse_handler.py: `format_sse_event(fp, "proxy:filter_prefs")`,
+        # emitted BARE — no {type,msg,data} envelope, matching what the FE's
+        # useSSEClient.ts expects for this one event). Re-sending an enveloped
+        # copy here for SSE (client_id set, websocket None) would be redundant
+        # at best: msg="filter_prefs" isn't in _RESPONSE_EVENT_MAP, so
+        # SSEManager.send_to()'s _get_event_type() inference mislabels it
+        # "mesh:message" and the FE drops it as unknown — and simply adding a
+        # mapping entry would be wrong too, since the payload here is enveloped
+        # while proxy:filter_prefs must stay bare. So: only emit on the legacy
+        # raw-WebSocket transport, which has no other filter_prefs delivery path.
+        if websocket:
+            fp = await self.storage_handler.get_filter_prefs()
+            fp_payload = {
+                "type": "response",
+                "msg": "filter_prefs",
+                "data": fp,
+            }
+            await self._send_response(websocket, fp_payload, client_id)
 
     async def _handle_summary_command(self, websocket: Any, client_id: str | None = None) -> None:
         """Handle summary command - sends message counts per destination."""
@@ -453,6 +466,7 @@ class MessageRouter:
         except (TypeError, ValueError):
             limit = DEFAULT_PAGE_LIMIT
         src = params.get("src")  # Own callsign for DM conversation pagination
+        request_id = params.get("request_id")
 
         page_data = await self.storage_handler.get_messages_page(dst, before, limit, src=src)
         payload = {
@@ -462,6 +476,8 @@ class MessageRouter:
             "data": page_data["messages"],
             "has_more": page_data["has_more"],
         }
+        if request_id is not None:
+            payload["request_id"] = request_id
         await self._send_response(websocket, payload, client_id)
 
     async def _handle_mheard_dump(
