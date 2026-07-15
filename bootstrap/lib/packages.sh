@@ -485,8 +485,13 @@ configure_caddy() {
   fi
 
   # Validate before (re)starting — a bad config must never take down a
-  # previously-working Caddy instance (mirrors the lighttpd -t guard above)
-  if ! caddy validate --config "$caddy_conf" --adapter caddyfile &>/dev/null; then
+  # previously-working Caddy instance (mirrors the lighttpd -t guard above).
+  # HOME=/root is pinned so `caddy validate` provisions its throwaway
+  # `tls internal` PKI CA under /root (not whatever $HOME the caller set):
+  # with HOME=/home/<user> it would MkdirAll a root-owned 0700 ~/.local/share
+  # into that user's home and break the later `sudo -u <user> uv sync`
+  # (defense-in-depth; the update-runner already forces HOME=root's home).
+  if ! HOME=/root caddy validate --config "$caddy_conf" --adapter caddyfile &>/dev/null; then
     log_warn "  Caddy config validation failed — leaving caddy service as-is"
     log_warn "  Run: caddy validate --config ${caddy_conf} --adapter caddyfile"
     return 0

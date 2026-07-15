@@ -17,6 +17,8 @@ user info text must contain "Node" — the built-in test cases assume both.
 import asyncio
 import sys
 
+from update_runner_tests import run_update_runner_tests
+
 from mcapp.ble_protocol_tests import run_ble_protocol_tests
 from mcapp.classifier.tests import run_all_tests as run_classifier_tests
 from mcapp.commands.dedup_tests import run_dedup_tests
@@ -79,6 +81,9 @@ async def main() -> int:
     ble_protocol_ok = run_ble_protocol_tests()
     print(f"ble_protocol: {'PASS' if ble_protocol_ok else 'FAIL'}")
 
+    update_runner_ok = run_update_runner_tests()
+    print(f"update_runner: {'PASS' if update_runner_ok else 'FAIL'}")
+
     handler = create_command_handler(
         router, None, "DK5EN", 48.15, 11.58, "TestStation", "MeshCom Test Node"
     )
@@ -101,6 +106,7 @@ async def main() -> int:
         and migration_chain_ok
         and meteo_ok
         and ble_protocol_ok
+        and update_runner_ok
         and commands_ok
     )
     return 0 if all_ok else 1

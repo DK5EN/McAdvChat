@@ -20,6 +20,7 @@ import contextlib
 import http.server
 import json
 import os
+import pwd
 import queue
 import re
 import shutil
@@ -65,6 +66,32 @@ UPDATE_TRIGGER_FILE = Path("/var/lib/mcapp/update-trigger")  # must match sse_ha
 _ANSI_RE = re.compile(r"\x1b\[[0-9;]*[a-zA-Z]")  # all ANSI escape sequences
 _DECORATIVE_LINE_RE = re.compile(r"^[\s╔╗╚╝═─┌┐└┘│┤├]+$")  # pure box-drawing decoration
 _BANNER_LINE_RE = re.compile(r"^\s*║\s*(.*?)\s*║?\s*$")  # ║ content ║ banner lines
+
+
+def build_bootstrap_env(home: Path, base_env: dict[str, str]) -> dict[str, str]:
+    """Build the environment for the root-run bootstrap subprocess.
+
+    HOME must belong to the user actually executing the bootstrap (root), NOT
+    the slot user (`home`). Root-run tools that honor $HOME — notably
+    `caddy validate`, which provisions its `tls internal` PKI CA under
+    $HOME/.local/share/caddy via MkdirAll(0700) — would otherwise create
+    root-owned 0700 directories inside the slot user's home, which then breaks
+    the later `sudo -u <user> uv sync` with EACCES (martin can no longer
+    traverse its own ~/.local/share). The slot user's identity travels
+    separately via SUDO_USER (the bootstrap resolves the real user/home from
+    it), so forcing HOME to the executing user's home reproduces the known-good
+    manual `sudo mcapp.sh` environment (HOME=/root, SUDO_USER=<user>).
+    """
+    env = dict(base_env)
+    env["HOME"] = pwd.getpwuid(os.geteuid()).pw_dir
+    # Bootstrap uses SUDO_USER to determine the real user for service files.
+    if "SUDO_USER" not in env:
+        env["SUDO_USER"] = home.name  # e.g. "martin" from /home/martin
+    # Ensure tools like uv are found (installed in the slot user's ~/.local/bin).
+    local_bin = str(home / ".local" / "bin")
+    if local_bin not in env.get("PATH", ""):
+        env["PATH"] = local_bin + ":" + env.get("PATH", "/usr/local/bin:/usr/bin:/bin")
+    return env
 
 
 def _clean_line(line: str) -> str | None:
@@ -330,7 +357,7 @@ def _check_http(url: str) -> bool:
 # ──────────────────────────────────────────────────────────────
 
 
-def run_update(bus: EventBus, dev_mode: bool = False) -> dict:  # noqa: PLR0912, PLR0915 - complex handler kept intact
+def run_update(bus: EventBus, dev_mode: bool = False) -> dict:  # noqa: PLR0915 - complex handler kept intact
     """Execute the full update cycle. Returns result dict."""
     start_time = time.time()
 
@@ -385,16 +412,11 @@ def run_update(bus: EventBus, dev_mode: bool = False) -> dict:  # noqa: PLR0912,
         if dev_mode:
             cmd.append("--dev")
 
-        # Set INSTALL_DIR to target slot
-        env = os.environ.copy()
-        env["HOME"] = str(home)
-        # Bootstrap uses SUDO_USER to determine the real user for service files
-        if "SUDO_USER" not in env:
-            env["SUDO_USER"] = home.name  # e.g. "martin" from /home/martin
-        # Ensure tools like uv are found (installed in ~/.local/bin)
-        local_bin = str(home / ".local" / "bin")
-        if local_bin not in env.get("PATH", ""):
-            env["PATH"] = local_bin + ":" + env.get("PATH", "/usr/local/bin:/usr/bin:/bin")
+        # Bootstrap subprocess env. HOME is the EXECUTING user's home (root),
+        # not the slot user's — otherwise root-run `caddy validate` drops a
+        # root-owned 0700 ~/.local/share into the slot user's home and breaks
+        # the later `sudo -u <user> uv sync`. See build_bootstrap_env.
+        env = build_bootstrap_env(home, os.environ.copy())
 
         print(f"[UPDATE-RUNNER] bootstrap cmd: {cmd}", flush=True)
         print(f"[UPDATE-RUNNER] bootstrap HOME={env.get('HOME')}", flush=True)
