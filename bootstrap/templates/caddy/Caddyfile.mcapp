@@ -1,0 +1,76 @@
+# mcapp-caddy-config-version: 1
+# (keep this number in sync with CADDY_CONFIG_VERSION in bootstrap/lib/packages.sh —
+#  configure_caddy() only rewrites this file when the marker version bumps)
+#
+# LAN-HTTPS default Caddyfile for mcapp.local.
+#
+# Caddy is the public front door on :80 and :443. lighttpd is the backend,
+# bound to 127.0.0.1:8082 (see configure_lighttpd() in bootstrap/lib/packages.sh)
+# — NOT port 8081, which is reserved by mcapp-ble.service's uvicorn on this host.
+#
+# Header policy: Cache-Control for the webapp (index.html, sw.js,
+# manifest.webmanifest, version.html -> no-cache; /webapp/assets/* -> immutable)
+# is owned by lighttpd's 99-mcapp.conf, NOT by Caddy. Caddy passes upstream
+# response headers through unchanged — do not add Cache-Control directives
+# here, that would create two competing sources of truth for the same headers.
+#
+# This file is installed/kept up to date by install_caddy()/configure_caddy()
+# in bootstrap/lib/packages.sh, keyed on the version marker above. It is
+# REPLACED (not supplemented) by ssl-tunnel-setup.sh if the operator opts into
+# public-domain TLS (DuckDNS/Cloudflare/deSEC) — that script writes its own
+# /etc/caddy/Caddyfile pointed at a real hostname with ACME-issued certs and
+# also reverse-proxies to lighttpd on 127.0.0.1:8082.
+{
+	auto_https disable_redirects
+}
+
+(mcapp_routes) {
+	# SSE event stream — must not be buffered
+	handle /events* {
+		reverse_proxy 127.0.0.1:2981 {
+			flush_interval -1
+		}
+	}
+
+	# REST API
+	handle /api/* {
+		reverse_proxy 127.0.0.1:2981
+	}
+
+	# Health check endpoint
+	handle /health* {
+		reverse_proxy 127.0.0.1:2981
+	}
+
+	# Caddy's local CA root certificate — lets LAN clients trust the
+	# self-signed cert issued by `tls internal` below without browser warnings.
+	handle /root.crt {
+		root * /var/lib/caddy
+		header Content-Type "application/x-x509-ca-cert"
+		header Content-Disposition "attachment; filename=root.crt"
+		file_server
+	}
+
+	# Everything else -> lighttpd (static webapp + SPA rewrite)
+	handle {
+		reverse_proxy 127.0.0.1:8082
+	}
+}
+
+# Plain HTTP — serves the FULL site, no redirect to HTTPS. This is a LAN
+# convenience default: ham radio LAN clients often haven't installed the
+# internal CA (see /root.crt above) yet, so forcing HTTPS would lock them out.
+mcapp.local:80 {
+	import mcapp_routes
+}
+
+# HTTPS via Caddy's internal CA (self-signed — mcapp.local is not a publicly
+# resolvable domain, so public ACME issuance is not possible here).
+mcapp.local:443 {
+	tls internal {
+		curves x25519mlkem768 x25519
+		protocols tls1.3 tls1.3
+	}
+
+	import mcapp_routes
+}

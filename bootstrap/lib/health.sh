@@ -16,12 +16,18 @@ health_check() {
   # Check services
   if ! check_service "mcapp"; then all_passed=false; fi
   if ! check_service "lighttpd"; then all_passed=false; fi
+  if ! check_service "caddy"; then all_passed=false; fi
 
   # Check endpoints
   if ! check_webapp_endpoint; then all_passed=false; fi
   if ! check_udp_port; then all_passed=false; fi
   if ! check_sse_endpoint; then all_passed=false; fi
   if ! check_lighttpd_proxy; then all_passed=false; fi
+
+  # Caddy HTTPS probe is advisory only (does NOT flip all_passed) — on first
+  # boot Caddy's `tls internal` CA/leaf generation can lag a few seconds, and
+  # we don't want that transient state to hard-abort the whole bootstrap.
+  check_caddy_https || true
 
   # Check data
   if ! check_sqlite_db; then all_passed=false; fi
@@ -103,13 +109,36 @@ check_sse_endpoint() {
 
 check_lighttpd_proxy() {
   # Verify lighttpd proxies /api/ and /events to FastAPI on port 2981
-  # Uses /health endpoint which exists on both direct and proxied paths
-  if curl -fsSL --connect-timeout 3 "http://localhost/health" &>/dev/null; then
+  # Uses /health endpoint which exists on both direct and proxied paths.
+  # lighttpd is now the backend on 127.0.0.1:8082 (Caddy owns :80/:443),
+  # so probe the backend port directly rather than :80.
+  if curl -fsSL --connect-timeout 3 "http://127.0.0.1:8082/health" &>/dev/null; then
     printf "  %-20s ${GREEN}[OK]${NC} proxying to FastAPI\n" "lighttpd proxy:"
     return 0
   fi
 
   printf "  %-20s ${RED}[FAIL]${NC} proxy not working\n" "lighttpd proxy:"
+  return 1
+}
+
+check_caddy_https() {
+  # Verify Caddy terminates TLS on :443 and proxies /health through to
+  # FastAPI (via lighttpd for static, direct for /health). -k because the
+  # LAN default uses `tls internal` (self-signed CA the client may not trust).
+  #
+  # Advisory only: caller ignores the return value (|| true) because on first
+  # boot Caddy's internal CA/leaf issuance can take a few seconds. Retry a few
+  # times, then WARN rather than FAIL so a cold start doesn't abort bootstrap.
+  local attempts=5
+  for ((i=1; i<=attempts; i++)); do
+    if curl -skf --connect-timeout 3 "https://localhost/health" &>/dev/null; then
+      printf "  %-20s ${GREEN}[OK]${NC} HTTPS responding\n" "caddy https:"
+      return 0
+    fi
+    sleep 2
+  done
+
+  printf "  %-20s ${YELLOW}[WARN]${NC} not responding yet (internal CA may still be issuing)\n" "caddy https:"
   return 1
 }
 

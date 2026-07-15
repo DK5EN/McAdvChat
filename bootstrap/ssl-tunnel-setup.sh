@@ -14,7 +14,9 @@
 #
 # Requirements:
 #   - McApp running and healthy
-#   - lighttpd serving on port 80
+#   - lighttpd running as the backend on 127.0.0.1:8082 (behind the
+#     LAN-HTTPS default Caddyfile.mcapp — this script REPLACES that
+#     Caddyfile with a public-domain one, it doesn't run alongside it)
 #   - Internet connectivity
 #   - Must be run as root (sudo)
 
@@ -65,7 +67,9 @@ preflight_checks() {
     [[ "$answer" =~ ^[Yy]$ ]] || exit 1
   fi
 
-  # Check lighttpd
+  # Check lighttpd — it is now the backend behind Caddy on 127.0.0.1:8082
+  # (see bootstrap/templates/caddy/Caddyfile.mcapp, the LAN-HTTPS default
+  # installed by bootstrap/lib/packages.sh), not a direct :80 listener.
   if systemctl is-active --quiet lighttpd 2>/dev/null; then
     log_ok "lighttpd is running"
   else
@@ -73,12 +77,20 @@ preflight_checks() {
     exit 1
   fi
 
-  # Check port 80 is lighttpd
-  if ss -tlnp | grep -q ':80 '; then
-    log_ok "Port 80 is listening"
+  if ss -tlnp 2>/dev/null | grep -q '127\.0\.0\.1:8082'; then
+    log_ok "lighttpd backend (127.0.0.1:8082) is listening"
   else
-    log_error "Port 80 is not listening"
+    log_error "lighttpd backend (127.0.0.1:8082) is not listening"
+    log_error "Run 'sudo ~/mcapp-slots/current/bootstrap/mcapp.sh' first to migrate lighttpd's port"
     exit 1
+  fi
+
+  # Port 80 is expected to already be occupied by the LAN-HTTPS default
+  # Caddy — this script's own Caddy install (below) replaces it in place.
+  if ss -tlnp 2>/dev/null | grep -q ':80 '; then
+    log_info "Port 80 is currently in use (likely the LAN-HTTPS default Caddy) — will be replaced"
+  else
+    log_warn "Port 80 is not listening — proceeding anyway, this script will bring Caddy up on it"
   fi
 
   # Check internet
@@ -520,7 +532,11 @@ remove_tls() {
     log_ok "Removed TLS settings from ${MCAPP_CONFIG}"
   fi
 
-  log_ok "TLS removed. lighttpd continues serving on port 80."
+  log_ok "TLS removed. lighttpd's backend (127.0.0.1:8082) is unaffected."
+  log_warn "Nothing is listening on :80/:443 now — re-run mcapp.sh to restore the"
+  log_warn "LAN-HTTPS default Caddyfile (bootstrap/templates/caddy/Caddyfile.mcapp)"
+  log_warn "and take back ports 80/443:"
+  log_warn "  sudo ~/mcapp-slots/current/bootstrap/mcapp.sh"
   log_info "Caddy binary and config left in place — remove manually if desired:"
   log_info "  sudo rm -f ${CADDY_BIN} ${CADDY_CONFIG} ${CADDY_ENV}"
   log_info "  sudo rm -rf /etc/caddy /var/lib/caddy"

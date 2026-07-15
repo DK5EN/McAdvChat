@@ -1,3 +1,7 @@
+# Installed by ssl-tunnel-setup.sh as /etc/caddy/Caddyfile — this REPLACES
+# the LAN-HTTPS default (bootstrap/templates/caddy/Caddyfile.mcapp), it does
+# not run alongside it. lighttpd is the backend on 127.0.0.1:8082 (moved off
+# :80 by configure_lighttpd() in bootstrap/lib/packages.sh).
 {
     dynamic_dns {
         provider cloudflare {env.CF_API_TOKEN}
@@ -15,5 +19,5 @@
         protocols tls1.3
     }
 
-    reverse_proxy localhost:80
+    reverse_proxy 127.0.0.1:8082
 }

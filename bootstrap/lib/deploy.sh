@@ -637,11 +637,22 @@ activate_services() {
 }
 
 disable_conflicting_services() {
-  # Caddy conflicts with lighttpd on port 80
-  if systemctl is-active --quiet caddy 2>/dev/null; then
-    log_info "  Stopping and disabling caddy (conflicts with lighttpd on port 80)..."
-    systemctl stop caddy
-    systemctl disable caddy
+  # Caddy is the public front door on :80/:443 (see install_caddy()/
+  # configure_caddy() in packages.sh, and bootstrap/templates/caddy/
+  # Caddyfile.mcapp) — lighttpd runs behind it on 127.0.0.1:8082. This used
+  # to stop+disable Caddy here on the theory that it "conflicts with
+  # lighttpd on port 80"; that's now inverted: Caddy must stay running, and
+  # it's lighttpd that gets moved off :80 (done in configure_lighttpd(),
+  # which already ran during install_packages(), earlier than this
+  # function in the boot sequence — see mcapp.sh Phase 4 vs Phase 6).
+  #
+  # Defensive check only: if lighttpd is somehow still bound to :80 (e.g.
+  # this run used --skip, which never calls install_packages()/
+  # configure_lighttpd() at all), warn loudly instead of silently letting
+  # Caddy and lighttpd fight over the port.
+  if ss -tlnp 2>/dev/null | grep ':80\b' | grep -q 'lighttpd'; then
+    log_warn "  lighttpd is still listening on :80 (expected 127.0.0.1:8082)"
+    log_warn "  Re-run mcapp.sh WITHOUT --skip so configure_lighttpd() can migrate the port"
   fi
 
   # Old mcapp process may still hold port 1799 (e.g. running from old venv/scripts)

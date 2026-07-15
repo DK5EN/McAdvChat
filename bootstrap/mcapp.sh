@@ -429,7 +429,8 @@ dry_run_report() {
       echo "  [SYSTEM] Disable unused services"
       echo "  [PACKAGES] Install uv package manager"
       echo "  [PACKAGES] Install apt packages (jq, curl, screen, etc.)"
-      echo "  [PACKAGES] Install and configure lighttpd"
+      echo "  [PACKAGES] Install and configure lighttpd (backend on 127.0.0.1:8082)"
+      echo "  [PACKAGES] Install and configure Caddy (LAN-HTTPS front door on :80/:443)"
       echo "  [DEPLOY] Download release tarball to ~/mcapp"
       echo "  [DEPLOY] Run uv sync to install Python dependencies"
       echo "  [DEPLOY] Download and install webapp"
@@ -460,7 +461,73 @@ dry_run_report() {
       ;;
   esac
 
+  report_caddy_state
+
   echo ""
+}
+
+#──────────────────────────────────────────────────────────────────
+# CADDY / LIGHTTPD PORT-STATE REPORT (for --check dry-run output)
+#──────────────────────────────────────────────────────────────────
+# Live-inspects the system (not simulated) so --check reflects reality
+# regardless of detect_install_state()'s fresh/incomplete/upgrade/migrate
+# bucketing above. CADDY_CONFIG_VERSION and LIGHTTPD_MCAPP_CONF_VERSION are
+# defined in lib/packages.sh, already sourced by the time this runs.
+report_caddy_state() {
+  echo "Caddy / lighttpd port state:"
+
+  if command_exists caddy; then
+    local caddy_ver
+    caddy_ver=$(caddy version 2>/dev/null | head -1)
+    echo "  caddy binary:   present (${caddy_ver:-unknown version})"
+  else
+    echo "  caddy binary:   NOT installed (would run: apt-get install -y caddy)"
+  fi
+
+  if systemctl is-enabled --quiet caddy 2>/dev/null; then
+    echo "  caddy service:  enabled"
+  else
+    echo "  caddy service:  NOT enabled (would enable on install)"
+  fi
+
+  if systemctl is-active --quiet caddy 2>/dev/null; then
+    echo "  caddy service:  running"
+  else
+    echo "  caddy service:  NOT running (would start on install)"
+  fi
+
+  local caddyfile="/etc/caddy/Caddyfile"
+  local tls_enabled="false"
+  if [[ -f "$CONFIG_FILE" ]] && command_exists jq; then
+    tls_enabled=$(jq -r '.TLS_ENABLED // false' "$CONFIG_FILE" 2>/dev/null)
+  fi
+
+  if [[ -f "$caddyfile" ]] && grep -qF "mcapp-caddy-config-version: ${CADDY_CONFIG_VERSION:-0}" "$caddyfile" 2>/dev/null; then
+    echo "  Caddyfile:      up to date (version ${CADDY_CONFIG_VERSION})"
+  elif [[ "$tls_enabled" == "true" ]]; then
+    echo "  Caddyfile:      owned by ssl-tunnel-setup.sh (TLS_ENABLED in config.json) — untouched"
+  elif [[ -f "$caddyfile" ]]; then
+    echo "  Caddyfile:      present but outdated (would rewrite to version ${CADDY_CONFIG_VERSION})"
+  else
+    echo "  Caddyfile:      missing (would write ${caddyfile})"
+  fi
+
+  local lh_conf="/etc/lighttpd/conf-available/99-mcapp.conf"
+  if [[ -f "$lh_conf" ]] && grep -qF "mcapp-lighttpd-config-version: ${LIGHTTPD_MCAPP_CONF_VERSION:-0}" "$lh_conf" 2>/dev/null; then
+    echo "  lighttpd conf:  up to date (version ${LIGHTTPD_MCAPP_CONF_VERSION}, bound to 127.0.0.1:8082)"
+  else
+    echo "  lighttpd conf:  would migrate to 127.0.0.1:8082 (version ${LIGHTTPD_MCAPP_CONF_VERSION})"
+  fi
+
+  if ss -tln 2>/dev/null | grep -q ':80\b'; then
+    if ss -tlnp 2>/dev/null | grep ':80\b' | grep -q 'caddy'; then
+      echo "  port 80 owner:  caddy (expected)"
+    else
+      echo "  port 80 owner:  something other than caddy — check for a conflict"
+    fi
+  else
+    echo "  port 80 owner:  nothing listening"
+  fi
 }
 
 # Run main
