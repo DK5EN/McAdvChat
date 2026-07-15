@@ -122,26 +122,38 @@ check_lighttpd_proxy() {
 }
 
 check_caddy_https() {
-  # NOTE: loopback-only — this proves Caddy answers HTTPS on localhost but
-  # canNOT detect a firewall-blocked :443 for external clients; that external
-  # contract is verified separately by scripts/pwa-smoke.sh <host>.
-  # Verify Caddy terminates TLS on :443 and proxies /health through to
-  # FastAPI (via lighttpd for static, direct for /health). -k because the
-  # LAN default uses `tls internal` (self-signed CA the client may not trust).
+  # Verify Caddy terminates TLS on :443 and proxies /health through to FastAPI.
   #
-  # Advisory only: caller ignores the return value (|| true) because on first
-  # boot Caddy's internal CA/leaf issuance can take a few seconds. Retry a few
-  # times, then WARN rather than FAIL so a cold start doesn't abort bootstrap.
+  # Probe the site Caddy ACTUALLY serves — NOT localhost. `tls internal` mints a
+  # leaf for the configured site name only, so Caddy has no certificate for
+  # "localhost" and https://localhost fails the TLS handshake every time — this
+  # is not a CA-timing issue and retrying never helps (it produced a permanent
+  # false WARN). caddy_site() (packages.sh) resolves the real site — the
+  # Caddyfile :443 name, else config.json TLS_HOSTNAME (public-TLS), else
+  # $(hostname).local — and we probe it on the loopback via --resolve so the
+  # check is independent of external DNS/mDNS. -k because the LAN default uses a
+  # self-signed internal CA the probe may not trust.
+  #
+  # NOTE: loopback-only — proves Caddy answers HTTPS locally but canNOT detect a
+  # firewall-blocked :443 for external clients; that external contract is
+  # verified separately by scripts/pwa-smoke.sh <host>.
+  #
+  # Advisory only (caller uses || true): on a cold boot the internal leaf can
+  # take a moment to issue, so retry a few times, then WARN rather than FAIL so
+  # a cold start doesn't abort bootstrap.
+  local site
+  site=$(caddy_site)
+
   local attempts=5
   for ((i=1; i<=attempts; i++)); do
-    if curl -skf --connect-timeout 3 "https://localhost/health" &>/dev/null; then
+    if curl -skf --resolve "${site}:443:127.0.0.1" --connect-timeout 3 "https://${site}/health" &>/dev/null; then
       printf "  %-20s ${GREEN}[OK]${NC} HTTPS responding\n" "caddy https:"
       return 0
     fi
     sleep 2
   done
 
-  printf "  %-20s ${YELLOW}[WARN]${NC} not responding yet (internal CA may still be issuing)\n" "caddy https:"
+  printf "  %-20s ${YELLOW}[WARN]${NC} Caddy HTTPS not responding on ${site}:443\n" "caddy https:"
   return 1
 }
 

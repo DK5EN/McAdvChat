@@ -527,6 +527,24 @@ configure_caddy() {
   log_ok "  Caddy configured"
 }
 
+# Resolve the hostname Caddy actually terminates TLS for. Used by the HTTPS
+# health probe and the CA-warmup nudge so both target the SNI Caddy can answer
+# — Caddy has NO certificate for "localhost", so probing localhost:443 fails the
+# handshake permanently. LAN default: the :443 site is a literal name in
+# /etc/caddy/Caddyfile (from Caddyfile.mcapp). Public-TLS Caddyfiles
+# (ssl-tunnel-setup.sh) instead use a `{$TLS_HOSTNAME}` env placeholder with no
+# literal :443, so fall back to the TLS_HOSTNAME recorded in config.json, then
+# to $(hostname).local.
+caddy_site() {
+  local site=""
+  site=$(awk -F: '/^[A-Za-z0-9._-]+:443[[:space:]]*\{/{print $1; exit}' /etc/caddy/Caddyfile 2>/dev/null)
+  local cfg="${CONFIG_FILE:-/etc/mcapp/config.json}"
+  if [[ -z "$site" && -f "$cfg" ]] && command -v jq &>/dev/null; then
+    site=$(jq -r '.TLS_HOSTNAME // ""' "$cfg" 2>/dev/null)
+  fi
+  echo "${site:-$(hostname).local}"
+}
+
 # Copy Caddy's `tls internal` CA root certificate to /var/lib/caddy/root.crt,
 # which Caddyfile.mcapp serves at GET /root.crt so LAN clients can install and
 # trust it. Caddy writes the CA lazily under its data dir on first internal-TLS
@@ -537,8 +555,14 @@ publish_caddy_root_crt() {
   local ca_dst="/var/lib/caddy/root.crt"
   local ca_src="/var/lib/caddy/.local/share/caddy/pki/authorities/local/root.crt"
 
-  # Nudge Caddy into provisioning the internal CA (lazy on first TLS use)
-  curl -skf --connect-timeout 3 "https://localhost/health" &>/dev/null || true
+  # Nudge Caddy into provisioning the internal CA + issuing the site leaf (both
+  # lazy on first TLS use). Must target the site Caddy actually serves (see
+  # caddy_site) — it has no cert for "localhost", so an https://localhost
+  # handshake fails and does not warm the site leaf.
+  local site
+  site=$(caddy_site)
+  curl -skf --resolve "${site}:443:127.0.0.1" --connect-timeout 3 \
+    "https://${site}/health" &>/dev/null || true
 
   local attempts=5
   local i

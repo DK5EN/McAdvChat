@@ -438,9 +438,13 @@ start_cloudflared() {
 health_check() {
   log_info "Running health check..."
 
-  # Test HTTPS locally
+  # Test HTTPS locally. Probe the real TLS_HOSTNAME via --resolve, NOT localhost:
+  # Caddy serves a cert for TLS_HOSTNAME only, so https://localhost fails the SNI
+  # handshake (-> 000) and would falsely report "certificate may still be issuing"
+  # forever. --resolve pins the name to the loopback so no real DNS is needed.
   local status
-  status=$(curl -sk -o /dev/null -w "%{http_code}" "https://localhost/webapp/" 2>/dev/null || echo "000")
+  status=$(curl -sk -o /dev/null -w "%{http_code}" \
+    --resolve "${TLS_HOSTNAME}:443:127.0.0.1" "https://${TLS_HOSTNAME}/webapp/" 2>/dev/null || echo "000")
 
   if [[ "$status" == "200" || "$status" == "301" || "$status" == "302" ]]; then
     log_ok "HTTPS responding (HTTP ${status})"
@@ -590,7 +594,15 @@ show_status() {
   if [[ -f "$CADDY_BIN" ]] && systemctl is-active --quiet caddy 2>/dev/null; then
     echo
     local cert_dates
-    cert_dates=$(echo | openssl s_client -connect localhost:443 2>/dev/null | openssl x509 -noout -dates 2>/dev/null || true)
+    local -a sni_arg=()
+    if [[ -f "$MCAPP_CONFIG" ]] && command -v jq >/dev/null 2>&1; then
+      local sni_host
+      sni_host=$(jq -r '.TLS_HOSTNAME // ""' "$MCAPP_CONFIG" 2>/dev/null)
+      [[ -n "$sni_host" ]] && sni_arg=(-servername "$sni_host")
+    fi
+    # -servername: openssl otherwise sends SNI "localhost", which Caddy has no
+    # cert for -> empty output. Present the SNI Caddy serves so cert dates show.
+    cert_dates=$(echo | openssl s_client -connect localhost:443 "${sni_arg[@]}" 2>/dev/null | openssl x509 -noout -dates 2>/dev/null || true)
     if [[ -n "$cert_dates" ]]; then
       echo "Certificate:"
       echo "  ${cert_dates}"
