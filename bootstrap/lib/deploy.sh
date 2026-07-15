@@ -139,6 +139,26 @@ get_target_slot() {
   echo "${oldest_slot:-0}"
 }
 
+# Resolve the release tag we intend to run for the given mode.
+resolve_target_version() {
+  local dev_mode="${1:-false}"
+  local pin_tag="${2:-}"
+  if [[ -n "$pin_tag" ]]; then
+    echo "$pin_tag"
+  elif [[ "$dev_mode" == "true" ]]; then
+    get_latest_prerelease_version
+  else
+    get_latest_release_version
+  fi
+}
+
+# Version recorded in a slot's metadata (empty when unknown/absent).
+slot_recorded_version() {
+  local slot_id="${1:-}"
+  [[ -z "$slot_id" ]] && return
+  jq -r '.version // ""' "${META_DIR}/slot-${slot_id}.json" 2>/dev/null || true
+}
+
 # Snapshot /etc config files for rollback
 snapshot_etc_files() {
   local slot_id="$1"
@@ -187,20 +207,49 @@ deploy_app() {
   local old_version
   old_version=$(get_installed_mcapp_version)
 
-  # Determine target slot for this deployment
-  DEPLOY_SLOT=$(get_target_slot)
+  # Resolve the version we intend to run, and which slot is active right now.
+  local remote_version active_slot active_version
+  remote_version=$(resolve_target_version "$dev_mode" "$pin_tag")
+  active_slot=$(get_active_slot)
+  active_version=$(slot_recorded_version "$active_slot")
+
+  # Decide whether to ROTATE to a fresh slot or deploy IN PLACE on the active
+  # one. Rotate only when genuinely rolling a different version forward (or
+  # forcing, or the active slot is missing/broken). A plain idempotent re-run —
+  # active slot already at the target version — must NOT rotate: get_target_slot
+  # returns the oldest NON-active slot, whose stale contents would then be
+  # activated and silently downgrade the box (exactly how a re-run rolled the
+  # backend from dev.5 back to a stale dev.3 slot).
+  local rotate=false
+  if [[ "$force" == "true" ]]; then
+    rotate=true
+  elif [[ "$remote_version" == "unknown" ]]; then
+    rotate=false
+  elif [[ -z "$active_slot" ]]; then
+    rotate=true
+  elif [[ "${active_version#v}" != "${remote_version#v}" ]]; then
+    rotate=true
+  elif [[ ! -f "${SLOTS_DIR}/slot-${active_slot}/pyproject.toml" ]]; then
+    rotate=true
+  fi
+
+  if [[ "$rotate" == "true" ]]; then
+    DEPLOY_SLOT=$(get_target_slot)
+  else
+    DEPLOY_SLOT="${active_slot:-$(get_target_slot)}"
+    [[ -n "$active_slot" ]] && \
+      log_info "  Active slot-${active_slot} already at ${remote_version} — deploying in place (no rotation)"
+  fi
   local deploy_target="${SLOTS_DIR}/slot-${DEPLOY_SLOT}"
   log_info "  Deploy target: slot-${DEPLOY_SLOT} (${deploy_target})"
 
   # Snapshot current /etc files before making changes
-  local active_slot
-  active_slot=$(get_active_slot)
   if [[ -n "$active_slot" ]]; then
     snapshot_etc_files "$active_slot"
   fi
 
-  # Deploy into target slot
-  deploy_release "$force" "$dev_mode" "$deploy_target" "$pin_tag"
+  # Deploy into target slot (pass the already-resolved remote version)
+  deploy_release "$force" "$dev_mode" "$deploy_target" "$pin_tag" "$remote_version"
   deploy_webapp "$force" "$deploy_target" "$pin_tag"
 
   # Guard: if target slot is still empty after deploy steps (e.g. version
@@ -292,57 +341,52 @@ deploy_release() {
   local dev_mode="${2:-false}"
   local deploy_target="${3:-$INSTALL_DIR}"
   local pin_tag="${4:-}"
+  local remote_version="${5:-}"
 
   log_info "Checking McApp release deployment..."
 
   local installed_version
-  local remote_version
-
   installed_version=$(get_installed_mcapp_version)
 
+  # remote_version is normally resolved once by the caller (deploy_app) and
+  # passed in; resolve here too so deploy_release stays usable standalone.
+  if [[ -z "$remote_version" ]]; then
+    remote_version=$(resolve_target_version "$dev_mode" "$pin_tag")
+  fi
   if [[ -n "$pin_tag" ]]; then
-    remote_version="$pin_tag"
     log_info "  Mode: pinned tag"
   elif [[ "$dev_mode" == "true" ]]; then
-    remote_version=$(get_latest_prerelease_version)
     log_info "  Mode: development (pre-release)"
-  else
-    remote_version=$(get_latest_release_version)
   fi
+
+  # What the TARGET slot currently holds. Activation points mcapp.service at
+  # this slot, so whether to (re)download is decided from the SLOT's own
+  # version vs the release we want — NOT the served webapp (WEBAPP_DIR), which
+  # can legitimately differ and previously masked a stale slot as "up to date"
+  # (that let a re-run activate an older slot and downgrade the backend).
+  local target_version=""
+  [[ -f "${deploy_target}/webapp/version.html" ]] && \
+    target_version=$(cat "${deploy_target}/webapp/version.html" 2>/dev/null)
+  local target_has_code=false
+  [[ -f "${deploy_target}/pyproject.toml" ]] && target_has_code=true
 
   log_info "  Installed: ${installed_version}"
   log_info "  Remote:    ${remote_version}"
 
-  # Check if target slot already has code (empty slots must always be populated)
-  local target_has_code=false
-  [[ -f "${deploy_target}/pyproject.toml" ]] && target_has_code=true
-
-  # Decide if update needed
-  if [[ -n "$pin_tag" ]]; then
-    log_info "  Pinned to tag: ${pin_tag}"
-  elif [[ "$force" == "true" ]]; then
-    log_info "  Force mode: reinstalling release"
-  elif [[ "$installed_version" == "not_installed" ]]; then
-    log_info "  McApp not installed, downloading..."
-  elif [[ "$remote_version" == "unknown" ]] && [[ "$target_has_code" == "true" ]]; then
-    log_warn "  Cannot check remote version, skipping update"
-    return 0
-  elif [[ "$dev_mode" == "false" ]] && [[ "$installed_version" == *-dev* ]]; then
-    log_info "  Switching from dev to production: ${installed_version} → ${remote_version}"
-  elif [[ "$target_has_code" == "true" ]] && version_gte "$installed_version" "${remote_version#v}"; then
-    # Catch stale dev content in target slot when deploying production
-    local slot_webapp="${deploy_target}/webapp/version.html"
-    if [[ "$dev_mode" == "false" ]] && [[ -f "$slot_webapp" ]] \
-        && grep -q -- '-dev\.' "$slot_webapp"; then
-      log_info "  Target slot has dev content, repopulating with production release"
-    else
-      log_info "  McApp is up to date"
+  if [[ "$force" == "true" ]]; then
+    log_info "  Force mode: reinstalling ${remote_version}"
+  elif [[ "$remote_version" == "unknown" ]]; then
+    if [[ "$target_has_code" == "true" ]]; then
+      log_warn "  Cannot determine remote version — leaving target slot as-is"
       return 0
     fi
-  elif [[ "$target_has_code" == "false" ]] && version_gte "$installed_version" "${remote_version#v}"; then
-    log_info "  McApp is up to date but target slot is empty, populating..."
+    log_error "  Cannot determine remote version and target slot is empty"
+    return 1
+  elif [[ "$target_has_code" == "true" ]] && [[ "${target_version#v}" == "${remote_version#v}" ]]; then
+    log_info "  McApp is up to date (slot already ${remote_version})"
+    return 0
   else
-    log_info "  Updating McApp: ${installed_version} → ${remote_version}"
+    log_info "  Deploying ${remote_version} (slot had: ${target_version:-empty})"
   fi
 
   download_and_install_release "$remote_version" "$deploy_target"
