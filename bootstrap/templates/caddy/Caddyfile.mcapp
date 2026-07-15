@@ -1,4 +1,4 @@
-# mcapp-caddy-config-version: 1
+# mcapp-caddy-config-version: 2
 # (keep this number in sync with CADDY_CONFIG_VERSION in bootstrap/lib/packages.sh —
 #  configure_caddy() only rewrites this file when the marker version bumps)
 #
@@ -28,6 +28,21 @@
 	# SSE event stream — must not be buffered
 	handle /events* {
 		reverse_proxy 127.0.0.1:2981 {
+			flush_interval -1
+		}
+	}
+
+	# Update-runner SSE progress stream (PWA Task 0.6). The runner is an
+	# ephemeral plain-http server on 127.0.0.1:2985 that only exists while an
+	# update/rollback is in flight; this route lets an https page connect
+	# same-origin (no mixed content) instead of the blocked http://host:2985.
+	# Exact match; rewrite -> the runner's /stream (its only route the webapp
+	# uses; it compares self.path with ==, so the prefix must NOT be stripped).
+	# 502 while no update is running is expected — the webapp only connects
+	# during an update and its retry loop covers the runner spawn window.
+	handle /update-stream {
+		rewrite * /stream
+		reverse_proxy 127.0.0.1:2985 {
 			flush_interval -1
 		}
 	}

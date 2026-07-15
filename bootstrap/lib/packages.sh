@@ -388,7 +388,7 @@ EOF
 # LIGHTTPD_MCAPP_CONF_VERSION above). Keep this number in sync with the
 # "mcapp-caddy-config-version:" comment in
 # bootstrap/templates/caddy/Caddyfile.mcapp.
-readonly CADDY_CONFIG_VERSION=1
+readonly CADDY_CONFIG_VERSION=2
 
 install_caddy() {
   log_info "Installing Caddy..."
