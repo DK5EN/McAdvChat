@@ -206,7 +206,7 @@ install_uv() {
 # changes, so upgraded installs actually pick up the new config (see
 # configure_lighttpd() below for why this replaced a "contains
 # Cache-Control" substring check).
-readonly LIGHTTPD_MCAPP_CONF_VERSION=2
+readonly LIGHTTPD_MCAPP_CONF_VERSION=3
 
 install_lighttpd() {
   log_info "Installing lighttpd..."
@@ -256,6 +256,23 @@ configure_lighttpd() {
     log_info "  Replaced customized lighttpd.conf (backup: $backup)"
   fi
 
+  # Move the (single) listen socket to 127.0.0.1:8082 in the BASE conf. It MUST
+  # live here and not in 99-mcapp.conf: the stock/template lighttpd.conf
+  # consumes server.port in `include_shell use-ipv6.pl + server.port` BEFORE it
+  # includes conf-enabled/*.conf, so server.port may be defined exactly once,
+  # up in the base. A stock Debian base ships `server.port = 80` and is NOT
+  # caught by the "webapp" migration above, which is exactly how an install ends
+  # up with server.port declared in both files → lighttpd's "Duplicate config
+  # variable ... server.port" → lighttpd AND Caddy both fail to start. Runs
+  # before the version-marker early-return so it reconciles the base regardless
+  # of 99-mcapp.conf state. Idempotent: no-ops once the base already reads 8082.
+  if [[ -f "$main_conf" ]]; then
+    sed -i -E 's/^(server\.port[[:space:]]*=[[:space:]]*)80([[:space:]]*)$/\18082\2/' "$main_conf"
+    if ! grep -qE '^[[:space:]]*server\.bind[[:space:]]*=' "$main_conf"; then
+      sed -i -E '/^server\.port[[:space:]]*=/a server.bind                 = "127.0.0.1"' "$main_conf"
+    fi
+  fi
+
   # Idempotency: rewrite only when the version marker is missing or stale.
   #
   # Previously this only checked whether the file contained the literal
@@ -285,10 +302,13 @@ configure_lighttpd() {
 
 server.modules += ("mod_rewrite", "mod_redirect", "mod_proxy", "mod_setenv")
 
-# Bind to localhost only on 8082 — Caddy is the public front door on :80/:443.
-# NOTE: port 8081 is reserved by mcapp-ble.service's uvicorn — do not reuse it.
-server.bind = "127.0.0.1"
-server.port = 8082
+# NOTE: the listen socket (server.bind = "127.0.0.1", server.port = 8082 — put
+# lighttpd behind Caddy, which owns the public :80/:443) is declared in the
+# BASE lighttpd.conf, NOT here. lighttpd forbids re-declaring server.port, and
+# the base consumes it (include_shell use-ipv6.pl + server.port) before it
+# includes this file — declaring it again here fails the whole config with
+# "Duplicate config variable ... server.port". port 8081 is reserved by
+# mcapp-ble.service's uvicorn — do not reuse it.
 
 # Enable streaming for SSE (Server-Sent Events) — prevents buffering
 server.stream-response-body = 2
@@ -373,13 +393,34 @@ readonly CADDY_CONFIG_VERSION=1
 install_caddy() {
   log_info "Installing Caddy..."
 
-  # Check if already installed (idempotent — Caddy ships in the Debian repo
-  # from bookworm/trixie onward, no third-party repo needed)
+  # The Caddyfile template uses a modern post-quantum TLS curve
+  # (x25519mlkem768) that needs Caddy >= 2.9. Debian's packaged caddy (trixie
+  # ships 2.6.2) is too old — `caddy validate` rejects the curve and Caddy
+  # never starts. Install from Caddy's official apt repo to get a current
+  # release (matches rpizero's 2.11.x). Skip if a new-enough caddy is present.
+  local caddy_minor=0
   if command -v caddy &>/dev/null; then
-    log_info "  Caddy already installed"
+    caddy_minor=$(caddy version 2>/dev/null | grep -oE '2\.[0-9]+' | head -1 | cut -d. -f2)
+    caddy_minor=${caddy_minor:-0}
+  fi
+
+  if command -v caddy &>/dev/null && [[ "$caddy_minor" -ge 9 ]]; then
+    log_info "  Caddy already installed ($(caddy version 2>/dev/null | head -1))"
   else
-    apt-get install -y -qq caddy
-    log_ok "  Caddy installed"
+    if command -v caddy &>/dev/null; then
+      log_info "  Caddy $(caddy version 2>/dev/null | head -1) too old (need >= 2.9) — installing current from official repo"
+    fi
+    if [[ ! -f /etc/apt/sources.list.d/caddy-stable.list ]]; then
+      apt-get install -y -qq debian-keyring debian-archive-keyring apt-transport-https curl gnupg
+      curl -1sLf 'https://dl.cloudsmith.io/public/caddy/stable/gpg.key' \
+        | gpg --dearmor --yes -o /usr/share/keyrings/caddy-stable-archive-keyring.gpg
+      curl -1sLf 'https://dl.cloudsmith.io/public/caddy/stable/debian.deb.txt' \
+        > /etc/apt/sources.list.d/caddy-stable.list
+      apt-get update -qq
+    fi
+    # --force-confold: keep our already-written /etc/caddy/Caddyfile on upgrade
+    apt-get install -y -qq -o Dpkg::Options::="--force-confold" caddy
+    log_ok "  Caddy installed ($(caddy version 2>/dev/null | head -1))"
   fi
 
   configure_caddy
@@ -454,7 +495,13 @@ configure_caddy() {
   # enable is idempotent — always ensure Caddy starts on boot
   systemctl enable caddy &>/dev/null || true
 
-  if [[ "$rewrote" == "true" ]]; then
+  # Restart when the config changed OR when Caddy isn't currently up. The
+  # second clause matters on a RECOVERY re-run: if a previous run wrote a valid
+  # Caddyfile but Caddy failed to start (e.g. it was an older build that
+  # rejected the config, now upgraded), the marker already matches so
+  # rewrote=false — without the is-active guard we'd validate happily and leave
+  # a down service down.
+  if [[ "$rewrote" == "true" ]] || ! systemctl is-active --quiet caddy; then
     # FULL restart (not reload) and CHECK the result. Ordering: this runs
     # AFTER configure_lighttpd() (earlier in install_packages) has already
     # done its full restart to free :80, so Caddy can bind :80/:443 here on
@@ -470,7 +517,7 @@ configure_caddy() {
       return 1
     fi
   else
-    log_info "  Caddy config unchanged — not restarting (idempotent no-op)"
+    log_info "  Caddy config unchanged and already running — not restarting (idempotent no-op)"
   fi
 
   # Publish Caddy's internal-CA root cert to the path Caddyfile.mcapp serves
