@@ -9,6 +9,23 @@
 install_packages() {
   install_apt_deps
   install_uv
+  ensure_web_frontend
+}
+
+# Idempotent install + configuration of the web front door.
+#
+# ORDER MATTERS: install_lighttpd (→ configure_lighttpd) moves lighttpd off
+# :80 onto 127.0.0.1:8082 and full-restarts it, freeing :80 BEFORE
+# install_caddy (→ configure_caddy) binds :80/:443. Both are idempotent —
+# command -v guards + version markers mean steady-state is a no-op with no
+# restart — so calling this repeatedly (and from more than one code path) is
+# safe.
+#
+# This exists as its own function because the web-updater path
+# (update-runner.py → `mcapp.sh --skip`) never runs install_packages(), so
+# without a second call site the :80→8082 move + Caddy install would never
+# reach production upgrades. See the --skip call site in mcapp.sh.
+ensure_web_frontend() {
   install_lighttpd
   install_caddy
 }

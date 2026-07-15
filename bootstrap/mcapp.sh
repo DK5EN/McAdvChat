@@ -354,6 +354,22 @@ main() {
       exit 1
     fi
     log_info "Skipping system setup and packages (--skip)"
+
+    # --skip is the path the web updater uses (update-runner.py always runs
+    # `mcapp.sh --skip`), which otherwise never runs install_packages() and so
+    # would never install the Caddy front door or move lighttpd off :80.
+    # ensure_web_frontend() is idempotent (steady-state no-op, no restart), so
+    # running it here every update is safe and closes that gap.
+    #
+    # SEEDING CAVEAT: update-runner.py drives each update using the CURRENTLY
+    # ACTIVE (pre-update) slot's mcapp.sh (update-runner.py:366-371), not the
+    # incoming release's. So this fix only becomes the driver once a release
+    # CONTAINING it is the active slot. The FIRST release that carries this
+    # change must therefore be seeded by a one-time manual full run
+    # (`sudo mcapp.sh` WITHOUT --skip) on each Pi — documented for the
+    # maintainer. After that, subsequent web-updater runs self-heal.
+    log_step "Ensuring web front end (lighttpd :8082 + Caddy :80/:443)..."
+    ensure_web_frontend
   else
     # Phase 1.5: Migration from old installation (if needed)
     if [[ "$state" == "migrate" ]]; then

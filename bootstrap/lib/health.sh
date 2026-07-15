@@ -122,6 +122,9 @@ check_lighttpd_proxy() {
 }
 
 check_caddy_https() {
+  # NOTE: loopback-only — this proves Caddy answers HTTPS on localhost but
+  # canNOT detect a firewall-blocked :443 for external clients; that external
+  # contract is verified separately by scripts/pwa-smoke.sh <host>.
   # Verify Caddy terminates TLS on :443 and proxies /health through to
   # FastAPI (via lighttpd for static, direct for /health). -k because the
   # LAN default uses `tls internal` (self-signed CA the client may not trust).
