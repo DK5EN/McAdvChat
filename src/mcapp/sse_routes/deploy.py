@@ -5,7 +5,7 @@ from __future__ import annotations
 import asyncio
 from typing import TYPE_CHECKING, Any
 
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, HTTPException, Request
 
 from ..logging_setup import get_logger
 from ..schemas import BlePinRequest, UpdateStartRequest
@@ -39,15 +39,21 @@ def build_deploy_router(manager: SSEManager) -> APIRouter:
     # ── Update / Deployment Endpoints ──────────────────────────
 
     @router.post("/api/update/start")
-    async def start_update(body: UpdateStartRequest | None = None) -> dict[str, str]:
+    async def start_update(
+        request: Request, body: UpdateStartRequest | None = None
+    ) -> dict[str, str]:
         """Launch the update runner process."""
         dev = body.dev if body else False
-        return await manager.launch_update_runner("update", dev=dev)
+        return await manager.launch_update_runner(
+            "update", dev=dev, request_host=request.headers.get("host")
+        )
 
     @router.post("/api/update/rollback")
-    async def start_rollback() -> dict[str, str]:
+    async def start_rollback(request: Request) -> dict[str, str]:
         """Launch the update runner in rollback mode."""
-        return await manager.launch_update_runner("rollback")
+        return await manager.launch_update_runner(
+            "rollback", request_host=request.headers.get("host")
+        )
 
     @router.get("/api/update/slots")
     async def get_slots() -> dict[str, Any]:

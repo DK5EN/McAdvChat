@@ -42,6 +42,27 @@ DEFAULT_SSE_PORT = 2981
 
 VERSION = f"v{__version__}"  # emitted in the FastAPI app metadata and GET /api/status
 
+# Hosts that are only reachable from the Pi itself — never hand these to a
+# remote browser as an update-runner stream URL (it would connect to its own
+# machine). See reachable_runner_host / launch_update_runner.
+_LOOPBACK_HOSTS = frozenset({"127.0.0.1", "localhost", "0.0.0.0", "::1"})  # noqa: S104 - string literals compared against, not a bind address
+
+
+def reachable_runner_host(request_host: str | None, bind_host: str) -> str:
+    """Pick the hostname a remote client can reach the update-runner on.
+
+    Prefer the Host the client used to reach the API (forwarded by lighttpd),
+    stripped of any port. Ignore loopback/wildcard values — those are only
+    reachable from the Pi itself and are exactly what made the browser connect
+    to its own localhost:2985. Fall back to the bind address, mapping the
+    0.0.0.0 wildcard to localhost as a last resort.
+    """
+    if request_host:
+        candidate = request_host.split(":", 1)[0].strip()
+        if candidate and candidate.lower() not in _LOOPBACK_HOSTS:
+            return candidate
+    return bind_host if bind_host != "0.0.0.0" else "localhost"  # noqa: S104 - comparing bind host string, not binding
+
 logger = get_logger(__name__)
 
 # Import FastAPI and related modules
@@ -411,8 +432,14 @@ class SSEManager:
         self,
         mode: str,
         dev: bool = False,
+        request_host: str | None = None,
     ) -> dict[str, Any]:
-        """Launch the standalone update runner via systemd .path trigger."""
+        """Launch the standalone update runner via systemd .path trigger.
+
+        `request_host` is the Host the client used to reach this API; it is used
+        to build the stream/status URLs so a remote browser connects to the Pi
+        (not its own loopback). See reachable_runner_host.
+        """
 
         logger.info("Update requested: mode=%s dev=%s", mode, dev)
 
@@ -443,8 +470,10 @@ class SSEManager:
 
         # Frontend will retry stream connection until runner is ready
 
-        # Determine the host from request context
-        host = self.host if self.host != "0.0.0.0" else "localhost"  # noqa: S104 - LAN service binds all interfaces by design
+        # Build the runner URLs on the host the CLIENT used to reach us, not
+        # self.host (the loopback bind address) — otherwise a remote browser is
+        # told to connect to its own 127.0.0.1:2985 and fails every retry.
+        host = reachable_runner_host(request_host, self.host)
 
         return {
             "status": "launched",
@@ -1035,6 +1064,34 @@ async def run_startup_tests() -> bool:  # noqa: PLR0915 - regression suite kept 
                 "event: test:overflow" in delivered,
             )
         )
+
+    # reachable_runner_host: the update-runner stream URL must use the host the
+    # CLIENT reached us on, never the loopback bind address (regression: a
+    # 127.0.0.1 stream_url made the browser connect to its own machine).
+    results.append(
+        (
+            "reachable_runner_host prefers the client's Host header",
+            reachable_runner_host("mcapp.local", "127.0.0.1") == "mcapp.local",
+        )
+    )
+    results.append(
+        (
+            "reachable_runner_host strips the port from the Host header",
+            reachable_runner_host("mcapp.local:80", "127.0.0.1") == "mcapp.local",
+        )
+    )
+    results.append(
+        (
+            "reachable_runner_host ignores a loopback Host, falls back to bind addr",
+            reachable_runner_host("localhost", "192.168.1.5") == "192.168.1.5",
+        )
+    )
+    results.append(
+        (
+            "reachable_runner_host maps a 0.0.0.0 bind fallback to localhost",
+            reachable_runner_host(None, "0.0.0.0") == "localhost",  # noqa: S104 - test fixture string, not a bind
+        )
+    )
 
     for label, ok in results:
         print(f"    {'✅ PASS' if ok else '❌ FAIL'} | {label}")
