@@ -63,6 +63,7 @@ def reachable_runner_host(request_host: str | None, bind_host: str) -> str:
             return candidate
     return bind_host if bind_host != "0.0.0.0" else "localhost"  # noqa: S104 - comparing bind host string, not binding
 
+
 logger = get_logger(__name__)
 
 # Import FastAPI and related modules
