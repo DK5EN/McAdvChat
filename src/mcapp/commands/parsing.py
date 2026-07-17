@@ -11,6 +11,13 @@ from .constants import CALLSIGN_TARGET_RE
 
 _MAX_GROUP_NUM = 99999
 
+# Quarantine group for blocked-callsign traffic. Group/broadcast messages from a
+# blocked callsign are redirected here on the live SSE path — kept out of normal
+# views but still inspectable — while personal/position traffic is dropped
+# outright. Mirrors the frontend spec (README: "Spam and illegal messages are
+# assigned to group 9999").
+SPAM_GROUP = "9999"
+
 
 def strip_relay_path(src_raw: str) -> str:
     """Strip a MeshCom relay-path suffix (comma-separated hops) from a raw src

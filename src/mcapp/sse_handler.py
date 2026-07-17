@@ -27,6 +27,7 @@ from typing import Any, ClassVar
 from . import __version__
 from .ble_client import ConnectionState
 from .classifier import Classifier
+from .commands.parsing import SPAM_GROUP
 from .logging_setup import get_logger
 from .schemas import DeleteMessagesRequest
 from .sqlite_storage import SQLiteStorage, create_sqlite_storage
@@ -593,8 +594,22 @@ class SSEManager:
         return "\n".join(lines) + "\n"
 
     async def _broadcast_handler(self, routed_message: dict[str, Any]) -> None:
-        """Handle messages from the router and broadcast to SSE clients."""
+        """Handle messages from the router and broadcast to SSE clients.
+
+        Blocklist-aware via the shared MessageRouter.blocklist_decision():
+        blocked personal/position traffic is not delivered at all, and blocked
+        group/broadcast traffic is quarantined to SPAM_GROUP so it stays out of
+        normal views but remains inspectable. The dst rewrite is applied to a
+        shallow COPY — never the shared routed_message["data"] — so the
+        storage/command subscribers of the same message are unaffected.
+        """
         message_data = routed_message["data"]
+        router = self.message_router
+        decision = router.blocklist_decision(message_data) if router is not None else "pass"
+        if decision == "drop":
+            return
+        if decision == "redirect":
+            message_data = {**message_data, "dst": SPAM_GROUP}
         await self.broadcast_message(message_data)
 
         if logger.isEnabledFor(10):  # DEBUG level

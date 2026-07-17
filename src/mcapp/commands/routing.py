@@ -19,6 +19,15 @@ class RoutingMixin(CommandHandlerBase):
     async def _message_handler(self, routed_message: dict[str, Any]) -> None:  # noqa: PLR0911 - complex handler kept intact
         """Handle incoming messages: dispatch echoes/ACKs, then parse and execute commands."""
         message_data = routed_message["data"]
+
+        # Blocked callsigns never trigger command processing (echoes, ACKs or
+        # ! commands) — same shared decision that gates the storage/broadcast
+        # paths, so a blocked station can't drive the bot even though its group
+        # traffic is still quarantined to SPAM_GROUP for viewing.
+        router = self.message_router
+        if router is not None and router.blocklist_decision(message_data) != "pass":
+            return
+
         src_type = message_data.get("src_type")
 
         logger.debug(

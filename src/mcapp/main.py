@@ -181,9 +181,14 @@ class MessageRouter:
         if self.storage_handler:
             message_data = routed_message["data"]
 
-            src = (message_data.get("src") or "").split(",")[0].upper()
-            if self._is_callsign_blocked(src):
-                self._logger.debug("Blocked message from %s", src)
+            # Blocked callsigns are never persisted — neither dropped personal
+            # traffic nor group traffic that the broadcast path quarantines to
+            # SPAM_GROUP live. Keeping them out of the messages/signal/position
+            # tables is what keeps a blocked station invisible in history and
+            # mHeard. The same shared decision gates the SSE and command paths,
+            # so every ingestion path agrees (previously only storage blocked).
+            if self.blocklist_decision(message_data) != "pass":
+                self._logger.debug("Blocked (not persisted) from %s", message_data.get("src"))
                 return
 
             raw_json = json.dumps(message_data)
@@ -196,6 +201,34 @@ class MessageRouter:
         if hasattr(command_handler, "blocked_callsigns"):
             return callsign in command_handler.blocked_callsigns
         return False
+
+    def blocklist_decision(self, data: dict[str, Any]) -> str:
+        """Classify an inbound mesh/BLE payload against the callsign blocklist.
+
+        Shared by every ingestion path (storage, SSE broadcast, command
+        handling) so blocking is enforced identically everywhere — not only on
+        persistence, the historical gap that let blocked callsigns still reach
+        the webapp live and trigger command responses. Returns:
+
+            "pass"     — src not blocked; handle normally.
+            "redirect" — blocked group/broadcast traffic; the broadcast path
+                         quarantines it to SPAM_GROUP (9999) for live viewing,
+                         while storage still drops it (live-only, never
+                         persisted, so it never lands in mHeard/history).
+            "drop"     — blocked personal/position/telemetry; suppressed on
+                         every path.
+
+        `dst` is normalized (strip + upper) before the group test — the raw
+        inbound payload is not pre-normalized on this path, so `is_group` would
+        otherwise misclassify e.g. " 20" as a non-group and drop it.
+        """
+        src = (data.get("src") or "").split(",")[0].upper()
+        if not self._is_callsign_blocked(src):
+            return "pass"
+        dst = (data.get("dst") or "").strip().upper()
+        if is_group(dst) or dst in ("*", "ALL"):
+            return "redirect"
+        return "drop"
 
     def register_protocol(self, name: str, handler: Any) -> None:
         """Register a protocol handler (UDP, BLE, WebSocket)"""

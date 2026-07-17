@@ -1460,89 +1460,188 @@ async def test_kickban_persistence(handler: Any) -> bool:
     return passed == total
 
 
-async def test_message_blocking_integration(handler: Any) -> bool:
-    """Drive the REAL inbound blocklist path (A1).
+async def test_message_blocking_integration(handler: Any) -> bool:  # noqa: PLR0915 - many independent per-path assertions kept in one suite
+    """Drive the REAL inbound blocklist enforcement across ALL ingestion paths.
 
-    Rather than re-implementing ``callsign in blocked_callsigns`` and asserting
-    against the test's own table (a tautology that never exercised production
-    code), this feeds message dicts through ``MessageRouter._storage_handler`` —
-    the actual ingestion hook that calls ``_is_callsign_blocked`` — and verifies a
-    blocked src is dropped (never stored) while a non-blocked src is stored. The
-    production predicate ``_is_callsign_blocked`` is asserted directly too.
+    Blocking is enforced by one shared decision — ``MessageRouter.blocklist_decision()``
+    — consulted identically by the storage, SSE-broadcast and command paths (the
+    historical bug was that only storage blocked, so blocked callsigns still
+    reached the webapp live and could drive the bot). Semantics:
 
-    Own-callsign behavior is verified against real code: there is no special
-    "own callsign always passes" branch — it passes solely because the callsign
-    is never in ``blocked_callsigns`` (handle_kickban refuses to add it).
+      - blocked personal (DM) / position / telemetry -> "drop"     (suppressed everywhere)
+      - blocked group / broadcast ("*"/"ALL")        -> "redirect" (live-only to SPAM_GROUP;
+                                                         never persisted, so never in mHeard)
+      - non-blocked / own callsign                   -> "pass"
+
+    Exercises real production code on every path: (a) the decision helper, (b)
+    storage — blocked never persisted, (c) SSE broadcast — DM dropped, group
+    rewritten to SPAM_GROUP on a COPY (shared dict untouched), (d) command —
+    blocked src short-circuited before command execution.
     """
+    from ..sse_handler import SSEManager  # test-only import, avoids an import cycle at module load
+    from .parsing import SPAM_GROUP
+
     if has_console:
-        print("\n🧪 Testing Message Blocking Integration (real inbound path):")
+        print("\n🧪 Testing Message Blocking Integration (all ingestion paths):")
         print("=" * 45)
 
     router = handler.message_router
     results: list[tuple[str, str, bool]] = []
 
-    if router is None or handler.storage_handler is None:
+    if router is None:
         if has_console:
-            print("⏭️  Skipped: no MessageRouter/storage in this test context")
+            print("⏭️  Skipped: no MessageRouter in this test context")
         return True
 
-    storage = handler.storage_handler
-
-    async def _row_exists(msg_id: str) -> bool:
-        rows = await storage._query("SELECT 1 FROM messages WHERE msg_id = ? LIMIT 1", (msg_id,))
-        return bool(rows)
-
-    async def _route(src: str, msg_id: str) -> None:
-        message_data = {
-            "src": src,
-            "dst": "20",
-            "msg": f"blocking probe {msg_id}",
-            "type": "msg",
-            "src_type": "udp",
-            "msg_id": msg_id,
-            "timestamp": now_ms(),
-        }
-        await router._storage_handler({"data": message_data})
+    def _record(label: str, ok: bool) -> None:
+        status = "✅ PASS" if ok else "❌ FAIL"
+        results.append((status, label, ok))
+        if has_console:
+            print(f"{status} | {label}")
 
     old_blocked: Any = getattr(handler, "blocked_callsigns", set())
     handler.blocked_callsigns = {"OE1ABC-5"}
 
-    # Each case: source callsign, msg_id, whether it should end up stored, label.
-    cases = [
-        ("OE1ABC-5", "BLK00001", False, "Blocked src is dropped (not stored)"),
-        ("W1XYZ-1", "BLK00002", True, "Non-blocked src is stored"),
-        ("oe1abc-5", "BLK00003", False, "Blocked src (lowercase) is normalized and dropped"),
-        (handler.my_callsign, "BLK00004", True, "Own callsign passes (never in blocklist)"),
-    ]
-
     try:
-        # Assert the production predicate directly (not a re-implemented `in`).
-        pred_checks = [
-            ("_is_callsign_blocked('OE1ABC-5') is True", router._is_callsign_blocked("OE1ABC-5")),
-            (
-                "_is_callsign_blocked('W1XYZ-1') is False",
-                not router._is_callsign_blocked("W1XYZ-1"),
-            ),
-            (
-                "_is_callsign_blocked(own) is False",
-                not router._is_callsign_blocked(handler.my_callsign),
-            ),
+        # ── (a) Shared decision helper: pass / drop / redirect classification ──
+        decision_cases = [
+            ("OE1ABC-5", "DL9XYZ-1", "drop", "blocked DM -> drop"),
+            ("OE1ABC-5", "232", "redirect", "blocked group -> redirect"),
+            ("OE1ABC-5", "TEST", "redirect", "blocked TEST group -> redirect"),
+            ("OE1ABC-5", "*", "redirect", "blocked broadcast '*' -> redirect"),
+            ("OE1ABC-5", "ALL", "redirect", "blocked broadcast 'ALL' -> redirect"),
+            ("OE1ABC-5", " 232 ", "redirect", "blocked group w/ whitespace -> redirect"),
+            ("oe1abc-5,DB0XYZ", "232", "redirect", "blocked lowercase+relay src -> redirect"),
+            ("OE1ABC-5", "", "drop", "blocked w/o dst (pos/telemetry) -> drop"),
+            ("W1XYZ-1", "232", "pass", "non-blocked group -> pass"),
+            (handler.my_callsign, "OE1ABC-5", "pass", "own callsign -> pass"),
         ]
-        for label, ok in pred_checks:
-            status = "✅ PASS" if ok else "❌ FAIL"
-            results.append((status, label, ok))
-            if has_console:
-                print(f"{status} | {label}")
+        for src, dst, expected, label in decision_cases:
+            got = router.blocklist_decision({"src": src, "dst": dst})
+            _record(f"decision: {label}", got == expected)
 
-        for src, msg_id, should_store, description in cases:
-            await _route(src, msg_id)
-            stored = await _row_exists(msg_id)
-            ok = stored == should_store
-            status = "✅ PASS" if ok else "❌ FAIL"
-            results.append((status, description, ok))
-            if has_console:
-                print(f"{status} | {description}")
-                print(f"     src={src} stored={stored} (expected {should_store})")
+        # ── (b) Storage path: blocked traffic is never persisted (live-only) ──
+        # Runs against an ephemeral tempfile DB when the handler has no storage
+        # (the canonical headless runner wires the command handler with
+        # storage=None), so this assertion is never silently skipped — mirrors
+        # the classifier/storage suites' isolation pattern.
+        async def _store(src: str, dst: str, msg_id: str) -> None:
+            await router._storage_handler(
+                {
+                    "data": {
+                        "src": src,
+                        "dst": dst,
+                        "msg": f"probe {msg_id}",
+                        "type": "msg",
+                        "src_type": "udp",
+                        "msg_id": msg_id,
+                        "timestamp": now_ms(),
+                    }
+                }
+            )
+
+        async def _row_exists(store: Any, msg_id: str) -> bool:
+            rows = await store._query("SELECT 1 FROM messages WHERE msg_id = ? LIMIT 1", (msg_id,))
+            return bool(rows)
+
+        store_cases = [
+            ("OE1ABC-5", "232", "BLK-G-1", False, "blocked group not persisted"),
+            ("OE1ABC-5", "DL9XYZ-1", "BLK-D-1", False, "blocked DM not persisted"),
+            ("W1XYZ-1", "232", "BLK-N-1", True, "non-blocked group persisted"),
+            (handler.my_callsign, "232", "BLK-O-1", True, "own callsign persisted"),
+        ]
+
+        async def _probe_storage(store: Any) -> None:
+            for src, dst, msg_id, should_store, label in store_cases:
+                await _store(src, dst, msg_id)
+                _record(f"storage: {label}", (await _row_exists(store, msg_id)) == should_store)
+
+        prior_storage = router.storage_handler
+        if prior_storage is not None:
+            await _probe_storage(prior_storage)
+        else:
+            import tempfile
+            from pathlib import Path
+
+            from ..sqlite_storage import create_sqlite_storage
+
+            with tempfile.TemporaryDirectory() as tmp_dir:
+                eph = await create_sqlite_storage(str(Path(tmp_dir) / "blocklist_test.db"))
+                router.storage_handler = eph
+                try:
+                    await _probe_storage(eph)
+                finally:
+                    router.storage_handler = prior_storage
+                    await eph.close()
+
+        # ── (c) SSE broadcast path: real SSEManager._broadcast_handler ──
+        # message_router=None on construction so it does not auto-subscribe to
+        # the live router; we wire it manually and capture the outgoing payload.
+        sse = SSEManager("127.0.0.1", 0, message_router=None)
+        sse.message_router = router
+        captured: list[dict[str, Any]] = []
+
+        async def _capture(message: dict[str, Any]) -> None:
+            captured.append(message)
+
+        sse.broadcast_message = _capture  # type: ignore[method-assign]
+
+        async def _broadcast(src: str, dst: str) -> dict[str, Any]:
+            payload = {"src": src, "dst": dst, "msg": "x", "type": "msg"}
+            captured.clear()
+            await sse._broadcast_handler({"source": "udp", "type": "mesh_message", "data": payload})
+            return payload
+
+        await _broadcast("OE1ABC-5", "DL9XYZ-1")
+        _record("broadcast: blocked DM dropped (not delivered)", captured == [])
+
+        shared = await _broadcast("OE1ABC-5", "232")
+        _record(
+            "broadcast: blocked group -> SPAM_GROUP on a copy (shared dict intact)",
+            len(captured) == 1 and captured[0].get("dst") == SPAM_GROUP and shared["dst"] == "232",
+        )
+
+        await _broadcast("W1XYZ-1", "232")
+        _record(
+            "broadcast: non-blocked delivered unchanged",
+            len(captured) == 1 and captured[0].get("dst") == "232",
+        )
+
+        # ── (d) Command path: blocked src short-circuited before execution ──
+        exec_calls: list[str] = []
+        real_should_execute = handler._should_execute_command
+
+        def _spy_should_execute(src: str, _dst: str, _msg: str) -> tuple[bool, Any]:
+            exec_calls.append(src)
+            return (False, None)
+
+        handler._should_execute_command = _spy_should_execute  # type: ignore[method-assign]
+        try:
+            for src, msg_id in (("OE1ABC-5", "CMD-BLK-1"), ("W1XYZ-1", "CMD-OK-1")):
+                await handler._message_handler(
+                    {
+                        "source": "udp",
+                        "type": "mesh_message",
+                        "data": {
+                            "src": src,
+                            "dst": "232",
+                            "msg": "!ping",
+                            "type": "msg",
+                            "src_type": "udp",
+                            "msg_id": msg_id,
+                        },
+                    }
+                )
+            _record("command: blocked src never reaches execution", exec_calls == ["W1XYZ-1"])
+        finally:
+            handler._should_execute_command = real_should_execute
+
+        # ── production predicate spot-check (not a re-implemented `in`) ──
+        _record("_is_callsign_blocked('OE1ABC-5') is True", router._is_callsign_blocked("OE1ABC-5"))
+        _record(
+            "_is_callsign_blocked('W1XYZ-1') is False",
+            not router._is_callsign_blocked("W1XYZ-1"),
+        )
 
     finally:
         handler.blocked_callsigns = old_blocked
