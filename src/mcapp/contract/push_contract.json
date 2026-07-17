@@ -1,6 +1,6 @@
 {
-  "version": 2,
-  "description": "MeshCom Web Push wire contract. Committed byte-identical to mc-chat and MCProxy; each repo's test suite implements these vectors. Frontend mirrors match_vectors + eligibility for its foreground-sound predicate. Do NOT edit one copy without the other. v2 (2026-07-17) adds via-routed dst resolution, push eligibility, dedup, and payload_vectors after a cross-backend parity audit found the two backends diverging on all four.",
+  "version": 3,
+  "description": "MeshCom Web Push wire contract. Committed byte-identical to mc-chat and MCProxy; each repo's test suite implements these vectors. Frontend mirrors match_vectors + eligibility for its foreground-sound predicate. Do NOT edit one copy without the other. v2 (2026-07-17) adds via-routed dst resolution, push eligibility, dedup, and payload_vectors after a cross-backend parity audit found the two backends diverging on all four. v3 (2026-07-17) adds a blocklist push-path gate: a message whose resolved source is on the node's GLOBAL blocked_callsigns set produces zero pushes (checked together with eligibility, BEFORE dedup/matching) — closing a bug where the push dispatcher bypassed the blocklist every other path enforces.",
   "endpoints": {
     "vapid_public_key": {
       "method": "GET",
@@ -34,6 +34,7 @@
   "src_resolution": "A src carries the relay path the OTHER way round — the FIRST comma-separated component is the real sender (e.g. 'DK5EN-99,OE1KBC-12' -> 'DK5EN-99'). SSID is kept.",
   "eligibility": "Checked ONCE per message, BEFORE per-subscription matching. A message is push-eligible IFF: (a) it is a chat text message — exclude telemetry (type:'tele'), position beacons (type:'pos'), and any non-text/no-text frame; AND (b) its resolved source (first comma-component of src) is NOT equal to the node's own callsign — never push the user's own outbound sends or mesh-echoes of them. An ineligible message produces zero pushes and does not open or feed a coalesce window.",
   "dedup": "A logical message may reach the backend more than once (multiple gateways, UDP retransmits) — this is why storage dedups on a ~60-min window. Push must fire AT MOST ONCE per logical message. Dedup key: msg_id within the dedup window when msg_id is truthy, else the tuple (resolved-src, resolved-dst, text). A duplicate must neither produce a second immediate push NOR increment a coalesce summary count.",
+  "blocklist": "Checked ONCE per message, together with eligibility and BEFORE dedup/matching. If the message's resolved source (src_resolution, case-insensitive) is an element of the node's blocked_callsigns set, produce ZERO pushes and do not open or feed any coalesce window. blocked_callsigns is the node's GLOBAL blocklist (admin kickban + curated sperrliste), NOT a per-subscription field. A message merely RELAYED THROUGH a blocked node (blocked callsign appears as a via-hop, not the first comma-component) is NOT suppressed.",
   "match_semantics": "Given an incoming eligible message with destination `dst`, the node's own configured callsign `own`, and a subscription's stored `filter`: first resolve `dst` per dst_resolution to `target`. Push to that subscription IFF ( target == own AND filter.dm ) OR ( target == '*' AND filter.broadcast ) OR ( target is an element of filter.groups, compared as trimmed strings ). A DM whose target is any other callsign never pushes.",
   "match_vectors": [
     { "name": "dm-to-self, dm on", "msg": { "src": "OE1ABC-1", "dst": "DK5EN-99", "type": "msg", "text": "hi" }, "filter": { "dm": true, "groups": [], "broadcast": false }, "should_push": true },
@@ -55,6 +56,13 @@
     { "name": "own mesh-echo (via-routed src resolves to own) is NOT eligible", "msg": { "src": "DK5EN-99,OE1KBC-12", "dst": "232", "type": "msg", "text": "echo of my post" }, "eligible": false },
     { "name": "telemetry frame is NOT eligible", "msg": { "src": "OE1ABC-1", "dst": "*", "type": "tele", "text": "" }, "eligible": false },
     { "name": "position beacon is NOT eligible", "msg": { "src": "OE1ABC-1", "dst": "*", "type": "pos" }, "eligible": false }
+  ],
+  "blocklist_vectors": [
+    { "name": "blocked DM sender -> no push", "msg": { "src": "OE9BLK-1", "dst": "DK5EN-99", "type": "msg", "text": "hi" }, "blocked": ["OE9BLK-1"], "sender_blocked": true },
+    { "name": "unblocked sender", "msg": { "src": "OE1ABC-1", "dst": "DK5EN-99", "type": "msg", "text": "hi" }, "blocked": ["OE9BLK-1"], "sender_blocked": false },
+    { "name": "case-insensitive match", "msg": { "src": "oe9blk-1", "dst": "DK5EN-99", "type": "msg", "text": "hi" }, "blocked": ["OE9BLK-1"], "sender_blocked": true },
+    { "name": "via-routed src resolves to real sender before block check", "msg": { "src": "OE9BLK-1,OE1KBC-12", "dst": "DK5EN-99", "type": "msg", "text": "relayed" }, "blocked": ["OE9BLK-1"], "sender_blocked": true },
+    { "name": "relay hop is NOT the sender - message via a blocked relay still pushes", "msg": { "src": "OE1ABC-1,OE9BLK-1", "dst": "DK5EN-99", "type": "msg", "text": "via blocked node" }, "blocked": ["OE9BLK-1"], "sender_blocked": false }
   ],
   "payload_schema": {
     "type": "message type string, e.g. 'msg'",

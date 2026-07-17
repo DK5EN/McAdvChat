@@ -1,12 +1,12 @@
-"""Startup regression suite for Web Push (Wave 5, PWA campaign, contract v2).
+"""Startup regression suite for Web Push (Wave 5, PWA campaign, contract v3).
 
 Implements every vector in `contract/push_contract.json` (a byte-verbatim copy
 of the shared wire contract; the mc-chat sibling implements the SAME vectors
 against its own implementation so both backends behave identically) — all
 match_vectors (incl. via-routed dst resolution), all eligibility_vectors, all
-payload_vectors, and the dedup coalesce scenario — plus subscribe/unsubscribe/
-upsert, prune-on-401/403/404/410, VAPID persistence, and an execution-
-isolation regression.
+blocklist_vectors, all payload_vectors, and the dedup coalesce scenario — plus
+subscribe/unsubscribe/upsert, prune-on-401/403/404/410, VAPID persistence, and
+an execution-isolation regression.
 
 NEVER calls real pywebpush — every `webpush_fn` used here is an injected stub
 — and NEVER generates a real VAPID keypair — `load_or_create_vapid`'s
@@ -38,6 +38,7 @@ from .push_delivery import (
     PushDispatcher,
     build_push_payload,
     is_eligible,
+    is_sender_blocked,
     load_or_create_vapid,
     matches,
 )
@@ -56,8 +57,9 @@ _CONTRACT_PATH = pathlib.Path(__file__).parent / "contract" / "push_contract.jso
 # (`shasum -a 256 push_contract.json` against the byte-verbatim copy handed
 # off by the orchestrator). If this ever stops matching, either this repo's
 # copy or the mc-chat sibling's copy has drifted — re-sync before trusting
-# either implementation.
-_EXPECTED_SHA256 = "4149a8b89717070fcd078f5a394caf47d278f66ac82e9e72071d4e198259f17d"
+# either implementation. v3 (2026-07-17): adds the blocklist push-path gate
+# + blocklist_vectors.
+_EXPECTED_SHA256 = "5d8d32cf1879d0e4a4929a4c231122e5a00444876ed99d2d75e90169f9b07689"
 
 # A fixed, obviously-fake VAPID keypair — never parsed as real crypto, since
 # every webpush_fn in this suite is a stub that ignores its value entirely.
@@ -83,15 +85,25 @@ class _StubMessageRouter:
     """Minimal MessageRouter stand-in: storage + configured callsign + a real
     subscribe/publish pubsub (mirrors `MessageRouter.subscribe`/`.publish` in
     `main.py`, including its per-handler try/except so one subscriber's
-    failure never blocks another — see main.py `publish()`)."""
+    failure never blocks another — see main.py `publish()`) + a protocol
+    registry (`get_protocol`, mirroring `MessageRouter.get_protocol`) so the
+    push router's blocklist source (`get_protocol("commands")`) resolves the
+    same way it does in production."""
 
     def __init__(self, storage: Any, callsign: str) -> None:
         self.storage_handler = storage
         self.my_callsign = callsign
         self._subscribers: dict[str, list[Any]] = {}
+        self._protocols: dict[str, Any] = {}
 
     def subscribe(self, message_type: str, handler_func: Any) -> None:
         self._subscribers.setdefault(message_type, []).append(handler_func)
+
+    def get_protocol(self, name: str) -> Any:
+        """Mirror `MessageRouter.get_protocol`: return the registered protocol
+        or None. These push tests register no `commands` protocol, so the
+        blocklist source resolves to None -> an empty set (gate inert)."""
+        return self._protocols.get(name)
 
     async def publish(self, source: str, message_type: str, data: dict[str, Any]) -> None:
         routed_message = {"source": source, "type": message_type, "data": data, "timestamp": 0}
@@ -161,6 +173,14 @@ async def run_push_tests() -> bool:
     # MCProxy but not on mc-chat.
     _test_eligibility_no_text_exclusion(_record)
 
+    # 1b-3. blocklist_vectors — pure predicate: resolved-src (first
+    #       comma-component, upper-cased) case-insensitive membership in the
+    #       node's GLOBAL blocked_callsigns set. A via-hop blocked call is NOT
+    #       the sender, so it does not suppress.
+    for vector in contract["blocklist_vectors"]:
+        actual = is_sender_blocked(vector["msg"], set(vector["blocked"]))
+        _record(f"blocklist: {vector['name']}", actual == vector["sender_blocked"])
+
     # 1c. payload_vectors — build_push_payload: ts ms->s conversion, msg/text
     #     fallback + null coercion, truncation (all exact-match, data-driven).
     for vector in contract["payload_vectors"]:
@@ -188,6 +208,12 @@ async def run_push_tests() -> bool:
     for code in contract["prune_status_codes"]:
         await _drive_one_delivery_and_check_prune(_record, status_code=code, expect_pruned=True)
     await _drive_one_delivery_and_check_prune(_record, status_code=500, expect_pruned=False)
+
+    # 4b. blocklist gate end-to-end: a blocked sender produces ZERO deliveries
+    #     through the real dispatcher pipeline — guards the gate WIRING in
+    #     handle_mesh_message, not just the pure is_sender_blocked predicate
+    #     (the old code had no gate, so this fails on the pre-fix behavior).
+    await _test_blocklist_gate_suppresses_delivery(_record)
 
     # 5. VAPID persistence (injected fake generator — never real crypto).
     _test_vapid_persistence(_record)
@@ -473,6 +499,72 @@ async def _drive_one_delivery_and_check_prune(
                         f"prune status={status_code}: subscription NOT deleted (non-prune code)",
                         still_present,
                     )
+            finally:
+                await dispatcher.stop()
+        finally:
+            await storage.close()
+
+
+async def _test_blocklist_gate_suppresses_delivery(record: _RecordFn) -> None:
+    """Drive one message from a BLOCKED sender through the REAL dispatcher
+    pipeline (handle_mesh_message -> queue -> background drain -> webpush_fn)
+    with the sender in the passed `blocked_callsigns` set: it must produce
+    zero deliveries and open no coalesce window (contract `blocklist`). A
+    DIFFERENT, unblocked sender to the SAME endpoint then delivers
+    immediately — proving the blocked message left no half-open window
+    behind. Guards the gate wiring, not just the pure predicate."""
+    calls: list[int] = []
+
+    def _stub_webpush(**_kwargs: Any) -> None:
+        calls.append(1)
+
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        storage = await create_sqlite_storage(pathlib.Path(tmp_dir) / "push_blocklist.db")
+        try:
+            endpoint = "https://push.example/blocklist"
+            await storage.upsert_push_subscription(
+                endpoint,
+                {"endpoint": endpoint, "keys": {"p256dh": "p", "auth": "a"}},
+                {"dm": True, "groups": [], "broadcast": False},
+            )
+            dispatcher = PushDispatcher(
+                storage=storage, vapid=_FAKE_VAPID, webpush_fn=_stub_webpush, now=lambda: 0.0
+            )
+            dispatcher.start()
+            try:
+                blocked_msg = {
+                    "src": "OE9BLK-1",
+                    "dst": "DK5EN-99",
+                    "type": "msg",
+                    "msg": "hi",
+                    "msg_id": 1,
+                    "timestamp": 0,
+                }
+                await dispatcher.handle_mesh_message(blocked_msg, "DK5EN-99", {"OE9BLK-1"})
+                # Give the (nonexistent, if the gate works) delivery a fixed
+                # window to have run; a negative can't be polled-until.
+                for _ in range(15):
+                    await asyncio.sleep(0.02)
+                record("blocklist gate: blocked sender produces zero deliveries", not calls)
+
+                unblocked_msg = {
+                    "src": "OE1ABC-1",
+                    "dst": "DK5EN-99",
+                    "type": "msg",
+                    "msg": "hi",
+                    "msg_id": 2,
+                    "timestamp": 0,
+                }
+                await dispatcher.handle_mesh_message(unblocked_msg, "DK5EN-99", {"OE9BLK-1"})
+                for _ in range(100):
+                    if calls:
+                        break
+                    await asyncio.sleep(0.02)
+                record(
+                    "blocklist gate: unblocked sender to the same endpoint still delivers "
+                    "immediately (blocked message opened no coalesce window)",
+                    bool(calls),
+                )
             finally:
                 await dispatcher.stop()
         finally:

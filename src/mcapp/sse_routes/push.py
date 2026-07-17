@@ -115,10 +115,17 @@ def build_push_router(
             """Subscriber for the "mesh_message" topic. See PushDispatcher.
             handle_mesh_message's docstring for why this never awaits
             delivery (execution_isolation)."""
-            own_callsign = manager.message_router.my_callsign if manager.message_router else None
+            mr = manager.message_router
+            own_callsign = mr.my_callsign if mr else None
             if not own_callsign:
                 return
-            await dispatcher.handle_mesh_message(routed_message["data"], own_callsign)
+            # contract `blocklist`: pass the node's live GLOBAL blocklist
+            # (admin kickban + curated sperrliste) so a blocked sender's
+            # message is suppressed on the push path too. Sourced defensively —
+            # the commands protocol may not be registered yet during startup.
+            cmds = mr.get_protocol("commands") if mr else None
+            blocked: set[str] = cmds.blocked_callsigns if cmds else set()
+            await dispatcher.handle_mesh_message(routed_message["data"], own_callsign, blocked)
 
         manager.message_router.subscribe("mesh_message", _on_mesh_message)
 

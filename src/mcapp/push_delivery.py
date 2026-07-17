@@ -135,6 +135,21 @@ def is_eligible(payload: dict[str, Any], own_callsign: str) -> bool:
     return resolved_src != own_callsign
 
 
+def is_sender_blocked(payload: dict[str, Any], blocked_callsigns: set[str]) -> bool:
+    """Pure predicate: contract `blocklist`. Checked ONCE per message,
+    together with eligibility and BEFORE dedup and per-subscription matching.
+
+    Returns True (suppress: zero pushes, no coalesce window opened or fed)
+    iff the message's resolved source (src_resolution — first comma-component,
+    upper-cased) is an element of the node's GLOBAL blocked_callsigns set,
+    compared case-insensitively. A message merely RELAYED THROUGH a blocked
+    node (the blocked callsign is a via-hop, not the first comma-component) is
+    NOT suppressed — only messages *originated* by a blocked callsign are.
+    """
+    resolved_src = _resolve_source(str(payload.get("src") or ""))
+    return resolved_src.upper() in {c.upper() for c in blocked_callsigns}
+
+
 def matches(payload: dict[str, Any], own_callsign: str, filt: dict[str, Any]) -> bool:
     """Pure predicate: contract `match_semantics`.
 
@@ -373,23 +388,39 @@ class PushDispatcher:
         self._drain_task = None
         self._sweep_task = None
 
-    async def handle_mesh_message(self, raw_message: dict[str, Any], own_callsign: str) -> None:
+    async def handle_mesh_message(
+        self,
+        raw_message: dict[str, Any],
+        own_callsign: str,
+        blocked_callsigns: set[str] | None = None,
+    ) -> None:
         """Subscriber for `MessageRouter`'s "mesh_message" topic.
 
         Fast and non-blocking: one local SQLite read (`list_push_subscriptions`,
         not the network call execution-isolation protects against) plus
-        in-memory eligibility/dedup/matching/coalescing. NEVER awaits push
-        delivery itself — a matching message only reaches the network via
+        in-memory eligibility/blocklist/dedup/matching/coalescing. NEVER awaits
+        push delivery itself — a matching message only reaches the network via
         `_enqueue` + `_drain_loop`, decoupled by `self._queue`.
 
-        Order (contract): eligibility once, then dedup once, then per-
-        subscription match+coalesce — an ineligible or duplicate message
-        never opens/feeds ANY subscription's coalesce window.
+        `blocked_callsigns` is the node's GLOBAL blocklist (admin kickban +
+        curated sperrliste); the caller (`sse_routes/push.py`) sources it live
+        from the commands protocol. Omitted / None => the gate is inert.
+
+        Order (contract): eligibility + blocklist once (together), then dedup
+        once, then per-subscription match+coalesce — an ineligible, blocked,
+        or duplicate message never opens/feeds ANY subscription's coalesce
+        window.
         """
         if not own_callsign:
             return
         payload = build_push_payload(raw_message)
         if not is_eligible(payload, own_callsign):
+            return
+        # contract `blocklist`: gate on the node's GLOBAL blocked_callsigns set
+        # together with eligibility and BEFORE dedup/matching — a blocked
+        # sender's message produces zero pushes, consumes no dedup slot, and
+        # opens no coalesce window (return before touching either).
+        if is_sender_blocked(payload, blocked_callsigns or set()):
             return
         if self.dedup.is_duplicate(payload):
             return
