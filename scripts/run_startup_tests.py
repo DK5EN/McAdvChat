@@ -25,8 +25,10 @@ from mcapp.commands.dedup_tests import run_dedup_tests
 from mcapp.commands.handler import create_command_handler
 from mcapp.commands.parsing_tests import run_parsing_tests
 from mcapp.commands.routing_tests import run_routing_tests
+from mcapp.contract_parity_tests import run_contract_parity_tests
 from mcapp.main import MessageRouter
 from mcapp.meteo_tests import run_meteo_tests
+from mcapp.send_path_tests import run_send_path_tests
 from mcapp.sqlite_storage import run_startup_tests as run_storage_tests
 from mcapp.sse_handler import run_startup_tests as run_sse_tests
 from mcapp.storage.conversation_key_tests import run_conversation_key_tests
@@ -41,6 +43,12 @@ async def main() -> int:
     router.set_callsign("DK5EN")
     suppression_ok = router.test_suppression_logic()
     print(f"suppression: {'PASS' if suppression_ok else 'FAIL'}")
+
+    send_path_ok = await run_send_path_tests()
+    print(f"send_path: {'PASS' if send_path_ok else 'FAIL'}")
+
+    contract_parity_ok = run_contract_parity_tests()
+    print(f"contract_parity: {'PASS' if contract_parity_ok else 'FAIL'}")
 
     udp_ok = await run_udp_handler_tests()
     print(f"udp_handler: {'PASS' if udp_ok else 'FAIL'}")
@@ -93,6 +101,8 @@ async def main() -> int:
 
     all_ok = (
         suppression_ok
+        and send_path_ok
+        and contract_parity_ok
         and udp_ok
         and udp_parsing_ok
         and storage_ok

@@ -2446,6 +2446,14 @@ async def test_self_command_suppression_logic(handler: Any) -> bool:  # noqa: PL
 
     test_cases = [
         ("!WX", "Weather command without target"),
+        # Regression guard at the SUPPRESSION layer for the shipped !wx text: leak:
+        # a callsign-shaped word inside a text: prefix is free text, not a remote
+        # target, so the command must still resolve locally (suppress=True). The
+        # leaf parsing_tests pin extract_target_callsign; this pins that the real
+        # should_suppress_outbound still funnels through it for this input.
+        # OE1ABC deliberately differs from my_callsign — a same-as-us callsign would
+        # suppress even with the old buggy parser, giving this case no teeth.
+        ("!WX TEXT:73 DE OE1ABC", "WX with callsign-shaped text: prefix (free text, still local)"),
         ("!TIME", "Time command without target"),
         ("!DICE", "Dice command without target"),
         ("!STATS", "Stats command without target"),
@@ -2468,9 +2476,13 @@ async def test_self_command_suppression_logic(handler: Any) -> bool:  # noqa: PL
     results = []
 
     if not handler.message_router or not hasattr(handler.message_router, "validator"):
+        # Fail CLOSED: this suite is the guard for the self-command suppression bug
+        # class (including the !wx text: raw-leak). A missing router/validator means
+        # it verified nothing — report failure, never a silent PASS. (In the real
+        # runner the router is always wired via create_command_handler.)
         if has_console:
-            print("⏭️  Skipped: no MessageRouter/validator in this test context")
-        return True
+            print("❌ FAIL: suppression test requires a MessageRouter/validator (fail-closed)")
+        return False
 
     validator = handler.message_router.validator
 
