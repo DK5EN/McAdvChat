@@ -96,7 +96,17 @@ cd /Users/martinwerner/WebDev/MCProxy
 git subtree pull --prefix=src/mcapp/contract mc-chat contract-subtree --squash
 ```
 
-Schema migrations: add new columns to `messages` or new tables via a `current_version < N` block in `sqlite_storage.initialize()` and bump `SCHEMA_VERSION`. Current schema: v19.
+Schema migrations: add new columns to `messages` or new tables via a `current_version < N` block in `sqlite_storage.initialize()` (the chain lives in `storage/migrations.py`) and bump `FINAL_SCHEMA_VERSION`. Current schema: **v21** (`push_subscriptions` added at v21 — see Web Push below).
+
+## Web Push (Wave 5)
+
+Web Push to browser / iOS-PWA clients, sharing one wire contract with mc-chat so both backends behave identically.
+
+- **Contract:** `src/mcapp/contract/push_contract.json` — vendored **byte-identical** from the webapp campaign (`webapp/pwa-impl-plan.md` Task 5.1). Defines the three `/api/push/*` endpoints, the filter `{ dm, groups[], broadcast }`, and the match / eligibility / dedup / coalesce / payload semantics. `push_tests.py` (wired into `run_startup_tests.py`) runs every vector; mc-chat runs the same corpus, so the two implementations can't drift.
+- **Routes:** `src/mcapp/sse_routes/push.py` (subscribe / unsubscribe / vapid-public-key). **Delivery:** `src/mcapp/push_delivery.py` — pure `matches()`/`is_eligible()` (resolve via-routed dst to the **last** comma-component; exclude non-chat frames and own-src), `PushCoalescer` (5s window), `PushDedup`, and a background dispatcher that calls `pywebpush` via `asyncio.to_thread` with timeouts. **The mesh-ingest path never awaits delivery** — a no-internet Pi must not stall the event loop / SSE heartbeats.
+- **Storage:** `push_subscriptions` table (schema v21), upsert by endpoint. Prune on pywebpush **401/403/404/410**.
+- **VAPID (two live gotchas — both bit us on first real delivery):** keypair generated once, persisted as the **raw base64url 32-byte scalar** — NOT PEM (pywebpush's `Vapid.from_string` base64-decodes it and dies on a PEM) — at `/var/lib/mcapp/vapid.json`, never committed. JWT `sub` = `mailto:admin@example.com` (a valid FQDN; Apple returns **403 `BadJwtToken`** for a no-TLD/`localhost` sub) — override via env `MESHCOM_VAPID_SUB`.
+- Delivery needs outbound internet from the Pi; degrades silently without it. `/api/push/*` is covered by the existing `^/api/` proxy rules — no Caddy change. Deploy installs deps with `uv sync --all-packages` (pulls `pywebpush` + the BLE workspace member) — see `bootstrap/lib/deploy.sh`.
 
 ## Configuration
 
@@ -119,7 +129,7 @@ Two Raspberry Pi Zero 2W targets: `mcapp.local` (production) and `rpizero.local`
 - Service: `systemctl status mcapp` — `ExecStart=/home/martin/.local/bin/uv run mcapp`
 - Source: `~/mcapp-slots/current/src/mcapp/`
 - Config: `/etc/mcapp/config.json`
-- DB: `/var/lib/mcapp/messages.db` (SQLite, WAL mode, schema v19)
+- DB: `/var/lib/mcapp/messages.db` (SQLite, WAL mode, schema v21)
 - Logs: `sudo journalctl -u mcapp.service -f`
 
 See `bootstrap/README.md` for installation, `doc/tls-architecture.md` for TLS setup, `doc/tls-maintenance-SOP.md` for maintenance.
