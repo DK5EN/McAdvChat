@@ -75,6 +75,7 @@ try:
     from .sse_routes.classifier import build_classifier_router
     from .sse_routes.deploy import build_deploy_router
     from .sse_routes.prefs import build_prefs_router
+    from .sse_routes.push import build_push_router
     from .sse_routes.stream import build_stream_router
     from .sse_routes.weather import build_weather_router
 
@@ -425,6 +426,7 @@ class SSEManager:
         app.include_router(build_classifier_router(self))
         app.include_router(build_weather_router(self))
         app.include_router(build_deploy_router(self))
+        app.include_router(build_push_router(self))
 
         return app
 

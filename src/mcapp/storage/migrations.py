@@ -346,6 +346,29 @@ class MigrationsMixin(StorageBase):
                     )
                     _set_schema_version(conn, 20)
 
+                if current_version < 21:  # noqa: PLR2004 - schema migration step
+                    # Column is `filter_json`, not `filter` — the latter is a
+                    # SQLite window-function keyword (mirrors mc-chat's column
+                    # name). This table hasn't shipped yet, so the column is
+                    # named correctly from the start rather than via a v22 step.
+                    conn.execute("""
+                        CREATE TABLE IF NOT EXISTS push_subscriptions (
+                            endpoint    TEXT PRIMARY KEY,
+                            subscription TEXT NOT NULL,
+                            filter_json TEXT NOT NULL DEFAULT
+                                '{"dm":true,"groups":[],"broadcast":false}',
+                            created_at  TEXT DEFAULT CURRENT_TIMESTAMP,
+                            updated_at  TEXT DEFAULT CURRENT_TIMESTAMP
+                        );
+                    """)
+                    logger.info(
+                        "Migration v%d → v21: created push_subscriptions table"
+                        " (Web Push, Wave 5; endpoint is the upsert key,"
+                        " subscription/filter_json are JSON blobs)",
+                        current_version,
+                    )
+                    _set_schema_version(conn, 21)
+
         await asyncio.to_thread(_init_db)
 
         # Initialize bucket accumulators from existing signal_log

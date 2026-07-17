@@ -10,11 +10,11 @@ end-to-end outcome plus two named spot-checks.
 
 Coverage:
   * DB A — full chain from the pre-migration base schema (no ``schema_version``
-    row → ``current_version == 0``): drives every step v2→v20 and asserts the
-    final schema marker is 20, plus the **v4 ACK-collapse** spot-check
+    row → ``current_version == 0``): drives every step v2→v21 and asserts the
+    final schema marker is 21, plus the **v4 ACK-collapse** spot-check
     (``_migrate_v3_to_v4`` step 8: ACK rows link ``send_success`` onto their
     original ``msg`` then are deleted).
-  * DB B — focused v17→v20 fixture with the post-v4 ``conversation_key`` column:
+  * DB B — focused v17→v21 fixture with the post-v4 ``conversation_key`` column:
     the **v18 conversation-key re-key** spot-check (a via-routed ``'VIA,TARGET'``
     row carrying a stale old-scheme key is re-keyed to ``compute_conversation_key``,
     while a non-routed control row is left untouched — proving the step is scoped).
@@ -38,7 +38,7 @@ from .constants import (
 
 logger = get_logger(__name__)
 
-FINAL_SCHEMA_VERSION = 20
+FINAL_SCHEMA_VERSION = 21
 BASE_TS = 1_770_000_000_000  # fixed ms timestamp so the suite is deterministic
 
 
@@ -67,7 +67,7 @@ async def _schema_version(storage: Any) -> int | None:
 
 
 async def _test_full_chain_from_base(results: list[tuple[str, bool]]) -> None:
-    """Build a pre-migration (v0/base) DB, run the whole v2→v20 chain, assert v4 ACK collapse."""
+    """Build a pre-migration (v0/base) DB, run the whole v2→v21 chain, assert v4 ACK collapse."""
     with tempfile.TemporaryDirectory() as tmp_dir:
         db_path = Path(tmp_dir) / "migration_chain_base.db"
 
@@ -135,15 +135,15 @@ async def _test_full_chain_from_base(results: list[tuple[str, bool]]) -> None:
         except Exception:
             logger.exception("full-chain migration from base schema raised")
             chain_ran = False
-            results.append(("full chain v0→v20: migrator runs end-to-end without error", False))
+            results.append(("full chain v0→v21: migrator runs end-to-end without error", False))
             return
 
-        results.append(("full chain v0→v20: migrator runs end-to-end without error", chain_ran))
+        results.append(("full chain v0→v21: migrator runs end-to-end without error", chain_ran))
         try:
             version = await _schema_version(storage)
             results.append(
                 (
-                    "full chain v0→v20: final schema_version marker is 20",
+                    "full chain v0→v21: final schema_version marker is 21",
                     version == FINAL_SCHEMA_VERSION,
                 )
             )
@@ -205,7 +205,7 @@ async def _test_v18_conversation_rekey(results: list[tuple[str, bool]]) -> None:
             # conversation_key column that v4 introduced (the only extra column the
             # v18 step reads/writes), station_positions + signal_log from the v2
             # SQL (signal_log intentionally still lacks the `source` column that v19
-            # adds), and schema_version pinned at 17 so initialize() runs v18→v20.
+            # adds), and schema_version pinned at 17 so initialize() runs v18→v21.
             with sqlite3.connect(db_path) as conn:
                 conn.executescript(CREATE_SCHEMA_SQL)
                 conn.executescript(CREATE_SCHEMA_V2_SQL)
@@ -246,15 +246,15 @@ async def _test_v18_conversation_rekey(results: list[tuple[str, bool]]) -> None:
             storage = await create_sqlite_storage(db_path)
         except Exception:
             logger.exception("v18 re-key migration raised")
-            results.append(("v18 re-key: migrator runs v17→v20 without error", False))
+            results.append(("v18 re-key: migrator runs v17→v21 without error", False))
             return
 
-        results.append(("v18 re-key: migrator runs v17→v20 without error", True))
+        results.append(("v18 re-key: migrator runs v17→v21 without error", True))
         try:
             version = await _schema_version(storage)
             results.append(
                 (
-                    "v18 re-key: final schema_version marker is 20",
+                    "v18 re-key: final schema_version marker is 21",
                     version == FINAL_SCHEMA_VERSION,
                 )
             )

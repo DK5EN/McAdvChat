@@ -1,0 +1,132 @@
+{
+  "version": 2,
+  "description": "MeshCom Web Push wire contract. Committed byte-identical to mc-chat and MCProxy; each repo's test suite implements these vectors. Frontend mirrors match_vectors + eligibility for its foreground-sound predicate. Do NOT edit one copy without the other. v2 (2026-07-17) adds via-routed dst resolution, push eligibility, dedup, and payload_vectors after a cross-backend parity audit found the two backends diverging on all four.",
+  "endpoints": {
+    "vapid_public_key": {
+      "method": "GET",
+      "path": "/api/push/vapid-public-key",
+      "response": { "publicKey": "<base64url-encoded VAPID application server public key>" }
+    },
+    "subscribe": {
+      "method": "POST",
+      "path": "/api/push/subscribe",
+      "request_example": {
+        "subscription": {
+          "endpoint": "https://web.push.apple.com/example-endpoint-aaa",
+          "keys": { "p256dh": "BExample_p256dh_key", "auth": "ExampleAuthSecret" }
+        },
+        "filter": { "dm": true, "groups": ["232", "9999"], "broadcast": false }
+      },
+      "response": { "ok": true },
+      "semantics": "Upsert by subscription.endpoint. Re-POSTing the same endpoint with a new filter overwrites the stored filter (this is how a pref change persists — there is no separate prefs endpoint). A malformed or missing filter field is coerced to filter_defaults; groups:null must be treated as [] and never crash the matcher."
+    },
+    "unsubscribe": {
+      "method": "POST",
+      "path": "/api/push/unsubscribe",
+      "request_example": { "endpoint": "https://web.push.apple.com/example-endpoint-aaa" },
+      "response": { "ok": true },
+      "semantics": "Delete the row whose endpoint matches. Idempotent: unsubscribing a missing endpoint still returns ok:true."
+    }
+  },
+  "filter_defaults": { "dm": true, "groups": [], "broadcast": false },
+  "own_callsign_for_vectors": "DK5EN-99",
+  "dst_resolution": "A via-routed destination is 'VIA[,VIA2],TARGET' — the real target is the LAST comma-separated component, trimmed (mirrors each backend's compute_conversation_key / _resolve_target: e.g. 'OE1KBC-12,232' -> '232', 'OE1KBC-12,DK5EN-99' -> 'DK5EN-99'). A dst with no comma is its own target. On a LoRa mesh, relay-hopped frames are the COMMON case, so this resolution is required, not an edge case. Both backends AND the frontend foreground-sound predicate MUST resolve dst identically before matching.",
+  "src_resolution": "A src carries the relay path the OTHER way round — the FIRST comma-separated component is the real sender (e.g. 'DK5EN-99,OE1KBC-12' -> 'DK5EN-99'). SSID is kept.",
+  "eligibility": "Checked ONCE per message, BEFORE per-subscription matching. A message is push-eligible IFF: (a) it is a chat text message — exclude telemetry (type:'tele'), position beacons (type:'pos'), and any non-text/no-text frame; AND (b) its resolved source (first comma-component of src) is NOT equal to the node's own callsign — never push the user's own outbound sends or mesh-echoes of them. An ineligible message produces zero pushes and does not open or feed a coalesce window.",
+  "dedup": "A logical message may reach the backend more than once (multiple gateways, UDP retransmits) — this is why storage dedups on a ~60-min window. Push must fire AT MOST ONCE per logical message. Dedup key: msg_id within the dedup window when msg_id is truthy, else the tuple (resolved-src, resolved-dst, text). A duplicate must neither produce a second immediate push NOR increment a coalesce summary count.",
+  "match_semantics": "Given an incoming eligible message with destination `dst`, the node's own configured callsign `own`, and a subscription's stored `filter`: first resolve `dst` per dst_resolution to `target`. Push to that subscription IFF ( target == own AND filter.dm ) OR ( target == '*' AND filter.broadcast ) OR ( target is an element of filter.groups, compared as trimmed strings ). A DM whose target is any other callsign never pushes.",
+  "match_vectors": [
+    { "name": "dm-to-self, dm on", "msg": { "src": "OE1ABC-1", "dst": "DK5EN-99", "type": "msg", "text": "hi" }, "filter": { "dm": true, "groups": [], "broadcast": false }, "should_push": true },
+    { "name": "dm-to-self, dm off", "msg": { "src": "OE1ABC-1", "dst": "DK5EN-99", "type": "msg", "text": "hi" }, "filter": { "dm": false, "groups": ["232"], "broadcast": true }, "should_push": false },
+    { "name": "dm-to-other-call never pushes", "msg": { "src": "OE1ABC-1", "dst": "OE3XYZ-7", "type": "msg", "text": "not mine" }, "filter": { "dm": true, "groups": ["232"], "broadcast": true }, "should_push": false },
+    { "name": "broadcast, broadcast on", "msg": { "src": "OE1ABC-1", "dst": "*", "type": "msg", "text": "cq" }, "filter": { "dm": false, "groups": [], "broadcast": true }, "should_push": true },
+    { "name": "broadcast, broadcast off", "msg": { "src": "OE1ABC-1", "dst": "*", "type": "msg", "text": "cq" }, "filter": { "dm": true, "groups": ["232"], "broadcast": false }, "should_push": false },
+    { "name": "group in list", "msg": { "src": "OE1ABC-1", "dst": "232", "type": "msg", "text": "group msg" }, "filter": { "dm": false, "groups": ["232", "9999"], "broadcast": false }, "should_push": true },
+    { "name": "group not in list", "msg": { "src": "OE1ABC-1", "dst": "232", "type": "msg", "text": "group msg" }, "filter": { "dm": true, "groups": ["9999"], "broadcast": true }, "should_push": false },
+    { "name": "group with surrounding whitespace still matches", "msg": { "src": "OE1ABC-1", "dst": "9999", "type": "msg", "text": "spam grp" }, "filter": { "dm": false, "groups": [" 9999 "], "broadcast": false }, "should_push": true },
+    { "name": "via-routed dm-to-self resolves to own", "msg": { "src": "OE1KBC-12,OE1ABC-1", "dst": "OE1KBC-12,DK5EN-99", "type": "msg", "text": "relayed dm" }, "filter": { "dm": true, "groups": [], "broadcast": false }, "should_push": true },
+    { "name": "via-routed group resolves to target", "msg": { "src": "OE1KBC-12,OE1ABC-1", "dst": "OE1KBC-12,232", "type": "msg", "text": "relayed grp" }, "filter": { "dm": false, "groups": ["232"], "broadcast": false }, "should_push": true },
+    { "name": "via-routed broadcast resolves to star", "msg": { "src": "OE1KBC-12,OE1ABC-1", "dst": "OE1KBC-12,*", "type": "msg", "text": "relayed cq" }, "filter": { "dm": false, "groups": [], "broadcast": true }, "should_push": true },
+    { "name": "via-routed dm-to-other still never pushes", "msg": { "src": "OE1KBC-12,OE1ABC-1", "dst": "OE1KBC-12,OE3XYZ-7", "type": "msg", "text": "relayed to other" }, "filter": { "dm": true, "groups": ["232"], "broadcast": true }, "should_push": false }
+  ],
+  "eligibility_vectors": [
+    { "name": "inbound chat is eligible", "msg": { "src": "OE1ABC-1", "dst": "DK5EN-99", "type": "msg", "text": "hi" }, "eligible": true },
+    { "name": "own outbound send is NOT eligible", "msg": { "src": "DK5EN-99", "dst": "232", "type": "msg", "text": "my group post" }, "eligible": false },
+    { "name": "own mesh-echo (via-routed src resolves to own) is NOT eligible", "msg": { "src": "DK5EN-99,OE1KBC-12", "dst": "232", "type": "msg", "text": "echo of my post" }, "eligible": false },
+    { "name": "telemetry frame is NOT eligible", "msg": { "src": "OE1ABC-1", "dst": "*", "type": "tele", "text": "" }, "eligible": false },
+    { "name": "position beacon is NOT eligible", "msg": { "src": "OE1ABC-1", "dst": "*", "type": "pos" }, "eligible": false }
+  ],
+  "payload_schema": {
+    "type": "message type string, e.g. 'msg'",
+    "src": "sender callsign string, as received (raw, may carry the relay path)",
+    "dst": "destination string as received (raw, may carry the relay path) — NOT resolved in the payload",
+    "text": "chat text: str(msg.get('msg') or msg.get('text') or ''), truncated to <= 120 chars",
+    "msg_id": "number or string",
+    "ts": "epoch SECONDS (number). If the source timestamp is epoch milliseconds it MUST be divided by 1000; a non-numeric value passes through unchanged."
+  },
+  "payload_vectors": [
+    {
+      "name": "ms timestamp converts to epoch seconds; text from msg field",
+      "raw": { "type": "msg", "src": "A-1", "dst": "DK5EN-99", "msg": "hi", "msg_id": 7, "timestamp": 1700000000000 },
+      "expected_payload": { "type": "msg", "src": "A-1", "dst": "DK5EN-99", "text": "hi", "msg_id": 7, "ts": 1700000000.0 }
+    },
+    {
+      "name": "text falls back to the text key and truncates at 120 chars",
+      "raw": { "type": "msg", "src": "A-1", "dst": "*", "text": "0123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890123456789", "msg_id": 8, "timestamp": 0 },
+      "expected_payload": { "type": "msg", "src": "A-1", "dst": "*", "text": "012345678901234567890123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890123456789", "msg_id": 8, "ts": 0.0 }
+    },
+    {
+      "name": "null msg coerces to empty string, not the literal 'None'",
+      "raw": { "type": "msg", "src": "A-1", "dst": "DK5EN-99", "msg": null, "msg_id": 9, "timestamp": 0 },
+      "expected_payload": { "type": "msg", "src": "A-1", "dst": "DK5EN-99", "text": "", "msg_id": 9, "ts": 0.0 }
+    }
+  ],
+  "coalesce": {
+    "window_seconds": 5,
+    "semantics": "Per-subscription rate limit. On an eligible+matching+non-duplicate message: if no window is open for this subscription, push it immediately (single-message payload) and open a 5s window. Messages that match while a window is open are buffered (not pushed). When the window closes, if the buffer is non-empty, emit exactly ONE summary push { count: len(buffer), latest: <payload of the last buffered message> } and close the window. The next matching message after the window is closed opens a fresh window with an immediate push. Uses an injectable now() clock in tests — never real wall-clock. Recommend a monotonic clock in production so an NTP step cannot stretch or collapse the window.",
+    "scenarios": [
+      {
+        "name": "two matching messages within the 5s window -> immediate + one summary",
+        "own_callsign": "DK5EN-99",
+        "filter": { "dm": true, "groups": [], "broadcast": false },
+        "events": [
+          [0.0, { "src": "A-1", "dst": "DK5EN-99", "type": "msg", "text": "one", "msg_id": 1, "ts": 0 }],
+          [2.0, { "src": "B-1", "dst": "DK5EN-99", "type": "msg", "text": "two", "msg_id": 2, "ts": 2 }]
+        ],
+        "expected_pushes": [
+          { "at_s": 0.0, "payload": { "type": "msg", "src": "A-1", "dst": "DK5EN-99", "text": "one", "msg_id": 1, "ts": 0 } },
+          { "at_s": 5.0, "summary": { "count": 1, "latest": { "type": "msg", "src": "B-1", "dst": "DK5EN-99", "text": "two", "msg_id": 2, "ts": 2 } } }
+        ]
+      },
+      {
+        "name": "single message -> one immediate push, no summary",
+        "own_callsign": "DK5EN-99",
+        "filter": { "dm": true, "groups": [], "broadcast": false },
+        "events": [
+          [0.0, { "src": "A-1", "dst": "DK5EN-99", "type": "msg", "text": "solo", "msg_id": 1, "ts": 0 }]
+        ],
+        "expected_pushes": [
+          { "at_s": 0.0, "payload": { "type": "msg", "src": "A-1", "dst": "DK5EN-99", "text": "solo", "msg_id": 1, "ts": 0 } }
+        ]
+      },
+      {
+        "name": "a duplicate (same msg_id) within the window neither re-pushes nor increments the summary count",
+        "own_callsign": "DK5EN-99",
+        "filter": { "dm": true, "groups": [], "broadcast": false },
+        "events": [
+          [0.0, { "src": "A-1", "dst": "DK5EN-99", "type": "msg", "text": "one", "msg_id": 1, "ts": 0 }],
+          [1.0, { "src": "A-1", "dst": "DK5EN-99", "type": "msg", "text": "one", "msg_id": 1, "ts": 0 }],
+          [2.0, { "src": "B-1", "dst": "DK5EN-99", "type": "msg", "text": "two", "msg_id": 2, "ts": 2 }]
+        ],
+        "expected_pushes": [
+          { "at_s": 0.0, "payload": { "type": "msg", "src": "A-1", "dst": "DK5EN-99", "text": "one", "msg_id": 1, "ts": 0 } },
+          { "at_s": 5.0, "summary": { "count": 1, "latest": { "type": "msg", "src": "B-1", "dst": "DK5EN-99", "text": "two", "msg_id": 2, "ts": 2 } } }
+        ]
+      }
+    ]
+  },
+  "prune_status_codes": [401, 403, 404, 410],
+  "prune_semantics": "When pywebpush delivery to a subscription returns any of these HTTP status codes, delete that subscription row. 401/403 catch stale-VAPID subscriptions after a key regeneration; 404/410 catch expired endpoints. Keep the subscription on any other status (e.g. 500) or a transient connection error. Pruning only on 404/410 would leave a dead-VAPID subscription failing forever.",
+  "execution_isolation": "The mesh-message ingest handler MUST NOT await push delivery. It only enqueues to an in-process queue; a background task drains the queue and calls pywebpush via asyncio.to_thread with explicit connect (~3s) and read (~5s) timeouts. The SSE broadcast of the message happens independently of, and never blocks on, push delivery. Delivery tasks/coroutines must be strongly referenced until done (never fire-and-forget an unreferenced create_task — it can be GC-dropped mid-flight).",
+  "vapid": "Keypair generated once per install at first use, persisted OUTSIDE the repo (mc-chat: ~/.meshcom-mock/vapid.json; MCProxy: /var/lib/mcapp/vapid.json), never committed."
+}

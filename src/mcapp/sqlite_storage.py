@@ -113,6 +113,53 @@ class SQLiteStorage(MigrationsMixin, IngestMixin, QueryMixin, PrefsMixin, Classi
         have a stable teardown hook.
         """
 
+    # ── Web Push subscriptions (Wave 5, PWA campaign) ───────────────────────
+    # `subscription`/`filter_json` are stored as JSON blobs (contract shapes:
+    # {"endpoint":..., "keys": {"p256dh":..., "auth":...}} and
+    # {"dm": bool, "groups": [str], "broadcast": bool}). Schema in
+    # storage/migrations.py (v21, `push_subscriptions`). The DB column is
+    # `filter_json`, not `filter` (a SQLite window-function keyword, and
+    # mirrors mc-chat's column name) — translated to/from the plain `"filter"`
+    # dict key at this boundary so callers never see the column name.
+
+    async def upsert_push_subscription(
+        self, endpoint: str, subscription: dict[str, Any], filt: dict[str, Any]
+    ) -> None:
+        """Insert or update a push subscription, keyed by endpoint. Re-upserting
+        the same endpoint with a new filter overwrites the stored filter — this
+        is how a preference change persists (contract `subscribe.semantics`;
+        there is no separate prefs endpoint)."""
+        await self._mutate(
+            """INSERT INTO push_subscriptions (endpoint, subscription, filter_json, updated_at)
+               VALUES (?, ?, ?, CURRENT_TIMESTAMP)
+               ON CONFLICT(endpoint) DO UPDATE SET
+                 subscription = excluded.subscription,
+                 filter_json = excluded.filter_json,
+                 updated_at = CURRENT_TIMESTAMP""",
+            (endpoint, json.dumps(subscription), json.dumps(filt)),
+        )
+
+    async def delete_push_subscription(self, endpoint: str) -> None:
+        """Delete the subscription row for `endpoint`. Idempotent: deleting a
+        missing endpoint is a no-op, not an error (contract `unsubscribe.semantics`;
+        also how prune-on-401/403/404/410 removes a dead subscription)."""
+        await self._mutate("DELETE FROM push_subscriptions WHERE endpoint = ?", (endpoint,))
+
+    async def list_push_subscriptions(self) -> list[dict[str, Any]]:
+        """Return every push subscription as `{endpoint, subscription, filter}`,
+        with `subscription`/`filter` parsed back into dicts."""
+        rows = await self._query(
+            "SELECT endpoint, subscription, filter_json FROM push_subscriptions"
+        )
+        return [
+            {
+                "endpoint": row["endpoint"],
+                "subscription": json.loads(row["subscription"]),
+                "filter": json.loads(row["filter_json"]),
+            }
+            for row in rows
+        ]
+
 
 async def create_sqlite_storage(db_path: str | Path) -> SQLiteStorage:
     """Create and initialize a SQLite storage instance."""
@@ -629,7 +676,7 @@ async def run_startup_tests() -> bool:  # noqa: PLR0915 - test suite lists one c
         finally:
             await storage.close()
 
-    # 8. Migration v18 → HEAD (currently v20): an existing v18 DB (signal_log without
+    # 8. Migration v18 → HEAD (currently v21): an existing v18 DB (signal_log without
     # `source`) must migrate cleanly and idempotently — startup on an old DB succeeds
     # (UDP 2.0 Track U, Wave U2). The v19 source-column backfill is spot-checked
     # explicitly; the final version assertion tracks whatever the latest migration is.
@@ -672,8 +719,8 @@ async def run_startup_tests() -> bool:  # noqa: PLR0915 - test suite lists one c
                 )
                 results.append(
                     (
-                        "v18→HEAD migration: schema at v20",
-                        schema_version == 20,  # noqa: PLR2004 - expected schema version
+                        "v18→HEAD migration: schema at v21",
+                        schema_version == 21,  # noqa: PLR2004 - expected schema version
                     )
                 )
             finally:

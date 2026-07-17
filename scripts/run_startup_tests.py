@@ -28,6 +28,7 @@ from mcapp.commands.routing_tests import run_routing_tests
 from mcapp.contract_parity_tests import run_contract_parity_tests
 from mcapp.main import MessageRouter
 from mcapp.meteo_tests import run_meteo_tests
+from mcapp.push_tests import run_push_tests
 from mcapp.send_path_tests import run_send_path_tests
 from mcapp.sqlite_storage import run_startup_tests as run_storage_tests
 from mcapp.sse_handler import run_startup_tests as run_sse_tests
@@ -86,6 +87,9 @@ async def main() -> int:
     meteo_ok = run_meteo_tests()
     print(f"meteo: {'PASS' if meteo_ok else 'FAIL'}")
 
+    push_ok = await run_push_tests()
+    print(f"push: {'PASS' if push_ok else 'FAIL'}")
+
     ble_protocol_ok = run_ble_protocol_tests()
     print(f"ble_protocol: {'PASS' if ble_protocol_ok else 'FAIL'}")
 
@@ -115,6 +119,7 @@ async def main() -> int:
         and query_ok
         and migration_chain_ok
         and meteo_ok
+        and push_ok
         and ble_protocol_ok
         and update_runner_ok
         and commands_ok
