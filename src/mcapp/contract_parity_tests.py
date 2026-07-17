@@ -22,7 +22,9 @@ from .commands.parsing import extract_target_callsign, is_group
 from .meteo import WeatherService
 from .suppression import should_suppress_outbound
 
-_CORPUS_PATH = pathlib.Path(__file__).parent / "command_contract.json"
+# Vendored from mc-chat via `git subtree` (source: mc-chat contract/). Do NOT edit
+# the JSON here — edit it in mc-chat and re-sync (see CLAUDE.md "Contract Subtree").
+_CORPUS_PATH = pathlib.Path(__file__).parent / "contract" / "command_contract.json"
 
 
 def run_contract_parity_tests() -> bool:

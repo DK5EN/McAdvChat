@@ -80,6 +80,22 @@ git subtree pull --prefix=src/mcapp/classifier mc-chat classifier --squash
 
 The `mc-chat` remote is a local path remote already configured in this repo.
 
+## Command-Contract Subtree
+
+`src/mcapp/contract/command_contract.json` is a **git subtree** vendored from mc-chat (`contract/`). **Do not edit it here** — edit it in mc-chat and re-sync.
+
+It is the shared command-interface parity corpus: target-extraction, suppression-decision, and `format_for_lora` cases that BOTH implementations must satisfy. `contract_parity_tests.py` runs production's impl against it; mc-chat's `tests/test_contract_parity.py` runs the mock's impl against the same corpus. This is what keeps the mock faithful to production (the drift that shipped the `!wx text:` raw-leak on the dev rig). When you change command routing/suppression/weather formatting, update the corpus in mc-chat and re-sync here — either side that no longer matches fails its parity test.
+
+### How to sync (after mc-chat contract changes are committed)
+
+```bash
+cd /Users/martinwerner/WebDev/mc-chat
+git subtree split --prefix=contract -b contract-subtree   # update split branch
+
+cd /Users/martinwerner/WebDev/MCProxy
+git subtree pull --prefix=src/mcapp/contract mc-chat contract-subtree --squash
+```
+
 Schema migrations: add new columns to `messages` or new tables via a `current_version < N` block in `sqlite_storage.initialize()` and bump `SCHEMA_VERSION`. Current schema: v19.
 
 ## Configuration
