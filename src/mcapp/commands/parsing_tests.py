@@ -65,6 +65,13 @@ def _test_extract_target_callsign(results: list[tuple[str, bool]]) -> None:
         ("empty string", "", None),
         ("missing ! prefix", "wx OE5HWN-12", None),
         ("no valid positional callsign", "!wx MSG POS", None),
+        # Regression: a callsign-shaped word inside a wx `text:` prefix is FREE
+        # TEXT, never a remote target — else the command is forwarded raw to the
+        # mesh instead of being resolved locally (the "!wx text:..." leak).
+        ("wx text: signature not a target", "!wx text:73 de DK5EN", None),
+        ("weather alias text: signature not a target", "!weather text:73 de DK5EN", None),
+        ("wx text: plain prefix not a target", "!wx text:Guten Morgen", None),
+        ("wx remote target before text: still found", "!wx OE5HWN-12 text:hello", "OE5HWN-12"),
     ]
     for label, msg, expected in cases:
         _record(

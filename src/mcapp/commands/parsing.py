@@ -30,7 +30,7 @@ def strip_relay_path(src_raw: str) -> str:
     )
 
 
-def extract_target_callsign(msg: str) -> str | None:  # noqa: PLR0911 - complex handler kept intact
+def extract_target_callsign(msg: str) -> str | None:  # noqa: PLR0911, PLR0912 - complex handler kept intact
     """Extract target callsign from command message.
 
     Priority:
@@ -65,7 +65,17 @@ def extract_target_callsign(msg: str) -> str | None:  # noqa: PLR0911 - complex 
             return None  # Invalid target format
 
     # Priority 2: Positional fallback (right-to-left, skip key:value pairs)
-    for part in reversed(parts[1:]):
+    scan = parts[1:]
+    # wx/weather: everything after a `text:` argument is FREE TEXT (mirrors
+    # _parse_wx), not a positional target — a personal-message signature like
+    # `!wx text:73 de DK5EN` must NOT be misread as a remote target (DK5EN),
+    # which would forward the command raw to the mesh instead of resolving it.
+    if command in ("WX", "WEATHER"):
+        for i, part in enumerate(scan):
+            if part.startswith("TEXT:"):
+                scan = scan[:i]  # drop the free-text tail from target scanning
+                break
+    for part in reversed(scan):
         if ":" in part:
             continue  # Skip key:value arguments
         potential = part.strip()
