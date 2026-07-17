@@ -19,5 +19,23 @@
         protocols tls1.3
     }
 
-    reverse_proxy 127.0.0.1:8082
+    # Update-runner SSE progress stream (PWA Task 0.6) — ephemeral plain-http
+    # runner on 127.0.0.1:2985, unbuffered. Rewrite -> /stream (the runner
+    # matches self.path == "/stream" exactly, so the prefix must NOT be
+    # stripped). 502 while no update is running is expected. Mirrors the
+    # internal-CA Caddyfile.mcapp (mcapp_routes) block so the in-app updater
+    # works over HTTPS in public-TLS mode too — without it, lighttpd's
+    # 99-mcapp.conf has no /update-stream rule and the request 404s.
+    handle /update-stream {
+        rewrite * /stream
+        reverse_proxy 127.0.0.1:2985 {
+            flush_interval -1
+        }
+    }
+
+    # Everything else -> lighttpd backend (static webapp + SPA rewrite; lighttpd
+    # re-proxies /api, /events, /health to 127.0.0.1:2981).
+    handle {
+        reverse_proxy 127.0.0.1:8082
+    }
 }
