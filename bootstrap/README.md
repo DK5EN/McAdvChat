@@ -12,7 +12,7 @@ Unified installer and updater for McApp - the MeshCom message proxy for ham radi
 | Component | Purpose |
 |-----------|---------|
 | lighttpd | Static file server + reverse proxy for Vue.js webapp and FastAPI |
-| uv | Python package manager (creates venv via `uv sync`) |
+| uv | Python package manager (creates venv via `uv sync --all-packages`) |
 | mcapp.service | systemd service for the message proxy |
 | mcapp-ble.service | systemd service for BLE communication (optional) |
 | unblock-bluetooth.service | Ensures Bluetooth is unblocked at boot (rfkill fix) |

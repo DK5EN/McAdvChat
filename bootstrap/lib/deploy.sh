@@ -603,13 +603,13 @@ download_webapp() {
 }
 
 #──────────────────────────────────────────────────────────────────
-# PYTHON ENVIRONMENT (uv sync)
+# PYTHON ENVIRONMENT (uv sync --all-packages)
 #──────────────────────────────────────────────────────────────────
 
 setup_python_env() {
   local deploy_target="${1:-$INSTALL_DIR}"
 
-  log_info "Setting up Python environment with uv sync..."
+  log_info "Setting up Python environment with uv sync --all-packages..."
 
   if [[ ! -f "${deploy_target}/pyproject.toml" ]]; then
     log_error "  No pyproject.toml found in ${deploy_target}"
@@ -653,7 +653,7 @@ setup_python_env() {
     fi
   fi
 
-  # Run uv sync as the real user (not root)
+  # Run uv sync --all-packages as the real user (not root)
   if [[ "$run_user" != "root" ]]; then
     sudo -u "$run_user" bash -c "cd '${deploy_target}' && '${uv_bin}' sync --all-packages"
   else
@@ -663,7 +663,7 @@ setup_python_env() {
   if [[ $? -eq 0 ]]; then
     log_ok "  Python environment ready (including workspace members)"
   else
-    log_error "  uv sync failed"
+    log_error "  uv sync --all-packages failed"
     return 1
   fi
 }

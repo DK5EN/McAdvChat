@@ -448,7 +448,7 @@ dry_run_report() {
       echo "  [PACKAGES] Install and configure lighttpd (backend on 127.0.0.1:8082)"
       echo "  [PACKAGES] Install and configure Caddy (LAN-HTTPS front door on :80/:443)"
       echo "  [DEPLOY] Download release tarball to ~/mcapp"
-      echo "  [DEPLOY] Run uv sync to install Python dependencies"
+      echo "  [DEPLOY] Run uv sync --all-packages to install Python dependencies"
       echo "  [DEPLOY] Download and install webapp"
       echo "  [SERVICES] Enable and start mcapp, lighttpd"
       ;;
@@ -462,7 +462,7 @@ dry_run_report() {
       echo "  [MIGRATE] Detected old installation (/usr/local/bin scripts)"
       echo "  [MIGRATE] Stop mcapp service"
       echo "  [MIGRATE] Download release tarball to ~/mcapp"
-      echo "  [MIGRATE] Run uv sync for dependencies"
+      echo "  [MIGRATE] Run uv sync --all-packages for dependencies"
       echo "  [MIGRATE] Update systemd service to use 'uv run mcapp'"
       echo "  [MIGRATE] Add missing config fields"
       echo "  [SYSTEM] Configure tmpfs, firewall, journald"
