@@ -5,7 +5,9 @@ from ..logging_setup import has_console as _has_console
 # Response chunking constants
 MAX_RESPONSE_LENGTH = 140  # Maximum characters per message chunk
 MAX_CHUNKS = 3  # Maximum number of response chunks
-CHUNK_SEND_DELAY_SECONDS = 12  # LoRa airtime spacing between response chunks
+# LoRa airtime spacing between response chunks, in seconds. Typed float: tests
+# override it with sub-second values and asyncio.sleep takes a float.
+CHUNK_SEND_DELAY_SECONDS: float = 12
 CHUNK_SEPARATOR_RESERVE = 2  # bytes reserved for the ", " two-part separator
 
 DEFAULT_THROTTLE_TIMEOUT = 5 * 60  # 5 minutes default
