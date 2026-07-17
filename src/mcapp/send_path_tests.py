@@ -7,20 +7,73 @@ each unit-tested elsewhere, but nothing drove the real wiring
 regression there could forward a locally-resolvable command RAW to the mesh while
 every leaf test stays green. This suite closes that gap by running messages
 through the real `MessageRouter._handle_outbound` with a recording transport and
-asserting what does — and does not — reach the wire.
+asserting what does — and does not — reach the wire. It also guards the OTHER half
+of the contract (`_resolve_and_capture`): a command addressed to us must resolve
+AND its reply must be TRANSMITTED to the mesh — the mock had exactly the inverse
+bug (resolved !wx but never uplinked the reply).
 
-Network-free: on the suppress path `_handle_outbound` routes to the command
-handler via a published event; with no command handler registered here, nothing
-resolves weather, so no DWD/OpenMeteo call happens. We only assert the transport
-side (raw sent vs not).
+Network-free: the raw-suppression cases use a bare router (nothing resolves the
+weather); the reply-transmission case stubs the weather fetch. No DWD/OpenMeteo
+call happens in either.
 """
 
 from __future__ import annotations
 
+import asyncio
 from typing import Any
 
 from .commands.constants import has_console
+from .commands.handler import create_command_handler
 from .main import MessageRouter
+
+_CANNED_WEATHER: dict[str, Any] = {
+    "temperatur_celsius": 21.5,
+    "luftfeuchtigkeit_prozent": 55,
+    "luftdruck_hpa": 1013.2,
+    "windgeschwindigkeit_kmh": 0,
+    "timestamp": "test",
+}
+
+
+async def _resolve_and_capture(src: str, dst: str, msg: str) -> list[str]:
+    """Drive an inbound command through the REAL CommandHandler and return the
+    messages actually TRANSMITTED to the mesh (`udp_message` publishes).
+
+    Guards the second half of the contract: a resolved command reply must be
+    transmitted, not merely computed/stored. (The mock had exactly this bug — it
+    resolved !wx but never uplinked the reply, so it reached the sender's webapp
+    but never the real network.) Weather is stubbed so no API is hit.
+    """
+    router = MessageRouter(None)
+    router.set_callsign("DK5EN")
+    handler = create_command_handler(
+        router, None, "DK5EN", 48.15, 11.58, "TestStation", "MeshCom Test Node"
+    )
+    router.register_protocol("commands", handler)
+
+    def _stub_fetch() -> dict[str, Any]:
+        return dict(_CANNED_WEATHER)
+
+    handler.weather_service._fetch_weather_data = _stub_fetch  # noqa: SLF001
+
+    transmitted: list[str] = []
+    orig_publish = router.publish
+
+    async def _capture(source: str, topic: str, data: dict[str, Any]) -> None:
+        if topic == "udp_message":
+            transmitted.append(str(data.get("msg", "")))
+        await orig_publish(source, topic, data)
+
+    router.publish = _capture  # type: ignore[method-assign]
+
+    inbound = {"data": {"src": src, "dst": dst, "msg": msg, "src_type": "udp"}}
+    await handler._message_handler(inbound)  # noqa: SLF001
+    # send_response chunks in a background task — poll until it publishes (or give up).
+    for _ in range(250):
+        if transmitted:
+            break
+        await asyncio.sleep(0.02)
+    return transmitted
 
 
 async def _drive(router: MessageRouter, src: str, dst: str, msg: str) -> list[dict[str, Any]]:
@@ -82,6 +135,19 @@ async def run_send_path_tests() -> bool:
     _record(
         "plain chat → forwarded unchanged",
         len(sent) == 1 and sent[0].get("msg") == "Hallo Gruppe",
+    )
+
+    # 5. The OTHER half of the contract: a command addressed to us must RESOLVE and
+    #    its reply must be TRANSMITTED to the mesh — not merely computed. The mock
+    #    had exactly this bug (resolved !wx but never uplinked the reply), and no
+    #    test caught it because the tests only asserted "raw not sent", never
+    #    "resolved reply IS sent".
+    transmitted = await _resolve_and_capture("OE5HWN-12", my, "!wx text:Hi")
+    _record(
+        "inbound !wx → RESOLVED reply transmitted to mesh (not raw)",
+        len(transmitted) == 1
+        and "WX" in transmitted[0].upper()
+        and not transmitted[0].startswith("!"),
     )
 
     passed = sum(1 for _, ok in results if ok)
