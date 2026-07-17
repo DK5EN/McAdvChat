@@ -17,8 +17,6 @@ import httpx
 
 from .logging_setup import get_logger
 
-_DAY_START_HOUR = 6
-_DAY_END_HOUR = 20
 _RAIN_REPORT_MIN_MM = 0.1
 _MAX_LORA_MSG_LEN = 149
 
@@ -62,6 +60,42 @@ def _messzeitpunkt_to_utc(timestamp_str: str) -> datetime:
     if parsed.tzinfo is not None:
         return parsed.astimezone(UTC)
     return parsed.replace(tzinfo=_BERLIN_TZ).astimezone(UTC)
+
+
+def _solar_altitude_deg(lat: float, lon: float, dt_utc: datetime) -> float:
+    """Altitude of the sun above the horizon, in degrees, at a location and UTC
+    time. NOAA low-precision solar-position algorithm — accurate to a few
+    arc-minutes, far beyond what a day/night label needs. A value > 0 means the
+    sun is up (daytime). Replaces the old fixed clock window, which mislabelled
+    dark winter evenings (e.g. 17:00) as daytime -> "sonnig" at night.
+    """
+    day_of_year = dt_utc.timetuple().tm_yday
+    hour = dt_utc.hour + dt_utc.minute / 60 + dt_utc.second / 3600
+    gamma = 2 * math.pi / 365 * (day_of_year - 1 + (hour - 12) / 24)
+    eqtime = 229.18 * (
+        0.000075
+        + 0.001868 * math.cos(gamma)
+        - 0.032077 * math.sin(gamma)
+        - 0.014615 * math.cos(2 * gamma)
+        - 0.040849 * math.sin(2 * gamma)
+    )
+    decl = (
+        0.006918
+        - 0.399912 * math.cos(gamma)
+        + 0.070257 * math.sin(gamma)
+        - 0.006758 * math.cos(2 * gamma)
+        + 0.000907 * math.sin(2 * gamma)
+        - 0.002697 * math.cos(3 * gamma)
+        + 0.00148 * math.sin(3 * gamma)
+    )
+    true_solar_min = hour * 60 + eqtime + 4 * lon  # lon east-positive
+    hour_angle = math.radians(true_solar_min / 4 - 180)
+    lat_rad = math.radians(lat)
+    cos_zenith = math.sin(lat_rad) * math.sin(decl) + math.cos(lat_rad) * math.cos(decl) * math.cos(
+        hour_angle
+    )
+    cos_zenith = max(-1.0, min(1.0, cos_zenith))
+    return 90.0 - math.degrees(math.acos(cos_zenith))
 
 
 logger = get_logger(__name__)
@@ -603,17 +637,23 @@ class WeatherService:
             return None
 
     def _is_daytime(self, timestamp_str: str | None) -> bool:
-        """Bestimme ob es Tag oder Nacht ist anhand des Messzeitpunkts"""
-        if not timestamp_str or timestamp_str == "unbekannt":
-            # Default: Tag annehmen
+        """True if the sun is above the horizon at the station location and the
+        reference time — real sunrise/sunset, not a fixed clock window (which
+        labelled dark winter evenings as day -> "sonnig" at night). Reference
+        time is the measurement timestamp when parseable, else now; without a
+        location we cannot compute it and assume day.
+        """
+        if self.lat is None or self.lon is None:
             return True
-        try:
-            local_hour = _messzeitpunkt_to_utc(timestamp_str).astimezone(_BERLIN_TZ).hour
-        except (ValueError, TypeError):
-            return True
-
-        else:
-            return _DAY_START_HOUR <= local_hour < _DAY_END_HOUR
+        ref: datetime | None = None
+        if timestamp_str and timestamp_str != "unbekannt":
+            try:
+                ref = _messzeitpunkt_to_utc(timestamp_str)
+            except (ValueError, TypeError):
+                ref = None
+        if ref is None:
+            ref = datetime.now(UTC)
+        return _solar_altitude_deg(self.lat, self.lon, ref) > 0.0
 
     def _calculate_cloud_coverage_description(
         self,
