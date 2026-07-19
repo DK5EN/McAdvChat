@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import asyncio
-from typing import Any
+from typing import Any, TypedDict
 
 import httpx
 
@@ -29,8 +29,18 @@ SPERRLISTE_URL = "https://raw.githubusercontent.com/DK5EN/McApp/main/sperrliste.
 SPERRLISTE_RETRY_LADDER_S: tuple[float, ...] = (30.0, 60.0, 120.0, 300.0)
 SPERRLISTE_REFRESH_INTERVAL_S = 24 * 60 * 60  # 24h
 
+
+class CommandSpec(TypedDict):
+    """Metadata for one entry in the COMMANDS registry."""
+
+    handler: str  # method name on CommandHandler, resolved via getattr in routing
+    args: list[str]  # accepted keyword arg names
+    format: str  # human-readable usage string (also drives !help)
+    description: str  # short help text
+
+
 # Command registry with handler functions and metadata
-COMMANDS = {
+COMMANDS: dict[str, CommandSpec] = {
     "search": {
         "handler": "handle_search",
         "args": ["call", "days"],

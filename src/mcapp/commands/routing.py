@@ -1,6 +1,6 @@
 """RoutingMixin: message handling, command parsing, execution routing."""
 
-from typing import Any, cast
+from typing import Any
 
 from ..logging_setup import get_logger
 from ._base import CommandHandlerBase
@@ -235,7 +235,7 @@ class RoutingMixin(CommandHandlerBase):
         if cmd not in COMMANDS:
             return "❌ Unknown command"
 
-        handler_name = cast(str, COMMANDS[cmd]["handler"])
+        handler_name = COMMANDS[cmd]["handler"]
         handler = getattr(self, handler_name, None)
 
         if not handler:

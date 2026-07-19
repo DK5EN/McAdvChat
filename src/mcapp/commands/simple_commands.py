@@ -75,15 +75,7 @@ class SimpleCommandsMixin(CommandHandlerBase):
         from .handler import COMMANDS  # noqa: PLC0415 - circular import avoidance
 
         def fmt(cmd: str) -> str:
-            # COMMANDS (handler.py, not owned by this module) is an untyped dict
-            # literal mixing str values ("format") with list[str] ("args"), so
-            # mypy infers each entry's value type as the join Sequence[str]
-            # rather than str. At runtime "format" is always a plain str; this
-            # isinstance check narrows precisely instead of casting blindly.
-            value = COMMANDS[cmd]["format"]
-            if not isinstance(value, str):
-                raise TypeError(f"COMMANDS[{cmd!r}]['format'] is not a str: {value!r}")
-            return value
+            return COMMANDS[cmd]["format"]
 
         response = "📋 Available commands: "
         response += "Search: " + ", ".join([fmt("search"), fmt("pos")]) + " | "
