@@ -52,6 +52,20 @@ Suites (all run by `scripts/run_startup_tests.py`):
 - `classifier.run_all_tests()` (in `src/mcapp/classifier/tests.py`) — uses an ephemeral tempfile SQLite so the live DB is untouched
 - plus storage, udp, and sse suites
 
+## Type Checking (mypy --strict)
+
+The whole workspace is `mypy --strict` clean — **both source roots must stay at zero errors** (there is no WIP baseline; regressions are failures, not warnings):
+
+```bash
+uv run mypy src/mcapp ble_service/src   # must print "Success: no issues found"
+```
+
+- **Run it through the project env (`uv run mypy`), NEVER `uvx mypy`/`pipx run mypy`.** mypy parses with the *running interpreter's* grammar; an ephemeral runner can pull a different Python and emit bogus `[syntax]` errors on version-gated stubs (e.g. numpy's `type` statements). In a workspace, the env must contain every member's deps — run `uv sync --all-packages` first.
+- Config lives in the root `pyproject.toml` `[tool.mypy]` (`python_version = "3.11"`, `strict = true`). Untyped third-party libs (`pywebpush`, `py_vapid`, `timezonefinder`) are silenced via `ignore_missing_imports` overrides; numpy (transitive) uses `follow_imports = "skip"` because its py.typed stubs need 3.12+ grammar. **Prefer an `ignore_missing_imports` override over installing `*-stubs` for libs you don't control** — stubs add many low-value errors; type your own code instead.
+- `mypy` is in the `[dependency-groups] dev` group.
+- Type test files too — `*_tests.py`/`tests.py` are strict-clean and stay that way. `src/mcapp/classifier/tests.py` is inside the mc-chat **git subtree**, so any type change there must be upstreamed to mc-chat (see below) to avoid drift.
+- `# type: ignore` is a documented last resort only: always `# type: ignore[code]  # reason` (never blanket — ruff `PGH` enforces this).
+
 ## Classifier Subtree
 
 `src/mcapp/classifier/` is a **git subtree** pulled from mc-chat (`meshcom_mock/classifier/`).

@@ -84,3 +84,35 @@ extend-immutable-calls = [
 "**/tests/**" = ["S101", "PLR2004", "SLF001", "ARG", "S105", "S106", "PLC0415"]
 "**/test_*.py" = ["S101", "PLR2004", "SLF001", "ARG", "S105", "S106", "PLC0415"]
 "**/tests.py" = ["S101", "PLR2004", "SLF001", "ARG", "PLC0415"]
+
+[dependency-groups]
+dev = [
+    "mypy>=2.3.0",
+]
+
+# --- Static type checking -------------------------------------------------
+# Run through the project env, NOT an ephemeral runner:
+#   uv run mypy src/mcapp
+# (uvx/pipx mypy parses under whatever Python they pull, emitting bogus
+# [syntax] errors on version-gated stubs — always use `uv run`.)
+[tool.mypy]
+python_version = "3.11"
+strict = true
+
+# Untyped third-party libs with no upstream stubs / py.typed marker.
+# Silence import errors only — we type our own code, not theirs.
+[[tool.mypy.overrides]]
+module = [
+    "pywebpush.*",
+    "py_vapid.*",
+    "timezonefinder.*",
+]
+ignore_missing_imports = true
+
+# numpy (transitive via timezonefinder) ships py.typed stubs that use 3.12+
+# `type` syntax; under python_version 3.11 mypy would mis-parse them. Skip
+# following into it — we never annotate against numpy directly.
+[[tool.mypy.overrides]]
+module = ["numpy.*"]
+follow_imports = "skip"
+follow_imports_for_stubs = true
