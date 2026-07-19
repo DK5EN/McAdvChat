@@ -54,7 +54,10 @@ async def _resolve_and_capture(src: str, dst: str, msg: str) -> list[str]:
     def _stub_fetch() -> dict[str, Any]:
         return dict(_CANNED_WEATHER)
 
-    handler.weather_service._fetch_weather_data = _stub_fetch  # noqa: SLF001
+    weather_service = handler.weather_service
+    if weather_service is None:
+        raise RuntimeError("test setup: create_command_handler must build a WeatherService")
+    setattr(weather_service, "_fetch_weather_data", _stub_fetch)  # noqa: B010 - deliberate monkeypatch
 
     transmitted: list[str] = []
     orig_publish = router.publish
@@ -64,7 +67,7 @@ async def _resolve_and_capture(src: str, dst: str, msg: str) -> list[str]:
             transmitted.append(str(data.get("msg", "")))
         await orig_publish(source, topic, data)
 
-    router.publish = _capture  # type: ignore[method-assign]
+    setattr(router, "publish", _capture)  # noqa: B010 - deliberate monkeypatch
 
     inbound = {"data": {"src": src, "dst": dst, "msg": msg, "src_type": "udp"}}
     await handler._message_handler(inbound)  # noqa: SLF001
@@ -101,6 +104,8 @@ async def run_send_path_tests() -> bool:
     router = MessageRouter(None)
     router.set_callsign("DK5EN")
     my = router.my_callsign
+    if my is None:
+        raise RuntimeError("test setup: set_callsign must populate my_callsign")
 
     results: list[tuple[str, bool]] = []
 

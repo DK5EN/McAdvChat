@@ -73,7 +73,9 @@ class BucketTuple(NamedTuple):
     snr_avg: float
     snr_min: float
     snr_max: float
-    count: int
+    # NamedTuple field 'count' intentionally shadows tuple.count; mypy flags the
+    # method-vs-field override, but the field is the documented signal_buckets column.
+    count: int  # type: ignore[assignment]  # field intentionally shadows tuple.count
 
 
 def compute_conversation_key(src: str, dst: str) -> str | None:

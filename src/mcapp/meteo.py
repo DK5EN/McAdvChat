@@ -657,7 +657,7 @@ class WeatherService:
 
     def _calculate_cloud_coverage_description(
         self,
-        cloud_percent: int | None,
+        cloud_percent: float | None,
         timestamp_str: str | None = None,
     ) -> str:
         """Berechne Wolkenbedeckung in Achteln (/8) und Beschreibung"""

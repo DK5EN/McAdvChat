@@ -95,7 +95,7 @@ async def run_query_tests() -> bool:  # noqa: PLR0915 - test suite lists one cas
                     " WHERE callsign = ? AND bucket_size = ?",
                     (callsign, _FIVE_MIN_MS),
                 )
-                return rows[0]["c"]
+                return int(rows[0]["c"])
 
             async def _wipe_buckets() -> None:
                 await storage._mutate("DELETE FROM signal_buckets")  # noqa: SLF001 - white-box test

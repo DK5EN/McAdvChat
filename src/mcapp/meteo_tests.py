@@ -220,6 +220,16 @@ def _test_okta_conversion() -> None:
         ws._calculate_cloud_coverage_description(0, night_ts),
         "klar",
     )
+    # NOTE: the 5 calls below pass genuinely fractional percentages
+    # (6.25/12.5/37.5/87.5) because the okta boundary math
+    # (`cloud_percent / _PERCENT_PER_OKTA`, _PERCENT_PER_OKTA == 12.5) only
+    # lands exactly on a rounding boundary — the case these tests exist to
+    # cover — for non-integer inputs; no int can be 12.5*n + 6.25 for integer
+    # n, so the banker's-rounding boundary (6.25 -> exactly 0.5) is only
+    # reachable with a float. `_calculate_cloud_coverage_description`'s
+    # parameter is therefore typed `cloud_percent: float | None` (the
+    # algorithm was always float-based; production call sites still feed it
+    # `_safe_int(...)` output, which int-widens cleanly to float).
     _check(
         "okta: 6.25% (round(0.5)==0 banker's rounding) still rounds to 0/8 -> sonnig",
         ws._calculate_cloud_coverage_description(6.25, day_ts),

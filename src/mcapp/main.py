@@ -391,6 +391,9 @@ class MessageRouter:
         self, websocket: Any, client_id: str | None = None
     ) -> None:
         """Handle smart initial payload - sends only last N messages per dst + summary."""
+        if self.storage_handler is None:
+            self._logger.warning("_handle_smart_initial_command: no storage_handler, skipping")
+            return
         initial_data, summary = await self.storage_handler.get_smart_initial_with_summary()
         acks_list = initial_data.get("acks", [])
 
@@ -480,6 +483,9 @@ class MessageRouter:
 
     async def _handle_summary_command(self, websocket: Any, client_id: str | None = None) -> None:
         """Handle summary command - sends message counts per destination."""
+        if self.storage_handler is None:
+            self._logger.warning("_handle_summary_command: no storage_handler, skipping")
+            return
         summary = await self.storage_handler.get_summary()
         payload: dict[str, Any] = {
             "type": "response",
@@ -492,6 +498,9 @@ class MessageRouter:
         self, websocket: Any, params: dict[str, Any], client_id: str | None = None
     ) -> None:
         """Handle paginated message fetch."""
+        if self.storage_handler is None:
+            self._logger.warning("_handle_messages_page_command: no storage_handler, skipping")
+            return
         dst = params.get("dst", "*")
         before = params.get("before", now_ms())
         try:

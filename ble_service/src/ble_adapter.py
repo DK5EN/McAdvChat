@@ -42,14 +42,46 @@ import struct
 import time
 from collections.abc import Callable
 from dataclasses import dataclass, field
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from enum import Enum, IntEnum
+from typing import TYPE_CHECKING, Any, cast
 
-from dbus_next import Variant
-from dbus_next.aio import MessageBus
+# Imported from their defining submodules (not the `dbus_next`/`dbus_next.aio`
+# packages) because those packages re-export these names without an `__all__`
+# entry — mypy strict's implicit-reexport check (attr-defined) rejects `from
+# dbus_next import Variant` / `from dbus_next.aio import MessageBus` even
+# though both names are real and fully typed (dbus_next ships py.typed).
+from dbus_next.aio.message_bus import MessageBus
+from dbus_next.aio.proxy_object import ProxyObject
 from dbus_next.constants import BusType
 from dbus_next.errors import DBusError, InterfaceNotFoundError
 from dbus_next.service import ServiceInterface, method
+from dbus_next.signature import Variant
+
+if TYPE_CHECKING:
+    # dbus_next.service._Method (see dbus_next/service.py) reads each D-Bus
+    # method parameter/return annotation via raw `inspect.signature(fn)` and
+    # `dbus_next._private.util.parse_annotation` — never via
+    # `typing.get_type_hints` — so it always sees the literal annotation
+    # strings "o"/"u"/"s"/"q" (D-Bus signature codes: OBJECT_PATH, UINT32,
+    # STRING, UINT16) below on MeshComPairingAgent's methods, regardless of
+    # these aliases. They exist purely so mypy can resolve those forward-ref
+    # strings to the concrete Python types dbus_next actually marshals them
+    # as (str for "o"/"s", int for "u"/"q"); nothing at runtime changes.
+    o = str
+    u = int
+    s = str
+    q = int
+
+# ProxyInterface (dbus_next.aio.proxy_object) instances have their
+# call_*/on_*/off_*/get_*/set_* members attached dynamically via setattr()
+# from the D-Bus introspection XML at construction time (see
+# dbus_next.proxy_object.BaseProxyObject.__init__) — there is no static
+# declaration for them, so mypy cannot type-check attribute access on a
+# ProxyInterface. Used for every proxy-interface-holding field/local in this
+# module. ProxyObject stays precisely typed since get_interface() /
+# get_children() ARE statically declared.
+DBusInterface = Any
 
 _MAX_CALLSIGN_LEN = 15
 _BLE_MTU_LIMIT = 247
@@ -178,12 +210,12 @@ class MeshComPairingAgent(ServiceInterface):
         super().__init__("org.bluez.Agent1")
         self._pin_getter = pin_getter
 
-    @method()
-    def Release(self):  # noqa: N802 - D-Bus Agent1 interface method
+    @method()  # type: ignore[untyped-decorator]  # dbus_next.service.method() is an untyped decorator upstream
+    def Release(self) -> None:  # noqa: N802 - D-Bus Agent1 interface method
         logger.info("Agent released")
 
-    @method()
-    def RequestPasskey(self, device: "o") -> "u":  # noqa: F821, N802 - D-Bus Agent1 interface
+    @method()  # type: ignore[untyped-decorator]  # dbus_next.service.method() is an untyped decorator upstream
+    def RequestPasskey(self, device: "o") -> "u":  # noqa: N802 - D-Bus Agent1 interface
         pin = self._pin_getter()
         logger.info(
             "Passkey requested for %s: returning %s",
@@ -192,8 +224,8 @@ class MeshComPairingAgent(ServiceInterface):
         )
         return pin
 
-    @method()
-    def RequestPinCode(self, device: "o") -> "s":  # noqa: F821, N802 - D-Bus Agent1 interface
+    @method()  # type: ignore[untyped-decorator]  # dbus_next.service.method() is an untyped decorator upstream
+    def RequestPinCode(self, device: "o") -> "s":  # noqa: N802 - D-Bus Agent1 interface
         pin = self._pin_getter()
         result = f"{pin:06d}" if pin > 0 else "000000"
         logger.info(
@@ -203,24 +235,24 @@ class MeshComPairingAgent(ServiceInterface):
         )
         return result
 
-    @method()
-    def DisplayPinCode(self, device: "o", pincode: "s"):  # noqa: F821, N802 - D-Bus Agent1 interface
+    @method()  # type: ignore[untyped-decorator]  # dbus_next.service.method() is an untyped decorator upstream
+    def DisplayPinCode(self, device: "o", pincode: "s") -> None:  # noqa: N802 - D-Bus Agent1 interface
         logger.info("DisplayPinCode for %s: %s", device, pincode)
 
-    @method()
-    def DisplayPasskey(self, device: "o", passkey: "u", entered: "q"):  # noqa: F821, N802 - D-Bus Agent1 interface
+    @method()  # type: ignore[untyped-decorator]  # dbus_next.service.method() is an untyped decorator upstream
+    def DisplayPasskey(self, device: "o", passkey: "u", entered: "q") -> None:  # noqa: N802 - D-Bus Agent1 interface
         logger.info("DisplayPasskey for %s: %s (%s entered)", device, passkey, entered)
 
-    @method()
-    def RequestConfirmation(self, device: "o", passkey: "u"):  # noqa: F821, N802 - D-Bus Agent1 interface
+    @method()  # type: ignore[untyped-decorator]  # dbus_next.service.method() is an untyped decorator upstream
+    def RequestConfirmation(self, device: "o", passkey: "u") -> None:  # noqa: N802 - D-Bus Agent1 interface
         logger.info("Confirm passkey %s for %s", passkey, device)
 
-    @method()
-    def AuthorizeService(self, device: "o", uuid: "s"):  # noqa: F821, N802 - D-Bus Agent1 interface
+    @method()  # type: ignore[untyped-decorator]  # dbus_next.service.method() is an untyped decorator upstream
+    def AuthorizeService(self, device: "o", uuid: "s") -> None:  # noqa: N802 - D-Bus Agent1 interface
         logger.info("Authorize service %s for %s", uuid, device)
 
-    @method()
-    def Cancel(self):  # noqa: N802 - D-Bus Agent1 interface method
+    @method()  # type: ignore[untyped-decorator]  # dbus_next.service.method() is an untyped decorator upstream
+    def Cancel(self) -> None:  # noqa: N802 - D-Bus Agent1 interface method
         logger.info("Request cancelled")
 
 
@@ -238,7 +270,7 @@ class BLEAdapter:
         write_uuid: str = NUS_RX_UUID,
         hello_bytes: bytes = OPEN_HELLO,
         notification_callback: Callable[[bytes], None] | None = None,
-    ):
+    ) -> None:
         self.read_uuid = read_uuid
         self.write_uuid = write_uuid
         self.hello_bytes = hello_bytes
@@ -248,28 +280,34 @@ class BLEAdapter:
         # the firmware will require this exact value via RequestPasskey.
         self.pairing_passkey: int = 0
 
-        # D-Bus objects
+        # D-Bus objects.  *_obj fields hold ProxyObject (statically typed:
+        # get_interface()/get_children() are declared). *_iface fields hold
+        # ProxyInterface but are typed via DBusInterface (Any) because their
+        # call_*/on_*/off_*/get_*/set_* members are attached dynamically —
+        # see the DBusInterface comment near the top of this module.
         self.bus: MessageBus | None = None
-        self.device_obj = None
-        self.dev_iface = None
-        self.props_iface = None
-        self.read_char_obj = None
-        self.read_char_iface = None
-        self.read_props_iface = None
-        self.write_char_iface = None
+        self.device_obj: ProxyObject | None = None
+        self.dev_iface: DBusInterface | None = None
+        self.props_iface: DBusInterface | None = None
+        self.read_char_obj: ProxyObject | None = None
+        self.read_char_iface: DBusInterface | None = None
+        self.read_props_iface: DBusInterface | None = None
+        self.write_char_iface: DBusInterface | None = None
 
         # State
         self._status = BLEStatus()
         self._operation_lock = asyncio.Lock()
         self._write_lock = asyncio.Lock()
-        self._keepalive_task: asyncio.Task | None = None
-        self._dst_check_task: asyncio.Task | None = None
+        self._keepalive_task: asyncio.Task[None] | None = None
+        self._dst_check_task: asyncio.Task[None] | None = None
         self._last_utc_offset: float | None = None
         self._connected_mac: str | None = None
         self._agent_registered: bool = False
         self._cancel_connect: bool = False
         self._disconnect_callback: Callable[[], None] | None = None
-        self._device_props_handler = None
+        self._device_props_handler: Callable[[str, dict[str, Variant], list[str]], Any] | None = (
+            None
+        )
 
     @property
     def status(self) -> BLEStatus:
@@ -294,17 +332,19 @@ class BLEAdapter:
         """
         if self.bus:
             with contextlib.suppress(Exception):
-                self.bus.disconnect()
+                # MessageBus.disconnect() has no return annotation upstream.
+                cast(Any, self.bus).disconnect()
             self.bus = None
 
     def _mac_to_dbus_path(self, mac: str) -> str:
         """Convert MAC address to D-Bus device path"""
         return f"{ADAPTER_PATH}/dev_{mac.replace(':', '_')}"
 
-    async def _ensure_bus(self):
-        """Ensure D-Bus connection is established"""
+    async def _ensure_bus(self) -> MessageBus:
+        """Ensure D-Bus connection is established, and return it (never None)."""
         if self.bus is None:
             self.bus = await MessageBus(bus_type=BusType.SYSTEM).connect()
+        return self.bus
 
     async def scan(
         self,
@@ -322,22 +362,22 @@ class BLEAdapter:
             List of discovered BLEDevice objects
         """
         async with self._operation_lock:
-            await self._ensure_bus()
+            bus = await self._ensure_bus()
 
             found_devices: dict[str, BLEDevice] = {}
             known_devices: list[BLEDevice] = []
 
             # Get adapter
             path = ADAPTER_PATH
-            introspection = await self.bus.introspect(BLUEZ_SERVICE_NAME, path)
-            adapter_obj = self.bus.get_proxy_object(BLUEZ_SERVICE_NAME, path, introspection)
-            adapter = adapter_obj.get_interface(ADAPTER_INTERFACE)
+            introspection = await bus.introspect(BLUEZ_SERVICE_NAME, path)
+            adapter_obj = bus.get_proxy_object(BLUEZ_SERVICE_NAME, path, introspection)
+            adapter: DBusInterface = adapter_obj.get_interface(ADAPTER_INTERFACE)
 
             # Get object manager for existing devices
-            obj_mgr = self.bus.get_proxy_object(
-                BLUEZ_SERVICE_NAME, "/", await self.bus.introspect(BLUEZ_SERVICE_NAME, "/")
+            obj_mgr = bus.get_proxy_object(
+                BLUEZ_SERVICE_NAME, "/", await bus.introspect(BLUEZ_SERVICE_NAME, "/")
             )
-            obj_mgr_iface = obj_mgr.get_interface(OBJECT_MANAGER_INTERFACE)
+            obj_mgr_iface: DBusInterface = obj_mgr.get_interface(OBJECT_MANAGER_INTERFACE)
 
             # Check known/paired devices first
             objects = await obj_mgr_iface.call_get_managed_objects()
@@ -361,7 +401,9 @@ class BLEAdapter:
                         known_devices.append(device)
 
             # Setup handler for new devices during scan
-            async def on_interfaces_added(path, interfaces):
+            async def on_interfaces_added(
+                path: str, interfaces: dict[str, dict[str, Variant]]
+            ) -> None:
                 if DEVICE_INTERFACE in interfaces:
                     props = interfaces[DEVICE_INTERFACE]
                     name = props.get("Name", Variant("s", "")).value
@@ -372,9 +414,11 @@ class BLEAdapter:
                             name=name, address=addr, rssi=rssi, paired=False, path=path
                         )
 
-            pending_tasks: set[asyncio.Task] = set()
+            pending_tasks: set[asyncio.Task[None]] = set()
 
-            def on_interfaces_added_sync(path, interfaces):
+            def on_interfaces_added_sync(
+                path: str, interfaces: dict[str, dict[str, Variant]]
+            ) -> None:
                 task = asyncio.create_task(on_interfaces_added(path, interfaces))
                 pending_tasks.add(task)
                 task.add_done_callback(pending_tasks.discard)
@@ -433,10 +477,12 @@ class BLEAdapter:
                     self._connected_mac = mac
                     self._status.state = ConnectionState.CONNECTED
                     # Read device name from BlueZ D-Bus
-                    try:
-                        name = (await self.props_iface.call_get(DEVICE_INTERFACE, "Name")).value
-                    except Exception:
-                        name = ""
+                    name = ""
+                    if self.props_iface is not None:
+                        try:
+                            name = (await self.props_iface.call_get(DEVICE_INTERFACE, "Name")).value
+                        except Exception:
+                            name = ""
                     self._status.device = BLEDevice(name=name, address=mac)
                     self._status.last_activity = time.time()
 
@@ -469,19 +515,19 @@ class BLEAdapter:
                 self._status.error = f"Connection failed after {max_retries} attempts"
             return False
 
-    async def _attempt_connection(self, _mac: str, path: str):
+    async def _attempt_connection(self, _mac: str, path: str) -> None:
         """Single connection attempt with stale BlueZ state handling"""
-        await self._ensure_bus()
+        bus = await self._ensure_bus()
 
-        introspection = await self.bus.introspect(BLUEZ_SERVICE_NAME, path)
-        self.device_obj = self.bus.get_proxy_object(BLUEZ_SERVICE_NAME, path, introspection)
+        introspection = await bus.introspect(BLUEZ_SERVICE_NAME, path)
+        self.device_obj = bus.get_proxy_object(BLUEZ_SERVICE_NAME, path, introspection)
 
         try:
-            self.dev_iface = self.device_obj.get_interface(DEVICE_INTERFACE)
+            self.dev_iface = cast(DBusInterface, self.device_obj.get_interface(DEVICE_INTERFACE))
         except InterfaceNotFoundError as e:
             raise ConnectionError(f"Device not found or not paired: {e}") from e
 
-        self.props_iface = self.device_obj.get_interface(PROPERTIES_INTERFACE)
+        self.props_iface = cast(DBusInterface, self.device_obj.get_interface(PROPERTIES_INTERFACE))
 
         # Check if BlueZ has stale connection (e.g. after device hard reboot)
         try:
@@ -523,17 +569,24 @@ class BLEAdapter:
         except TimeoutError as e:
             raise ConnectionError("GATT characteristic discovery timeout") from e
 
-        if not self.read_char_iface or not self.write_char_iface:
+        # read_char_obj/read_char_iface (and write_char_iface) are always set as a
+        # pair by _find_characteristics(); checking read_char_iface here also
+        # narrows read_char_obj for mypy.
+        if not self.read_char_iface or not self.read_char_obj or not self.write_char_iface:
             raise ConnectionError("Required GATT characteristics not found")
 
-        self.read_props_iface = self.read_char_obj.get_interface(PROPERTIES_INTERFACE)
+        self.read_props_iface = cast(
+            DBusInterface, self.read_char_obj.get_interface(PROPERTIES_INTERFACE)
+        )
 
-    def _subscribe_device_properties(self):
+    def _subscribe_device_properties(self) -> None:
         """Subscribe to D-Bus PropertiesChanged on device for instant disconnect detection"""
         if not self.props_iface:
             return
 
-        async def _on_device_props_changed(iface: str, changed: dict, _invalidated: list):
+        async def _on_device_props_changed(
+            iface: str, changed: dict[str, Variant], _invalidated: list[str]
+        ) -> None:
             if (
                 iface == DEVICE_INTERFACE
                 and "Connected" in changed
@@ -545,7 +598,7 @@ class BLEAdapter:
         self._device_props_handler = _on_device_props_changed
         self.props_iface.on_properties_changed(_on_device_props_changed)
 
-    def _unsubscribe_device_properties(self):
+    def _unsubscribe_device_properties(self) -> None:
         """Unsubscribe from device PropertiesChanged signal"""
         if self._device_props_handler and self.props_iface:
             with contextlib.suppress(Exception):
@@ -554,6 +607,9 @@ class BLEAdapter:
 
     async def _wait_for_services_resolved(self, timeout: float = 10.0) -> bool:  # noqa: ASYNC109 - public API takes timeout
         """Wait for BLE services to be discovered"""
+        if self.props_iface is None:
+            return False
+
         start = time.time()
 
         while (time.time() - start) < timeout:
@@ -569,7 +625,7 @@ class BLEAdapter:
 
         return False
 
-    async def _find_characteristics(self, device_path: str):
+    async def _find_characteristics(self, device_path: str) -> None:
         """Find read and write GATT characteristics"""
         self.read_char_obj, self.read_char_iface = await self._find_gatt_characteristic(
             device_path, self.read_uuid
@@ -578,7 +634,9 @@ class BLEAdapter:
             device_path, self.write_uuid
         )
 
-    async def _find_gatt_characteristic(self, path: str, target_uuid: str):
+    async def _find_gatt_characteristic(
+        self, path: str, target_uuid: str
+    ) -> tuple[ProxyObject | None, DBusInterface | None]:
         """Find GATT characteristic by UUID under `path` (BLE-12).
 
         One GetManagedObjects() D-Bus round-trip (the same call scan() already
@@ -587,10 +645,11 @@ class BLEAdapter:
         the whole object tree's interfaces/properties in one call.
         """
         try:
-            obj_mgr = self.bus.get_proxy_object(
-                BLUEZ_SERVICE_NAME, "/", await self.bus.introspect(BLUEZ_SERVICE_NAME, "/")
+            bus = await self._ensure_bus()
+            obj_mgr = bus.get_proxy_object(
+                BLUEZ_SERVICE_NAME, "/", await bus.introspect(BLUEZ_SERVICE_NAME, "/")
             )
-            obj_mgr_iface = obj_mgr.get_interface(OBJECT_MANAGER_INTERFACE)
+            obj_mgr_iface: DBusInterface = obj_mgr.get_interface(OBJECT_MANAGER_INTERFACE)
             objects = await obj_mgr_iface.call_get_managed_objects()
         except Exception:
             return None, None
@@ -606,20 +665,18 @@ class BLEAdapter:
             if uuid_prop is None or uuid_prop.value.lower() != target_uuid_lower:
                 continue
             try:
-                child_introspect = await self.bus.introspect(BLUEZ_SERVICE_NAME, obj_path)
-                child_obj = self.bus.get_proxy_object(
-                    BLUEZ_SERVICE_NAME, obj_path, child_introspect
-                )
+                child_introspect = await bus.introspect(BLUEZ_SERVICE_NAME, obj_path)
+                child_obj = bus.get_proxy_object(BLUEZ_SERVICE_NAME, obj_path, child_introspect)
             except Exception:
                 logger.debug("Failed to build proxy object for %s", obj_path, exc_info=True)
                 continue
             else:
-                char_iface = child_obj.get_interface(GATT_CHARACTERISTIC_INTERFACE)
+                char_iface: DBusInterface = child_obj.get_interface(GATT_CHARACTERISTIC_INTERFACE)
                 return child_obj, char_iface
 
         return None, None
 
-    async def _cleanup_failed_connection(self):
+    async def _cleanup_failed_connection(self) -> None:
         """Clean up after failed connection — guaranteed to reset state"""
         try:
             if self.dev_iface:
@@ -632,10 +689,10 @@ class BLEAdapter:
         finally:
             if self.bus:
                 with contextlib.suppress(Exception):
-                    self.bus.disconnect()
+                    cast(Any, self.bus).disconnect()
             self._reset_state()
 
-    def _reset_state(self):
+    def _reset_state(self) -> None:
         """Reset all state variables"""
         self.bus = None
         self.device_obj = None
@@ -691,7 +748,7 @@ class BLEAdapter:
         # Clean up
         if self.bus:
             with contextlib.suppress(Exception):
-                self.bus.disconnect()
+                cast(Any, self.bus).disconnect()
 
         self._reset_state()
         self._status.state = ConnectionState.DISCONNECTED
@@ -700,9 +757,9 @@ class BLEAdapter:
         logger.info("Disconnected")
         return True
 
-    async def start_notify(self):
+    async def start_notify(self) -> None:
         """Start receiving notifications from device"""
-        if not self.is_connected or not self.read_char_iface:
+        if not self.is_connected or not self.read_char_iface or not self.read_props_iface:
             raise RuntimeError("Not connected")
 
         # Check if already notifying
@@ -720,7 +777,7 @@ class BLEAdapter:
 
         logger.info("Notifications started")
 
-    async def _stop_notify(self):
+    async def _stop_notify(self) -> None:
         """Stop notifications"""
         if not self.read_char_iface:
             return
@@ -737,7 +794,9 @@ class BLEAdapter:
             if "No notify session started" not in str(e):
                 raise
 
-    async def _on_props_changed(self, iface: str, changed: dict, _invalidated: list):
+    async def _on_props_changed(
+        self, iface: str, changed: dict[str, Variant], _invalidated: list[str]
+    ) -> None:
         """Handle property changes (notifications)"""
         if iface != GATT_CHARACTERISTIC_INTERFACE:
             return
@@ -785,7 +844,7 @@ class BLEAdapter:
             else:
                 return True
 
-    def _on_disconnect_detected(self):
+    def _on_disconnect_detected(self) -> None:
         """Handle unexpected disconnect (write failure or D-Bus signal)"""
         if self._status.state == ConnectionState.DISCONNECTED:
             return  # Already handled
@@ -861,9 +920,13 @@ class BLEAdapter:
         after DST transitions.
         """
 
-        # Calculate current UTC offset of the system timezone (handles DST)
+        # Calculate current UTC offset of the system timezone (handles DST).
+        # utcoffset() is `timedelta | None` on the general `datetime` type
+        # (None only for naive datetimes); `local_now` is always tz-aware
+        # here since it's derived via astimezone() from datetime.now(UTC),
+        # so the `or timedelta()` fallback never actually triggers.
         local_now = datetime.now(UTC).astimezone()
-        utc_offset_hours = local_now.utcoffset().total_seconds() / 3600
+        utc_offset_hours = (local_now.utcoffset() or timedelta()).total_seconds() / 3600
 
         # Send UTC offset first so the firmware applies it to the timestamp
         offset_cmd = f"--utcoff {utc_offset_hours:+.1f}"
@@ -1037,7 +1100,7 @@ class BLEAdapter:
 
         return await self.write(_frame(MsgType.SAVE_AND_REBOOT))  # length=2, no payload
 
-    async def query_extended_registers(self):
+    async def query_extended_registers(self) -> None:
         """
         Query device registers NOT auto-sent on connection.
 
@@ -1060,13 +1123,13 @@ class BLEAdapter:
             except Exception as e:
                 logger.warning("Extended query %s failed: %s", cmd, e)
 
-    def _start_keepalive(self):
+    def _start_keepalive(self) -> None:
         """Start keepalive task"""
         if self._keepalive_task and not self._keepalive_task.done():
             return
         self._keepalive_task = asyncio.create_task(self._keepalive_loop())
 
-    async def _keepalive_loop(self):
+    async def _keepalive_loop(self) -> None:
         """Send periodic keepalive commands"""
         try:
             while self.is_connected:
@@ -1077,13 +1140,13 @@ class BLEAdapter:
         except asyncio.CancelledError:
             pass
 
-    def _start_dst_check(self):
+    def _start_dst_check(self) -> None:
         """Start periodic DST transition check"""
         if self._dst_check_task and not self._dst_check_task.done():
             return
         self._dst_check_task = asyncio.create_task(self._dst_check_loop())
 
-    async def _dst_check_loop(self):
+    async def _dst_check_loop(self) -> None:
         """Check hourly for DST transitions and update device UTC offset."""
 
         try:
@@ -1092,8 +1155,12 @@ class BLEAdapter:
                 if not self.is_connected:
                     break
 
+                # See set_time()'s comment: utcoffset() is `timedelta | None`
+                # on the general `datetime` type, but local_now is always
+                # tz-aware here, so the `or timedelta()` fallback never
+                # actually triggers.
                 local_now = datetime.now(UTC).astimezone()
-                current_offset = local_now.utcoffset().total_seconds() / 3600
+                current_offset = (local_now.utcoffset() or timedelta()).total_seconds() / 3600
 
                 if self._last_utc_offset is not None and current_offset != self._last_utc_offset:
                     logger.info(
@@ -1116,7 +1183,7 @@ class BLEAdapter:
             True if pairing successful
         """
         async with self._operation_lock:
-            await self._ensure_bus()
+            bus = await self._ensure_bus()
 
             path = self._mac_to_dbus_path(mac)
 
@@ -1126,25 +1193,25 @@ class BLEAdapter:
             # without re-registering.
             if not self._agent_registered:
                 agent = MeshComPairingAgent(lambda: self.pairing_passkey)
-                self.bus.export(AGENT_PATH, agent)
+                bus.export(AGENT_PATH, agent)
 
-                manager_obj = self.bus.get_proxy_object(
+                manager_obj = bus.get_proxy_object(
                     BLUEZ_SERVICE_NAME,
                     "/org/bluez",
-                    await self.bus.introspect(BLUEZ_SERVICE_NAME, "/org/bluez"),
+                    await bus.introspect(BLUEZ_SERVICE_NAME, "/org/bluez"),
                 )
-                agent_manager = manager_obj.get_interface("org.bluez.AgentManager1")
+                agent_manager: DBusInterface = manager_obj.get_interface("org.bluez.AgentManager1")
                 await agent_manager.call_register_agent(AGENT_PATH, "KeyboardDisplay")
                 await agent_manager.call_request_default_agent(AGENT_PATH)
                 self._agent_registered = True
 
             # Pair
-            dev_obj = self.bus.get_proxy_object(
-                BLUEZ_SERVICE_NAME, path, await self.bus.introspect(BLUEZ_SERVICE_NAME, path)
+            dev_obj = bus.get_proxy_object(
+                BLUEZ_SERVICE_NAME, path, await bus.introspect(BLUEZ_SERVICE_NAME, path)
             )
 
             try:
-                dev_iface = dev_obj.get_interface(DEVICE_INTERFACE)
+                dev_iface: DBusInterface = dev_obj.get_interface(DEVICE_INTERFACE)
             except InterfaceNotFoundError:
                 logger.exception("Device not found: %s", mac)
                 return False
@@ -1153,7 +1220,7 @@ class BLEAdapter:
                 await dev_iface.call_pair()
                 await dev_iface.set_trusted(True)
 
-                is_paired = await dev_iface.get_paired()
+                is_paired = bool(await dev_iface.get_paired())
                 logger.info("Paired with %s: %s", mac, is_paired)
 
                 # Disconnect after pairing
@@ -1179,17 +1246,17 @@ class BLEAdapter:
             True if unpairing successful
         """
         async with self._operation_lock:
-            await self._ensure_bus()
+            bus = await self._ensure_bus()
 
             device_path = self._mac_to_dbus_path(mac)
             adapter_path = ADAPTER_PATH
 
-            adapter_obj = self.bus.get_proxy_object(
+            adapter_obj = bus.get_proxy_object(
                 BLUEZ_SERVICE_NAME,
                 adapter_path,
-                await self.bus.introspect(BLUEZ_SERVICE_NAME, adapter_path),
+                await bus.introspect(BLUEZ_SERVICE_NAME, adapter_path),
             )
-            adapter_iface = adapter_obj.get_interface(ADAPTER_INTERFACE)
+            adapter_iface: DBusInterface = adapter_obj.get_interface(ADAPTER_INTERFACE)
 
             try:
                 await adapter_iface.call_remove_device(device_path)

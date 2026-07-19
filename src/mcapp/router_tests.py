@@ -20,6 +20,7 @@ def run_suppression_tests(router: "MessageRouter") -> bool:
     logger.info("Testing Suppression Logic:")
     logger.info("=" * 50)
 
+    assert router.my_callsign is not None  # noqa: S101 - test helper
     test_cases: list[tuple[str | None, str, str, bool, str]] = [
         # Tuple layout: src, dst, msg, expected_suppression, description
         (router.my_callsign, "20", "!WX", True, "Group ohne Target → lokal"),

@@ -71,6 +71,7 @@ logger = get_logger(__name__)
 try:
     from fastapi import FastAPI, HTTPException
     from fastapi.middleware.cors import CORSMiddleware
+    from starlette.routing import Route
 
     from .sse_routes.classifier import build_classifier_router
     from .sse_routes.deploy import build_deploy_router
@@ -883,7 +884,7 @@ async def run_startup_tests() -> bool:  # noqa: PLR0915 - regression suite kept 
             delete_endpoint = next(
                 route.endpoint
                 for route in prefs_router.routes
-                if getattr(route, "path", "") == "/api/delete_messages"
+                if isinstance(route, Route) and route.path == "/api/delete_messages"
             )
 
             # Client omits own_call (old webapp): key used to degenerate to

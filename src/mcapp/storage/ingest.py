@@ -281,7 +281,10 @@ class IngestMixin(StorageBase):
         is_lora_observation = src_type == "lora" and msg_type in ("pos", "msg")
         has_signal = (is_mheard or is_lora_observation) and rssi is not None and snr is not None
 
-        if has_signal:
+        # The explicit `rssi is not None and snr is not None` re-check is redundant at
+        # runtime (has_signal already implies both) but lets mypy narrow them to non-None
+        # for the range comparisons and _accumulate_signal call below.
+        if has_signal and rssi is not None and snr is not None:
             if (
                 VALID_RSSI_RANGE[0] <= rssi <= VALID_RSSI_RANGE[1]
                 and VALID_SNR_RANGE[0] <= snr <= VALID_SNR_RANGE[1]
@@ -715,7 +718,7 @@ class IngestMixin(StorageBase):
         # failure falls back to NULL columns, which a later reclassify run picks up.
         # Classifier.classify() has its own fallback, but we do not rely on that —
         # a misbehaving classifier must not drop the message.
-        cls_cols = (None, None, None, None, None)
+        cls_cols: tuple[Any, ...] = (None, None, None, None, None)
         if self._classifier is not None:
             try:
                 cls = await self._classifier.classify(

@@ -33,7 +33,7 @@ import json
 import time
 from collections.abc import Callable
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 from pywebpush import WebPushException
 from pywebpush import webpush as _real_webpush
@@ -323,7 +323,11 @@ def load_or_create_vapid(
     never runs in the suite.
     """
     if path.exists():
-        return json.loads(path.read_text(encoding="utf-8"))
+        # The file is only ever written below (or by `generate_vapid_keypair`'s
+        # own persistence path elsewhere), always as a flat dict[str, str] —
+        # json.loads is untyped (returns Any), so cast to the known shape
+        # rather than leaving the return type as Any.
+        return cast("dict[str, str]", json.loads(path.read_text(encoding="utf-8")))
     keypair = generator()
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(keypair), encoding="utf-8")

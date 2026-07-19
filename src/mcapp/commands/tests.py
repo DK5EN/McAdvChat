@@ -274,13 +274,16 @@ async def test_response_serialization_and_drain() -> bool:  # noqa: PLR0915 - on
         return True
 
     results: list[tuple[str, bool]] = []
-    orig_delay = response_module.CHUNK_SEND_DELAY_SECONDS
+    # getattr/setattr (not `.CHUNK_SEND_DELAY_SECONDS`) below: the constant is not
+    # explicitly reexported from response_module, so direct attribute access trips
+    # mypy's attr-defined under no_implicit_reexport.
+    orig_delay = getattr(response_module, "CHUNK_SEND_DELAY_SECONDS")  # noqa: B009
     orig_drain = response_module.RESPONSE_DRAIN_TIMEOUT_S
     try:
-        response_module.CHUNK_SEND_DELAY_SECONDS = 0.01
+        setattr(response_module, "CHUNK_SEND_DELAY_SECONDS", 0.01)  # noqa: B010
 
         # Scenario 1: two replies to the SAME recipient must not interleave.
-        handler1 = _Harness()
+        handler1 = _Harness()  # type: ignore[abstract]  # partial test double for CommandHandler mixins
         await handler1.send_response(resp_ab, "OE1AAA-1")
         await handler1.send_response(resp_cd, "OE1AAA-1")
         await asyncio.gather(*list(handler1._response_bg_tasks))
@@ -296,8 +299,8 @@ async def test_response_serialization_and_drain() -> bool:  # noqa: PLR0915 - on
         # Scenario 2: a different recipient is NOT blocked by an in-flight reply.
         # A ≥0.5 s inter-chunk gap removes the timing cliff: OE2BBB-2's single chunk
         # reliably lands in the gap between OE1AAA-1's two chunks (order A, E, B).
-        handler2 = _Harness()
-        response_module.CHUNK_SEND_DELAY_SECONDS = 0.5
+        handler2 = _Harness()  # type: ignore[abstract]  # partial test double for CommandHandler mixins
+        setattr(response_module, "CHUNK_SEND_DELAY_SECONDS", 0.5)  # noqa: B010
         await handler2.send_response(resp_ab, "OE1AAA-1")  # 2 chunks, sleeps between
         await handler2.send_response("E" * 20, "OE2BBB-2")  # 1 chunk, no sleep
         await asyncio.gather(*list(handler2._response_bg_tasks))
@@ -312,8 +315,8 @@ async def test_response_serialization_and_drain() -> bool:  # noqa: PLR0915 - on
         # Scenario 3: shutdown drains a nearly-done send instead of cancelling it.
         # Poll until chunk 1 is observed on the wire (task now sleeping before
         # chunk 2) rather than trusting a bare `sleep(0)` to have advanced it.
-        handler3 = _Harness()
-        response_module.CHUNK_SEND_DELAY_SECONDS = 0.05
+        handler3 = _Harness()  # type: ignore[abstract]  # partial test double for CommandHandler mixins
+        setattr(response_module, "CHUNK_SEND_DELAY_SECONDS", 0.05)  # noqa: B010
         await handler3.send_response(resp_ab, "OE3CCC-3")
         chunk1_out = await _wait_until(lambda: len(handler3.message_router.sent) == 1)
         results.append(("Chunk 1 observed before drain (scenario 3 setup)", chunk1_out))
@@ -326,8 +329,8 @@ async def test_response_serialization_and_drain() -> bool:  # noqa: PLR0915 - on
         )
 
         # Scenario 4: after the drain timeout, stragglers are cancelled and tracked set cleared.
-        handler4 = _Harness()
-        response_module.CHUNK_SEND_DELAY_SECONDS = 5.0
+        handler4 = _Harness()  # type: ignore[abstract]  # partial test double for CommandHandler mixins
+        setattr(response_module, "CHUNK_SEND_DELAY_SECONDS", 5.0)  # noqa: B010
         response_module.RESPONSE_DRAIN_TIMEOUT_S = 0.02
         await handler4.send_response(resp_ab, "OE4DDD-4")
         # Poll until chunk 1 is out (task now sleeping 5 s before chunk 2).
@@ -340,7 +343,7 @@ async def test_response_serialization_and_drain() -> bool:  # noqa: PLR0915 - on
             )
         )
     finally:
-        response_module.CHUNK_SEND_DELAY_SECONDS = orig_delay
+        setattr(response_module, "CHUNK_SEND_DELAY_SECONDS", orig_delay)  # noqa: B010
         response_module.RESPONSE_DRAIN_TIMEOUT_S = orig_drain
 
     for label, ok in results:
@@ -1615,7 +1618,7 @@ async def test_message_blocking_integration(handler: Any) -> bool:  # noqa: PLR0
             exec_calls.append(src)
             return (False, None)
 
-        handler._should_execute_command = _spy_should_execute  # type: ignore[method-assign]
+        handler._should_execute_command = _spy_should_execute
         try:
             for src, msg_id in (("OE1ABC-5", "CMD-BLK-1"), ("W1XYZ-1", "CMD-OK-1")):
                 await handler._message_handler(
@@ -2305,7 +2308,7 @@ async def test_self_command_execution(handler: Any) -> bool:  # noqa: PLR0915 - 
         if not cmd_result:
             raise AssertionError(f"{command} failed to parse")
         cmd, kwargs = cmd_result
-        return await handler.execute_command(cmd, kwargs, src)
+        return str(await handler.execute_command(cmd, kwargs, src))
 
     def _record(label: str, ok: bool, response: str = "") -> None:
         status = "✅ PASS" if ok else "❌ FAIL"
@@ -2338,7 +2341,7 @@ async def test_self_command_execution(handler: Any) -> bool:  # noqa: PLR0915 - 
             "timestamp": "test",
         }
         orig_fetch = weather._fetch_weather_data
-        weather._fetch_weather_data = lambda: canned  # type: ignore[method-assign]
+        weather._fetch_weather_data = lambda: canned
         try:
             expected_wx = weather.format_for_lora(canned)
             wx_response = await _run("!WX")
@@ -2353,7 +2356,7 @@ async def test_self_command_execution(handler: Any) -> bool:  # noqa: PLR0915 - 
                 "!WX self-command returns exact formatted weather (offline)", wx_ok, wx_response
             )
         finally:
-            weather._fetch_weather_data = orig_fetch  # type: ignore[method-assign]
+            weather._fetch_weather_data = orig_fetch
 
     # --- !TIME: structural, current (TZ-aware) year, not an error ---
     await _assert_cmd(

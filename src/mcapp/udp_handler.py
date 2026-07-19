@@ -280,7 +280,11 @@ async def run_startup_tests() -> bool:
 
     call_count = 0
 
-    async def _flaky(_data: bytes, _addr: tuple[str, int]) -> None:
+    # Param names must match `_process_received_message(self, data, addr)`
+    # exactly (not `_data`/`_addr`) — mypy's method-assign compatibility check
+    # is name-sensitive (LSP-style), so a mismatched name turns this into a
+    # plain "assignment" error instead of the expected "method-assign" one.
+    async def _flaky(data: bytes, addr: tuple[str, int]) -> None:  # noqa: ARG001 - signature must match the real method for the monkeypatch below
         nonlocal call_count
         call_count += 1
         if call_count == 1:

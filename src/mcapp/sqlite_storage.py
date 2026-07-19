@@ -18,6 +18,7 @@ import asyncio
 import json
 import sqlite3
 import tempfile
+from collections.abc import Sequence
 from pathlib import Path
 from typing import Any
 
@@ -96,7 +97,7 @@ class SQLiteStorage(MigrationsMixin, IngestMixin, QueryMixin, PrefsMixin, Classi
 
         return await asyncio.to_thread(_run)
 
-    async def _execute_many(self, query: str, params_list: list[tuple[Any, ...]]) -> None:
+    async def _execute_many(self, query: str, params_list: Sequence[tuple[Any, ...]]) -> None:
         """Execute many queries in thread pool."""
 
         def _run() -> None:
@@ -189,7 +190,7 @@ async def run_startup_tests() -> bool:  # noqa: PLR0915 - test suite lists one c
                 rows = await storage._query(  # noqa: SLF001 - white-box startup test
                     "SELECT COUNT(*) as c FROM signal_log WHERE callsign = ?", (callsign,)
                 )
-                return rows[0]["c"]
+                return int(rows[0]["c"])
 
             async def _signal_sources(callsign: str) -> list[str]:
                 rows = await storage._query(  # noqa: SLF001 - white-box startup test

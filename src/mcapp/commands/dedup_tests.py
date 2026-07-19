@@ -179,14 +179,18 @@ class _DedupTestHarness(DedupMixin):
 
 def run_dedup_tests() -> bool:
     """Run the DedupMixin test suite. Returns True iff every case passes."""
-    original_time = dedup_module.time
+    # getattr/setattr (not `.time`) below: dedup_module.time is the stdlib `time`
+    # module, imported but not explicitly reexported, so direct attribute access
+    # trips mypy's attr-defined under no_implicit_reexport; setattr also avoids
+    # an incompatible-assignment error (Module vs _FakeClock).
+    original_time = getattr(dedup_module, "time")  # noqa: B009
     results: list[tuple[str, bool]] = []
     try:
         clock = _FakeClock()
-        dedup_module.time = clock
-        results = _DedupTestHarness(clock).collect_results()
+        setattr(dedup_module, "time", clock)  # noqa: B010
+        results = _DedupTestHarness(clock).collect_results()  # type: ignore[abstract]  # partial test double for CommandHandler mixins
     finally:
-        dedup_module.time = original_time
+        setattr(dedup_module, "time", original_time)  # noqa: B010
 
     print("Testing Dedup Logic:")
     print("=" * 50)

@@ -34,7 +34,7 @@ def _record(results: list[tuple[str, bool]], label: str, actual: Any, expected: 
 
 def _norm_msg(msg: str) -> str:
     """Run a raw msg through ``normalize_unified`` and return the cleaned msg field."""
-    return normalize_unified({"src": "OE1ABC", "dst": "20", "msg": msg})["msg"]
+    return str(normalize_unified({"src": "OE1ABC", "dst": "20", "msg": msg})["msg"])
 
 
 def _test_strip_relay_path(results: list[tuple[str, bool]]) -> None:

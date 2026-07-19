@@ -5,7 +5,7 @@ from __future__ import annotations
 import asyncio
 import zoneinfo
 from datetime import datetime
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, cast
 
 from fastapi import APIRouter, HTTPException
 
@@ -93,7 +93,10 @@ def build_weather_router(manager: SSEManager) -> APIRouter:
 
         def _lookup() -> str | None:
             # First call constructs TimezoneFinder (slow) — keep that off the loop too.
-            return _get_tz_finder().timezone_at(lat=lat, lng=lon)
+            # timezonefinder ships no stubs (import-ignored in pyproject.toml),
+            # so `.timezone_at()` types as Any; its documented contract is
+            # `Optional[str]`, which is what we cast to here.
+            return cast("str | None", _get_tz_finder().timezone_at(lat=lat, lng=lon))
 
         tz_name = await asyncio.to_thread(_lookup)
         if not tz_name:

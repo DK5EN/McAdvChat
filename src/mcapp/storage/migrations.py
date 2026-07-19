@@ -374,7 +374,7 @@ class MigrationsMixin(StorageBase):
         # Initialize bucket accumulators from existing signal_log
         await self._init_bucket_accumulators()
 
-        self._initialized = True
+        self._initialized: bool = True
         logger.info("SQLite database initialized")
 
     @staticmethod

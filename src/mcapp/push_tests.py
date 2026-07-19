@@ -26,7 +26,7 @@ import json
 import pathlib
 import tempfile
 import time
-from typing import Any
+from typing import TYPE_CHECKING, Any, cast
 
 from pywebpush import WebPushException
 
@@ -51,6 +51,9 @@ from .sse_routes.push import (
     PushUnsubscribeRequest,
     build_push_router,
 )
+
+if TYPE_CHECKING:
+    from .sse_handler import SSEManager
 
 _CONTRACT_PATH = pathlib.Path(__file__).parent / "contract" / "push_contract.json"
 # Captured once when this suite was updated for contract v2
@@ -158,7 +161,7 @@ async def run_push_tests() -> bool:
     #    cover them — it's already data-driven off the fixture).
     own_for_vectors = contract["own_callsign_for_vectors"]
     for vector in contract["match_vectors"]:
-        actual = matches(vector["msg"], own_for_vectors, vector["filter"])
+        actual: bool | dict[str, Any] = matches(vector["msg"], own_for_vectors, vector["filter"])
         _record(f"match: {vector['name']}", actual == vector["should_push"])
 
     # 1b. eligibility_vectors — pure predicate (type allowlist + own-src exclusion).
@@ -357,7 +360,14 @@ async def _test_subscribe_unsubscribe_upsert(record: _RecordFn) -> None:
         try:
             manager = _StubManager(_StubMessageRouter(storage, "DK5EN-99"))
             dispatcher = PushDispatcher(storage=storage, vapid=_FAKE_VAPID, now=lambda: 0.0)
-            router = build_push_router(manager, vapid=_FAKE_VAPID, dispatcher=dispatcher)
+            router = build_push_router(
+                # _StubManager only implements the SSEManager subset
+                # build_push_router actually touches (require_storage +
+                # .message_router.my_callsign) — see its class docstring.
+                cast("SSEManager", manager),
+                vapid=_FAKE_VAPID,
+                dispatcher=dispatcher,
+            )
             try:
                 vapid_endpoint = _find_route_endpoint(router, "/api/push/vapid-public-key")
                 subscribe_endpoint = _find_route_endpoint(router, "/api/push/subscribe")
@@ -698,7 +708,12 @@ async def _test_execution_isolation_via_publish(record: _RecordFn) -> None:
                 storage=storage, vapid=_FAKE_VAPID, webpush_fn=_slow_stub, now=lambda: 0.0
             )
             manager = _StubManager(router_stub)
-            build_push_router(manager, vapid=_FAKE_VAPID, dispatcher=dispatcher)
+            build_push_router(
+                # See the analogous cast in _test_subscribe_unsubscribe_upsert.
+                cast("SSEManager", manager),
+                vapid=_FAKE_VAPID,
+                dispatcher=dispatcher,
+            )
             try:
                 raw_msg = {
                     "src": "OE1ABC-1",

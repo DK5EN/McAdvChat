@@ -50,10 +50,10 @@ def run_contract_parity_tests() -> bool:
     # Suppression decision (inputs are normalized to upper, as on the real path)
     for case in corpus["suppression"]:
         data = {"src": case["src"].upper(), "dst": case["dst"].upper(), "msg": case["msg"]}
-        actual = should_suppress_outbound(data, my_callsign, is_group)
+        actual_suppress = should_suppress_outbound(data, my_callsign, is_group)
         _record(
             f"suppress src={case['src']} dst={case['dst']} {case['msg']!r} -> {case['suppress']}",
-            actual == case["suppress"],
+            actual_suppress == case["suppress"],
         )
 
     # format_for_lora output (weather-string wire snapshot, incl. day/night)
