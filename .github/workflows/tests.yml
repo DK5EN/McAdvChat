@@ -16,10 +16,12 @@ jobs:
     name: lint + startup test suites
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
 
       - name: Install uv
-        uses: astral-sh/setup-uv@v7
+        # setup-uv stopped publishing moving major/minor tags at v8 (supply-chain
+        # hardening) — @v9 does not exist; pin the exact release.
+        uses: astral-sh/setup-uv@v9.0.0
         with:
           enable-cache: true
 
