@@ -78,7 +78,7 @@ Webapp frontend (3 files):
 Add migration:
 
 ```python
-("send_status", "INTEGER DEFAULT 0"),
+(("send_status", "INTEGER DEFAULT 0"),)
 ```
 
 `send_status` values: `0` = queued, `1` = sent (BLE write OK), `2` = on air (echo received, `msg_id` known), `3` = delivered (ACK received).
@@ -96,7 +96,7 @@ This replaces the boolean `send_success` for new messages. Keep `send_success` f
 **Current flow:**
 ```python
 # line ~382
-await message_router.publish('ble', 'ble_message', {"msg": msg, "dst": dst})
+await message_router.publish("ble", "ble_message", {"msg": msg, "dst": dst})
 return {"status": "ok", "message": "Message queued for delivery"}
 ```
 
@@ -228,11 +228,15 @@ Add a method that publishes status changes through the message router:
 async def _publish_status_update(self, db_id: int, send_status: int, msg_id: str | None = None):
     """Publish delivery status change to SSE clients."""
     if self._message_router:
-        await self._message_router.publish("storage", "msg_status", {
-            "id": db_id,
-            "send_status": send_status,
-            "msg_id": msg_id,
-        })
+        await self._message_router.publish(
+            "storage",
+            "msg_status",
+            {
+                "id": db_id,
+                "send_status": send_status,
+                "msg_id": msg_id,
+            },
+        )
 ```
 
 **File:** `MCProxy/src/mcapp/sse_handler.py`

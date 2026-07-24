@@ -158,6 +158,7 @@ class CommandHandler(
         message_router: Any = None,
         storage_handler: Any = None,
         my_callsign: str = "DK0XXX",
+        *,
         lat: float | None = None,
         lon: float | None = None,
         stat_name: str = "",
@@ -340,6 +341,7 @@ def create_command_handler(  # noqa: PLR0913 - signature fixed by call sites
     message_router: Any,
     storage_handler: Any,
     call_sign: str,
+    *,
     lat: float | None = None,
     lon: float | None = None,
     stat_name: str = "",
@@ -347,5 +349,11 @@ def create_command_handler(  # noqa: PLR0913 - signature fixed by call sites
 ) -> CommandHandler:
     """Factory function to create and integrate CommandHandler"""
     return CommandHandler(
-        message_router, storage_handler, call_sign, lat, lon, stat_name, user_info_text
+        message_router,
+        storage_handler,
+        call_sign,
+        lat=lat,
+        lon=lon,
+        stat_name=stat_name,
+        user_info_text=user_info_text,
     )

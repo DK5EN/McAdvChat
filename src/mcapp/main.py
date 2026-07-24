@@ -272,6 +272,7 @@ class MessageRouter:
     async def route_command(  # noqa: PLR0912, PLR0913, PLR0915 - complex handler kept intact; signature fixed by call sites
         self,
         command: str,
+        *,
         websocket: Any = None,
         MAC: str | None = None,  # noqa: N803 - webapp wire-format field
         BLE_Pin: str | None = None,  # noqa: N803 - webapp wire-format field
@@ -1253,10 +1254,10 @@ async def build_app(cfg: Config) -> AppContext:  # noqa: PLR0915 - sequential wi
         message_router,
         storage_handler,
         cfg.call_sign,
-        cfg.location.latitude,
-        cfg.location.longitude,
-        cfg.location.station_name,
-        cfg.user_info_text,
+        lat=cfg.location.latitude,
+        lon=cfg.location.longitude,
+        stat_name=cfg.location.station_name,
+        user_info_text=cfg.user_info_text,
     )
     message_router.register_protocol("commands", command_handler)
     command_handler.start_dedup_cleanup()

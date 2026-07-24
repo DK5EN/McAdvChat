@@ -110,9 +110,7 @@ Schema v9 migration resets all altitude values to NULL:
 
 ```python
 if current_version < 9:
-    updated = conn.execute(
-        "UPDATE station_positions SET alt = NULL WHERE alt IS NOT NULL"
-    ).rowcount
+    updated = conn.execute("UPDATE station_positions SET alt = NULL WHERE alt IS NOT NULL").rowcount
 ```
 
 Altitudes self-correct within ~30 minutes as new position beacons arrive from all three ingestion paths (UDP, BLE local, BLE remote), all of which now deliver meters correctly.

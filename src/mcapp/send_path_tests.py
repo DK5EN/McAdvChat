@@ -47,7 +47,13 @@ async def _resolve_and_capture(src: str, dst: str, msg: str) -> list[str]:
     router = MessageRouter(None)
     router.set_callsign("DK5EN")
     handler = create_command_handler(
-        router, None, "DK5EN", 48.15, 11.58, "TestStation", "MeshCom Test Node"
+        router,
+        None,
+        "DK5EN",
+        lat=48.15,
+        lon=11.58,
+        stat_name="TestStation",
+        user_info_text="MeshCom Test Node",
     )
     router.register_protocol("commands", handler)
 

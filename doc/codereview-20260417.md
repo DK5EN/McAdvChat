@@ -130,9 +130,9 @@ The pre-existing uncommitted `pyproject.toml` diff (dropping `aiohttp`/`aiohttp-
 - **What:** Every command handler ends with:
   ```python
   if websocket:
-      await self.publish('router', 'websocket_direct', {'websocket': websocket, 'data': payload})
+      await self.publish("router", "websocket_direct", {"websocket": websocket, "data": payload})
   else:
-      await self.publish('router', 'websocket_message', payload)
+      await self.publish("router", "websocket_message", payload)
   ```
 - **Risk:** Any change to routing (rate limiting, logging, priority queue) needs six edits.
 - **Fix:** `_send_payload(payload, websocket=None)` on `MessageRouter`. Every handler becomes one call.
@@ -149,13 +149,13 @@ The pre-existing uncommitted `pyproject.toml` diff (dropping `aiohttp`/`aiohttp-
 - **What:** Each op repeats:
   ```python
   try:
-      await self._publish_status('<op>', 'info', ...)
+      await self._publish_status("<op>", "info", ...)
       response = await self._request(...)
       ...
-      await self._publish_status('<op> result', 'ok'|'error', ...)
+      await self._publish_status("<op> result", "ok" | "error", ...)
       return success
   except Exception as e:
-      await self._publish_status('<op> result', 'error', str(e))
+      await self._publish_status("<op> result", "error", str(e))
       return False
   ```
 - **Fix:** `_execute_ble_operation(op_name, request_coro)` wraps the try/publish/error pattern. Each op shrinks to 3 lines.

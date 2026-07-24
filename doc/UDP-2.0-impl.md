@@ -107,7 +107,7 @@ firmware (`aprs_functions.cpp`) but **not serialized** to Extern-UDP. So for UDP
 
 ```python
 # sqlite_storage.py:1288-1289
-is_mheard   = not msg_id and src_type == "ble" and msg_type == "pos"
+is_mheard = not msg_id and src_type == "ble" and msg_type == "pos"
 is_position = msg_type == "pos" and not is_mheard
 ```
 
@@ -189,11 +189,12 @@ Every wave must leave `uvx ruff check` and `uvx ruff format --check .` clean and
    ```python
    has_signal = (
        src_type in ("ble", "lora")
-       and rssi is not None and snr is not None
+       and rssi is not None
+       and snr is not None
        and VALID_RSSI_RANGE[0] <= rssi <= VALID_RSSI_RANGE[1]
        and VALID_SNR_RANGE[0] <= snr <= VALID_SNR_RANGE[1]
    )
-   is_mheard   = not msg_id and src_type == "ble" and msg_type == "pos"  # keep for compat where needed
+   is_mheard = not msg_id and src_type == "ble" and msg_type == "pos"  # keep for compat where needed
    is_position = msg_type == "pos" and not is_mheard
    ```
    (Exact shape at coding agent's discretion — the invariant is: *lora pos/msg with valid signal →

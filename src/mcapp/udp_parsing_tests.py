@@ -84,8 +84,10 @@ def _test_try_repair_json() -> list[tuple[str, bool]]:
     dropped = try_repair_json(junk_datagram)
     results.append(
         (
-            "try_repair_json: >bound repairs dropped after exactly "
-            "MAX_JSON_REPAIR_ATTEMPTS removals",
+            (
+                "try_repair_json: >bound repairs dropped after exactly "
+                "MAX_JSON_REPAIR_ATTEMPTS removals"
+            ),
             dropped == expected_sentinel,
         )
     )

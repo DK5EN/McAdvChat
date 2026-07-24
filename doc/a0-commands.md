@@ -819,17 +819,19 @@ from bleak import BleakClient, BleakScanner
 MESHCOM_SERVICE_UUID = "6E400001-B5A3-F393-E0A9-E50E24DCCA9E"
 TX_CHAR_UUID = "6E400002-B5A3-F393-E0A9-E50E24DCCA9E"  # Write to device
 
+
 async def send_command(device_address, command):
     """Send a command to MeshCom device via BLE"""
     async with BleakClient(device_address) as client:
         # Prepare 0xA0 message
-        cmd_bytes = command.encode('utf-8')
+        cmd_bytes = command.encode("utf-8")
         length = len(cmd_bytes) + 2
         message = bytes([length, 0xA0]) + cmd_bytes
 
         # Send via BLE
         await client.write_gatt_char(TX_CHAR_UUID, message)
         print(f"Sent: {command}")
+
 
 # Usage
 asyncio.run(send_command("AA:BB:CC:DD:EE:FF", "--info"))

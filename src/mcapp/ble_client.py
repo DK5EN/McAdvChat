@@ -310,6 +310,7 @@ class BLEClientBase(ABC):
 
 async def create_ble_client(  # noqa: PLR0913 - signature fixed by call sites
     mode: BLEMode = BLEMode.DISABLED,
+    *,
     notification_callback: Callable[[dict[str, Any]], None] | None = None,
     device_mac: str | None = None,  # noqa: ARG001 - BLE-mode interface compatibility
     remote_url: str | None = None,

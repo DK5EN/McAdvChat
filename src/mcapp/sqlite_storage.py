@@ -504,8 +504,10 @@ async def run_startup_tests() -> bool:  # noqa: PLR0915 - test suite lists one c
             lb = live_buckets[0] if live_buckets else {}
             results.append(
                 (
-                    "live accumulator: flushed bucket has exact count + count-weighted "
-                    "rssi/snr averages (min/max too)",
+                    (
+                        "live accumulator: flushed bucket has exact count + count-weighted "
+                        "rssi/snr averages (min/max too)"
+                    ),
                     lb.get("bucket_ts") == b0
                     and lb.get("count") == len(seed_rssi)
                     and _approx(lb.get("rssi_avg"), exp_rssi_avg)
@@ -563,8 +565,10 @@ async def run_startup_tests() -> bool:  # noqa: PLR0915 - test suite lists one c
             bf = bf_buckets[0] if bf_buckets else {}
             results.append(
                 (
-                    "backfill: signal_buckets rebuilt as one bucket with exact count + "
-                    "count-weighted averages (min/max too)",
+                    (
+                        "backfill: signal_buckets rebuilt as one bucket with exact count + "
+                        "count-weighted averages (min/max too)"
+                    ),
                     len(bf_buckets) == 1
                     and bf.get("bucket_ts") == bf_bucket
                     and bf.get("count") == len(bf_rssi)
@@ -633,8 +637,10 @@ async def run_startup_tests() -> bool:  # noqa: PLR0915 - test suite lists one c
             )
             results.append(
                 (
-                    "store_message + real classifier: info_score/template_hash/classifier_ver "
-                    "all populated (non-NULL)",
+                    (
+                        "store_message + real classifier: info_score/template_hash/classifier_ver "
+                        "all populated (non-NULL)"
+                    ),
                     d4a.get("info_score") is not None
                     and d4a.get("template_hash") is not None
                     and len(d4a["template_hash"]) == template_hash_len
@@ -669,8 +675,10 @@ async def run_startup_tests() -> bool:  # noqa: PLR0915 - test suite lists one c
             )
             results.append(
                 (
-                    "store_message: classifier exception does not block ingestion "
-                    "(row still stored)",
+                    (
+                        "store_message: classifier exception does not block ingestion "
+                        "(row still stored)"
+                    ),
                     d4b_rows[0]["c"] == 1,
                 )
             )

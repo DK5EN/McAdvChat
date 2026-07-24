@@ -102,9 +102,9 @@ class RoutingMixin(CommandHandlerBase):
             msg_text,
             msg_id,
             content_hash,
-            response_target,
-            src,
-            src_type,
+            response_target=response_target,
+            src=src,
+            src_type=src_type,
         )
 
     def _resolve_response_target(self, src: str, dst: str, target_type: str) -> str:
@@ -118,6 +118,7 @@ class RoutingMixin(CommandHandlerBase):
         msg_text: str,
         msg_id: Any,
         content_hash: str,
+        *,
         response_target: str,
         src: str,
         src_type: str,

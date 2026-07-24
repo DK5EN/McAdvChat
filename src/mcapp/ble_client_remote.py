@@ -124,6 +124,7 @@ class BLEClientRemote(BLEClientBase):
         method: str,
         endpoint: str,
         data: dict[str, Any] | None = None,
+        *,
         retries: int = REQUEST_RETRIES,
         retry_delay: float = REQUEST_RETRY_DELAY_S,
         request_timeout: float | None = None,

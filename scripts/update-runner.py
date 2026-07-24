@@ -677,7 +677,8 @@ def _download_bootstrap(dev_mode: bool) -> str:
 
     with tempfile.NamedTemporaryFile(suffix=".sh", delete=False) as tmp:
         script_path = tmp.name
-    urllib.request.urlretrieve(url, script_path)  # noqa: S310 - fixed https URL
+    # URL is a fixed https:// literal built above — no scheme injection possible.
+    urllib.request.urlretrieve(url, script_path)
     return script_path
 
 

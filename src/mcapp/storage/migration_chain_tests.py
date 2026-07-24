@@ -264,8 +264,10 @@ async def _test_v18_conversation_rekey(results: list[tuple[str, bool]]) -> None:
             )
             results.append(
                 (
-                    "v18 re-key: via-routed 'VIA,TARGET' row re-keyed to compute_conversation_key "
-                    f"('{expected_key}')",
+                    (
+                        "v18 re-key: via-routed 'VIA,TARGET' row re-keyed to "
+                        f"compute_conversation_key ('{expected_key}')"
+                    ),
                     bool(via_row) and via_row[0]["conversation_key"] == expected_key,
                 )
             )

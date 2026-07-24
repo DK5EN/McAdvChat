@@ -63,16 +63,20 @@ def run_suppression_tests(router: "MessageRouter") -> bool:
             "test",
             "!wx",
             True,
-            "Kleinschreibung src/dst wird normalisiert (upper) → wie Test-Gruppe ohne Target, "
-            "lokal",
+            (
+                "Kleinschreibung src/dst wird normalisiert (upper) → wie Test-Gruppe ohne Target, "
+                "lokal"
+            ),
         ),
         (
             router.my_callsign,
             "20",
             "!WX OE5HWN-12{045",
             False,
-            "Message-ID-Suffix {NNN} wird vor Routing-Entscheidung entfernt → Ziel bleibt "
-            "OE5HWN-12, senden",
+            (
+                "Message-ID-Suffix {NNN} wird vor Routing-Entscheidung entfernt → Ziel bleibt "
+                "OE5HWN-12, senden"
+            ),
         ),
         (
             router.my_callsign,
@@ -86,8 +90,10 @@ def run_suppression_tests(router: "MessageRouter") -> bool:
             "20,OE5ABC-1*",
             "!WX",
             True,
-            "Via-Pfad im dst (Komma) wird NICHT gestrippt (strip_relay_path gilt nur für src) "
-            "→ ungültiges Ziel, lokal unterdrückt",
+            (
+                "Via-Pfad im dst (Komma) wird NICHT gestrippt (strip_relay_path gilt nur für src) "
+                "→ ungültiges Ziel, lokal unterdrückt"
+            ),
         ),
     ]
 

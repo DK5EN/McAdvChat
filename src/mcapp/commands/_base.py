@@ -90,6 +90,7 @@ class CommandHandlerBase(Protocol):
         msg_text: str,
         msg_id: Any,
         content_hash: str,
+        *,
         response_target: str,
         src: str,
         src_type: str,

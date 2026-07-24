@@ -172,11 +172,12 @@ The public surface the rest of the codebase uses.
 ```python
 @dataclass(frozen=True, slots=True)
 class Classification:
-    category: str                         # always set, defaults to "other"
-    tags: tuple[str, ...]                 # sorted, deduplicated
-    info_score: float                     # 0..1
-    template_hash: str                    # always set (12 hex)
-    classifier_version: int               # snapshot taken at classify time
+    category: str  # always set, defaults to "other"
+    tags: tuple[str, ...]  # sorted, deduplicated
+    info_score: float  # 0..1
+    template_hash: str  # always set (12 hex)
+    classifier_version: int  # snapshot taken at classify time
+
 
 class Classifier:
     def __init__(self, storage: MessageStorage) -> None: ...
@@ -187,9 +188,12 @@ class Classifier:
     async def classify(self, msg: dict) -> Classification:
         """Layer 1 + Layer 2 (update + threshold) + Layer 3 (score)."""
 
-    async def reclassify(self, since: int | None = None,
-                         category: str | None = None,
-                         progress_cb: Callable[[int, int], Awaitable[None]] | None = None) -> str:
+    async def reclassify(
+        self,
+        since: int | None = None,
+        category: str | None = None,
+        progress_cb: Callable[[int, int], Awaitable[None]] | None = None,
+    ) -> str:
         """Return job_id; runs in a background task."""
 ```
 
@@ -260,10 +264,10 @@ without losing them.
 ```python
 def fingerprint(text: str) -> str:
     t = text.strip()
-    t = URL_RE.sub("URL", t)                       # http(s) URLs first
-    t = EMOJI_RE.sub("E", t)                       # emoji ranges
-    t = re.sub(r"\d+(?:[.,]\d+)?", "#", t)         # numbers (int/float)
-    t = re.sub(r"\s+", " ", t)                     # whitespace collapse
+    t = URL_RE.sub("URL", t)  # http(s) URLs first
+    t = EMOJI_RE.sub("E", t)  # emoji ranges
+    t = re.sub(r"\d+(?:[.,]\d+)?", "#", t)  # numbers (int/float)
+    t = re.sub(r"\s+", " ", t)  # whitespace collapse
     t = t.lower()
     return hashlib.sha1(t.encode("utf-8")).hexdigest()[:12]
 ```
@@ -329,15 +333,15 @@ weighted and clamped.
 def compute(msg: dict, category: str, tags: set[str], tpl_count: int) -> float:
     text = msg["msg"] or ""
     # Positive contributors
-    word_count    = len(re.findall(r"\w+", text))
-    len_factor    = min(word_count / 15.0, 1.0)              # caps at 15 words
-    directed      = 1.0 if category == "directed" else 0.0
-    group_chat    = 1.0 if category == "qso" else 0.0
-    freshness     = 1.0 / (1 + tpl_count)                    # inverse of template freq
+    word_count = len(re.findall(r"\w+", text))
+    len_factor = min(word_count / 15.0, 1.0)  # caps at 15 words
+    directed = 1.0 if category == "directed" else 0.0
+    group_chat = 1.0 if category == "qso" else 0.0
+    freshness = 1.0 / (1 + tpl_count)  # inverse of template freq
     # Negative contributors
     emoji_density = count_emoji(text) / max(len(text), 1)
-    url_density   = 1.0 if "has_url" in tags else 0.0
-    known_beacon  = 1.0 if "beacon" in tags or "auto_beacon" in tags else 0.0
+    url_density = 1.0 if "has_url" in tags else 0.0
+    known_beacon = 1.0 if "beacon" in tags or "auto_beacon" in tags else 0.0
 
     score = (
         0.30 * len_factor
@@ -348,7 +352,7 @@ def compute(msg: dict, category: str, tags: set[str], tpl_count: int) -> float:
         - 0.10 * url_density
         - 0.40 * known_beacon
     )
-    return max(0.0, min(1.0, score + 0.5))                   # center around 0.5
+    return max(0.0, min(1.0, score + 0.5))  # center around 0.5
 ```
 
 Weights are constants; iterate once we have real data. Document them in

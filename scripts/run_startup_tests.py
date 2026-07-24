@@ -97,7 +97,13 @@ async def main() -> int:
     print(f"update_runner: {'PASS' if update_runner_ok else 'FAIL'}")
 
     handler = create_command_handler(
-        router, None, "DK5EN", 48.15, 11.58, "TestStation", "MeshCom Test Node"
+        router,
+        None,
+        "DK5EN",
+        lat=48.15,
+        lon=11.58,
+        stat_name="TestStation",
+        user_info_text="MeshCom Test Node",
     )
     router.register_protocol("commands", handler)
     commands_ok = await handler.run_all_tests()

@@ -113,6 +113,7 @@ def _decode_data_frame(  # noqa: PLR0913 - all fields are needed from the shared
     byte_msg: bytes,
     payload_type: int,
     msg_id: int,
+    *,
     max_hop: int,
     mesh_info: int,
     remaining_msg: bytes,
@@ -213,7 +214,13 @@ def decode_binary_message(byte_msg: bytes) -> dict[str, Any] | None:
 
     if bytes(byte_msg[:2]) in {b"@:", b"@!"}:
         return _decode_data_frame(
-            byte_msg, payload_type, msg_id, max_hop, mesh_info, remaining_msg, calced_fcs
+            byte_msg,
+            payload_type,
+            msg_id,
+            max_hop=max_hop,
+            mesh_info=mesh_info,
+            remaining_msg=remaining_msg,
+            calced_fcs=calced_fcs,
         )
 
     logger.warning("Invalid mesh format: unrecognized frame prefix %r", byte_msg[:2])
