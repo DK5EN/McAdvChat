@@ -4,11 +4,15 @@ Content preserved from CLAUDE.md — SQLite database documentation and query exa
 
 ## SQLite Storage Backend
 
-The SQLite backend (`sqlite_storage.py`) is the default for production deployments. Schema version 10 includes dedicated tables for positions and signal data (see `2026-02-11_1400-position-signal-architecture-ADR.md` for full architecture).
+The SQLite backend (`sqlite_storage.py`) is the default for production deployments. Dedicated tables for positions and signal data landed at v10 (see `2026-02-11_1400-position-signal-architecture-ADR.md` for full architecture).
 
 **Journal mode:** WAL (Write-Ahead Logging) for concurrent reads during writes.
 
-### Tables (Schema V10)
+**Current schema: v21.** The migration chain lives in `storage/migrations.py` as `current_version < N` blocks, driven from `sqlite_storage.initialize()`; `FINAL_SCHEMA_VERSION` gates it. Add a new block and bump that constant — never edit an existing block.
+
+### Tables (Schema v21)
+
+Core message/signal tables (v10):
 
 | Table | Purpose |
 |-------|---------|
@@ -16,6 +20,25 @@ The SQLite backend (`sqlite_storage.py`) is the default for production deploymen
 | `station_positions` | One row per station (UPSERT). Location from position beacons, signal from MHeard beacons — updated independently |
 | `signal_log` | Raw RSSI/SNR measurements from every MHeard beacon (~130/hour) |
 | `signal_buckets` | Pre-aggregated time buckets (5-min for 8d, 1-hour for 365d) for mHeard charts |
+| `telemetry` | Temperature, humidity, pressure, battery, altitude readings |
+
+Added v7–v21:
+
+| Table | Added | Purpose |
+|-------|-------|---------|
+| `read_counts` | v7 | Per-destination read markers |
+| `hidden_destinations` | v10 | Destinations hidden in the webapp |
+| `blocked_texts` | v11 | Text-pattern blocklist |
+| `mheard_sidebar` | v12 | mHeard sidebar state |
+| `wx_sidebar` | v13 | Weather sidebar state |
+| `classifier_rules` | v16 | Layer-1 regex rules (`builtin=1` seeds are editable but never deleted) |
+| `beacon_templates` | v16 | Layer-2 template fingerprints — count/srcs/auto_beacon, `user_action` override |
+| `classifier_meta` | v16 | `classifier_ver` + `backfill_done:v{N}` markers |
+| `filter_prefs` | v17 | Single-row (`id = 1`) webapp filter preferences JSON |
+| `kickban_callsigns` | v20 | Persists admin `!kb` kickbans across restarts. The curated sperrliste is re-fetched separately and is **never** persisted here |
+| `push_subscriptions` | v21 | Web Push subs, upsert by `endpoint`. Column is `filter_json`, **not** `filter` — the latter is a SQLite window-function keyword |
+
+`mheard_cache` exists in older DBs but is unused.
 
 **Key design principle:** MHeard beacons (RSSI/SNR, no coordinates) and position beacons (lat/lon, no signal) are completely disjoint packet types. `station_positions` merges them per callsign with independent field-group updates — signal fields never overwrite location fields and vice versa.
 
@@ -30,6 +53,8 @@ The SQLite backend (`sqlite_storage.py`) is the default for production deploymen
 | `idx_messages_type_timestamp` | `type, timestamp DESC` | Smart initial payload, recent messages |
 | `idx_messages_type_dst_timestamp` | `type, dst, timestamp DESC` | Paginated channel queries |
 | `idx_signal_log_cs_ts` | `callsign, timestamp DESC` | Signal log time-range queries |
+| `idx_messages_category` | `category` | Classifier category filters (v16) |
+| `idx_messages_template_hash` | `template_hash` | Template/beacon grouping (v16) |
 
 ### Retention (nightly pruning at 04:00)
 
@@ -69,9 +94,11 @@ conn.close()
 \""
 ```
 
-**Schema version:** 10 (WAL mode enabled)
+**Schema version:** 21 (WAL mode enabled)
 
 ### Tables (Production Stats)
+
+Row counts are order-of-magnitude only, sampled 2026-04, and drift with retention — re-measure before relying on them.
 
 | Table | Rows (approx) | Purpose |
 |-------|---------------|---------|
@@ -81,7 +108,7 @@ conn.close()
 | `signal_buckets` | ~7k | Pre-aggregated 5-min and 1-hour signal buckets |
 | `telemetry` | ~20 | Temperature, humidity, pressure readings |
 | `mheard_cache` | 0 | Unused cache table |
-| `schema_version` | 1 | Current schema version (10) |
+| `schema_version` | 1 | Holds the single current schema version (21) |
 
 ### Key columns in `messages`
 
@@ -102,6 +129,13 @@ conn.close()
 | `conversation_key` | TEXT | For DM grouping (e.g., `DK5EN<>DL4GLE`) |
 | `echo_id` | TEXT | Echo tracking ID from `{NNN` suffix |
 | `acked` / `send_success` | INTEGER | ACK tracking flags (0 or 1) |
+| `category` | TEXT | Classifier primary category (v16) |
+| `tags` | TEXT | Classifier tags, JSON array (v16) |
+| `info_score` | REAL | Classifier info score ∈ [0, 1] (v16) |
+| `template_hash` | TEXT | 12-char sha1 template fingerprint (v16) |
+| `classifier_ver` | INTEGER | Rule-set version this row was classified under; drives backfill (v16) |
+
+Other columns added since v10: `telemetry.batt` (v14), `telemetry.alt`, `hum2`/`extras` on `telemetry` and `station_positions` (v15), and `signal_log.source` (v19 — `'mheard'` for BLE MHeard, `'lora'` for Extern-UDP; existing rows were backfilled as `'mheard'`).
 
 ### Common Queries
 

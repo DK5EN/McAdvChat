@@ -2,7 +2,7 @@
 
 ## Project Overview
 
-McApp is a message proxy service for MeshCom (LoRa mesh network for ham radio operators). It bridges MeshCom nodes with web clients via SSE/REST (FastAPI), supporting both UDP and Bluetooth Low Energy (BLE) connections. Runs on Raspberry Pi, serves a Vue.js web app through lighttpd.
+McApp is a message proxy service for MeshCom (LoRa mesh network for ham radio operators). It bridges MeshCom nodes with web clients via SSE/REST (FastAPI), supporting both UDP and Bluetooth Low Energy (BLE) connections. Runs on Raspberry Pi; Caddy terminates TLS on :80/:443 and lighttpd (backend on :8082) serves the Vue.js SPA and reverse-proxies the API.
 
 Companion frontend: `/Users/martinwerner/WebDev/webapp` (separate git repo — commit each repo independently).
 
@@ -10,29 +10,28 @@ Companion frontend: `/Users/martinwerner/WebDev/webapp` (separate git repo — c
 
 Entry point: `src/mcapp/main.py` → `MessageRouter` (central pub/sub hub connecting UDP, BLE, SSE, and command handlers). All source in `src/mcapp/`. The `commands/` package uses mixin-based architecture assembled in `handler.py`.
 
-See `doc/dataflow.md` for data flow diagrams and `doc/2026-02-11_1400-position-signal-architecture-ADR.md` for position/signal table design.
-
-## Package Management
-
-- **Python**: `uv` only — NEVER use `pip` or `venv`
-- **Frontend** (webapp repo): `npm`
+Detail lives in `doc/`, not here — start with `architecture-reference.md`, `dataflow.md` (flow diagrams), `database-reference.md` (schema/queries), and `operations-reference.md` (deploy, config, health, troubleshooting).
 
 ## Development Commands
 
+**Python: `uv` only — NEVER `pip` or `venv`.** Frontend (webapp repo): `npm`.
+
 ```bash
-export MCAPP_ENV=dev       # Enables verbose logging
-uv run mcapp               # Run locally
-uvx ruff check             # Lint (must pass before committing)
-uvx ruff check --fix       # Auto-fix
-uvx ruff format            # Format (must be clean before committing)
-./scripts/release.sh       # Create release (interactive, run from development branch)
+export MCAPP_ENV=dev                            # verbose logging + /etc/mcapp/config.dev.json
+uv run mcapp                                    # run locally
+uvx ruff check [--fix]                          # lint
+uvx ruff format [--check .]                     # format
+uv run mypy src/mcapp ble_service/src           # types
+uv run python scripts/run_startup_tests.py      # tests
+./scripts/release.sh                            # release (interactive, from development branch)
 ```
+
+All must be clean before committing. CI (`.github/workflows/tests.yml`, Python 3.11) enforces only three of them — ruff check, ruff format --check, and the startup runner. **`mypy` is mandatory but unenforced by CI, so run it locally** or strict-clean regressions merge unnoticed.
 
 ## Code Quality
 
-- `uvx ruff check` is mandatory — zero tolerance for errors and warnings
-- `uvx ruff format` is the mandatory formatter — run it before committing (`uvx ruff format --check .` must be clean)
-- **Ruff config** in `pyproject.toml`: `line-length = 100`, `target-version = "py311"`, strict rule set (bugbear, security, pylint, pyupgrade, simplify, datetime-TZ, async, pathlib, naming, …) — see the `[tool.ruff.lint]` section for the full list and documented ignores
+- `uvx ruff check` and `uvx ruff format --check .` are mandatory — zero tolerance for errors and warnings
+- **Ruff config** in `pyproject.toml`: `line-length = 100`, `target-version = "py311"`, strict rule set — see `[tool.ruff.lint]` for the full list and documented ignores
 - **Keep all `[tool.ruff*]` sections identical** across `pyproject.toml`, `ble_service/pyproject.toml` and mc-chat's `pyproject.toml` — the classifier subtree must lint clean under the same rules in both repos
 - New `# noqa` markers need a trailing reason comment and should stay rare — prefer a real fix
 - **Git branches**: `development` (default), `main` (production)
@@ -40,110 +39,75 @@ uvx ruff format            # Format (must be clean before committing)
 
 ## Testing
 
-No pytest. **The canonical, authoritative test runner is `scripts/run_startup_tests.py`** — it runs all 6 suites with isolated/ephemeral state and is exit-code gated (exit 0 = all passed; needs network for weather APIs). CI and releases must trust this runner, not the in-app run.
+No pytest. **The canonical, authoritative test runner is `scripts/run_startup_tests.py`** — it runs every suite with isolated/ephemeral state, is exit-code gated (0 = all passed), and is fully offline (the command suite stubs the weather fetch). It needs no TTY and no `/etc/mcapp`. CI and releases must trust this runner, not the in-app run.
 
-Headless (no TTY, no `/etc/mcapp` needed): `uv run python scripts/run_startup_tests.py`.
+Suites are registered in `main()` of that script (~19 of them: suppression, send_path, contract_parity, udp, storage, sse, classifier, parsing, dedup, routing, query, migration_chain, meteo, push, ble_protocol, update_runner, commands, …). **Add new suites there** — a suite not wired into that `main()` is not gated by anything.
 
-The in-app startup path (when `has_console()` is true) runs only a **non-fatal smoke check**: the suppression suite (read-only, pure `router.validator` logic). It intentionally proceeds on failure because the service is a resilient always-on proxy. The command suite is deliberately **not** run in-app — `run_all_tests()` mutates the live handler (blocked_callsigns, group responses, active pings, beacons) while UDP/BLE are already listening, so it belongs only in the isolated headless runner.
-
-Suites (all run by `scripts/run_startup_tests.py`):
-- `message_router.test_suppression_logic()` — also the in-app smoke check
-- `command_handler.run_all_tests()` (in `src/mcapp/commands/tests.py`) — headless runner only
-- `classifier.run_all_tests()` (in `src/mcapp/classifier/tests.py`) — uses an ephemeral tempfile SQLite so the live DB is untouched
-- plus storage, udp, and sse suites
+The in-app startup path (when `has_console()` is true) runs only a **non-fatal smoke check**: the suppression suite (read-only, pure `router.validator` logic). It proceeds on failure because the service is a resilient always-on proxy. The command suite is deliberately **not** run in-app — `run_all_tests()` mutates the live handler (blocked_callsigns, group responses, active pings, beacons) while UDP/BLE are already listening, so it belongs only in the isolated headless runner.
 
 ## Type Checking (mypy --strict)
 
-The whole workspace is `mypy --strict` clean — **both source roots must stay at zero errors** (there is no WIP baseline; regressions are failures, not warnings):
+The whole workspace is `mypy --strict` clean — **both source roots must stay at zero errors** (no WIP baseline; regressions are failures, not warnings). `uv run mypy src/mcapp ble_service/src` must print "Success: no issues found".
 
-```bash
-uv run mypy src/mcapp ble_service/src   # must print "Success: no issues found"
-```
+- **Run it through the project env (`uv run mypy`), NEVER `uvx mypy`/`pipx run mypy`.** mypy parses with the *running interpreter's* grammar; an ephemeral runner can pull a different Python and emit bogus `[syntax]` errors on version-gated stubs (e.g. numpy's `type` statements). In a workspace the env must contain every member's deps — run `uv sync --all-packages` first.
+- Config in root `pyproject.toml` `[tool.mypy]`. Untyped third-party libs (`pywebpush`, `py_vapid`, `timezonefinder`) are silenced via `ignore_missing_imports`; numpy (transitive) uses `follow_imports = "skip"` because its py.typed stubs need 3.12+ grammar. **Prefer an `ignore_missing_imports` override over installing `*-stubs` for libs you don't control.**
+- Test files are strict-clean too and stay that way.
+- `# type: ignore` is a documented last resort: always `# type: ignore[code]  # reason` (ruff `PGH` enforces this).
 
-- **Run it through the project env (`uv run mypy`), NEVER `uvx mypy`/`pipx run mypy`.** mypy parses with the *running interpreter's* grammar; an ephemeral runner can pull a different Python and emit bogus `[syntax]` errors on version-gated stubs (e.g. numpy's `type` statements). In a workspace, the env must contain every member's deps — run `uv sync --all-packages` first.
-- Config lives in the root `pyproject.toml` `[tool.mypy]` (`python_version = "3.11"`, `strict = true`). Untyped third-party libs (`pywebpush`, `py_vapid`, `timezonefinder`) are silenced via `ignore_missing_imports` overrides; numpy (transitive) uses `follow_imports = "skip"` because its py.typed stubs need 3.12+ grammar. **Prefer an `ignore_missing_imports` override over installing `*-stubs` for libs you don't control** — stubs add many low-value errors; type your own code instead.
-- `mypy` is in the `[dependency-groups] dev` group.
-- Type test files too — `*_tests.py`/`tests.py` are strict-clean and stay that way. `src/mcapp/classifier/tests.py` is inside the mc-chat **git subtree**, so any type change there must be upstreamed to mc-chat (see below) to avoid drift.
-- `# type: ignore` is a documented last resort only: always `# type: ignore[code]  # reason` (never blanket — ruff `PGH` enforces this).
+## Vendored Subtrees (do not edit in place)
 
-## Classifier Subtree
+Two directories are `git subtree`s from mc-chat. **Edits belong in mc-chat and are synced here** — editing them locally guarantees drift. The `mc-chat` remote is a local path remote already configured in this repo.
 
-`src/mcapp/classifier/` is a **git subtree** pulled from mc-chat (`meshcom_mock/classifier/`).
-**Do not edit files in this directory directly** — edits belong in mc-chat and are synced here.
-
-Every inbound message is annotated inline in `store_message()` with a primary `category`, free-form `tags` (JSON array), `info_score ∈ [0, 1]`, and a 12-char `template_hash`. Messages are never dropped — the webapp decides what to hide.
-
-- Layer 1 (`classifier/rules.py` + `seed.py`): data-driven regex rules in the `classifier_rules` table. First match by `(priority, id)` sets category; all matches contribute tags. Seed defaults are `builtin=1` — editable via REST but never deleted.
-- Layer 2 (`classifier/template.py`): fingerprint normalizes URLs/emojis/numbers and hashes sha1[:12]. `beacon_templates` tracks count/srcs/auto_beacon per fingerprint. Multi-threshold: 8 lifetime, 5 in 24 h, 3 in 72 h. `user_action='promote'|'demote'` overrides.
-- Layer 3 (`classifier/score.py`): blended info score with tunable weights.
-- Orchestrator (`classifier/classify.py`): `Classifier.classify(msg)` combines all three layers. Never blocks ingestion.
-
-Rule mutations bump `classifier_ver` via `storage.bump_classifier_version()` + `classifier.load()`. Startup auto-backfills once per version via a `backfill_done:v{N}` marker in `classifier_meta`.
-
-SSE events: `proxy:classifier_rules` (on connect + after mutations), `proxy:classifier_stats` (60 s), `proxy:classifier_template_event` (threshold crossing), `proxy:reclassify_progress` (batch updates).
-
-### How to sync (after mc-chat classifier changes are committed)
+| Path | Upstream prefix | Split branch |
+|---|---|---|
+| `src/mcapp/classifier/` | `meshcom_mock/classifier` | `classifier` |
+| `src/mcapp/contract/` | `contract` | `contract-subtree` |
 
 ```bash
 cd /Users/martinwerner/WebDev/mc-chat
-git subtree split --prefix=meshcom_mock/classifier -b classifier   # update split branch
+git subtree split --prefix=<upstream prefix> -b <split branch>
 
 cd /Users/martinwerner/WebDev/MCProxy
-git subtree pull --prefix=src/mcapp/classifier mc-chat classifier --squash
+git subtree pull --prefix=<path> mc-chat <split branch> --squash
 ```
 
-The `mc-chat` remote is a local path remote already configured in this repo.
+**Classifier** — every inbound message is annotated inline in `store_message()` with a primary `category`, free-form `tags` (JSON array), `info_score ∈ [0, 1]`, and a 12-char `template_hash`. Messages are never dropped; the webapp decides what to hide. Three layers: data-driven regex rules (`rules.py`/`seed.py`, `classifier_rules` table, first match by `(priority, id)` wins), template fingerprinting (`template.py`, `beacon_templates`), and scoring (`score.py`), combined by `Classifier.classify()` in `classify.py` — which never blocks ingestion. Rule mutations must bump `classifier_ver` via `storage.bump_classifier_version()` + `classifier.load()`; startup auto-backfills once per version via a `backfill_done:v{N}` marker in `classifier_meta`. Design detail: `doc/spam-filter-BE.md`.
 
-## Command-Contract Subtree
+**Command contract** (`contract/command_contract.json`) — the shared parity corpus (target extraction, suppression decisions, `format_for_lora`) that both implementations must satisfy. `contract_parity_tests.py` runs production against it; mc-chat's `tests/test_contract_parity.py` runs the mock against the same corpus. When you change command routing, suppression, or weather formatting, update the corpus in mc-chat and re-sync — otherwise one side fails its parity test.
 
-`src/mcapp/contract/command_contract.json` is a **git subtree** vendored from mc-chat (`contract/`). **Do not edit it here** — edit it in mc-chat and re-sync.
+## Schema Migrations
 
-It is the shared command-interface parity corpus: target-extraction, suppression-decision, and `format_for_lora` cases that BOTH implementations must satisfy. `contract_parity_tests.py` runs production's impl against it; mc-chat's `tests/test_contract_parity.py` runs the mock's impl against the same corpus. This is what keeps the mock faithful to production (the drift that shipped the `!wx text:` raw-leak on the dev rig). When you change command routing/suppression/weather formatting, update the corpus in mc-chat and re-sync here — either side that no longer matches fails its parity test.
+Add columns/tables via a `current_version < N` block in the chain in `storage/migrations.py` (driven from `sqlite_storage.initialize()`) and bump `FINAL_SCHEMA_VERSION`. Current schema: **v21** (`push_subscriptions`).
 
-### How to sync (after mc-chat contract changes are committed)
-
-```bash
-cd /Users/martinwerner/WebDev/mc-chat
-git subtree split --prefix=contract -b contract-subtree   # update split branch
-
-cd /Users/martinwerner/WebDev/MCProxy
-git subtree pull --prefix=src/mcapp/contract mc-chat contract-subtree --squash
-```
-
-Schema migrations: add new columns to `messages` or new tables via a `current_version < N` block in `sqlite_storage.initialize()` (the chain lives in `storage/migrations.py`) and bump `FINAL_SCHEMA_VERSION`. Current schema: **v21** (`push_subscriptions` added at v21 — see Web Push below).
-
-## Web Push (Wave 5)
+## Web Push
 
 Web Push to browser / iOS-PWA clients, sharing one wire contract with mc-chat so both backends behave identically.
 
-- **Contract:** `src/mcapp/contract/push_contract.json` — vendored **byte-identical** from the webapp campaign (`webapp/docs/archive/pwa-impl-plan.md` Task 5.1 — archived, campaign complete). Defines the three `/api/push/*` endpoints, the filter `{ dm, groups[], broadcast }`, and the match / eligibility / dedup / coalesce / payload semantics. `push_tests.py` (wired into `run_startup_tests.py`) runs every vector; mc-chat runs the same corpus, so the two implementations can't drift.
-- **Routes:** `src/mcapp/sse_routes/push.py` (subscribe / unsubscribe / vapid-public-key). **Delivery:** `src/mcapp/push_delivery.py` — pure `matches()`/`is_eligible()` (resolve via-routed dst to the **last** comma-component; exclude non-chat frames and own-src), `PushCoalescer` (5s window), `PushDedup`, and a background dispatcher that calls `pywebpush` via `asyncio.to_thread` with timeouts. **The mesh-ingest path never awaits delivery** — a no-internet Pi must not stall the event loop / SSE heartbeats.
-- **Storage:** `push_subscriptions` table (schema v21), upsert by endpoint. Prune on pywebpush **401/403/404/410**.
-- **VAPID (two live gotchas — both bit us on first real delivery):** keypair generated once, persisted as the **raw base64url 32-byte scalar** — NOT PEM (pywebpush's `Vapid.from_string` base64-decodes it and dies on a PEM) — at `/var/lib/mcapp/vapid.json`, never committed. JWT `sub` = `mailto:admin@example.com` (a valid FQDN; Apple returns **403 `BadJwtToken`** for a no-TLD/`localhost` sub) — override via env `MESHCOM_VAPID_SUB`.
-- Delivery needs outbound internet from the Pi; degrades silently without it. `/api/push/*` is covered by the existing `^/api/` proxy rules — no Caddy change. Deploy installs deps with `uv sync --all-packages` (pulls `pywebpush` + the BLE workspace member) — see `bootstrap/lib/deploy.sh`.
+- **Contract:** `src/mcapp/contract/push_contract.json` — defines the three `/api/push/*` endpoints, the filter `{ dm, groups[], broadcast }`, and match/eligibility/dedup/coalesce/payload semantics. `push_tests.py` runs every vector; mc-chat runs the same corpus.
+- **Routes:** `src/mcapp/sse_routes/push.py`. **Delivery:** `src/mcapp/push_delivery.py` — pure `matches()`/`is_eligible()` (resolve via-routed dst to the **last** comma-component; exclude non-chat frames and own-src), `PushCoalescer` (5 s window), `PushDedup`, and a background dispatcher calling `pywebpush` via `asyncio.to_thread` with timeouts. **The mesh-ingest path never awaits delivery** — a no-internet Pi must not stall the event loop / SSE heartbeats.
+- **Storage:** `push_subscriptions`, upsert by endpoint. Prune on pywebpush **401/403/404/410**.
+- **VAPID (two gotchas, both hit on first real delivery):** the keypair is generated once and persisted as the **raw base64url 32-byte scalar**, NOT PEM (pywebpush's `Vapid.from_string` base64-decodes it and dies on a PEM), at `/var/lib/mcapp/vapid.json` — never committed. JWT `sub` must be a valid FQDN (`mailto:admin@example.com`); Apple returns **403 `BadJwtToken`** for a no-TLD/`localhost` sub. Override via `MESHCOM_VAPID_SUB`.
+- Delivery needs outbound internet from the Pi and degrades silently without it. `/api/push/*` is covered by the existing `^/api/` proxy rules — no Caddy change.
 
 ## Configuration
 
-Config file: `/etc/mcapp/config.json` (dev: `/etc/mcapp/config.dev.json`, auto-selected via `MCAPP_ENV=dev`).
-BLE mode: `remote` or `disabled` (`MCAPP_BLE_MODE` env override). See `ble_service/README.md` for BLE service API.
+`/etc/mcapp/config.json` (dev: `/etc/mcapp/config.dev.json`, auto-selected via `MCAPP_ENV=dev`).
+BLE mode: `remote` or `disabled` (`MCAPP_BLE_MODE` env override). See `ble_service/README.md` for the BLE service API.
 
 ## Key Gotchas
 
 - **All DB timestamps are in milliseconds** (not seconds). Divide by 1000 for `datetime.fromtimestamp()`. Forgetting this causes `ValueError: year 58089 is out of range`.
-- **SSH + python3 -c quoting**: Use single quotes for Python code, `\"` for strings inside. Never use f-strings with dict key access — use `%` formatting. Or write a temp script with `cat > /tmp/q.py << 'PYEOF'`.
-- **MHeard beacons** (RSSI/SNR, no coordinates) and **position beacons** (lat/lon, no signal) used to be disjoint packet types. Since firmware `c4ad78bb`, an Extern-UDP `pos` packet (`src_type=="lora"`) carries **both** — `store_message()` updates both `station_positions` field groups (signal + position) in that case. See `doc/2026-02-11_1400-position-signal-architecture-ADR.md`'s 2026-07-05 amendment and `doc/UDP-2.0-impl.md`.
-- **Extern-UDP wire format** (node → proxy, JSON, port 1799, bidirectional): `rssi`/`snr` are present only on `pos`/`msg` packets, only since firmware `c4ad78bb` (2026-03-01) — detect capability by key presence, there's no protocol version field. Both are already final values: RSSI is dBm as-is, SNR is already ÷4 in firmware — **never re-scale either**. Only `src_type=="lora"` (received over RF) carries real signal; `"node"`/`"udp"` send a `0/0` sentinel and must be excluded by an explicit `src_type` check, not just a range check.
+- **SSH + `python3 -c` quoting**: single-quote the Python code, `\"` for strings inside. Never use f-strings with dict key access — use `%` formatting, or write a temp script with `cat > /tmp/q.py << 'PYEOF'`.
+- **MHeard beacons** (RSSI/SNR, no coordinates) and **position beacons** (lat/lon, no signal) used to be disjoint packet types. Since firmware `c4ad78bb`, an Extern-UDP `pos` packet with `src_type=="lora"` carries **both** — `store_message()` then updates both `station_positions` field groups. See the 2026-07-05 amendment in `doc/2026-02-11_1400-position-signal-architecture-ADR.md` and `doc/UDP-2.0-impl.md`.
+- **Extern-UDP wire format** (node → proxy, JSON, port 1799, bidirectional): `rssi`/`snr` appear only on `pos`/`msg` packets and only since firmware `c4ad78bb` (2026-03-01) — detect by key presence, there is no protocol version field. Both are already final values: RSSI is dBm as-is, SNR is already ÷4 in firmware — **never re-scale either**. Only `src_type=="lora"` carries real signal; `"node"`/`"udp"` send a `0/0` sentinel and must be excluded by an explicit `src_type` check, not a range check.
 
 ## Deployment
 
-Two Raspberry Pi Zero 2W targets: `mcapp.local` (production) and `rpizero.local` (integration).
+Two Raspberry Pi Zero 2W targets: `mcapp.local` (production) and `rpizero.local` (integration). Same layout on both:
 
-**On-device layout (both Pis, same structure):**
-- Slot system: `~/mcapp-slots/slot-0`, `slot-1`, `slot-2`; `~/mcapp-slots/current` symlink points to active slot
-- Service: `systemctl status mcapp` — `ExecStart=/home/martin/.local/bin/uv run mcapp`
-- Source: `~/mcapp-slots/current/src/mcapp/`
-- Config: `/etc/mcapp/config.json`
-- DB: `/var/lib/mcapp/messages.db` (SQLite, WAL mode, schema v21)
-- Logs: `sudo journalctl -u mcapp.service -f`
+- Slots: `~/mcapp-slots/slot-{0,1,2}`, with `~/mcapp-slots/current` symlinked to the active one
+- Service: `systemctl status mcapp` — `ExecStart=/home/martin/.local/bin/uv run mcapp`; logs via `sudo journalctl -u mcapp.service -f`
+- DB: `/var/lib/mcapp/messages.db` (SQLite, WAL)
+- Deploy installs deps with `uv sync --all-packages` (pulls `pywebpush` + the BLE workspace member) — see `bootstrap/lib/deploy.sh`
 
 See `bootstrap/README.md` for installation, `doc/tls-architecture.md` for TLS setup, `doc/tls-maintenance-SOP.md` for maintenance.
