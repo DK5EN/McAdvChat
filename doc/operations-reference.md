@@ -111,7 +111,6 @@ bootstrap/
 │   └── cloudflared/       # Cloudflare Tunnel templates
 │       ├── config.yml.tmpl
 │       └── cloudflared.service
-├── requirements.txt     # Python dependencies (minimum versions)
 └── README.md            # Installation documentation
 ```
 
