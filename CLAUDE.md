@@ -103,7 +103,11 @@ BLE mode: `remote` or `disabled` (`MCAPP_BLE_MODE` env override). See `ble_servi
 
 ## Deployment
 
-Two Raspberry Pi Zero 2W targets: `mcapp.local` (production) and `rpizero.local` (integration). Same layout on both:
+`mcapp.local` (Raspberry Pi Zero 2W) is **the** production target and currently the only host running
+MCProxy. `rpizero.local` used to be the integration target but no longer runs it at all — verified
+2026-07-25: `mcapp.service` is absent there, `mcproxy.service` is masked, and the box runs mc-chat.
+
+On-device layout:
 
 - Slots: `~/mcapp-slots/slot-{0,1,2}`, with `~/mcapp-slots/current` symlinked to the active one
 - Service: `systemctl status mcapp` — `ExecStart=/home/martin/.local/bin/uv run mcapp`; logs via `sudo journalctl -u mcapp.service -f`
