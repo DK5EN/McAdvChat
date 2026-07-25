@@ -13,7 +13,7 @@ concurrency:
 
 jobs:
   test:
-    name: lint + startup test suites
+    name: lint + types + startup test suites
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
@@ -33,6 +33,18 @@ jobs:
 
       - name: Ruff format check
         run: uvx ruff format --check .
+
+      # --all-packages is load-bearing: the root package does NOT depend on the
+      # ble_service workspace member, so a plain sync leaves its deps (dbus-next,
+      # …) uninstalled and mypy reports import errors across ble_service/src.
+      - name: Sync workspace (all members)
+        run: uv sync --all-packages
+
+      # Must run through the project env, never uvx/pipx — mypy parses with the
+      # running interpreter's grammar, and an ephemeral runner can pull a
+      # different Python and emit bogus [syntax] errors on version-gated stubs.
+      - name: Mypy (strict)
+        run: uv run mypy src/mcapp ble_service/src
 
       # scripts/run_startup_tests.py is the canonical, exit-code-gated runner.
       # It is fully offline (weather is stubbed) and needs no /etc/mcapp config.

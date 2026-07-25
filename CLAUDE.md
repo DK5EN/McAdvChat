@@ -26,7 +26,7 @@ uv run python scripts/run_startup_tests.py      # tests
 ./scripts/release.sh                            # release (interactive, from development branch)
 ```
 
-All must be clean before committing. CI (`.github/workflows/tests.yml`, Python 3.11) enforces only three of them — ruff check, ruff format --check, and the startup runner. **`mypy` is mandatory but unenforced by CI, so run it locally** or strict-clean regressions merge unnoticed.
+All four are enforced by CI (`.github/workflows/tests.yml`, Python 3.11) and must be clean before committing.
 
 ## Code Quality
 
