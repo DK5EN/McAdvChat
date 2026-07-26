@@ -62,6 +62,11 @@ class SQLiteStorage(MigrationsMixin, IngestMixin, QueryMixin, PrefsMixin, Classi
         # Reference to classifier (set via set_classifier after construction)
         self._classifier = None
 
+        # Parsed push_subscriptions cache; None = cold. Read on EVERY inbound mesh
+        # message by PushDispatcher.handle_mesh_message, mutated only by
+        # subscribe/unsubscribe/prune — see list_push_subscriptions.
+        self._push_subs_cache: list[dict[str, Any]] | None = None
+
         # Ensure parent directory exists
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
 
@@ -139,27 +144,58 @@ class SQLiteStorage(MigrationsMixin, IngestMixin, QueryMixin, PrefsMixin, Classi
                  updated_at = CURRENT_TIMESTAMP""",
             (endpoint, json.dumps(subscription), json.dumps(filt)),
         )
+        self._invalidate_push_subs_cache()
 
     async def delete_push_subscription(self, endpoint: str) -> None:
         """Delete the subscription row for `endpoint`. Idempotent: deleting a
         missing endpoint is a no-op, not an error (contract `unsubscribe.semantics`;
         also how prune-on-401/403/404/410 removes a dead subscription)."""
         await self._mutate("DELETE FROM push_subscriptions WHERE endpoint = ?", (endpoint,))
+        self._invalidate_push_subs_cache()
+
+    def _invalidate_push_subs_cache(self) -> None:
+        """Drop the cached subscription list. Called from BOTH mutators, which is
+        every write path there is: subscribe (upsert), unsubscribe (delete), and
+        prune-on-401/403/404/410 (also delete). Caching in the dispatcher instead
+        would have needed the route layer to remember to notify it; sitting behind
+        the storage methods, invalidation cannot be forgotten by a new caller.
+        """
+        self._push_subs_cache = None
 
     async def list_push_subscriptions(self) -> list[dict[str, Any]]:
         """Return every push subscription as `{endpoint, subscription, filter}`,
-        with `subscription`/`filter` parsed back into dicts."""
-        rows = await self._query(
-            "SELECT endpoint, subscription, filter_json FROM push_subscriptions"
-        )
-        return [
-            {
-                "endpoint": row["endpoint"],
-                "subscription": json.loads(row["subscription"]),
-                "filter": json.loads(row["filter_json"]),
-            }
-            for row in rows
-        ]
+        with `subscription`/`filter` parsed back into dicts.
+
+        Served from an in-memory cache. `PushDispatcher.handle_mesh_message` calls
+        this for EVERY inbound mesh message, so uncached it was a SQLite round-trip
+        plus 2N `json.loads` per packet on a Pi Zero — on the ingest path the whole
+        push design is built to keep cheap. Subscriptions change only when a browser
+        subscribes/unsubscribes or a dead endpoint is pruned, so the steady state is
+        a dict lookup.
+
+        The returned list is a fresh list object, so a caller cannot append to or
+        clear the cache; the subscription dicts inside are SHARED and must be treated
+        as read-only. A dict already handed out stays valid after an invalidation,
+        which is what the coalescer wants — an open window keeps delivering against
+        the subscription as it was when the window opened.
+
+        Correct only because this process is the sole writer of `push_subscriptions`.
+        An external writer (a second mcapp instance on the same DB, or a manual
+        `sqlite3` UPDATE) would not be noticed until the next local mutation.
+        """
+        if self._push_subs_cache is None:
+            rows = await self._query(
+                "SELECT endpoint, subscription, filter_json FROM push_subscriptions"
+            )
+            self._push_subs_cache = [
+                {
+                    "endpoint": row["endpoint"],
+                    "subscription": json.loads(row["subscription"]),
+                    "filter": json.loads(row["filter_json"]),
+                }
+                for row in rows
+            ]
+        return list(self._push_subs_cache)
 
 
 async def create_sqlite_storage(db_path: str | Path) -> SQLiteStorage:

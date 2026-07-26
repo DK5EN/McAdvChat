@@ -240,13 +240,16 @@ async def run_push_tests() -> bool:
     #     (the old code had no gate, so this fails on the pre-fix behavior).
     await _test_blocklist_gate_suppresses_delivery(_record)
 
-    # 4c. Node-local policy filter at the wiring seam: text ACKs and {CET} broadcasts
-    #     pass the shared contract's `eligibility` (type "msg" + non-empty text) but
-    #     must never produce a notification.
+    # 4c. Contract `eligibility` clause (c): text ACKs and {CET} broadcasts pass
+    #     clause (a) (type "msg" + non-empty text) but must never notify.
     _test_node_local_noise_filter(_record)
 
     # 4d. Both ingest topics are subscribed — a BLE-only node must get pushes too.
     await _test_push_subscribes_to_both_ingest_topics(_record)
+
+    # 4e. The subscription cache must be invalidated by every write path, or a new
+    #     subscriber silently gets no pushes until the next restart.
+    await _test_push_subscription_cache_invalidation(_record)
 
     # 5. VAPID persistence (injected fake generator — never real crypto).
     _test_vapid_persistence(_record)
@@ -746,6 +749,88 @@ async def _test_push_subscribes_to_both_ingest_topics(record: _RecordFn) -> None
         )
     finally:
         await dispatcher.stop()
+
+
+async def _test_push_subscription_cache_invalidation(record: _RecordFn) -> None:
+    """`list_push_subscriptions()` is cached because the dispatcher calls it for
+    every inbound mesh message. Every write path must invalidate, or a browser that
+    just subscribed gets no pushes until the service restarts.
+
+    The prune-on-4xx path is covered by `_test_prune_on_status`, which polls
+    `list_push_subscriptions()` after a 410 — a stale cache there would keep
+    returning the deleted row and that assertion would time out.
+    """
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        storage = await create_sqlite_storage(pathlib.Path(tmp_dir) / "push_subs_cache.db")
+        try:
+            queries: list[str] = []
+            real_query = storage._query  # noqa: SLF001 - counting the reads this cache exists to avoid
+
+            async def _counting_query(query: str, params: tuple[Any, ...] = ()) -> Any:
+                if "push_subscriptions" in query:
+                    queries.append(query)
+                return await real_query(query, params)
+
+            storage._query = _counting_query  # type: ignore[method-assign]  # noqa: SLF001 - counts the reads this cache removes
+
+            ep_a = "https://push.example/cache-A"
+            await storage.upsert_push_subscription(
+                ep_a,
+                {"endpoint": ep_a, "keys": {"p256dh": "p", "auth": "a"}},
+                {"dm": True, "groups": [], "broadcast": False},
+            )
+
+            first = await storage.list_push_subscriptions()
+            after_first = len(queries)
+            for _ in range(5):
+                await storage.list_push_subscriptions()
+            record(
+                "subs cache: 5 further reads cost zero extra DB queries",
+                len(first) == 1 and len(queries) == after_first,
+            )
+
+            # A new subscriber must be visible immediately.
+            ep_b = "https://push.example/cache-B"
+            await storage.upsert_push_subscription(
+                ep_b,
+                {"endpoint": ep_b, "keys": {"p256dh": "p", "auth": "a"}},
+                {"dm": True, "groups": [], "broadcast": False},
+            )
+            after_upsert = await storage.list_push_subscriptions()
+            record(
+                "subs cache: upsert invalidates — a new subscriber is visible at once",
+                {s["endpoint"] for s in after_upsert} == {ep_a, ep_b},
+            )
+
+            # A filter change on an EXISTING endpoint also goes through upsert.
+            await storage.upsert_push_subscription(
+                ep_a,
+                {"endpoint": ep_a, "keys": {"p256dh": "p", "auth": "a"}},
+                {"dm": False, "groups": ["232"], "broadcast": True},
+            )
+            changed = await storage.list_push_subscriptions()
+            new_filter = next(s["filter"] for s in changed if s["endpoint"] == ep_a)
+            record(
+                "subs cache: a re-upserted filter is not served stale",
+                new_filter == {"dm": False, "groups": ["232"], "broadcast": True},
+            )
+
+            await storage.delete_push_subscription(ep_b)
+            after_delete = await storage.list_push_subscriptions()
+            record(
+                "subs cache: delete invalidates — the row is gone at once",
+                {s["endpoint"] for s in after_delete} == {ep_a},
+            )
+
+            # The caller must not be handed the cache's own list object.
+            handed_out = await storage.list_push_subscriptions()
+            handed_out.clear()
+            record(
+                "subs cache: a caller mutating the returned list cannot empty the cache",
+                len(await storage.list_push_subscriptions()) == 1,
+            )
+        finally:
+            await storage.close()
 
 
 async def _test_execution_isolation(record: _RecordFn) -> None:
