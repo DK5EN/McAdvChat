@@ -78,6 +78,18 @@ class BucketTuple(NamedTuple):
     count: int  # type: ignore[assignment]  # field intentionally shadows tuple.count
 
 
+def escape_like(value: str) -> str:
+    """Escape LIKE wildcards in a user-supplied value.
+
+    Must be paired with ``ESCAPE '\\'`` in the query. Without this a search for
+    ``%`` becomes ``LIKE '%%%'`` and matches every row, turning a scoped lookup into
+    a full unindexed table scan (and, in get_search_summary, feeding non-numeric
+    values into a ``key=int`` sort). Single definition shared by every LIKE call
+    site — it was hand-inlined in some and simply forgotten in others.
+    """
+    return value.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+
+
 def compute_conversation_key(src: str, dst: str) -> str | None:
     """Compute conversation key for message grouping.
 

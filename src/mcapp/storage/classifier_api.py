@@ -13,7 +13,7 @@ from typing import Any
 
 from ..util import now_ms
 from ._base import StorageBase
-from .constants import _MSG_SELECT, SQLITE_BUSY_TIMEOUT_S
+from .constants import _MSG_SELECT, SQLITE_BUSY_TIMEOUT_S, escape_like
 
 
 class ClassifierApiMixin(StorageBase):
@@ -426,7 +426,7 @@ class ClassifierApiMixin(StorageBase):
         unicode_texts = [t for t in texts if not t.isascii()]
 
         for text in ascii_texts:
-            escaped = text.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+            escaped = escape_like(text)
             rows = await self._query(
                 "SELECT COUNT(*) as c FROM messages"
                 " WHERE timestamp >= ? AND msg LIKE ? ESCAPE '\\'",

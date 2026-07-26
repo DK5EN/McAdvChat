@@ -25,6 +25,11 @@ class SendMessageRequest(BaseModel):
     before: int | None = None
     limit: int = 20
     client_id: str | None = None  # SSE client to target for page/command responses
+    # V8.6 page correlation: the webapp sends this on a page_request and reads it back
+    # off proxy:messages_page to match a response to the exact request. Without the
+    # field pydantic dropped it at the request boundary, so the backend's echo was
+    # unreachable and the webapp silently fell back to its sentDst heuristic.
+    request_id: str | None = None
 
 
 class ReadCountRequest(BaseModel):

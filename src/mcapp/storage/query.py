@@ -48,6 +48,7 @@ from .constants import (
     VALID_RSSI_RANGE,
     VALID_SNR_RANGE,
     compute_conversation_key,
+    escape_like,
 )
 
 logger = get_logger(__name__)
@@ -435,7 +436,10 @@ class QueryMixin(StorageBase):
             query = (
                 f"SELECT {_MSG_SELECT} FROM messages"  # noqa: S608 - identifiers from fixed set; values parameterized
                 " WHERE type = 'msg' AND msg NOT LIKE '%:ack%'"
-                " AND conversation_key = '*' AND msg NOT LIKE '{CET}%'"
+                # (msg IS NULL OR ...) mirrors delete_messages_by_dst: in SQLite
+                # `NULL NOT LIKE x` is NULL, not true, so a NULL-msg broadcast row was
+                # invisible on this page while the '*' DELETE happily removed it.
+                " AND conversation_key = '*' AND (msg IS NULL OR msg NOT LIKE '{CET}%')"
                 " AND timestamp < ?"
                 " ORDER BY timestamp DESC LIMIT ?"
             )
@@ -460,6 +464,12 @@ class QueryMixin(StorageBase):
             )
             params = (dst, before_timestamp, limit + 1)
         elif dst:
+            # Last-resort exact match. A callsign dst normally cannot reach here: the
+            # route layer resolves a missing `src` to the node's own callsign (mirroring
+            # delete_messages_by_dst's own_call fallback) so `is_dm` holds and the
+            # conversation_key branch above runs. Relay-hopped rows are keyed by
+            # conversation_key (migration v18), so this branch would miss them — it only
+            # remains for rows a pre-v18 mcdump import left unkeyed.
             query = (
                 f"SELECT {_MSG_SELECT} FROM messages"  # noqa: S608 - identifiers from fixed set; values parameterized
                 " WHERE type = 'msg' AND msg NOT LIKE '%:ack%'"
@@ -831,14 +841,18 @@ class QueryMixin(StorageBase):
         """Aggregate search: counts, last timestamps, destinations, SIDs."""
         cutoff_ms = int((time.time() - days * SECONDS_PER_DAY) * 1000)
 
-        # Build src filter based on search type
+        # Build src filter based on search type. The callsign is user input, so it goes
+        # through escape_like + ESCAPE '\' (as get_positions already did) — otherwise a
+        # search for '%' matched every src and ran three unindexed 30-day aggregates
+        # over the whole messages table.
         params: tuple[Any, ...] = ()
+        escaped = escape_like(callsign.upper())
         if search_type == "prefix":
-            src_filter = " AND UPPER(src) LIKE ?"
-            params = (cutoff_ms, f"%{callsign.upper()}-%")
+            src_filter = " AND UPPER(src) LIKE ? ESCAPE '\\'"
+            params = (cutoff_ms, f"%{escaped}-%")
         elif search_type == "exact":
-            src_filter = " AND UPPER(src) LIKE ?"
-            params = (cutoff_ms, f"%{callsign.upper()}%")
+            src_filter = " AND UPPER(src) LIKE ? ESCAPE '\\'"
+            params = (cutoff_ms, f"%{escaped}%")
         else:
             src_filter = ""
             params = (cutoff_ms,)
@@ -873,7 +887,11 @@ class QueryMixin(StorageBase):
             " AND dst GLOB '[0-9]*'",
             params,
         )
-        result["destinations"] = sorted([r["dst"] for r in dest_rows], key=int)
+        # GLOB '[0-9]*' only guarantees the dst STARTS with a digit, so a dst like
+        # '1abc' used to raise ValueError inside key=int and 500 the request.
+        result["destinations"] = sorted(
+            [r["dst"] for r in dest_rows if str(r["dst"]).isdigit()], key=int
+        )
 
         # Query 3: SID activity (prefix search only)
         if search_type == "prefix":
@@ -899,9 +917,7 @@ class QueryMixin(StorageBase):
     async def get_positions(self, callsign: str, days: int) -> list[dict[str, Any]]:
         """Get position data for a callsign."""
         cutoff_ms = int((time.time() - days * SECONDS_PER_DAY) * 1000)
-        escaped_callsign = (
-            callsign.upper().replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
-        )
+        escaped_callsign = escape_like(callsign.upper())
 
         rows = await self._query(
             "SELECT raw_json FROM messages"

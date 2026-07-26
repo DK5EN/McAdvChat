@@ -150,8 +150,18 @@ class IngestMixin(StorageBase):
         """Upsert station_positions table based on packet type.
 
         update_type: 'signal' (MHeard) or 'position' (position beacon)
+
+        `.get("timestamp")` with a fallback is NOT enough: a frame carrying an explicit
+        `"timestamp": null` returns None, not the default. Combined with SQLite's scalar
+        MAX() — which yields NULL if ANY argument is NULL — one such frame used to pin
+        that callsign's `last_seen` to NULL forever, so it rendered as epoch 1970 on the
+        map (query.py's `row["last_seen"] or 0`) and became immune to pruning (which
+        guards `last_seen IS NOT NULL`). A literal 0 is preserved: ble_protocol's
+        unparseable-node-clock fallback deliberately produces epoch 0.
         """
-        timestamp = data.get("timestamp", now_ms())
+        timestamp = data.get("timestamp")
+        if timestamp is None:
+            timestamp = now_ms()
 
         if update_type == "signal":
             await self._mutate(
@@ -162,7 +172,8 @@ class IngestMixin(StorageBase):
                        rssi = excluded.rssi,
                        snr = excluded.snr,
                        signal_ts = excluded.signal_ts,
-                       last_seen = MAX(station_positions.last_seen, excluded.last_seen),
+                       last_seen = MAX(COALESCE(station_positions.last_seen, 0),
+                                       COALESCE(excluded.last_seen, 0)),
                        hw_id = COALESCE(excluded.hw_id, station_positions.hw_id),
                        lora_mod = COALESCE(excluded.lora_mod, station_positions.lora_mod),
                        mesh = COALESCE(excluded.mesh, station_positions.mesh)
@@ -231,7 +242,8 @@ class IngestMixin(StorageBase):
                        via_paths = CASE WHEN excluded.via_paths != '[]'
                            THEN excluded.via_paths ELSE station_positions.via_paths END,
                        position_ts = excluded.position_ts,
-                       last_seen = MAX(station_positions.last_seen, excluded.last_seen)
+                       last_seen = MAX(COALESCE(station_positions.last_seen, 0),
+                                       COALESCE(excluded.last_seen, 0))
                 """,
                 (
                     callsign,
@@ -284,21 +296,30 @@ class IngestMixin(StorageBase):
         # The explicit `rssi is not None and snr is not None` re-check is redundant at
         # runtime (has_signal already implies both) but lets mypy narrow them to non-None
         # for the range comparisons and _accumulate_signal call below.
-        if has_signal and rssi is not None and snr is not None:
-            if (
-                VALID_RSSI_RANGE[0] <= rssi <= VALID_RSSI_RANGE[1]
-                and VALID_SNR_RANGE[0] <= snr <= VALID_SNR_RANGE[1]
-            ):
-                source = "mheard" if is_mheard else "lora"
-                await self._mutate(
-                    "INSERT INTO signal_log (callsign, timestamp, rssi, snr, source)"
-                    " VALUES (?, ?, ?, ?, ?)",
-                    (callsign, timestamp, rssi, snr, source),
-                )
-                # Accumulate into bucket and flush completed ones
-                completed = self._accumulate_signal(callsign, timestamp, rssi, snr)
-                await self._flush_completed_buckets(completed)
-
+        #
+        # ALL THREE writes are inside the range guard. station_positions.rssi/snr feed
+        # the map and station list, so the station_positions upsert used to sit outside
+        # it and made the map disagree with the chart built from signal_buckets (which
+        # correctly rejects an out-of-range reading), permanently — the signal upsert
+        # has no COALESCE/NULLIF guard, so `rssi = excluded.rssi` sticks. Harmless while
+        # this branch was BLE-MHeard-only; the UDP-2.0 widening to every
+        # src_type=="lora" pos/msg frame turned a firmware glitch into a poisoned row.
+        if (
+            has_signal
+            and rssi is not None
+            and snr is not None
+            and VALID_RSSI_RANGE[0] <= rssi <= VALID_RSSI_RANGE[1]
+            and VALID_SNR_RANGE[0] <= snr <= VALID_SNR_RANGE[1]
+        ):
+            source = "mheard" if is_mheard else "lora"
+            await self._mutate(
+                "INSERT INTO signal_log (callsign, timestamp, rssi, snr, source)"
+                " VALUES (?, ?, ?, ?, ?)",
+                (callsign, timestamp, rssi, snr, source),
+            )
+            # Accumulate into bucket and flush completed ones
+            completed = self._accumulate_signal(callsign, timestamp, rssi, snr)
+            await self._flush_completed_buckets(completed)
             await self._upsert_station_position(callsign, message, "signal")
 
         return is_mheard
@@ -557,7 +578,12 @@ class IngestMixin(StorageBase):
                 "         ?, ?, ?, ?, ?)",
                 params,
             )
-        except sqlite3.OperationalError:
+        # sqlite3.Error, not OperationalError: IntegrityError (a NOT NULL/UNIQUE
+        # violation) and InterfaceError ("type 'dict' is not supported" when a nested
+        # JSON object reaches a scalar bind) are SIBLINGS of OperationalError, not
+        # subclasses, so they escaped this guard entirely — the graceful
+        # "message dropped" log never fired and the rest of store_message was skipped.
+        except sqlite3.Error:
             logger.exception(
                 "store_message: INSERT failed for msg_id=%s src=%s dst=%s (message dropped)",
                 msg_id,
@@ -677,15 +703,29 @@ class IngestMixin(StorageBase):
                     (ack_num,),
                 )
 
-        # Time-windowed dedup: reject only if same msg_id was seen within DEDUP_WINDOW_MS.
-        # MHeard beacons (msg_id=None) skip this check — they have their own throttle below.
+        # Time-windowed dedup: reject only if the SAME SENDER's same msg_id was seen
+        # within DEDUP_WINDOW_MS. MHeard beacons (msg_id=None) skip this check — they
+        # have their own throttle below.
+        #
         # Checked here (before signal ingestion, not just before the final INSERT) so a
-        # duplicate-delivered datagram (firmware is known to double-deliver) can't double-count
-        # into signal_log/signal_buckets (UDP 2.0 Track U, Wave U2).
+        # duplicate-delivered datagram (firmware is known to double-deliver) can't
+        # double-count into signal_log/signal_buckets (UDP 2.0 Track U, Wave U2).
+        #
+        # The sender scope is load-bearing. msg_id is a 32-bit node-local counter, so two
+        # stations collide regularly inside a 60-minute window; while this gate was
+        # unscoped, moving it ahead of the dual-write meant the SECOND station's frame
+        # returned early and it vanished from station_positions/signal_log/telemetry
+        # entirely — no map marker, no mHeard entry, no last_seen refresh — not merely
+        # from the redundant `messages` row it was meant to skip. Comparing the resolved
+        # sender (first comma-component of the stored relay path, matching this method's
+        # own `callsign`) still dedups the same beacon arriving over several mesh paths.
         if msg_id is not None:
             existing = await self._query(
-                "SELECT 1 FROM messages WHERE msg_id = ? AND timestamp > ? LIMIT 1",
-                (msg_id, timestamp - DEDUP_WINDOW_MS),
+                "SELECT 1 FROM messages WHERE msg_id = ? AND timestamp > ?"
+                " AND UPPER(TRIM(CASE WHEN instr(src, ',') > 0"
+                "   THEN substr(src, 1, instr(src, ',') - 1) ELSE src END)) = ?"
+                " LIMIT 1",
+                (msg_id, timestamp - DEDUP_WINDOW_MS, callsign.upper()),
             )
             if existing:
                 return
@@ -1009,7 +1049,8 @@ class IngestMixin(StorageBase):
                    co2 = COALESCE(NULLIF(excluded.co2, 0), station_positions.co2),
                    batt = COALESCE(NULLIF(excluded.batt, 0), station_positions.batt),
                    telemetry_ts = excluded.telemetry_ts,
-                   last_seen = MAX(station_positions.last_seen, excluded.last_seen),
+                   last_seen = MAX(COALESCE(station_positions.last_seen, 0),
+                                   COALESCE(excluded.last_seen, 0)),
                    extras = COALESCE(excluded.extras, station_positions.extras)
             """,
             (

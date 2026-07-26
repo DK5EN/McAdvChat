@@ -118,13 +118,17 @@ def build_stream_router(manager: SSEManager, version: str) -> APIRouter:  # noqa
         try:
             if request.type == "page_request":
                 # Paginated message fetch — response via SSE stream
-                page_data = {
+                page_data: dict[str, Any] = {
                     "dst": request.dst,
                     "before": getattr(request, "before", None),
                     "limit": getattr(request, "limit", 20),
                 }
                 if request.src:
                     page_data["src"] = request.src
+                # V8.6: forward the correlation id so _handle_messages_page_command can
+                # echo it back on proxy:messages_page.
+                if request.request_id is not None:
+                    page_data["request_id"] = request.request_id
                 await manager.message_router.route_command(
                     "get_messages_page",
                     websocket=None,

@@ -514,7 +514,13 @@ class MessageRouter:
             limit = max(1, min(int(params.get("limit", DEFAULT_PAGE_LIMIT)), MAX_PAGE_LIMIT))
         except (TypeError, ValueError):
             limit = DEFAULT_PAGE_LIMIT
-        src = params.get("src")  # Own callsign for DM conversation pagination
+        # Own callsign for DM conversation pagination. Resolve server-side when the
+        # client omits it (the wire protocol makes it optional), mirroring the
+        # delete_messages route's own_call fallback: without it get_messages_page's
+        # is_dm test fails and it falls back to an exact `dst = ?`, which misses every
+        # relay-hopped row that migration v18 keyed by conversation_key — the
+        # conversation showed up in smart_initial but scrolled back empty.
+        src = params.get("src") or self.my_callsign
         request_id = params.get("request_id")
 
         page_data = await self.storage_handler.get_messages_page(dst, before, limit, src=src)
