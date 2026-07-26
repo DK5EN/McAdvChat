@@ -1,0 +1,130 @@
+{
+  "version": 1,
+  "description": "MeshCom message-dedup contract. Shared by three independent implementations: the webapp store (src/stores/messages/dedup.ts), MCProxy's push layer (src/mcapp/push_delivery.py PushDedup, derived from storage/constants.py DEDUP_WINDOW_MS), and mc-chat's push layer (meshcom_mock/push.py PushService._is_duplicate, previously a free literal). Scope: pins exactly two things -- (1) `window_ms`, the dedup window duration in milliseconds; (2) the abstract key-derivation PRECEDENCE, msg_id-primary else content-fallback over (src, dst, text). Does NOT pin how a repo represents a key internally (webapp: a flat pipe-delimited string; MCProxy/mc-chat: a tuple) -- each repo's test adapts these vectors into its own key function and compares on ITS OWN notion of key equality. NOT PINNED IN v1: exact window-boundary/expiry mechanics. The three current implementations genuinely differ here, not merely on inclusive-vs-exclusive boundary: webapp's isDuplicateByKey compares symmetric `Math.abs(ts - timestamp) <= window_ms` against every timestamp ever recorded for a key, keyed off each MESSAGE's own reported timestamp; MCProxy's PushDedup is a one-sided forward expiry keyed off wall-clock CALL time (an OrderedDict of key to seen_at, pruned once `now() - seen_at` exceeds the window, never refreshed on a repeat hit); mc-chat's PushService._is_duplicate is also a one-sided forward expiry, but records an absolute `expiry = now + window_seconds` at first sight and prunes when `expiry <= now`. Because two of the three key off call time rather than message timestamp, every `window_vectors` entry below stays at least a full minute clear of the window boundary in either direction, so all three implementations pass regardless of this divergence. SYNC RULE: canonical source lives upstream in mc-chat's contract/dedup_contract.json (same git-subtree pattern as push_contract.json -- mc-chat is upstream). MCProxy's src/mcapp/contract/dedup_contract.json and the webapp's vendored copy at src/stores/messages/__tests__/dedup_contract.json must stay byte-identical to the upstream copy -- edit the upstream copy and re-sync, never edit a vendored copy in place. The one allowed exception is formatting: the webapp's vendored copy is reformatted by this repo's Prettier, so it may differ in whitespace only -- all three copies must remain parse-equal.",
+  "window_ms": 3600000,
+  "key_semantics": {
+    "precedence": "msg_id-primary: any truthy msg_id keys the message ALONE, independent of src/dst/text. Two messages sharing the same truthy msg_id share a dedup key even if every other field differs; two messages with different truthy msg_ids never share a key even if every other field is identical.",
+    "content_fallback": "A falsy or absent msg_id (missing field, empty string, zero, or null/None -- each repo's own wire representation of 'no usable id') falls back to a CONTENT key over the abstract fields (src, dst, text) below. Two content-keyed messages share a key iff all three fields match exactly; differing in even one of the three produces a different key.",
+    "content_fields": ["src", "dst", "text"],
+    "representation_note": "This contract pins the ABSTRACT precedence only, not the concrete key encoding: webapp encodes a key as a flat string (`id:<msg_id>` or `c:<src>|<dst>|<text>`); MCProxy and mc-chat encode a key as a tuple (`('id', msg_id)` / `('triple', src, dst, text)` or equivalent). Each repo's test adapts key_vectors below into its own key function and asserts same_key against key equality in its own representation."
+  },
+  "key_vectors": [
+    {
+      "name": "same truthy msg_id, different text -> same key (id dominates content)",
+      "a": { "msg_id": "42", "src": "OE1ABC-1", "dst": "232", "text": "hello" },
+      "b": { "msg_id": "42", "src": "OE1ABC-1", "dst": "232", "text": "a completely different message" },
+      "same_key": true
+    },
+    {
+      "name": "different truthy msg_id, identical content -> different key (id dominates)",
+      "a": { "msg_id": "42", "src": "OE1ABC-1", "dst": "232", "text": "hello" },
+      "b": { "msg_id": "43", "src": "OE1ABC-1", "dst": "232", "text": "hello" },
+      "same_key": false
+    },
+    {
+      "name": "msg_id absent on both -> content fallback, identical fields -> same key",
+      "a": { "src": "OE1ABC-1", "dst": "232", "text": "hello" },
+      "b": { "src": "OE1ABC-1", "dst": "232", "text": "hello" },
+      "same_key": true
+    },
+    {
+      "name": "msg_id explicitly falsy (empty string) on both -> content fallback, identical fields -> same key",
+      "a": { "msg_id": "", "src": "OE1ABC-1", "dst": "232", "text": "hello" },
+      "b": { "msg_id": "", "src": "OE1ABC-1", "dst": "232", "text": "hello" },
+      "same_key": true
+    },
+    {
+      "name": "absent and falsy msg_id are equivalent -> both fall back to the same content key",
+      "a": { "src": "OE1ABC-1", "dst": "232", "text": "hello" },
+      "b": { "msg_id": "", "src": "OE1ABC-1", "dst": "232", "text": "hello" },
+      "same_key": true
+    },
+    {
+      "name": "content fallback, differs in src only -> different key",
+      "a": { "src": "OE1ABC-1", "dst": "232", "text": "hello" },
+      "b": { "src": "OE1XYZ-2", "dst": "232", "text": "hello" },
+      "same_key": false
+    },
+    {
+      "name": "content fallback, differs in dst only -> different key",
+      "a": { "src": "OE1ABC-1", "dst": "232", "text": "hello" },
+      "b": { "src": "OE1ABC-1", "dst": "9999", "text": "hello" },
+      "same_key": false
+    },
+    {
+      "name": "content fallback, differs in text only -> different key",
+      "a": { "src": "OE1ABC-1", "dst": "232", "text": "hello" },
+      "b": { "src": "OE1ABC-1", "dst": "232", "text": "goodbye" },
+      "same_key": false
+    },
+    {
+      "name": "truthy msg_id never collides with a content-keyed message, even with identical src/dst/text",
+      "a": { "msg_id": "42", "src": "OE1ABC-1", "dst": "232", "text": "hello" },
+      "b": { "src": "OE1ABC-1", "dst": "232", "text": "hello" },
+      "same_key": false
+    }
+  ],
+  "window_vectors": [
+    {
+      "name": "id-keyed, 1 second apart, well within the window -> duplicate",
+      "msg_id": "1",
+      "src": "OE1ABC-1",
+      "dst": "232",
+      "text": "hello",
+      "delta_ms": 1000,
+      "duplicate": true
+    },
+    {
+      "name": "id-keyed, 30 minutes apart, well within the window -> duplicate",
+      "msg_id": "2",
+      "src": "OE1ABC-1",
+      "dst": "232",
+      "text": "hello",
+      "delta_ms": 1800000,
+      "duplicate": true
+    },
+    {
+      "name": "id-keyed, 59 minutes apart, a full minute short of the window -> duplicate",
+      "msg_id": "3",
+      "src": "OE1ABC-1",
+      "dst": "232",
+      "text": "hello",
+      "delta_ms": 3540000,
+      "duplicate": true
+    },
+    {
+      "name": "id-keyed, 61 minutes apart, a full minute past the window -> not a duplicate",
+      "msg_id": "4",
+      "src": "OE1ABC-1",
+      "dst": "232",
+      "text": "hello",
+      "delta_ms": 3660000,
+      "duplicate": false
+    },
+    {
+      "name": "id-keyed, 2 hours apart, well past the window -> not a duplicate",
+      "msg_id": "5",
+      "src": "OE1ABC-1",
+      "dst": "232",
+      "text": "hello",
+      "delta_ms": 7200000,
+      "duplicate": false
+    },
+    {
+      "name": "content-keyed (no msg_id), 1 second apart, well within the window -> duplicate",
+      "src": "OE1ABC-1",
+      "dst": "232",
+      "text": "hello",
+      "delta_ms": 1000,
+      "duplicate": true
+    },
+    {
+      "name": "content-keyed (no msg_id), 2 hours apart, well past the window -> not a duplicate",
+      "src": "OE1ABC-1",
+      "dst": "232",
+      "text": "hello",
+      "delta_ms": 7200000,
+      "duplicate": false
+    }
+  ]
+}
