@@ -115,6 +115,43 @@ def build_push_payload(raw_message: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def _push_text(payload: dict[str, Any]) -> str:
+    """The msg-or-text fallback extraction, coerced exactly as
+    `build_push_payload` does it. Shared by eligibility clauses (a) and (c) so
+    both judge the same string.
+
+    In production the caller has always run `build_push_payload` first, so
+    `text` is already populated and `msg` is absent — the fallback matters only
+    for the contract fixture's own vectors, which spell some frames with a `msg`
+    key. Reading both keeps this predicate's verdict identical to mc-chat's on
+    every vector instead of merely coincidentally equal (a `msg`-only ACK used
+    to be rejected here by clause (a) for having no `text`, and by clause (c)
+    upstream — same answer, different reason, one refactor away from diverging).
+    """
+    return str(payload.get("text") or payload.get("msg") or "")
+
+
+def _is_node_local_noise(payload: dict[str, Any]) -> bool:
+    """Contract `eligibility` (c) / `eligibility_noise_semantics`: True iff the
+    message is a text ACK or a `{CET}` time broadcast.
+
+    Both arrive as ordinary `type:"msg"` text frames, so clause (a) passes them.
+    Without this, the mesh's `"<CALL>  :ackNNN"` reply to every outbound message
+    meant the operator got one notification per message they SENT (default
+    `filter.dm = true`), and every `broadcast: true` subscriber was notified for
+    each `{CET}` time broadcast — which `storage._should_filter_message` refuses
+    to even persist.
+
+    The `":ack"` substring test is deliberately as broad as the
+    `msg NOT LIKE '%:ack%'` exclusion every message query in `storage/query.py`
+    already applies: a push must never announce a message that no conversation
+    view will show. See the contract's `eligibility_noise_semantics` for the
+    accepted false positive.
+    """
+    text = _push_text(payload)
+    return ":ack" in text or text.startswith("{CET}")
+
+
 def is_eligible(payload: dict[str, Any], own_callsign: str) -> bool:
     """Pure predicate: contract `eligibility`. Checked ONCE per message,
     before dedup and before per-subscription matching.
@@ -122,16 +159,17 @@ def is_eligible(payload: dict[str, Any], own_callsign: str) -> bool:
     (a) must be a chat text message — type == "msg" AND non-empty text
         (excludes telemetry ('tele'), position beacons ('pos'), any other
         non-chat type, and any no-text frame — a type:"msg" with empty text
-        must not push a blank notification). Callers always pass the
-        already-built payload (`build_push_payload` output or a
-        contract-fixture dict of the same shape), so `text` here is already
-        the msg-or-text-fallback extraction — checking it directly stays
-        consistent with that extraction without re-deriving it.
+        must not push a blank notification).
     (b) resolved source (first comma-component of src) must NOT be the
         node's own callsign — never push our own outbound sends or
         mesh-echoes of them.
+    (c) must not be node-local noise — a text ACK or a `{CET}` time
+        broadcast. This lived at the router wiring seam until contract v4
+        made the exclusion universal; see `_is_node_local_noise`.
     """
-    if payload.get("type") != "msg" or not payload.get("text"):
+    if payload.get("type") != "msg" or not _push_text(payload):
+        return False
+    if _is_node_local_noise(payload):
         return False
     resolved_src = _resolve_source(str(payload.get("src") or ""))
     return resolved_src != own_callsign

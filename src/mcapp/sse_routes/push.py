@@ -76,29 +76,6 @@ class PushUnsubscribeRequest(BaseModel):
     endpoint: str = Field(min_length=1)
 
 
-def _is_node_local_noise(raw_message: dict[str, Any]) -> bool:
-    """Node-local policy filter applied BEFORE the contract predicates.
-
-    `push_contract.json`'s `eligibility` only excludes non-`msg` types and empty text,
-    so two classes of frame that MCProxy never shows a user still produced a push:
-
-    * **Text ACKs** — `type:"msg"` frames whose body is `"<CALL>  :ackNNN"`. Every
-      message the operator sends gets one back addressed to them, so with the default
-      `filter.dm = true` they got a notification reading `DK5EN-1  :ack753` for every
-      single send. Storage keeps these rows but every message query excludes them with
-      `msg NOT LIKE '%:ack%'`.
-    * **`{CET}` time broadcasts** — `_should_filter_message` refuses to even persist
-      these, yet any `broadcast: true` subscriber was notified for each one.
-
-    Kept OUT of `push_delivery.is_eligible()` deliberately: that function implements the
-    shared contract corpus that mc-chat must satisfy byte-for-byte. This is the node's
-    own policy layer at the wiring seam. If the exclusion should be universal, the
-    contract needs updating in mc-chat and re-syncing through the subtree.
-    """
-    text = str(raw_message.get("msg") or raw_message.get("text") or "")
-    return text.startswith("{CET}") or ":ack" in text
-
-
 def build_push_router(
     manager: SSEManager,
     *,
@@ -145,8 +122,10 @@ def build_push_router(
             if not own_callsign:
                 return
             data = routed_message["data"]
-            if _is_node_local_noise(data):
-                return
+            # Text-ACK / {CET} suppression used to sit here as a node-local policy
+            # filter; contract v4 made it eligibility clause (c), so it now lives in
+            # push_delivery.is_eligible where mc-chat's corpus gates it too.
+            #
             # contract `blocklist`: pass the node's live GLOBAL blocklist
             # (admin kickban + curated sperrliste) so a blocked sender's
             # message is suppressed on the push path too. Sourced defensively —

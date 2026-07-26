@@ -16,12 +16,11 @@ touches `/var/lib/mcapp/vapid.json` or performs real crypto. See
 `push_delivery.py`'s module docstring for the testability seams this suite
 exercises.
 
-WARNING — `contract/push_contract.json` lives inside the `src/mcapp/contract/` git
-subtree but is NOT part of it: mc-chat's `contract-subtree` branch carries only
-`command_contract.json` and keeps its push contract at `tests/fixtures/push_contract.json`.
-A `git subtree pull --prefix=src/mcapp/contract` therefore DELETES the file `_CONTRACT_PATH`
-points at, breaking this suite and the whole gated runner. See the warning in CLAUDE.md's
-"Vendored Subtrees" section.
+`contract/push_contract.json` is subtree-managed, with mc-chat upstream — edit it
+there and re-sync (CLAUDE.md, "Vendored Subtrees"), never in place here. Until
+2026-07-26 mc-chat kept it at `tests/fixtures/`, OUTSIDE the subtree prefix, so a
+`git subtree pull --prefix=src/mcapp/contract` deleted the file `_CONTRACT_PATH`
+points at and broke this suite together with the whole gated runner.
 """
 
 from __future__ import annotations
@@ -44,6 +43,7 @@ from .push_delivery import (
     PushCoalescer,
     PushDedup,
     PushDispatcher,
+    _is_node_local_noise,
     build_push_payload,
     is_eligible,
     is_sender_blocked,
@@ -57,7 +57,6 @@ from .sse_routes.push import (
     PushSubscriptionInfo,
     PushSubscriptionKeys,
     PushUnsubscribeRequest,
-    _is_node_local_noise,
     build_push_router,
 )
 
@@ -65,13 +64,14 @@ if TYPE_CHECKING:
     from .sse_handler import SSEManager
 
 _CONTRACT_PATH = pathlib.Path(__file__).parent / "contract" / "push_contract.json"
-# Captured once when this suite was updated for contract v2
-# (`shasum -a 256 push_contract.json` against the byte-verbatim copy handed
-# off by the orchestrator). If this ever stops matching, either this repo's
-# copy or the mc-chat sibling's copy has drifted — re-sync before trusting
-# either implementation. v3 (2026-07-17): adds the blocklist push-path gate
-# + blocklist_vectors.
-_EXPECTED_SHA256 = "5d8d32cf1879d0e4a4929a4c231122e5a00444876ed99d2d75e90169f9b07689"
+# Captured once per contract version. mc-chat is UPSTREAM of this file (see the
+# module docstring): a mismatch means either this copy was edited in place —
+# which a subtree pull will overwrite — or the pull has not been run yet.
+# v3 (2026-07-17): adds the blocklist push-path gate + blocklist_vectors.
+# v4 (2026-07-26): file moved inside mc-chat's subtree'd `contract/` prefix;
+# adds eligibility clause (c) — text ACKs and {CET} broadcasts are not
+# push-eligible.
+_EXPECTED_SHA256 = "2ccd2e0657ac0d797152c65f255f04e942d54acf8182451beeeb026b0760c44b"
 
 # The VAPID keyfile holds a raw P-256 private scalar, so load_or_create_vapid chmods it
 # owner-only. At the default 0644 any local account could forge VAPID JWTs as this node.
@@ -675,10 +675,14 @@ def _test_vapid_persistence(record: _RecordFn) -> None:
 
 
 def _test_node_local_noise_filter(record: _RecordFn) -> None:
-    """The wiring seam must drop frames MCProxy never shows a user, which the shared
-    contract's `eligibility` (type + non-empty text only) lets through: text ACKs and
-    {CET} time broadcasts. Without this every message the operator sent produced a
+    """Contract `eligibility` clause (c): frames MCProxy never shows a user must not
+    push, even though clause (a) (type + non-empty text) lets them through — text ACKs
+    and {CET} time broadcasts. Without this every message the operator SENT produced a
     push notification reading e.g. 'DK5EN-1  :ack753'.
+
+    The fixture's own eligibility_vectors cover this through `is_eligible`; these
+    assertions pin the predicate directly, including the boundary cases the vectors
+    guard, so a refactor of the clause order in `is_eligible` cannot quietly widen it.
     """
     record(
         "noise filter: a text ACK is not pushed",
@@ -695,6 +699,23 @@ def _test_node_local_noise_filter(record: _RecordFn) -> None:
     record(
         "noise filter: a normal chat message IS pushed",
         not _is_node_local_noise({"type": "msg", "msg": "Servus, wie geht's?"}),
+    )
+    record(
+        "noise filter: 'ack' as a plain word is NOT noise — only ':ack' is",
+        not _is_node_local_noise({"type": "msg", "msg": "did you ack that?"}),
+    )
+    record(
+        "noise filter: {CET} must be a PREFIX, not a substring",
+        not _is_node_local_noise({"type": "msg", "msg": "time was {CET}12:00"}),
+    )
+    # Clause (c) reached through the public predicate: an ACK from another station,
+    # addressed to us, with a filter that would otherwise match it.
+    record(
+        "eligibility: a text ACK is ineligible via is_eligible, not just the helper",
+        not is_eligible(
+            {"type": "msg", "src": "OE1ABC-1", "dst": "DK5EN-1", "text": "DK5EN-1  :ack7"},
+            "DK5EN-1",
+        ),
     )
 
 

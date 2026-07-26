@@ -71,16 +71,12 @@ cd /Users/martinwerner/WebDev/MCProxy
 git subtree pull --prefix=<path> mc-chat <split branch> --squash
 ```
 
-> **⚠ `src/mcapp/contract/push_contract.json` is NOT in the subtree.** mc-chat's
-> `contract-subtree` branch contains only `command_contract.json`; mc-chat keeps its push
-> contract at `tests/fixtures/push_contract.json`, **outside** the `contract/` prefix. So
-> the `git subtree pull` above **deletes** `src/mcapp/contract/push_contract.json`, which
-> breaks `push_tests.py` (`_CONTRACT_PATH`) and with it the whole gated
-> `run_startup_tests.py`. The two copies are kept byte-identical **by hand** (there is a
-> sha256 tripwire in `push_tests.py`). Before the next contract sync, pick one: add
-> `push_contract.json` to mc-chat's `contract/` prefix so it really is shared, or move
-> MCProxy's copy out of `src/mcapp/contract/`. Until then, restore the file after every
-> `contract` subtree pull.
+Both `command_contract.json` and `push_contract.json` are inside mc-chat's `contract/` prefix,
+so the pull above carries both. `push_contract.json` was **outside** it (at mc-chat's
+`tests/fixtures/`) until 2026-07-26, which meant every `contract` subtree pull silently
+**deleted** MCProxy's copy and broke `push_tests.py` (`_CONTRACT_PATH`) along with the whole
+gated `run_startup_tests.py`. Both suites pin a sha256 of their local copy; mc-chat is
+upstream, so a contract edit starts there and reaches this repo by split + pull.
 
 **Classifier** — every inbound message is annotated inline in `store_message()` with a primary `category`, free-form `tags` (JSON array), `info_score ∈ [0, 1]`, and a 12-char `template_hash`. Messages are never dropped; the webapp decides what to hide. Three layers: data-driven regex rules (`rules.py`/`seed.py`, `classifier_rules` table, first match by `(priority, id)` wins), template fingerprinting (`template.py`, `beacon_templates`), and scoring (`score.py`), combined by `Classifier.classify()` in `classify.py` — which never blocks ingestion. Rule mutations must bump `classifier_ver` via `storage.bump_classifier_version()` + `classifier.load()`; startup auto-backfills once per version via a `backfill_done:v{N}` marker in `classifier_meta`. Design detail: `doc/spam-filter-BE.md`.
 
