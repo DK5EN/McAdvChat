@@ -17,7 +17,7 @@ from typing import Any
 # BLE client abstraction - supports local, remote, and disabled modes
 from .ble_client import BLEMode, ConnectionState, create_ble_client
 from .commands import create_command_handler
-from .commands.parsing import is_group, normalize_unified
+from .commands.parsing import is_group, normalize_unified, strip_relay_path
 from .config_loader import (
     BLE_SERVICE_URL,
     MESHCOM_UDP_PORT,
@@ -218,14 +218,20 @@ class MessageRouter:
             "drop"     — blocked personal/position/telemetry; suppressed on
                          every path.
 
-        `dst` is normalized (strip + upper) before the group test — the raw
-        inbound payload is not pre-normalized on this path, so `is_group` would
-        otherwise misclassify e.g. " 20" as a non-group and drop it.
+        `src` and `dst` are both normalized before use — the raw inbound payload is
+        not pre-normalized on this path. `src` goes through the same
+        `strip_relay_path` the command path applies three lines after this guard, so
+        a stray-whitespace `src` can no longer slip past the blocklist and then
+        normalize cleanly into command execution. `dst` is resolved to its real
+        target (last comma-component of a via-routed 'VIA,TARGET') and stripped +
+        upper-cased before the group test, so a relayed group post from a blocked
+        station is quarantined to SPAM_GROUP instead of being dropped outright, and
+        `is_group` no longer misclassifies e.g. " 20" as a non-group.
         """
-        src = (data.get("src") or "").split(",")[0].upper()
+        src = strip_relay_path(data.get("src") or "")
         if not self._is_callsign_blocked(src):
             return "pass"
-        dst = (data.get("dst") or "").strip().upper()
+        dst = (data.get("dst") or "").rsplit(",", maxsplit=1)[-1].strip().upper()
         if is_group(dst) or dst in ("*", "ALL"):
             return "redirect"
         return "drop"
@@ -1322,12 +1328,23 @@ async def build_app(cfg: Config) -> AppContext:  # noqa: PLR0915 - sequential wi
                 mode=BLEMode.DISABLED,
                 message_router=message_router,
             )
+            # Re-register: the failed remote client may already be registered from
+            # above, and leaving it there means every BLE command keeps routing to a
+            # dead client while ctx.ble_client points at this stub — two sources of
+            # truth, and _shutdown_services would call the stub's no-op stop().
+            message_router.register_protocol("ble_client", ble_client)
+            await ble_client.start()
     else:
         # Create disabled stub
         ble_client = await create_ble_client(
             mode=BLEMode.DISABLED,
             message_router=message_router,
         )
+        # Must be registered like the remote client: MessageRouter._get_ble_client()
+        # resolves through the protocol registry, so without this every BLE route and
+        # command silently no-ops in `disabled` mode instead of getting the stub's
+        # "BLE disabled" status event — the null object's entire purpose.
+        message_router.register_protocol("ble_client", ble_client)
         await ble_client.start()
 
     # Start SSE server if enabled

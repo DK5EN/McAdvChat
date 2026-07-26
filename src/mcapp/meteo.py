@@ -137,6 +137,11 @@ class WeatherService:
         self._cache: dict[str, Any] | None = None
         self._cache_time: float = 0.0
         self._cache_lock = threading.Lock()
+        # Monotonic location generation. Bumped by update_location() WITHOUT taking
+        # _cache_lock (see that method for why) and compared here so a cache entry
+        # — or an in-flight fetch — that belongs to a superseded location is discarded.
+        self._cache_generation: int = 0
+        self._cached_generation: int = -1
 
         logger.info(
             "WeatherService initialisiert für %s %s/%s, Hybrid-Modus: DWD + OpenMeteo",
@@ -152,9 +157,18 @@ class WeatherService:
         if stat_name:
             self.stat_name = stat_name
         # A stale cache would otherwise keep serving weather for the old location.
-        with self._cache_lock:
-            self._cache = None
-            self._cache_time = 0.0
+        #
+        # Deliberately LOCK-FREE: this method is synchronous and is called directly
+        # on the asyncio thread (main.py's `_cache_gps` ble_notification subscriber
+        # and sse_routes/weather.py's `/api/weather` handler), while
+        # get_weather_data() holds `_cache_lock` across the whole blocking
+        # `_fetch_weather_data()` — up to ~96 s when the weather APIs are slow, the
+        # documented degraded state on a Pi with no internet. Acquiring the lock
+        # here froze the entire event loop for that long: SSE heartbeats stopped,
+        # UDP ingest stalled, BLE notifications queued. Bumping a counter instead
+        # invalidates the cache in O(1) and never blocks; the writer is always the
+        # single event-loop thread, the reader is the worker thread.
+        self._cache_generation += 1
 
     def get_weather_data(self, *, bypass_cache: bool = False) -> dict[str, Any]:
         """Cached hybrid weather fetch (SSE-06).
@@ -173,13 +187,18 @@ class WeatherService:
             return self._fetch_weather_data()
 
         with self._cache_lock:
-            if self._cache is not None:
+            generation = self._cache_generation
+            if self._cache is not None and self._cached_generation == generation:
                 ttl = WEATHER_ERROR_CACHE_TTL_S if "error" in self._cache else WEATHER_CACHE_TTL_S
                 if (time.monotonic() - self._cache_time) < ttl:
                     return self._cache
             data = self._fetch_weather_data()
-            self._cache = data
-            self._cache_time = time.monotonic()
+            # Only publish the result if the location didn't move while we fetched —
+            # otherwise this would re-cache weather for the superseded coordinates.
+            if self._cache_generation == generation:
+                self._cache = data
+                self._cache_time = time.monotonic()
+                self._cached_generation = generation
             return data
 
     def _fetch_weather_data(self) -> dict[str, Any]:  # noqa: PLR0912, PLR0915 - complex handler kept intact

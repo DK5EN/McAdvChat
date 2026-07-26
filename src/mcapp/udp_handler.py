@@ -7,7 +7,7 @@ import json
 import socket
 import unicodedata
 from collections.abc import Callable
-from typing import Any
+from typing import Any, cast
 
 from .logging_setup import get_logger
 from .util import FEET_TO_METERS, now_ms
@@ -89,16 +89,41 @@ def try_repair_json(text: str) -> dict[str, Any]:
     """
     for i in range(min(len(text), MAX_JSON_REPAIR_ATTEMPTS)):
         try:
-            result: dict[str, Any] = json.loads(text)
+            parsed: Any = json.loads(text)
         except json.JSONDecodeError as e:
             pos = e.pos if hasattr(e, "pos") else i
             if pos >= len(text):
                 break
             text = text[:pos] + text[pos + 1 :]
         else:
-            return result
+            if isinstance(parsed, dict):
+                return cast("dict[str, Any]", parsed)
+            # Valid JSON, but a bare list/number/string is not a MeshCom frame.
+            # Returning it would make `"msg" not in message` do a membership test on
+            # a list (or raise TypeError on an int) and then blow up on
+            # `message["timestamp"] = ...` — an unauthenticated remote log flood via
+            # a one-byte datagram to :1799. Treat it as unrepairable instead.
+            logger.debug("Discarding non-object JSON datagram (%s)", type(parsed).__name__)
+            return {"raw_text": text, "error": "invalid_json_not_an_object"}
     logger.debug("JSON repair gave up after %d attempts", MAX_JSON_REPAIR_ATTEMPTS)
     return {"raw_text": text, "error": "invalid_json_repair_failed"}
+
+
+def _log_non_chat_frame(message: dict[str, Any]) -> None:
+    """Log a frame that carries no `msg` field.
+
+    Keeps a DROPPED datagram (try_repair_json's error sentinel) distinguishable from a
+    legitimate non-chat frame: both used to share one DEBUG line, which made lost
+    frames invisible in production logs.
+    """
+    if message.get("error"):
+        logger.warning(
+            "Dropped malformed UDP datagram (%s): %.120s",
+            message["error"],
+            message.get("raw_text", ""),
+        )
+    else:
+        logger.debug("Non-chat message without msg field: %s", message)
 
 
 class UDPHandler:
@@ -122,6 +147,22 @@ class UDPHandler:
         self.send_socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         self._running = False
         self._listen_task: asyncio.Task[None] | None = None
+
+    def _ensure_send_socket(self) -> socket.socket:
+        """Return a usable send socket, re-creating it if it was closed.
+
+        CO-10 made `send_socket` long-lived (created in __init__) and
+        `stop_listening()` closes it unconditionally — but nothing recreated it.
+        The shutdown ladder stops UDP (step 3) while the SSE server keeps serving
+        for up to SHUTDOWN_TIMEOUT_SSE_S (step 4), so a `POST /api/send` landing in
+        that window used to `sendto()` on a closed fd, get its OSError swallowed by
+        `send_message`'s handler, and silently drop the operator's message. A
+        stop→start cycle of the same instance was permanently broken the same way.
+        """
+        if self.send_socket.fileno() == -1:
+            logger.debug("send_socket was closed; re-creating")
+            self.send_socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        return self.send_socket
 
     async def start_listening(self) -> None:
         if self._running:
@@ -224,7 +265,7 @@ class UDPHandler:
                 if self.message_router:
                     await self.message_router.publish("udp", "mesh_message", message)
                 return
-            logger.debug("Non-chat message without msg field: %s", message)
+            _log_non_chat_frame(message)
             return
 
         message["timestamp"] = now_ms()
@@ -252,7 +293,7 @@ class UDPHandler:
                 len(json_data),
                 json_data.decode("utf-8"),
             )
-            self.send_socket.sendto(json_data, self.target_address)
+            self._ensure_send_socket().sendto(json_data, self.target_address)
 
         except Exception:
             logger.exception("UDP_SEND failed")

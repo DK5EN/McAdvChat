@@ -91,6 +91,22 @@ def _test_try_repair_json() -> list[tuple[str, bool]]:
             dropped == expected_sentinel,
         )
     )
+
+    # (d) REGRESSION: valid JSON that is not an object must NOT be returned as-is.
+    #     try_repair_json is annotated `-> dict[str, Any]` and every caller relies on
+    #     that, but json.loads happily returns a list/int/str. A bare `5` datagram to
+    #     :1799 used to reach `message["timestamp"] = now_ms()` and raise TypeError on
+    #     every packet — an unauthenticated remote log flood. Each of these must come
+    #     back as the non-object sentinel dict instead.
+    for label, wire in (("list", "[1, 2, 3]"), ("int", "5"), ("string", '"msg"')):
+        non_object = try_repair_json(wire)
+        results.append(
+            (
+                f"try_repair_json: bare JSON {label} returns the non-object sentinel dict",
+                isinstance(non_object, dict)
+                and non_object.get("error") == "invalid_json_not_an_object",
+            )
+        )
     return results
 
 

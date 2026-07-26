@@ -169,7 +169,11 @@ class CommandHandler(
         self.message_router = message_router
         self.storage_handler = storage_handler
         self.my_callsign = my_callsign.upper()
-        self.admin_callsign_base = my_callsign.split("-", maxsplit=1)[0]
+        # Derive from the already-normalized form: admin_commands.handle_kickban
+        # compares it against an upper-cased callsign, so splitting the raw argument
+        # let a lower/mixed-case CALL_SIGN slip past the "cannot block own callsign"
+        # guard — and the resulting self-block is persisted across restarts.
+        self.admin_callsign_base = self.my_callsign.split("-", maxsplit=1)[0]
         self.lat = lat
         self.lon = lon
         self.stat_name = stat_name

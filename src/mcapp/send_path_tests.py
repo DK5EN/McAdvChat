@@ -161,6 +161,62 @@ async def run_send_path_tests() -> bool:
         and not transmitted[0].startswith("!"),
     )
 
+    # 6-8. REGRESSION: blocklist_decision must normalize src and dst the same way the
+    #      paths behind it do. It used to `.split(",")[0].upper()` src with no
+    #      `.strip()` (so a whitespace-padded src walked straight past the guard and
+    #      then normalized cleanly into command execution) and to test `is_group` on
+    #      the raw dst with no via-routed resolution (so a relayed group post from a
+    #      blocked station was DROPPED instead of quarantined to SPAM_GROUP).
+    blocked_router = MessageRouter(None)
+    blocked_router.set_callsign("DK5EN")
+    blocked_handler = create_command_handler(
+        blocked_router,
+        None,
+        "DK5EN",
+        lat=48.15,
+        lon=11.58,
+        stat_name="TestStation",
+        user_info_text="MeshCom Test Node",
+    )
+    blocked_router.register_protocol("commands", blocked_handler)
+    blocked_handler.blocked_callsigns.add("OE9BAD-1")
+
+    _record(
+        "blocklist: whitespace-padded src is still recognized as blocked",
+        blocked_router.blocklist_decision({"src": " OE9BAD-1 ", "dst": "20"}) != "pass",
+    )
+    _record(
+        "blocklist: via-routed group dst from a blocked src redirects (not drops)",
+        blocked_router.blocklist_decision({"src": "OE9BAD-1,OE1VIA-2", "dst": "OE1VIA-2,20"})
+        == "redirect",
+    )
+    _record(
+        "blocklist: blocked src on a personal dst still drops",
+        blocked_router.blocklist_decision({"src": "OE9BAD-1", "dst": "DK5EN-99"}) == "drop",
+    )
+    _record(
+        "blocklist: unblocked src passes",
+        blocked_router.blocklist_decision({"src": "OE1GOOD-1", "dst": "20"}) == "pass",
+    )
+
+    # 9. REGRESSION: admin_callsign_base must come from the UPPER-CASED callsign.
+    #    handle_kickban upper-cases the requested callsign before comparing, so
+    #    deriving the base from the raw config value let a lower-case CALL_SIGN slip
+    #    past the "cannot block own callsign" guard — and the self-block is persisted.
+    lower_handler = create_command_handler(
+        MessageRouter(None),
+        None,
+        "dk5en-99",
+        lat=48.15,
+        lon=11.58,
+        stat_name="TestStation",
+        user_info_text="MeshCom Test Node",
+    )
+    _record(
+        "admin_callsign_base is upper-cased even for a lower-case CALL_SIGN",
+        lower_handler.admin_callsign_base == "DK5EN",
+    )
+
     passed = sum(1 for _, ok in results if ok)
     total = len(results)
     if has_console:

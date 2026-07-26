@@ -434,6 +434,16 @@ class CTCPingMixin(CommandHandlerBase):
 
             ping_info = self.active_pings[message_id]
 
+            # _handle_ack_message sets ack_processed and only pops active_pings AFTER
+            # awaiting _record_ack_result (which awaits publish()). An ACK landing
+            # just before the timeout therefore leaves the entry visible across an
+            # await, and without this guard the same ping is recorded twice — the
+            # timeout result can even complete the test first, reporting 100% loss
+            # for a ping that was actually ACKed.
+            if ping_info.ack_processed:
+                logger.debug("Ping %s already ACKed, skipping timeout", message_id)
+                return
+
             timeout_result = {
                 "sequence": ping_info.sequence_info or "",
                 "rtt": None,
@@ -447,7 +457,9 @@ class CTCPingMixin(CommandHandlerBase):
                 await self._record_ping_result(test_id, timeout_result) if test_id else False
             )
 
-            del self.active_pings[message_id]
+            # pop, not del: _record_ping_result above awaits, so a concurrent ACK
+            # handler may already have removed the entry.
+            self.active_pings.pop(message_id, None)
 
             if test_id and test_id in self.ping_tests:
                 timeout_msg = (
