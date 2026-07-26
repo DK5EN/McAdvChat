@@ -20,7 +20,7 @@ def run_suppression_tests(router: "MessageRouter") -> bool:
     logger.info("Testing Suppression Logic:")
     logger.info("=" * 50)
 
-    assert router.my_callsign is not None  # noqa: S101 - test helper
+    assert router.my_callsign is not None
     test_cases: list[tuple[str | None, str, str, bool, str]] = [
         # Tuple layout: src, dst, msg, expected_suppression, description
         (router.my_callsign, "20", "!WX", True, "Group ohne Target → lokal"),
@@ -100,12 +100,12 @@ def run_suppression_tests(router: "MessageRouter") -> bool:
     results: list[tuple[str, str, bool, bool, str]] = []
     for src_or_none, dst, msg, expected, description in test_cases:
         test_data: dict[str, str | None] = {"src": src_or_none, "dst": dst, "msg": msg}
-        assert router.validator is not None  # noqa: S101 - test helper
+        assert router.validator is not None
         normalized = router.validator.normalize_message_data(test_data)
         actual = router.validator.should_suppress_outbound(normalized)
 
         status = "✅ PASS" if actual == expected else "❌ FAIL"
-        assert router.validator is not None  # noqa: S101 - test helper
+        assert router.validator is not None
         reason = router.validator.get_suppression_reason(normalized)
 
         results.append((status, description, actual, expected, reason))

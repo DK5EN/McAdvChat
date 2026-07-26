@@ -62,7 +62,7 @@ async def run_migration_chain_tests() -> bool:
 
 
 async def _schema_version(storage: Any) -> int | None:
-    rows = await storage._query("SELECT version FROM schema_version LIMIT 1")  # noqa: SLF001 - white-box test
+    rows = await storage._query("SELECT version FROM schema_version LIMIT 1")
     return rows[0]["version"] if rows else None
 
 
@@ -149,7 +149,7 @@ async def _test_full_chain_from_base(results: list[tuple[str, bool]]) -> None:
             )
 
             # --- v4 ACK-collapse spot-check ---
-            acked = await storage._query(  # noqa: SLF001 - white-box test
+            acked = await storage._query(
                 "SELECT send_success FROM messages WHERE msg_id = ? AND type = 'msg'",
                 ("MSG-ACK-ME",),
             )
@@ -159,7 +159,7 @@ async def _test_full_chain_from_base(results: list[tuple[str, bool]]) -> None:
                     bool(acked) and acked[0]["send_success"] == 1,
                 )
             )
-            noack = await storage._query(  # noqa: SLF001 - white-box test
+            noack = await storage._query(
                 "SELECT send_success FROM messages WHERE msg_id = ? AND type = 'msg'",
                 ("MSG-NOACK",),
             )
@@ -169,9 +169,7 @@ async def _test_full_chain_from_base(results: list[tuple[str, bool]]) -> None:
                     bool(noack) and (noack[0]["send_success"] or 0) == 0,
                 )
             )
-            ack_rows = await storage._query(  # noqa: SLF001 - white-box test
-                "SELECT COUNT(*) AS c FROM messages WHERE type = 'ack'"
-            )
+            ack_rows = await storage._query("SELECT COUNT(*) AS c FROM messages WHERE type = 'ack'")
             results.append(
                 (
                     "v4 ACK collapse: ACK rows are deleted after being folded in",
@@ -259,7 +257,7 @@ async def _test_v18_conversation_rekey(results: list[tuple[str, bool]]) -> None:
                 )
             )
 
-            via_row = await storage._query(  # noqa: SLF001 - white-box test
+            via_row = await storage._query(
                 "SELECT conversation_key FROM messages WHERE msg_id = ?", ("VIA-0001",)
             )
             results.append(
@@ -272,7 +270,7 @@ async def _test_v18_conversation_rekey(results: list[tuple[str, bool]]) -> None:
                 )
             )
 
-            ctrl_row = await storage._query(  # noqa: SLF001 - white-box test
+            ctrl_row = await storage._query(
                 "SELECT conversation_key FROM messages WHERE msg_id = ?", ("CTRL-0001",)
             )
             results.append(

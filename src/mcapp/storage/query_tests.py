@@ -61,7 +61,7 @@ async def run_query_tests() -> bool:  # noqa: PLR0915 - test suite lists one cas
                 # stats packs the six signal columns in this order: rssi avg, rssi
                 # min, rssi max, snr avg, snr min, snr max.
                 rssi_avg, rssi_min, rssi_max, snr_avg, snr_min, snr_max = stats
-                await storage._mutate(  # noqa: SLF001 - white-box test seeds the table directly
+                await storage._mutate(
                     "INSERT OR REPLACE INTO signal_buckets"
                     " (callsign, bucket_ts, bucket_size, rssi_avg, rssi_min, rssi_max,"
                     "  snr_avg, snr_min, snr_max, count)"
@@ -81,7 +81,7 @@ async def run_query_tests() -> bool:  # noqa: PLR0915 - test suite lists one cas
                 )
 
             async def _hourly_row(callsign: str) -> dict[str, Any] | None:
-                rows = await storage._query(  # noqa: SLF001 - white-box test
+                rows = await storage._query(
                     "SELECT * FROM signal_buckets"
                     " WHERE callsign = ? AND bucket_size = ?"
                     " ORDER BY bucket_ts",
@@ -90,7 +90,7 @@ async def run_query_tests() -> bool:  # noqa: PLR0915 - test suite lists one cas
                 return rows[0] if rows else None
 
             async def _count_5min(callsign: str) -> int:
-                rows = await storage._query(  # noqa: SLF001 - white-box test
+                rows = await storage._query(
                     "SELECT COUNT(*) AS c FROM signal_buckets"
                     " WHERE callsign = ? AND bucket_size = ?",
                     (callsign, _FIVE_MIN_MS),
@@ -98,7 +98,7 @@ async def run_query_tests() -> bool:  # noqa: PLR0915 - test suite lists one cas
                 return int(rows[0]["c"])
 
             async def _wipe_buckets() -> None:
-                await storage._mutate("DELETE FROM signal_buckets")  # noqa: SLF001 - white-box test
+                await storage._mutate("DELETE FROM signal_buckets")
 
             # --- (a) count-weighted averaging is EXACT -------------------------------
             # Two 5-min buckets in ONE hour, both older than the 8-day rollup cutoff.

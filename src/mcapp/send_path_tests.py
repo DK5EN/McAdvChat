@@ -76,7 +76,7 @@ async def _resolve_and_capture(src: str, dst: str, msg: str) -> list[str]:
     setattr(router, "publish", _capture)  # noqa: B010 - deliberate monkeypatch
 
     inbound = {"data": {"src": src, "dst": dst, "msg": msg, "src_type": "udp"}}
-    await handler._message_handler(inbound)  # noqa: SLF001
+    await handler._message_handler(inbound)
     # send_response chunks in a background task — poll until it publishes (or give up).
     for _ in range(250):
         if transmitted:
@@ -95,9 +95,7 @@ async def _drive(router: MessageRouter, src: str, dst: str, msg: str) -> list[di
 
     # Deliberately drives the internal outbound seam — the whole point of this suite
     # is to exercise _handle_outbound end-to-end (see module docstring).
-    await router._handle_outbound(  # noqa: SLF001
-        {"data": {"src": src, "dst": dst, "msg": msg}}, "udp", fake_send
-    )
+    await router._handle_outbound({"data": {"src": src, "dst": dst, "msg": msg}}, "udp", fake_send)
     return sent
 
 

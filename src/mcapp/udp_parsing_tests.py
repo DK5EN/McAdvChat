@@ -11,10 +11,12 @@ standalone parsing helpers that had no coverage before:
 * The ``NODE-<octet>`` pseudo-callsign derivation inside
   ``UDPHandler._process_received_message``.
 
-Unlike ``tests.py`` this filename is NOT covered by the per-file ruff relief, so
-it runs clean under the full strict rule set: no bare ``assert`` (booleans in a
-results list instead), named constants for magic numbers, and private-member
-access confined behind justified ``# noqa: SLF001``.
+``*_tests.py`` now carries the same per-file ruff relief as ``tests.py`` and
+``test_*.py`` (see ``[tool.ruff.lint.per-file-ignores]``). This suite predates that
+and still avoids what the relief permits: no bare ``assert`` (booleans in a results
+list instead, which is what the startup runner reports on) and named constants for
+magic numbers. Keep it that way — the results-list style is what makes each case
+print its own PASS/FAIL label.
 
 All timestamps in the wire format are milliseconds.
 """
@@ -197,7 +199,7 @@ async def _test_pseudo_callsign() -> list[tuple[str, bool]]:
     ipv4_addr = ("192.168.68.88", _SENDER_PORT)
     try:
         # White-box: drive the embedded NODE-<octet> derivation directly.
-        await handler4._process_received_message(tele, ipv4_addr)  # noqa: SLF001 - white-box
+        await handler4._process_received_message(tele, ipv4_addr)
         derived_ok = bool(ipv4_router.calls) and ipv4_router.calls[-1][2].get("src") == "NODE-88"
     finally:
         handler4.send_socket.close()
@@ -211,7 +213,7 @@ async def _test_pseudo_callsign() -> list[tuple[str, bool]]:
     ipv6_addr = ("fe80::1", _SENDER_PORT)
     try:
         # White-box: drive the IPv6 skip path directly.
-        await handler6._process_received_message(tele, ipv6_addr)  # noqa: SLF001 - white-box
+        await handler6._process_received_message(tele, ipv6_addr)
         skipped_ok = not ipv6_router.calls
     finally:
         handler6.send_socket.close()

@@ -764,14 +764,14 @@ async def _test_push_subscription_cache_invalidation(record: _RecordFn) -> None:
         storage = await create_sqlite_storage(pathlib.Path(tmp_dir) / "push_subs_cache.db")
         try:
             queries: list[str] = []
-            real_query = storage._query  # noqa: SLF001 - counting the reads this cache exists to avoid
+            real_query = storage._query
 
             async def _counting_query(query: str, params: tuple[Any, ...] = ()) -> Any:
                 if "push_subscriptions" in query:
                     queries.append(query)
                 return await real_query(query, params)
 
-            storage._query = _counting_query  # type: ignore[method-assign]  # noqa: SLF001 - counts the reads this cache removes
+            storage._query = _counting_query  # type: ignore[method-assign]
 
             ep_a = "https://push.example/cache-A"
             await storage.upsert_push_subscription(

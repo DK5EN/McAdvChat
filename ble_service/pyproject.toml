@@ -95,6 +95,11 @@ extend-immutable-calls = [
 # Test code: asserts, magic values, private access, fixture args are fine
 "**/tests/**" = ["S101", "PLR2004", "SLF001", "ARG", "S105", "S106", "PLC0415"]
 "**/test_*.py" = ["S101", "PLR2004", "SLF001", "ARG", "S105", "S106", "PLC0415"]
+# `*_tests.py` is MCProxy's dominant test naming (push_tests.py, router_tests.py,
+# udp_parsing_tests.py, ...): in-package suites run by scripts/run_startup_tests.py.
+# It matched NONE of the patterns above, so those files carried hand-written
+# `# noqa: S101` markers to say what this line now says once.
+"**/*_tests.py" = ["S101", "PLR2004", "SLF001", "ARG", "S105", "S106", "PLC0415"]
 "**/tests.py" = ["S101", "PLR2004", "SLF001", "ARG", "PLC0415"]
 
 [tool.pytest.ini_options]

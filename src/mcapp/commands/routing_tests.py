@@ -83,7 +83,7 @@ def _test_resolve_response_target() -> bool:
 
     results: list[tuple[str, str, bool]] = []
     for src, dst, target_type, expected, description in test_cases:
-        actual = RoutingMixin._resolve_response_target(  # noqa: SLF001 - testing private routing method directly
+        actual = RoutingMixin._resolve_response_target(
             stub,  # type: ignore[arg-type]
             src,
             dst,
@@ -177,7 +177,7 @@ def _test_error_response_text() -> bool:
 
     results: list[tuple[str, str, bool]] = []
     for error, expected, description in test_cases:
-        actual = RoutingMixin._error_response_text(error)  # noqa: SLF001 - testing private mapping directly
+        actual = RoutingMixin._error_response_text(error)
         ok = actual == expected
         status = "✅ PASS" if ok else "❌ FAIL"
         results.append((status, description, ok))

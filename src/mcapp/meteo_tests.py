@@ -1,4 +1,3 @@
-# ruff: noqa: SLF001
 # This suite intentionally exercises WeatherService's private pure-logic helpers
 # (_fuse_weather_data, _validate_data_age, _calculate_humidity_from_dewpoint,
 # _calculate_cloud_coverage_description, _wind_direction_to_compass) directly —
