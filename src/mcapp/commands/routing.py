@@ -4,10 +4,6 @@ from typing import Any
 
 from ..logging_setup import get_logger
 from ._base import CommandHandlerBase
-from .constants import (
-    COMMAND_THROTTLING,
-    DEFAULT_THROTTLE_TIMEOUT,
-)
 from .parsing import extract_target_callsign, is_group, normalize_unified, parse_command
 
 logger = get_logger(__name__)
@@ -86,13 +82,15 @@ class RoutingMixin(CommandHandlerBase):
 
         response_target = self._resolve_response_target(src, dst, target_type)
 
-        # Content-level throttle
+        # Content-level throttle. The window is per-command (COMMAND_THROTTLING, in
+        # SECONDS — 5 s for dice/time/group/kb/topic) and enforced by
+        # _cleanup_throttle_cache's eviction, so the message must not claim the 5-minute
+        # default: it used to tell a throttled `!dice` sender "once per 5min".
         content_hash = self._get_content_hash(src, msg_text, dst)
         if self._is_throttled(content_hash):
             logger.debug("Throttled: %s command '%s'", src, msg_text)
             await self.send_response(
-                f"⏳ Command throttled. Same command allowed once per "
-                f"{DEFAULT_THROTTLE_TIMEOUT // 60}min",
+                "⏳ Command throttled. Try the same command again shortly.",
                 response_target,
                 src_type,
             )
@@ -134,15 +132,13 @@ class RoutingMixin(CommandHandlerBase):
 
             cmd, kwargs = cmd_result
 
-            if self._is_throttled(content_hash, cmd):
-                timeout_min = COMMAND_THROTTLING.get(cmd, DEFAULT_THROTTLE_TIMEOUT // 60)
-                await self.send_response(
-                    f"⏳ !{cmd} throttled. Try again in {timeout_min}min",
-                    response_target,
-                    src_type,
-                )
-                return
-
+            # NOTE: no second throttle check here. `_is_throttled` ignores its command
+            # argument (the per-command timeout is honoured by _cleanup_throttle_cache's
+            # eviction instead, which reads the command stored alongside each entry), so
+            # a `self._is_throttled(content_hash, cmd)` call was byte-identical to the one
+            # `handle_command` already made on the same hash before calling us — the
+            # branch was unreachable, and its message mixed units (COMMAND_THROTTLING
+            # values are SECONDS, rendered as "min").
             response = await self.execute_command(cmd, kwargs, src)
             self._mark_msg_id_processed(msg_id)
             self._mark_content_processed(content_hash, cmd)

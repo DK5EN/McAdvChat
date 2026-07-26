@@ -4,6 +4,7 @@ import asyncio
 import contextlib
 import re
 import time
+import uuid
 from dataclasses import dataclass, field
 from enum import StrEnum
 from typing import Any
@@ -528,7 +529,14 @@ class CTCPingMixin(CommandHandlerBase):
         self, target: str, payload_size: int, repeat_count: int, requester: str
     ) -> None:
         """Start the ping test sequence"""
-        test_id = f"{target}_{int(time.time())}"
+        # uuid4 suffix, not a bare 1-second-resolution timestamp: test_id keys both
+        # self.ping_tests and the _completing_test_ids idempotence set, and _start_ping_test
+        # runs from a fire-and-forget task. Two `!ctcping <same target>` in the same wall
+        # clock second (two operators, or a duplicate-delivered datagram that slips the
+        # dedup window) collided, so the second PingTest overwrote the first — orphaning the
+        # first test's monitor_task, misattributing its results to the wrong requester, and
+        # defeating _trigger_completion_if_done's per-test idempotence.
+        test_id = f"{target}_{int(time.time())}_{uuid.uuid4().hex[:8]}"
 
         test_summary = PingTest(
             test_id=test_id,
@@ -565,6 +573,12 @@ class CTCPingMixin(CommandHandlerBase):
 
             monitor_task = asyncio.create_task(self._monitor_test_completion(test_id))
             test_summary.monitor_task = monitor_task
+            # Also register in _ping_bg_tasks like every other create_task in this file.
+            # Held only via ping_tests[test_id], this task lost its last strong reference
+            # the moment _complete_test dropped that entry and could be garbage-collected
+            # mid-flight; nothing in the shutdown ladder cancelled it either.
+            self._ping_bg_tasks.add(monitor_task)
+            monitor_task.add_done_callback(self._ping_bg_tasks.discard)
 
         except Exception as e:
             logger.exception("Ping test error")

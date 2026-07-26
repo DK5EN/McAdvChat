@@ -72,6 +72,27 @@ def _test_extract_target_callsign(results: list[tuple[str, bool]]) -> None:
         ("weather alias text: signature not a target", "!weather text:73 de DK5EN", None),
         ("wx text: plain prefix not a target", "!wx text:Guten Morgen", None),
         ("wx remote target before text: still found", "!wx OE5HWN-12 text:hello", "OE5HWN-12"),
+        # Regression: the text: cutoff used to apply ONLY to the positional fallback,
+        # so Priority 1 (which scans every token) still picked up a `target:` inside the
+        # free-text tail and re-opened the raw-leak the cutoff exists to close.
+        (
+            "wx target: inside the text: tail is free text, not a remote target",
+            "!wx text:73 de OE1ABC target:DK5EN",
+            None,
+        ),
+        (
+            "weather alias: target: inside the text: tail is free text",
+            "!weather text:vy 73 target:OE5HWN-12",
+            None,
+        ),
+        # ...but an explicit target BEFORE text: is still honoured.
+        (
+            "wx target: before text: is still a remote target",
+            "!wx target:OE5HWN-12 text:73 de DK5EN",
+            "OE5HWN-12",
+        ),
+        # A non-greedy command gets no cutoff: target: anywhere still wins.
+        ("time target: still found (no greedy text arg)", "!time target:OE5HWN-12", "OE5HWN-12"),
     ]
     for label, msg, expected in cases:
         _record(

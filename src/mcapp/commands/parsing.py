@@ -18,6 +18,18 @@ _MAX_GROUP_NUM = 99999
 # assigned to group 9999").
 SPAM_GROUP = "9999"
 
+# Commands whose `text:` argument is GREEDY: everything after it is free text, never a
+# positional target and never another key:value argument. Single source of truth for both
+# `parse_command`'s dispatch and `extract_target_callsign`'s scan window — they disagreed
+# while the tuple was hand-inlined in each. `topic` also takes a free-text argument but
+# never has a target at all (it returns early below), so it does not belong here.
+#
+# The deeper fix is a `greedy_text_arg` field on the COMMANDS TypedDict in handler.py,
+# so a new free-text command needs no edit here; that also requires updating
+# contract/command_contract.json (which currently enshrines "text: cutoff is
+# wx/weather-only") in mc-chat and re-syncing the subtree.
+GREEDY_TEXT_COMMANDS = ("WX", "WEATHER")
+
 
 def strip_relay_path(src_raw: str) -> str:
     """Strip a MeshCom relay-path suffix (comma-separated hops) from a raw src
@@ -54,8 +66,24 @@ def extract_target_callsign(msg: str) -> str | None:  # noqa: PLR0911, PLR0912 -
     if command in ["GROUP", "KB", "TOPIC"]:
         return None
 
+    # Truncate at a greedy `text:` argument BEFORE either priority runs: everything
+    # after it is free text (mirrors _parse_wx), so neither a positional callsign nor a
+    # `target:` token in there is a remote target. A personal-message signature like
+    # `!wx text:73 de DK5EN` or `!wx text:73 de OE1ABC target:DK5EN` must resolve
+    # locally, not be forwarded RAW to the mesh.
+    #
+    # The cutoff used to be applied only to the positional fallback, so Priority 1 —
+    # which scans EVERY token — still picked up a `target:` inside the signature and
+    # re-opened the exact raw-leak this guard exists to prevent.
+    scan = parts[1:]
+    if command in GREEDY_TEXT_COMMANDS:
+        for i, part in enumerate(scan):
+            if part.startswith("TEXT:"):
+                scan = scan[:i]
+                break
+
     # Priority 1: Explicit target:CALLSIGN parameter (scanned anywhere)
-    for part in parts[1:]:
+    for part in scan:
         if part.startswith("TARGET:"):
             potential = part[7:]  # Remove 'TARGET:' prefix
             if potential in ["LOCAL", ""]:
@@ -65,16 +93,6 @@ def extract_target_callsign(msg: str) -> str | None:  # noqa: PLR0911, PLR0912 -
             return None  # Invalid target format
 
     # Priority 2: Positional fallback (right-to-left, skip key:value pairs)
-    scan = parts[1:]
-    # wx/weather: everything after a `text:` argument is FREE TEXT (mirrors
-    # _parse_wx), not a positional target — a personal-message signature like
-    # `!wx text:73 de DK5EN` must NOT be misread as a remote target (DK5EN),
-    # which would forward the command raw to the mesh instead of resolving it.
-    if command in ("WX", "WEATHER"):
-        for i, part in enumerate(scan):
-            if part.startswith("TEXT:"):
-                scan = scan[:i]  # drop the free-text tail from target scanning
-                break
     for part in reversed(scan):
         if ":" in part:
             continue  # Skip key:value arguments
@@ -301,8 +319,9 @@ def parse_command(msg_text: str) -> tuple[str, dict[str, Any]] | None:
     if cmd not in COMMANDS:
         return None
 
-    # wx/weather needs the raw msg_text for TEXT: capture
-    if cmd in ("wx", "weather"):
+    # The greedy-text commands need the raw msg_text for TEXT: capture. Same set that
+    # extract_target_callsign truncates its scan at — keep them derived from one constant.
+    if cmd.upper() in GREEDY_TEXT_COMMANDS:
         return cmd, _parse_wx(parts, msg_text)
 
     parser = _COMMAND_PARSERS.get(cmd, _parse_generic)
