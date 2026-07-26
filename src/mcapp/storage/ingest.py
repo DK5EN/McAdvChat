@@ -1095,7 +1095,7 @@ class IngestMixin(StorageBase):
         if not self._bucket_accumulators:
             return
         bucket_ms = BUCKET_SECONDS * 1000
-        flush_data = []
+        flush_data: list[BucketTuple] = []
         for (callsign, bucket_start), values in self._bucket_accumulators.items():
             rssi_vals = values["rssi"]
             snr_vals = values["snr"]
@@ -1103,11 +1103,8 @@ class IngestMixin(StorageBase):
                 flush_data.append(
                     self._build_bucket_tuple(callsign, bucket_start, bucket_ms, rssi_vals, snr_vals)
                 )
-        if flush_data:
-            await self._execute_many(
-                "INSERT OR REPLACE INTO signal_buckets"
-                " (callsign, bucket_ts, bucket_size, rssi_avg, rssi_min, rssi_max,"
-                "  snr_avg, snr_min, snr_max, count)"
-                " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                flush_data,
-            )
+        # Reuse the writer instead of re-spelling the signal_buckets column list a third
+        # time: `signal_buckets` gained `bucket_size` once already, and this path feeds the
+        # chart queries, so a copy that missed such a change would show up as wrong charts
+        # rather than an error.
+        await self._flush_completed_buckets(flush_data)

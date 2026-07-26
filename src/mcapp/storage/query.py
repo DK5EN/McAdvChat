@@ -585,17 +585,24 @@ class QueryMixin(StorageBase):
             progress_callback=progress_callback,
         )
 
-    async def process_mheard_yearly(self, progress_callback: Any = None) -> list[dict[str, Any]]:
-        """Process 1-hour signal buckets for yearly mHeard statistics."""
-        cutoff_ms = now_ms() - ONE_YEAR_MS
+    async def _process_mheard_window(
+        self, cutoff_ms: int, label: str, progress_callback: Any = None
+    ) -> list[dict[str, Any]]:
+        """Shared body of the yearly/monthly mHeard reports.
+
+        They differed only in the cutoff and three strings, while `main.py` already
+        parameterizes the three *callers* through `_MHEARD_DUMP_VARIANTS` — so the gap
+        parameters, the empty-result early return and the progress protocol were
+        maintained in two places for one concept.
+        """
         if progress_callback:
-            await progress_callback("start", "Querying yearly data...")
+            await progress_callback("start", f"Querying {label} data...")
         bucket_rows = await self._query_rolled_up_buckets(cutoff_ms)
         if not bucket_rows:
             if progress_callback:
-                await progress_callback("done", "No yearly data available")
+                await progress_callback("done", f"No {label} data available")
             return []
-        logger.debug("Using %d hourly signal_buckets for yearly report", len(bucket_rows))
+        logger.debug("Using %d hourly signal_buckets for %s report", len(bucket_rows), label)
         return await self._build_chart_series(
             bucket_rows,
             gap_threshold_s=HOURLY_GAP_THRESHOLD,
@@ -603,22 +610,16 @@ class QueryMixin(StorageBase):
             progress_callback=progress_callback,
         )
 
+    async def process_mheard_yearly(self, progress_callback: Any = None) -> list[dict[str, Any]]:
+        """Process 1-hour signal buckets for yearly mHeard statistics."""
+        return await self._process_mheard_window(
+            now_ms() - ONE_YEAR_MS, "yearly", progress_callback
+        )
+
     async def process_mheard_monthly(self, progress_callback: Any = None) -> list[dict[str, Any]]:
         """Process signal buckets for 30-day mHeard statistics."""
-        cutoff_ms = now_ms() - ONE_MONTH_MS
-        if progress_callback:
-            await progress_callback("start", "Querying monthly data...")
-        bucket_rows = await self._query_rolled_up_buckets(cutoff_ms)
-        if not bucket_rows:
-            if progress_callback:
-                await progress_callback("done", "No monthly data available")
-            return []
-        logger.debug("Using %d signal_buckets for monthly report", len(bucket_rows))
-        return await self._build_chart_series(
-            bucket_rows,
-            gap_threshold_s=HOURLY_GAP_THRESHOLD,
-            gap_offset_s=HOURLY_BUCKET_S,
-            progress_callback=progress_callback,
+        return await self._process_mheard_window(
+            now_ms() - ONE_MONTH_MS, "monthly", progress_callback
         )
 
     async def _query_rolled_up_buckets(self, cutoff_ms: int) -> list[dict[str, Any]]:

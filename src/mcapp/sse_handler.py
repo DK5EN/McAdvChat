@@ -321,7 +321,9 @@ class SSEManager:
                 )
             # Classifier rules snapshot — webapp hydrates its rule editor without
             # a round-trip.
-            if self.classifier is not None and storage is not None:
+            # `storage` is already truthy inside this block — no need to re-test it here
+            # or below.
+            if self.classifier is not None:
                 try:
                     rule_rows = await storage.get_classifier_rules_raw()
                     yield self.format_sse_event(
@@ -333,8 +335,7 @@ class SSEManager:
             if self.classifier is not None:
                 try:
                     stats = await self.classifier.collect_stats()
-                    if storage is not None:
-                        stats["blocked_text_hits_24h"] = await storage.count_blocked_text_hits_24h()
+                    stats["blocked_text_hits_24h"] = await storage.count_blocked_text_hits_24h()
                     yield self.format_sse_event(stats, "proxy:classifier_stats")
                 except Exception as exc:
                     logger.warning("classifier stats snapshot failed: %s", exc)

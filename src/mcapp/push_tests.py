@@ -15,6 +15,13 @@ parameters are always supplied explicitly so router construction never
 touches `/var/lib/mcapp/vapid.json` or performs real crypto. See
 `push_delivery.py`'s module docstring for the testability seams this suite
 exercises.
+
+WARNING — `contract/push_contract.json` lives inside the `src/mcapp/contract/` git
+subtree but is NOT part of it: mc-chat's `contract-subtree` branch carries only
+`command_contract.json` and keeps its push contract at `tests/fixtures/push_contract.json`.
+A `git subtree pull --prefix=src/mcapp/contract` therefore DELETES the file `_CONTRACT_PATH`
+points at, breaking this suite and the whole gated runner. See the warning in CLAUDE.md's
+"Vendored Subtrees" section.
 """
 
 from __future__ import annotations

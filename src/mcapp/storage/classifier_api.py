@@ -8,9 +8,9 @@ against this storage without any meshcom_mock imports.
 import asyncio
 import json
 import sqlite3
-from datetime import UTC, datetime
 from typing import Any
 
+from ..classifier.types import ms_to_zulu
 from ..util import now_ms
 from ._base import StorageBase
 from .constants import _MSG_SELECT, SQLITE_BUSY_TIMEOUT_S, escape_like
@@ -54,7 +54,7 @@ class ClassifierApiMixin(StorageBase):
         enabled: bool = True,
         builtin: bool = False,
     ) -> dict[str, Any]:
-        now_zulu = datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
+        now_zulu = ms_to_zulu(now_ms())
         tags_json = json.dumps(extra_tags) if extra_tags else None
 
         def _run() -> int:
@@ -103,7 +103,7 @@ class ClassifierApiMixin(StorageBase):
         if not set_parts:
             rows = await self._query("SELECT * FROM classifier_rules WHERE id = ?", (rule_id,))
             return rows[0] if rows else None
-        now_zulu = datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
+        now_zulu = ms_to_zulu(now_ms())
         set_parts.append("updated_at = ?")
         params.extend([now_zulu, rule_id])
         await self._mutate(
@@ -214,8 +214,6 @@ class ClassifierApiMixin(StorageBase):
     async def upsert_beacon_template(
         self, hash_: str, msg: str, src: str, now_ms: int
     ) -> dict[str, Any]:
-        from ..classifier.types import ms_to_zulu  # noqa: PLC0415 - avoid circular import
-
         now_zulu = ms_to_zulu(now_ms)
 
         def _run() -> None:
@@ -451,8 +449,6 @@ class ClassifierApiMixin(StorageBase):
     async def get_top_beacon_templates(
         self, since_ms: int, limit: int = 10
     ) -> list[dict[str, Any]]:
-        from ..classifier.types import ms_to_zulu  # noqa: PLC0415 - avoid circular import
-
         cutoff = ms_to_zulu(since_ms)
         rows = await self._query(
             "SELECT template_hash, example_msg, count, auto_beacon "
