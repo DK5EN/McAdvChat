@@ -15,6 +15,7 @@ construction/teardown, and the module-level regression test suite.
 """
 
 import asyncio
+import inspect
 import json
 import sqlite3
 import tempfile
@@ -23,6 +24,7 @@ from pathlib import Path
 from typing import Any
 
 from .logging_setup import get_logger
+from .storage._base import StorageBase
 from .storage.classifier_api import ClassifierApiMixin
 from .storage.constants import (
     BUCKET_SECONDS,
@@ -778,6 +780,28 @@ async def run_startup_tests() -> bool:  # noqa: PLR0915 - test suite lists one c
             logger.exception("v18→HEAD migration test raised")
             migration_ok = False
         results.append(("v18→HEAD migration: idempotent re-open succeeds", migration_ok))
+
+    # StorageBase's stubs all raise NotImplementedError (CMD-09). That only helps if a
+    # stub is genuinely unreachable, so assert every one is really overridden — a mixin
+    # method renamed or moved without updating _base.py would otherwise turn into a
+    # runtime NotImplementedError on the ingest path instead of a mypy error.
+    stub_names = [
+        name
+        for name, value in vars(StorageBase).items()
+        if inspect.isfunction(value) and not name.startswith("__")
+    ]
+    unresolved = [
+        name
+        for name in stub_names
+        if getattr(SQLiteStorage, name, None) is getattr(StorageBase, name)
+    ]
+    results.append(
+        (
+            f"StorageBase: all {len(stub_names)} cross-mixin stubs are overridden"
+            + (f" (unresolved: {', '.join(unresolved)})" if unresolved else ""),
+            bool(stub_names) and not unresolved,
+        )
+    )
 
     for label, ok in results:
         print(f"    {'✅ PASS' if ok else '❌ FAIL'} | {label}")
