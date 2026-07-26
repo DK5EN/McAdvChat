@@ -30,7 +30,9 @@ import asyncio
 import base64
 import contextlib
 import json
+import stat
 import time
+from collections import OrderedDict
 from collections.abc import Callable
 from pathlib import Path
 from typing import Any, cast
@@ -248,12 +250,19 @@ class PushDedup:
     def __init__(self, window_seconds: float, now: Callable[[], float]) -> None:
         self._window_seconds = window_seconds
         self._now = now
-        self._seen: dict[Any, float] = {}
+        # OrderedDict, and a hit never refreshes its timestamp, so insertion order IS
+        # expiry order — _prune() can stop at the first live entry instead of walking
+        # the whole map. The window is an hour (DEDUP_WINDOW_MS), so the old O(n)
+        # comprehension rebuilt a throwaway list over an hour of traffic on EVERY
+        # inbound chat frame, even with zero push subscriptions.
+        self._seen: OrderedDict[Any, float] = OrderedDict()
 
     def _prune(self) -> None:
         cutoff = self._now() - self._window_seconds
-        expired = [key for key, seen_at in self._seen.items() if seen_at < cutoff]
-        for key in expired:
+        while self._seen:
+            key, seen_at = next(iter(self._seen.items()))
+            if seen_at >= cutoff:
+                break
             del self._seen[key]
 
     def is_duplicate(self, payload: dict[str, Any]) -> bool:
@@ -321,16 +330,38 @@ def load_or_create_vapid(
 
     `generator` is an injectable seam — tests pass a fake so real EC crypto
     never runs in the suite.
+
+    NEVER raises. This runs inside `build_app()` (via `_create_app` →
+    `build_push_router`) with no try/except anywhere on the path, so any exception
+    here took down the ENTIRE proxy — UDP ingest, BLE, SSE — not just Web Push. A
+    truncated `vapid.json` (power loss mid-write on a Pi with no fsync) or an
+    unwritable `/var/lib/mcapp` used to mean `mcapp.service` never started again,
+    with nothing in the log pointing at push. Push degrades to "no delivery" instead.
     """
     if path.exists():
-        # The file is only ever written below (or by `generate_vapid_keypair`'s
-        # own persistence path elsewhere), always as a flat dict[str, str] —
-        # json.loads is untyped (returns Any), so cast to the known shape
-        # rather than leaving the return type as Any.
-        return cast("dict[str, str]", json.loads(path.read_text(encoding="utf-8")))
-    keypair = generator()
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(keypair), encoding="utf-8")
+        try:
+            loaded = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            logger.exception("VAPID keyfile at %s is unreadable/corrupt; regenerating", path)
+        else:
+            if isinstance(loaded, dict) and loaded.get("private_key") and loaded.get("public_key"):
+                return cast("dict[str, str]", loaded)
+            logger.warning("VAPID keyfile at %s has an unexpected shape; regenerating", path)
+
+    try:
+        keypair = generator()
+    except Exception:
+        logger.exception("VAPID keypair generation failed; Web Push disabled for this run")
+        return {"private_key": "", "public_key": "", "subject": DEFAULT_VAPID_SUBJECT}
+
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(keypair), encoding="utf-8")
+        # 0600: this is a raw P-256 private scalar. At the default 0644 any local
+        # account could read it and forge VAPID JWTs authenticating as this node.
+        path.chmod(stat.S_IRUSR | stat.S_IWUSR)
+    except OSError:
+        logger.exception("Could not persist VAPID keypair to %s; using an ephemeral key", path)
     return keypair
 
 
@@ -383,7 +414,13 @@ class PushDispatcher:
             self._sweep_task = asyncio.create_task(self._sweep_loop())
 
     async def stop(self) -> None:
-        """Cancel the background tasks. Used by tests for clean teardown."""
+        """Cancel the background tasks.
+
+        Called from `SSEManager.stop_server()` (which the shutdown ladder reaches at
+        step 4) as well as by tests. Previously nothing in production called this, so
+        both perpetual tasks were still pending at process exit — a drain task could be
+        mid-`asyncio.to_thread(webpush)` when the loop was torn down.
+        """
         for task in (self._drain_task, self._sweep_task):
             if task is not None:
                 task.cancel()
@@ -452,8 +489,15 @@ class PushDispatcher:
         against a fake clock instead (see module docstring)."""
         while True:
             await asyncio.sleep(self._sweep_interval)
-            for sub, summary in self.coalescer.pop_expired():
-                self._enqueue(sub, summary)
+            # Guarded like _drain_loop: an unhandled exception here killed the task
+            # permanently and SILENTLY, so every coalesced summary (the 2nd..Nth message
+            # inside a window) was buffered and never delivered again until restart while
+            # immediate pushes kept working — the symptom looked like "coalescing broke".
+            try:
+                for sub, summary in self.coalescer.pop_expired():
+                    self._enqueue(sub, summary)
+            except Exception:
+                logger.exception("push coalesce sweep failed; continuing")
 
     async def _drain_loop(self) -> None:
         while True:

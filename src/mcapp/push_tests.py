@@ -24,6 +24,7 @@ import contextlib
 import hashlib
 import json
 import pathlib
+import stat
 import tempfile
 import time
 from typing import TYPE_CHECKING, Any, cast
@@ -49,6 +50,7 @@ from .sse_routes.push import (
     PushSubscriptionInfo,
     PushSubscriptionKeys,
     PushUnsubscribeRequest,
+    _is_node_local_noise,
     build_push_router,
 )
 
@@ -63,6 +65,10 @@ _CONTRACT_PATH = pathlib.Path(__file__).parent / "contract" / "push_contract.jso
 # either implementation. v3 (2026-07-17): adds the blocklist push-path gate
 # + blocklist_vectors.
 _EXPECTED_SHA256 = "5d8d32cf1879d0e4a4929a4c231122e5a00444876ed99d2d75e90169f9b07689"
+
+# The VAPID keyfile holds a raw P-256 private scalar, so load_or_create_vapid chmods it
+# owner-only. At the default 0644 any local account could forge VAPID JWTs as this node.
+_EXPECTED_VAPID_FILE_MODE = 0o600
 
 # A fixed, obviously-fake VAPID keypair — never parsed as real crypto, since
 # every webpush_fn in this suite is a stub that ignores its value entirely.
@@ -102,6 +108,12 @@ class _StubMessageRouter:
     def subscribe(self, message_type: str, handler_func: Any) -> None:
         self._subscribers.setdefault(message_type, []).append(handler_func)
 
+    @property
+    def subscriptions(self) -> dict[str, list[Any]]:
+        """Read-only view of the topic -> handlers map, so tests can assert WHICH
+        ingest topics a router wired itself to without reaching into a private."""
+        return self._subscribers
+
     def get_protocol(self, name: str) -> Any:
         """Mirror `MessageRouter.get_protocol`: return the registered protocol
         or None. These push tests register no `commands` protocol, so the
@@ -122,6 +134,9 @@ class _StubManager:
 
     def __init__(self, message_router: Any) -> None:
         self.message_router = message_router
+        # Set by build_push_router so SSEManager.stop_server() can cancel the
+        # dispatcher's perpetual tasks; declared here so the stub matches.
+        self.push_dispatcher: Any = None
 
     def require_storage(self) -> Any:
         return self.message_router.storage_handler
@@ -217,6 +232,14 @@ async def run_push_tests() -> bool:
     #     handle_mesh_message, not just the pure is_sender_blocked predicate
     #     (the old code had no gate, so this fails on the pre-fix behavior).
     await _test_blocklist_gate_suppresses_delivery(_record)
+
+    # 4c. Node-local policy filter at the wiring seam: text ACKs and {CET} broadcasts
+    #     pass the shared contract's `eligibility` (type "msg" + non-empty text) but
+    #     must never produce a notification.
+    _test_node_local_noise_filter(_record)
+
+    # 4d. Both ingest topics are subscribed — a BLE-only node must get pushes too.
+    await _test_push_subscribes_to_both_ingest_topics(_record)
 
     # 5. VAPID persistence (injected fake generator — never real crypto).
     _test_vapid_persistence(_record)
@@ -605,6 +628,96 @@ def _test_vapid_persistence(record: _RecordFn) -> None:
             calls["n"] == 1,
         )
         record("vapid: persisted keypair is stable across loads", first == second)
+        record(
+            "vapid: private key file is 0600, not world-readable",
+            stat.S_IMODE(path.stat().st_mode) == _EXPECTED_VAPID_FILE_MODE,
+        )
+
+    # REGRESSION: load_or_create_vapid runs inside build_app() with no try/except on the
+    # path, so a raise here took down the whole proxy (UDP + BLE + SSE), not just push.
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        corrupt = pathlib.Path(tmp_dir) / "vapid.json"
+        corrupt.write_text("", encoding="utf-8")  # truncated by a power loss mid-write
+        calls["n"] = 0
+        recovered = load_or_create_vapid(path=corrupt, generator=_fake_generator)
+        record(
+            "vapid: a truncated keyfile is regenerated instead of raising",
+            recovered.get("private_key") == "fake-priv" and calls["n"] == 1,
+        )
+
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        wrong_shape = pathlib.Path(tmp_dir) / "vapid.json"
+        wrong_shape.write_text('["not", "a", "dict"]', encoding="utf-8")
+        calls["n"] = 0
+        reshaped = load_or_create_vapid(path=wrong_shape, generator=_fake_generator)
+        record(
+            "vapid: a valid-JSON non-object keyfile is regenerated instead of raising",
+            reshaped.get("private_key") == "fake-priv" and calls["n"] == 1,
+        )
+
+    def _exploding_generator() -> dict[str, str]:
+        raise RuntimeError("no cryptography available")
+
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        path = pathlib.Path(tmp_dir) / "nested" / "vapid.json"
+        degraded = load_or_create_vapid(path=path, generator=_exploding_generator)
+        record(
+            "vapid: keygen failure degrades to an empty keypair, never raises",
+            degraded["private_key"] == "" and degraded["public_key"] == "",
+        )
+
+
+def _test_node_local_noise_filter(record: _RecordFn) -> None:
+    """The wiring seam must drop frames MCProxy never shows a user, which the shared
+    contract's `eligibility` (type + non-empty text only) lets through: text ACKs and
+    {CET} time broadcasts. Without this every message the operator sent produced a
+    push notification reading e.g. 'DK5EN-1  :ack753'.
+    """
+    record(
+        "noise filter: a text ACK is not pushed",
+        _is_node_local_noise({"type": "msg", "msg": "DK5EN-1  :ack753"}),
+    )
+    record(
+        "noise filter: a {CET} time broadcast is not pushed",
+        _is_node_local_noise({"type": "msg", "msg": "{CET}12:34:56"}),
+    )
+    record(
+        "noise filter: the `text` key is honoured like `msg`",
+        _is_node_local_noise({"type": "msg", "text": "OE1ABC-1  :ack9"}),
+    )
+    record(
+        "noise filter: a normal chat message IS pushed",
+        not _is_node_local_noise({"type": "msg", "msg": "Servus, wie geht's?"}),
+    )
+
+
+async def _test_push_subscribes_to_both_ingest_topics(record: _RecordFn) -> None:
+    """Push must subscribe to "ble_notification" as well as "mesh_message".
+
+    Storage, the SSE broadcast, and the command handler all subscribe to both; push
+    subscribed only to "mesh_message", so a node in BLE `remote` mode (a documented,
+    supported configuration) delivered ZERO pushes, silently.
+    """
+    router_stub = _StubMessageRouter(None, "DK5EN-99")
+    manager = _StubManager(router_stub)
+    dispatcher = PushDispatcher(storage=None, vapid=_FAKE_VAPID, webpush_fn=lambda **_k: None)
+    try:
+        build_push_router(cast("SSEManager", manager), vapid=_FAKE_VAPID, dispatcher=dispatcher)
+        subscribed = router_stub.subscriptions
+        record(
+            'push subscribes to "mesh_message"',
+            len(subscribed.get("mesh_message", [])) == 1,
+        )
+        record(
+            'push subscribes to "ble_notification" too (BLE-only nodes get pushes)',
+            len(subscribed.get("ble_notification", [])) == 1,
+        )
+        record(
+            "push dispatcher is reachable from the manager for shutdown",
+            manager.push_dispatcher is dispatcher,
+        )
+    finally:
+        await dispatcher.stop()
 
 
 async def _test_execution_isolation(record: _RecordFn) -> None:

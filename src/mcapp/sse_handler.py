@@ -84,7 +84,7 @@ try:
 except ImportError:
     FASTAPI_AVAILABLE = False
     logger.warning("FastAPI not installed. SSE transport will not be available.")
-    logger.warning("Install with: pip install fastapi uvicorn")
+    logger.warning("Install with: uv sync --all-packages")
 
 try:
     import uvicorn
@@ -145,6 +145,12 @@ class SSEManager:
         self.server: Any = None
         self._server_task: asyncio.Task[None] | None = None
         self.shutdown_event = asyncio.Event()
+        # Set by build_push_router so stop_server() can cancel the push dispatcher's
+        # perpetual drain/sweep tasks. Typed Any because push_delivery is only importable
+        # behind the FastAPI try/except above. Previously the dispatcher was reachable
+        # only as an attribute monkey-patched onto the APIRouter, so no shutdown path
+        # could see it and both tasks were still pending at process exit.
+        self.push_dispatcher: Any = None
 
         # Subscribe to messages from the router
         if message_router:
@@ -728,6 +734,10 @@ class SSEManager:
                     self._server_task.cancel()
                     with contextlib.suppress(asyncio.CancelledError):
                         await self._server_task
+
+        if self.push_dispatcher is not None:
+            with contextlib.suppress(Exception):
+                await self.push_dispatcher.stop()
 
         await self._disconnect_all_clients()
         logger.info("SSE server stopped")
