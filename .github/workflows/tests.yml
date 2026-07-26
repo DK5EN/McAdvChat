@@ -28,11 +28,17 @@ jobs:
       - name: Pin Python 3.11
         run: uv python install 3.11
 
+      # Ruff is PINNED. Unpinned, `uvx ruff` resolves the newest release at run
+      # time, so a ruff release could turn a green branch red with no change of
+      # ours — and new rules land in the `RUF`/`PL`/`S` prefixes this repo selects
+      # wholesale. Commit 23b37b5 ("clear ruff 0.16 fallout") was exactly that.
+      # Bump deliberately, and in lockstep with mc-chat + ble_service, which must
+      # lint the shared classifier/ and contract/ subtrees under identical rules.
       - name: Ruff lint
-        run: uvx ruff check .
+        run: uvx ruff@0.16.0 check .
 
       - name: Ruff format check
-        run: uvx ruff format --check .
+        run: uvx ruff@0.16.0 format --check .
 
       # --all-packages is load-bearing: the root package does NOT depend on the
       # ble_service workspace member, so a plain sync leaves its deps (dbus-next,
