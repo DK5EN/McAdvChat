@@ -1,94 +1,120 @@
 {
-  "description": "Canonical vectors for the callsign-blocklist gate, shared between MCProxy's MessageRouter.blocklist_decision (src/mcapp/main.py) and the webapp's mirror of it in processDataElement (src/services/messageProcessor.ts). Both sides classify an inbound payload from a blocked src as pass/redirect/drop using the same rules: strip the via-relay path off src before matching (first comma component), resolve dst to its effective target (last comma component of a via-routed 'VIA,TARGET'), and treat numeric groups plus '*'/'ALL'/'TEST' as group-like (redirect to the spam group) while everything else drops. `blocklist` entries are matched by EXACT string (no SSID normalization) against src, both sides upper-cased before comparison.\n\nEach vector's `decision` is MCProxy's actual output (verified live against MessageRouter.blocklist_decision — see MCProxy/src/mcapp/send_path_tests.py). Where the webapp's mirror provably disagrees, the vector also carries `webapp_decision` plus a `note` explaining the divergence; both sides then assert their OWN real behavior against the correct field rather than papering over the mismatch. This file is vendored byte-for-byte (parsed-equal, not literal-byte-equal — Prettier reformats the webapp copy) at webapp/src/services/__tests__/blocklist_decision_vectors.json; a spec there diffs the two copies when both repos are checked out side by side.\n\nKNOWN DIVERGENCE (documented, not fixed — code-simpl-v2.md item 4d): MCProxy's is_group() (src/mcapp/commands/parsing.py) enforces a 1..99999 numeric range for group dsts. The webapp's isGroupDst (src/utils/callsignUtils.ts) is a bare /^\\d+$/ test with no range check. So an out-of-range numeric dst (e.g. '0', or 6+ digits like '100000') is classified group-like by the webapp but NOT by MCProxy — MCProxy drops such traffic from a blocked src while the webapp would redirect it to the spam group instead. Real MeshCom group ids never leave 1..99999 in practice, so this has no observed production impact; flagged here rather than patched because fixing either side is outside this vector-authoring task's remit.",
+  "description": "Canonical vectors for the callsign-blocklist gate, shared between MCProxy's MessageRouter.blocklist_decision (src/mcapp/main.py) and the webapp's mirror of it in processDataElement (src/services/messageProcessor.ts). Both sides classify an inbound payload from a blocked src as pass/redirect/drop using the same rules: strip the via-relay path off src before matching (first comma component), resolve dst to its effective target (last comma component of a via-routed 'VIA,TARGET'), and treat numeric groups plus '*'/'ALL'/'TEST' as group-like (redirect to the spam group) while everything else drops. `blocklist` entries are matched by EXACT string (no SSID normalization) against src, both sides upper-cased before comparison.\n\nEach vector's `decision` is MCProxy's actual output (verified live against MessageRouter.blocklist_decision — see MCProxy/src/mcapp/send_path_tests.py). This file is vendored byte-for-byte (parsed-equal, not literal-byte-equal — Prettier reformats the webapp copy) at webapp/src/services/__tests__/blocklist_decision_vectors.json; a spec there diffs the two copies when both repos are checked out side by side.\n\nRESOLVED DIVERGENCE (2026-07-27 drift-resolution campaign, webapp docs/code-simpl-v2.md): earlier versions of this file documented that the webapp's isGroupDst was a bare /^\\d+$/ test while MCProxy's is_group() enforced 1..99999, so an out-of-range numeric dst ('0', '100000') from a blocked src redirected on the webapp but dropped on MCProxy. The group predicate is now unified across all three repos (see group_dst_vectors.json, canonical at MCProxy/src/mcapp/commands/group_dst_vectors.json) and BOTH sides drop: the former divergence vectors below carry a single `decision` like every other vector, and the per-side `webapp_decision`/`note` escape hatch is gone from this file.",
   "canonical": "MCProxy/src/mcapp/blocklist_decision_vectors.json",
   "vectors": [
     {
       "name": "unblocked src passes through",
-      "blocklist": ["OE9BAD-1"],
+      "blocklist": [
+        "OE9BAD-1"
+      ],
       "src": "OE1GOOD-1",
       "dst": "20",
       "decision": "pass"
     },
     {
       "name": "blocked src + numeric group dst redirects to the spam group",
-      "blocklist": ["OE9BAD-1"],
+      "blocklist": [
+        "OE9BAD-1"
+      ],
       "src": "OE9BAD-1",
       "dst": "20",
       "decision": "redirect"
     },
     {
       "name": "blocked src + personal dst drops (not redirected)",
-      "blocklist": ["OE9BAD-1"],
+      "blocklist": [
+        "OE9BAD-1"
+      ],
       "src": "OE9BAD-1",
       "dst": "DK5EN-99",
       "decision": "drop"
     },
     {
       "name": "blocked src + broadcast dst '*' redirects",
-      "blocklist": ["OE9BAD-1"],
+      "blocklist": [
+        "OE9BAD-1"
+      ],
       "src": "OE9BAD-1",
       "dst": "*",
       "decision": "redirect"
     },
     {
       "name": "blocked src + broadcast dst 'ALL' redirects",
-      "blocklist": ["OE9BAD-1"],
+      "blocklist": [
+        "OE9BAD-1"
+      ],
       "src": "OE9BAD-1",
       "dst": "ALL",
       "decision": "redirect"
     },
     {
       "name": "blocked src + special group dst 'TEST' redirects",
-      "blocklist": ["OE9BAD-1"],
+      "blocklist": [
+        "OE9BAD-1"
+      ],
       "src": "OE9BAD-1",
       "dst": "TEST",
       "decision": "redirect"
     },
     {
       "name": "via-routed blocked src (sender is the first hop) + group dst redirects",
-      "blocklist": ["DJ4XI-12"],
+      "blocklist": [
+        "DJ4XI-12"
+      ],
       "src": "DJ4XI-12,RELAY-1",
       "dst": "20",
       "decision": "redirect"
     },
     {
       "name": "via-routed blocked src + personal dst drops",
-      "blocklist": ["DJ4XI-12"],
+      "blocklist": [
+        "DJ4XI-12"
+      ],
       "src": "DJ4XI-12,RELAY-1",
       "dst": "DK5EN-99",
       "decision": "drop"
     },
     {
       "name": "via-routed group dst resolves from the LAST comma component",
-      "blocklist": ["OE9BAD-1"],
+      "blocklist": [
+        "OE9BAD-1"
+      ],
       "src": "OE9BAD-1",
       "dst": "RELAY-1,20",
       "decision": "redirect"
     },
     {
       "name": "a blocked RELAY hop (not the sender) must NOT trigger the gate",
-      "blocklist": ["RELAY-1"],
+      "blocklist": [
+        "RELAY-1"
+      ],
       "src": "DJ4XI-12,RELAY-1",
       "dst": "20",
       "decision": "pass"
     },
     {
       "name": "SSID-specific block does not cover a different SSID of the same base call",
-      "blocklist": ["OE9BAD-1"],
+      "blocklist": [
+        "OE9BAD-1"
+      ],
       "src": "OE9BAD-2",
       "dst": "20",
       "decision": "pass"
     },
     {
       "name": "base-callsign block does not cover any SSID'd variant (exact match only, no normalization)",
-      "blocklist": ["OE9BAD"],
+      "blocklist": [
+        "OE9BAD"
+      ],
       "src": "OE9BAD-1",
       "dst": "20",
       "decision": "pass"
     },
     {
       "name": "lower-case incoming src is still matched (both sides upper-case before comparing)",
-      "blocklist": ["OE9BAD-1"],
+      "blocklist": [
+        "OE9BAD-1"
+      ],
       "src": "oe9bad-1",
       "dst": "20",
       "decision": "redirect"
@@ -102,28 +128,30 @@
     },
     {
       "name": "numeric group dst at the upper boundary (99999) is still in-range on both sides",
-      "blocklist": ["OE9BAD-1"],
+      "blocklist": [
+        "OE9BAD-1"
+      ],
       "src": "OE9BAD-1",
       "dst": "99999",
       "decision": "redirect"
     },
     {
-      "name": "DIVERGENCE: dst '0' is out of MCProxy's 1..99999 group range but webapp's isGroupDst has no lower bound",
-      "blocklist": ["OE9BAD-1"],
+      "name": "out-of-range numeric dst '0' is not a group: blocked src drops (unified 2026-07-27, group_dst_vectors.json)",
+      "blocklist": [
+        "OE9BAD-1"
+      ],
       "src": "OE9BAD-1",
       "dst": "0",
-      "decision": "drop",
-      "webapp_decision": "redirect",
-      "note": "MCProxy's is_group() requires 1 <= n <= 99999, so '0' is not a group and blocklist_decision drops. The webapp's isGroupDst (src/utils/callsignUtils.ts) is a bare /^\\d+$/ test with no range check, so it treats '0' as group-like and redirects to the spam group instead. Not patched — see this file's top-level description."
+      "decision": "drop"
     },
     {
-      "name": "DIVERGENCE: dst '100000' is out of MCProxy's 1..99999 group range but webapp's isGroupDst has no upper bound",
-      "blocklist": ["OE9BAD-1"],
+      "name": "out-of-range numeric dst '100000' is not a group: blocked src drops (unified 2026-07-27, group_dst_vectors.json)",
+      "blocklist": [
+        "OE9BAD-1"
+      ],
       "src": "OE9BAD-1",
       "dst": "100000",
-      "decision": "drop",
-      "webapp_decision": "redirect",
-      "note": "Same divergence class as dst '0': MCProxy's is_group() caps at 99999, MCProxy drops. The webapp's isGroupDst has no upper bound, so it redirects. Not patched — see this file's top-level description."
+      "decision": "drop"
     }
   ]
 }

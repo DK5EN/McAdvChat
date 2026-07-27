@@ -404,7 +404,11 @@ async def run_query_tests() -> bool:  # noqa: PLR0915 - test suite lists one cas
                     "232",
                 ),
             )
-            page = await storage.get_messages_page("232")
+            # Explicit cursor: the default before_timestamp=now_ms() races the
+            # rows inserted at drift_ts/drift_ts+1 when this block runs within
+            # one millisecond (the page query is strictly `timestamp < ?`),
+            # making the assertions below flaky.
+            page = await storage.get_messages_page("232", before_timestamp=drift_ts + 10)
             page_msgs = page["messages"]
             results.append(
                 (
@@ -435,6 +439,41 @@ async def run_query_tests() -> bool:  # noqa: PLR0915 - test suite lists one cas
                 (
                     "drift: real ':ack931' ack IS in the smart-initial acks payload",
                     any(":ack931" in m for m in initial["acks"]),
+                )
+            )
+
+            # --- unified group predicate in get_messages_page (group_dst_vectors.json) --
+            # Post-v2 ingest gives a message to out-of-range dst '0' a NULL
+            # conversation_key. The old page branch classified '0' as a group
+            # (bare isdigit) and queried conversation_key = '0' — missing the
+            # row entirely. Unified, '0' is no group: the request falls to the
+            # exact-dst arm and the row stays reachable.
+            await storage._mutate(
+                "INSERT INTO messages"
+                " (msg_id, src, dst, msg, type, timestamp, src_type, conversation_key)"
+                " VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    "DRIFT-ZERO",
+                    "OE1ABC-1",
+                    "0",
+                    "message to out-of-range dst zero",
+                    "msg",
+                    drift_ts + 2,
+                    "lora",
+                    None,
+                ),
+            )
+            # Explicit cursor: the default before_timestamp=now_ms() can equal
+            # the row's timestamp when this block runs within one millisecond,
+            # and the page query is strictly `timestamp < ?`.
+            zero_page = await storage.get_messages_page("0", before_timestamp=drift_ts + 10)
+            results.append(
+                (
+                    (
+                        "unified group predicate: page for out-of-range dst '0' serves its"
+                        " NULL-key row via the exact-dst arm (old group-shape missed it)"
+                    ),
+                    any("out-of-range dst zero" in m for m in zero_page["messages"]),
                 )
             )
         finally:

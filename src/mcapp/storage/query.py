@@ -15,6 +15,7 @@ from pathlib import Path
 from statistics import mean
 from typing import Any, cast
 
+from ..commands.parsing import is_group
 from ..logging_setup import get_logger
 from ..util import now_ms
 from ._base import StorageBase
@@ -421,8 +422,13 @@ class QueryMixin(StorageBase):
         if before_timestamp is None:
             before_timestamp = now_ms()
 
+        # is_dm keeps the bare digit-shape test on purpose: its question is
+        # "could dst be a personal callsign", not "is dst a group" — an
+        # out-of-range digit dst like '0' is neither and must fall through to
+        # the exact-dst arm below (which still serves its legacy rows), not
+        # into the DM arm whose conversation_key would be NULL.
         is_dm = dst and src and not dst.isdigit() and dst != "*"
-        is_group = bool(dst) and (dst.isdigit() or dst == "TEST")
+        is_group_dst = bool(dst) and is_group(dst)
 
         params: tuple[Any, ...] = ()
         if dst == "Time":
@@ -461,9 +467,12 @@ class QueryMixin(StorageBase):
                 " AND timestamp < ? ORDER BY timestamp DESC LIMIT ?"
             )
             params = (conv_key, before_timestamp, limit + 1)
-        elif is_group:
+        elif is_group_dst:
             # Group: match via conversation_key so via-routed posts
-            # (dst 'VIA,232' → key '232') are included in the page
+            # (dst 'VIA,232' → key '232') are included in the page.
+            # Unified predicate (group_dst_vectors.json): an out-of-range
+            # digit dst never takes this shape — post-v2 its rows carry a
+            # NULL conversation_key, which this arm could never match.
             query = (
                 f"SELECT {_MSG_SELECT} FROM messages"  # noqa: S608 - identifiers from fixed set; values parameterized
                 " WHERE type = 'msg' AND msg NOT GLOB '*:ack[0-9]*'"

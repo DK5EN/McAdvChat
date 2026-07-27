@@ -9,6 +9,7 @@ import json
 import sqlite3
 from typing import Any, cast
 
+from ..commands.parsing import is_group
 from ..logging_setup import get_logger
 from ._base import StorageBase
 from .constants import SQLITE_BUSY_TIMEOUT_S, compute_conversation_key
@@ -67,7 +68,13 @@ class PrefsMixin(StorageBase):
                         " AND type IN ('msg', 'ack')"
                         " AND (msg IS NULL OR msg NOT LIKE '{CET}%')"
                     )
-                elif dst.isdigit() or dst == "TEST":
+                elif is_group(dst):
+                    # Unified predicate (group_dst_vectors.json). An
+                    # out-of-range digit dst ('0') falls to the personal arm,
+                    # whose conversation key is None post-v2 and matches
+                    # nothing — consistent with "no bucket". Legacy rows
+                    # keyed verbatim pre-v2 are no longer deletable here;
+                    # the app no longer surfaces such buckets at all.
                     cursor = conn.execute(
                         "DELETE FROM messages WHERE conversation_key = ?"
                         " AND type IN ('msg', 'ack')",

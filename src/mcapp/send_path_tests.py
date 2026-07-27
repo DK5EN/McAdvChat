@@ -99,10 +99,12 @@ def _run_blocklist_contract_vectors(record: Callable[[str, bool], None]) -> None
     (messageProcessor.blocklist.spec.ts) so both implementations stay pinned to one
     behavioral contract instead of drifting via comment-only parity (docs/
     code-simpl-v2.md item 4d). Each vector's `decision` is this function's own live
-    output. A few vectors also carry a `webapp_decision` + `note` documenting a
-    known src/webapp divergence (the webapp's isGroupDst has no 1..99999 range
-    check, unlike this file's is_group) — this loop asserts only the canonical
-    `decision`; the webapp spec asserts `webapp_decision` for those.
+    output. Since the 2026-07-27 drift-resolution campaign every vector carries a
+    single `decision` asserted identically on both sides — the former
+    `webapp_decision`/`note` escape hatch (the webapp's isGroupDst used to lack
+    the 1..99999 range check) is gone: the group predicate is unified across all
+    three repos (commands/group_dst_vectors.json), so an out-of-range numeric dst
+    from a blocked src now drops everywhere.
 
     Factored out of run_send_path_tests() to keep that function under ruff's
     PLR0915 statement-count limit rather than suppressing the check.

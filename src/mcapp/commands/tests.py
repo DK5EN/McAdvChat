@@ -10,7 +10,9 @@ from typing import Any
 
 from ..util import now_ms
 from .constants import has_console
-from .parsing import parse_command
+from .parsing import is_group, parse_command
+
+_GROUP_DST_VECTORS_PATH = Path(__file__).parent / "group_dst_vectors.json"
 
 # --- Hermetic storage fixture (B1) ------------------------------------------
 # The storage-backed self-commands (!STATS / !MHEARD / !SEARCH / !POS) used to
@@ -92,6 +94,54 @@ async def _seed_test_storage(storage: Any) -> None:
     ]
     for row in rows:
         await storage.store_message(row, json.dumps(row))
+
+
+def test_group_dst_vectors() -> bool:
+    """Replay the canonical cross-repo group-predicate contract through the real
+    is_group (drift-resolution campaign 2026-07-27, webapp docs/code-simpl-v2.md
+    decision D2).
+
+    THIS directory holds the canonical group_dst_vectors.json; mc-chat
+    (tests/fixtures/) and the webapp (src/utils/__tests__/) vendor parse-equal
+    copies and replay every vector against their own implementations, so the
+    three predicates cannot drift silently. The non-ASCII-digit vectors ('٣',
+    '²', '１２３') pin the isascii() gate: str.isdigit() accepts all three while
+    the unified predicate must reject them — and must never crash on '²', where
+    isdigit() is True but int() raises.
+    """
+    if has_console:
+        print("\n🧪 Testing group_dst_vectors.json contract (unified is_group):")
+        print("=" * 50)
+
+    with _GROUP_DST_VECTORS_PATH.open(encoding="utf-8") as f:
+        contract = json.load(f)
+    vectors: list[dict[str, Any]] = contract["vectors"]
+
+    # Guard against a silently empty replay loop.
+    results: list[bool] = [len(vectors) > 0]
+    if not vectors and has_console:
+        print("❌ FAIL | group_dst_vectors.json carries no vectors")
+
+    for vector in vectors:
+        actual = is_group(vector["dst"])
+        ok = actual == vector["is_group"]
+        results.append(ok)
+        if has_console:
+            status = "✅ PASS" if ok else "❌ FAIL"
+            print(f"{status} | {vector['name']}")
+            if not ok:
+                print(
+                    f"     is_group({vector['dst']!r}) = {actual!r}"
+                    f" (expected: {vector['is_group']!r})"
+                )
+
+    passed = sum(1 for ok in results if ok)
+    total = len(results)
+    if has_console:
+        print(f"🧪 group_dst_vectors Summary: {passed}/{total} tests passed")
+        print("=" * 50)
+
+    return all(results)
 
 
 def test_meteo_timezone_validators() -> bool:
@@ -383,6 +433,7 @@ async def run_all_tests(handler: Any) -> bool:
             handler.message_router.storage_handler = storage
 
         try:
+            group_vectors_passed = test_group_dst_vectors()
             meteo_tz_passed = test_meteo_timezone_validators()
             meteo_cache_passed = test_meteo_negative_cache()
             response_passed = await test_response_serialization_and_drain()
@@ -409,6 +460,7 @@ async def run_all_tests(handler: Any) -> bool:
 
     total_passed = all(
         [
+            group_vectors_passed,
             meteo_tz_passed,
             meteo_cache_passed,
             response_passed,

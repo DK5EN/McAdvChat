@@ -9,14 +9,19 @@ router_tests.run_suppression_tests(): a results list, PASS/FAIL lines, a summary
 and a bool return.
 
 In addition to the hand-written cases below, this suite replays the vendored
-cross-repo contract at ./conversation_key_vectors.json (docs/code-simpl-v2.md item
-4b in the webapp repo). THIS file is the canonical copy — compute_conversation_key
-is authoritative here — and the webapp vendors a parse-equal copy at
-src/utils/__tests__/conversation_key_vectors.json, replayed there against its own
+cross-repo contract at ./conversation_key_vectors.json (v2 — drift-resolution
+campaign 2026-07-27; originally docs/code-simpl-v2.md item 4b in the webapp
+repo). THIS file is the canonical copy — compute_conversation_key is
+authoritative here. The webapp vendors a parse-equal copy at
+src/utils/__tests__/conversation_key_vectors.json, replayed against its own
 mirror helpers (effectiveDst / makePairKey / translateServerSummaryKey in
-src/utils/callsignUtils.ts). See that JSON's own "description" field for exactly
-which invariant is pinned and which intentional divergence (self-DM handling) is
-documented rather than silently papered over.
+src/utils/callsignUtils.ts), and mc-chat vendors one at
+tests/fixtures/conversation_key_vectors.json, replayed against its
+_conversation_key mirror in meshcom_mock/storage.py. See the JSON's own
+"description" field for exactly which invariant is pinned — including the v2
+rule that an all-ASCII-digit target outside the unified group range 1..99999
+yields None — and which intentional divergence (self-DM handling) is documented
+rather than silently papered over.
 """
 
 import json
@@ -29,10 +34,14 @@ _VECTORS_PATH = Path(__file__).parent / "conversation_key_vectors.json"
 
 def _load_conversation_key_vectors() -> list[dict[str, str | None]]:
     """Load the vendored cross-repo conversation-key vectors. Canonical copy —
-    the webapp's copy at src/utils/__tests__/conversation_key_vectors.json must
-    stay parse-equal to this one (its own Prettier may reformat it)."""
+    the webapp's copy at src/utils/__tests__/conversation_key_vectors.json and
+    mc-chat's at tests/fixtures/conversation_key_vectors.json must stay
+    parse-equal to this one (the webapp's Prettier may reformat it)."""
     with _VECTORS_PATH.open(encoding="utf-8") as f:
         contract = json.load(f)
+    if contract["version"] != 2:
+        msg = f"conversation_key_vectors.json version {contract['version']!r} != 2"
+        raise AssertionError(msg)
     vectors: list[dict[str, str | None]] = contract["vectors"]
     return vectors
 

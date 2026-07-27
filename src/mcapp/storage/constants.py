@@ -4,6 +4,8 @@ SQLiteStorage mixins (ST-04). Moved verbatim out of sqlite_storage.py.
 
 from typing import NamedTuple
 
+from ..commands.parsing import is_group
+
 # Constants matching message_storage.py
 BUCKET_SECONDS = 5 * 60
 VALID_RSSI_RANGE = (-140, -30)
@@ -98,14 +100,27 @@ def compute_conversation_key(src: str, dst: str) -> str | None:
     Via-routed dst is 'VIA[,VIA2],TARGET' — the real target is the LAST
     comma component (e.g. 'OE1KBC-12,232' → group 232). The src field
     carries the relay path the other way round: FIRST component = sender.
+
+    The group branch delegates to the unified cross-repo predicate
+    (commands/parsing.py:is_group; contracts ./conversation_key_vectors.json v2
+    and ../commands/group_dst_vectors.json). An in-range group target keeps its
+    RAW string as the key (string-preserving: '00232' → '00232', 'test' →
+    'test'), while an all-ASCII-digit target OUTSIDE 1..99999 ('0', '100000')
+    yields None — no bucket at all. Callers fall back to
+    COALESCE(conversation_key, dst), so client-visible partitioning for such
+    traffic is unchanged.
     """
     if not dst:
         return None
     target = dst.rsplit(",", maxsplit=1)[-1].strip()
-    if target.isdigit() or target == "TEST":
+    if is_group(target):
         return target
     if target == "*":
         return "*"
+    if target.isascii() and target.isdigit():
+        # All-ASCII digits but outside the 1..99999 group range: no bucket
+        # (conversation_key_vectors.json v2), NOT a degenerate DM pair.
+        return None
     # DM: strip SSIDs, sort alphabetically
     base_src = src.split(",", maxsplit=1)[0].split("-", maxsplit=1)[0]
     base_dst = target.split("-")[0]

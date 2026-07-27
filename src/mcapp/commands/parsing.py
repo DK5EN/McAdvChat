@@ -104,7 +104,21 @@ def extract_target_callsign(msg: str) -> str | None:  # noqa: PLR0911, PLR0912 -
 
 
 def is_group(dst: str) -> bool:
-    """Check if destination is a group."""
+    """Check if destination is a group.
+
+    Unified cross-repo predicate (drift-resolution campaign 2026-07-27): dst is
+    a group iff it equals 'TEST' case-insensitively, OR it is a non-empty
+    all-ASCII-digit string whose integer value is 1..99999 (leading zeros
+    allowed: '00232' is group 232). Contract: ./group_dst_vectors.json —
+    canonical HERE, vendored parse-equal and replayed by mc-chat
+    (tests/fixtures/) and the webapp (src/utils/__tests__/).
+
+    The isascii() gate before isdigit() is load-bearing: str.isdigit() accepts
+    non-ASCII digits that int() happily parses ('٣' == 3, '１２３' == 123 —
+    group ids the webapp's ASCII-only regex rejects) and even some int()
+    rejects ('²' raises ValueError). After the gate only ASCII '0'-'9' remain,
+    int() cannot raise, so the former try/except ValueError guard is gone.
+    """
     if not dst:
         return False
 
@@ -112,15 +126,9 @@ def is_group(dst: str) -> bool:
     if dst.upper() == "TEST":
         return True
 
-    # Numeric groups: 1-99999
-    if dst.isdigit():
-        try:
-            group_num = int(dst)
-        except ValueError:
-            return False
-
-        else:
-            return 1 <= group_num <= _MAX_GROUP_NUM
+    # Numeric groups: 1-99999, ASCII digits only
+    if dst.isascii() and dst.isdigit():
+        return 1 <= int(dst) <= _MAX_GROUP_NUM
     return False
 
 
