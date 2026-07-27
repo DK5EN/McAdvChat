@@ -22,10 +22,21 @@ Coverage:
       8-day pos cutoff by ±30 min are seeded; the correct ones must survive. A
       naive-local cutoff (non-zero UTC offset ≥ 1 h) would shift the boundary
       past both rows and fail this test.
+  (d) The ':ack<N>' predicate seam (docs/code-simpl-v2.md item 4c) — replays
+      the vendored ack_predicate_vectors.json's `contains_ack_marker` column
+      against the REAL SQL exclusion clause query.py's read paths use
+      ("... AND msg NOT LIKE '%:ack%'"), and its `is_ack_strict`/`ack_number`
+      columns against a documented literal mirror of ingest.py:695's regex
+      (see the comment above _INGEST_ACK_REGEX_MIRROR for why it's a mirror,
+      not a call into ingest.py — that call site has no clean seam to unit
+      test in isolation without touching ingest.py, which is out of scope
+      here).
 
 All timestamps are MILLISECONDS (project-wide DB convention).
 """
 
+import json
+import re
 import tempfile
 from pathlib import Path
 from typing import Any
@@ -41,6 +52,34 @@ _FIVE_MIN_MS = BUCKET_SECONDS * 1000
 _MS_PER_HOUR = 3600 * 1000
 _MS_PER_DAY = 24 * _MS_PER_HOUR
 _POS_RETENTION_MS = DEFAULT_POS_RETENTION_HOURS * _MS_PER_HOUR  # 8 days
+
+# Vendored copy of the cross-repo ':ack<N>' predicate truth table (docs/code-
+# simpl-v2.md item 4c). mc-chat is upstream/canonical
+# (tests/fixtures/ack_predicate_vectors.json); this copy must stay
+# byte-identical (webapp's predicates.spec.ts drift-checks its own copy,
+# parsed, against both this file and mc-chat's).
+_ACK_VECTORS_PATH = Path(__file__).parent / "ack_predicate_vectors.json"
+
+# Mirrors ingest.py:695's inline ack-number regex BYTE FOR BYTE. That call
+# site (`if msg and ":ack" in msg: ack_match = re.search(r":ack(\d+)", msg)`)
+# sits inside store_message(), a large function that also does echo_id
+# lookup, time-windowed dedup, and a DB mutation — there is no clean seam to
+# import or call it in isolation without either touching ingest.py (out of
+# scope for this campaign item) or building a much larger integration
+# harness around store_message's full side effects. This constant is an
+# explicitly-flagged, honest substitute: it pins the PATTERN so a future
+# unreviewed edit to ingest.py's regex is at least visible as a diff here,
+# but it is NOT proof the production code path still behaves identically.
+# mc-chat's decoder.py uses the textually identical pattern and IS exercised
+# through real production code in mc-chat/tests/test_decoder.py — that is
+# the actual regex-engine coverage for this exact pattern.
+_INGEST_ACK_REGEX_MIRROR = re.compile(r":ack(\d+)")
+
+
+def _load_ack_vectors() -> list[dict[str, Any]]:
+    with _ACK_VECTORS_PATH.open(encoding="utf-8") as f:
+        contract = json.load(f)
+    return list(contract["vectors"])
 
 
 async def run_query_tests() -> bool:  # noqa: PLR0915 - test suite lists one case per assertion
@@ -241,6 +280,70 @@ async def run_query_tests() -> bool:  # noqa: PLR0915 - test suite lists one cas
                     await _count_5min("UTCOLD") == 0,
                 )
             )
+
+            # --- (d) ':ack<N>' predicate seam (docs/code-simpl-v2.md item 4c) -----
+            ack_vectors = _load_ack_vectors()
+            ack_vectors_present_label = (
+                "ack predicate: vendored fixture carries vectors to replay"
+                " (guards against a silently empty loop)"
+            )
+            results.append((ack_vectors_present_label, len(ack_vectors) > 0))
+
+            for i, vector in enumerate(ack_vectors):
+                # (d1) contains_ack_marker, replayed against the REAL SQL predicate
+                # query.py's read paths use (get_smart_initial_with_summary,
+                # get_messages_page, etc.: "... AND msg NOT LIKE '%:ack%'").
+                msg_id = f"ACKVEC-{i}"
+                await storage._mutate(
+                    "INSERT INTO messages (msg_id, src, dst, msg, type, timestamp, src_type)"
+                    " VALUES (?, ?, ?, ?, ?, ?, ?)",
+                    (msg_id, "TESTCALL-1", "232", vector["text"], "msg", now_ms() + i, "lora"),
+                )
+                not_like_rows = await storage._query(
+                    "SELECT COUNT(*) AS c FROM messages WHERE msg_id = ? AND msg NOT LIKE '%:ack%'",
+                    (msg_id,),
+                )
+                survives_not_like_filter = not_like_rows[0]["c"] == 1
+                expected_excluded = bool(vector["contains_ack_marker"])
+                # contains_ack_marker=true means the real exclusion clause must
+                # filter this row OUT (i.e. it must NOT survive NOT LIKE) — so
+                # "survives" and "expected_excluded" must always disagree.
+                excluded_word = "excluded" if expected_excluded else "kept"
+                sql_check_label = (
+                    f"ack predicate SQL 'NOT LIKE %:ack%': {vector['name']}"
+                    f" ({excluded_word} as expected)"
+                )
+                results.append((sql_check_label, survives_not_like_filter != expected_excluded))
+
+                # (d2) is_ack_strict / ack_number, replayed against the literal
+                # mirror of ingest.py:695's regex (see _INGEST_ACK_REGEX_MIRROR's
+                # docstring-comment for why this is a mirror, not a direct call).
+                # No "py" runtime_overrides exist in the fixture today, so this
+                # always falls back to the vector's generic (Python-default)
+                # fields — the fallback chain is kept anyway so a future fixture
+                # update that DOES add a "py" override is honored automatically.
+                py_override = vector.get("runtime_overrides", {}).get("py", {})
+                expected_strict = py_override.get("is_ack_strict", vector["is_ack_strict"])
+                expected_number = py_override.get("ack_number", vector["ack_number"])
+                match = (
+                    _INGEST_ACK_REGEX_MIRROR.search(vector["text"])
+                    if vector["text"] and ":ack" in vector["text"]
+                    else None
+                )  # mirrors ingest.py:694's short-circuit guard exactly
+                actual_strict = match is not None
+                actual_number = match.group(1) if match else None
+                results.append(
+                    (
+                        f"ack predicate ingest.py-mirror regex: {vector['name']} is_ack_strict",
+                        actual_strict == expected_strict,
+                    )
+                )
+                results.append(
+                    (
+                        f"ack predicate ingest.py-mirror regex: {vector['name']} ack_number",
+                        actual_number == expected_number,
+                    )
+                )
         finally:
             await storage.close()
 

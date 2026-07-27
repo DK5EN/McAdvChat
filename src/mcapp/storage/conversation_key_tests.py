@@ -7,9 +7,61 @@ function, so a regression here would silently scramble conversation history.
 Pure function under test — no DB, no network. Follows the house pattern used by
 router_tests.run_suppression_tests(): a results list, PASS/FAIL lines, a summary,
 and a bool return.
+
+In addition to the hand-written cases below, this suite replays the vendored
+cross-repo contract at ./conversation_key_vectors.json (docs/code-simpl-v2.md item
+4b in the webapp repo). THIS file is the canonical copy — compute_conversation_key
+is authoritative here — and the webapp vendors a parse-equal copy at
+src/utils/__tests__/conversation_key_vectors.json, replayed there against its own
+mirror helpers (effectiveDst / makePairKey / translateServerSummaryKey in
+src/utils/callsignUtils.ts). See that JSON's own "description" field for exactly
+which invariant is pinned and which intentional divergence (self-DM handling) is
+documented rather than silently papered over.
 """
 
+import json
+from pathlib import Path
+
 from .constants import compute_conversation_key
+
+_VECTORS_PATH = Path(__file__).parent / "conversation_key_vectors.json"
+
+
+def _load_conversation_key_vectors() -> list[dict[str, str | None]]:
+    """Load the vendored cross-repo conversation-key vectors. Canonical copy —
+    the webapp's copy at src/utils/__tests__/conversation_key_vectors.json must
+    stay parse-equal to this one (its own Prettier may reformat it)."""
+    with _VECTORS_PATH.open(encoding="utf-8") as f:
+        contract = json.load(f)
+    vectors: list[dict[str, str | None]] = contract["vectors"]
+    return vectors
+
+
+def _replay_shared_vectors(results: list[bool]) -> None:
+    """Replay every vector from the vendored cross-repo contract through the real
+    compute_conversation_key, printing PASS/FAIL in the same style as the
+    hand-written cases above and appending each outcome to `results` so it counts
+    toward the overall pass/fail summary. Split out from run_conversation_key_tests
+    to keep that function under the house statement-count limit (PLR0915)."""
+    print()
+    print("Shared cross-repo contract (conversation_key_vectors.json, webapp mirror):")
+    print("=" * 50)
+    for vector in _load_conversation_key_vectors():
+        v_src = vector["src"]
+        v_dst = vector["dst"]
+        v_expected = vector["server_key"]
+        v_name = vector["name"]
+        assert v_src is not None
+        assert v_dst is not None
+        v_actual = compute_conversation_key(v_src, v_dst)
+        ok = v_actual == v_expected
+        status = "✅ PASS" if ok else "❌ FAIL"
+        results.append(ok)
+        print(f"{status} | {v_name}")
+        print(
+            f"     compute_conversation_key({v_src!r}, {v_dst!r}) = {v_actual!r}"
+            f" (expected: {v_expected!r})"
+        )
 
 
 def run_conversation_key_tests() -> bool:
@@ -138,6 +190,8 @@ def run_conversation_key_tests() -> bool:
     results.append(ok)
     print(f"{status} | Empty dst → None (no conversation key)")
     print(f"     compute_conversation_key('DK5EN-9', '') = {no_key!r} (expected: None)")
+
+    _replay_shared_vectors(results)
 
     passed = sum(1 for r in results if r)
     total = len(results)

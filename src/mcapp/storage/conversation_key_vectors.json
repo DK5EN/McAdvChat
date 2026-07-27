@@ -1,0 +1,97 @@
+{
+  "description": "MeshCom conversation-key contract, shared by two independent implementations: MCProxy's compute_conversation_key (src/mcapp/storage/constants.py -- the authoritative function; conversation history, pagination and delete are all keyed on its output) and the webapp, which never recomputes a server key from scratch but consumes and locally re-derives one via three helpers in src/utils/callsignUtils.ts: effectiveDst (the via-routed-dst 'last comma component' extraction), makePairKey (the SSID-stripped, sorted DM pair, joined with the webapp's LOCAL PAIR_SEPARATOR '~' instead of this contract's SERVER_PAIR_SEPARATOR '<>'), and translateServerSummaryKey (translates a raw '<>'-joined server key -- exactly this contract's server_key -- into the webapp's local sidebar key). `server_key` below is the exact return value of compute_conversation_key(src, dst); null when it returns None (falsy dst, i.e. no conversation key at all). Pins: (1) groups/'TEST'/'*' dst -> the last via-routed comma component, VERBATIM, with no SSID stripping -- exactly effectiveDst's output; (2) DMs -> both sides' SSID-stripped base callsigns, sorted, joined '<>' -- exactly makePairKey's sort, modulo separator translation ('<>' vs '~'). Does NOT pin: SSID-shape/plausibility validation. compute_conversation_key sorts and joins unconditionally, with no notion of 'is this a real callsign' -- it will happily key a self-DM (same base callsign, different SSID) as 'X<>X'. The webapp's makePairKey/isValidPairMember layer additionally rejects a pair whose two SSID-stripped bases are identical, returning null instead of a degenerate 'X~X'. This is a genuine, confirmed, and INTENTIONAL divergence (not a bug): compute_conversation_key answers 'what bucket does this message belong to' for the server's own conversation history (a self-DM is a real, storable bucket), while makePairKey answers a narrower question -- 'is this a valid THIRD-PARTY pair to show in the sidebar' -- where a self-referential pair has no meaning. See the 'self-DM, degenerate pair' vector: both sides replay it and BOTH assert their own (different, and both correct for their own purpose) result; this contract does not average away that difference. Also not pinned: character case. compute_conversation_key never uppercases src/dst (real wire traffic is always uppercase already); the webapp's normalizeCallsign forcibly uppercases. No vector below exercises lowercase input, so this asymmetry is never triggered here -- it would need its own vectors (and a decision on which side is 'right') before being pinned. SYNC RULE: canonical source is THIS file (compute_conversation_key is authoritative and lives in this repo). The webapp's vendored copy at src/utils/__tests__/conversation_key_vectors.json must stay parse-equal -- its own Prettier reformats it, so whitespace/quoting differences are expected and fine; only content drift is a failure.",
+  "canonical": "MCProxy/src/mcapp/storage/conversation_key_vectors.json",
+  "version": 1,
+  "vectors": [
+    {
+      "name": "group numeric dst",
+      "src": "DK5EN-9",
+      "dst": "20",
+      "server_key": "20"
+    },
+    {
+      "name": "TEST dst",
+      "src": "DK5EN-9",
+      "dst": "TEST",
+      "server_key": "TEST"
+    },
+    {
+      "name": "wildcard broadcast dst",
+      "src": "DK5EN-9",
+      "dst": "*",
+      "server_key": "*"
+    },
+    {
+      "name": "DM forward",
+      "src": "OE5HWN-12",
+      "dst": "DK5EN-15",
+      "server_key": "DK5EN<>OE5HWN"
+    },
+    {
+      "name": "DM reverse (symmetry: same key as forward)",
+      "src": "DK5EN-15",
+      "dst": "OE5HWN-12",
+      "server_key": "DK5EN<>OE5HWN"
+    },
+    {
+      "name": "via-routed dst, one hop, group",
+      "src": "DK5EN-9",
+      "dst": "OE1KBC-12,232",
+      "server_key": "232"
+    },
+    {
+      "name": "via-routed dst, two hops, group",
+      "src": "DK5EN-9",
+      "dst": "OE1KBC-12,OE3XYZ-5,20",
+      "server_key": "20"
+    },
+    {
+      "name": "via-routed dst, DM (target extracted before SSID-strip/sort)",
+      "src": "DK5EN-9",
+      "dst": "OE1KBC-12,OE5HWN-3",
+      "server_key": "DK5EN<>OE5HWN"
+    },
+    {
+      "name": "via-routed src (relay path; first component is the sender), DM",
+      "src": "OE5HWN-3,OE1KBC-12",
+      "dst": "DK5EN-9",
+      "server_key": "DK5EN<>OE5HWN"
+    },
+    {
+      "name": "dst without SSID -> base callsign used as-is",
+      "src": "DK5EN-9",
+      "dst": "OE5HWN",
+      "server_key": "DK5EN<>OE5HWN"
+    },
+    {
+      "name": "src without SSID -> base callsign used as-is",
+      "src": "OE5HWN",
+      "dst": "DK5EN-9",
+      "server_key": "DK5EN<>OE5HWN"
+    },
+    {
+      "name": "self-DM, degenerate pair (same base callsign, different SSID)",
+      "src": "DK5EN-9",
+      "dst": "DK5EN-15",
+      "server_key": "DK5EN<>DK5EN"
+    },
+    {
+      "name": "different DM partner -> distinct key from the OE5HWN pair",
+      "src": "DK5EN-9",
+      "dst": "OE9XYZ-1",
+      "server_key": "DK5EN<>OE9XYZ"
+    },
+    {
+      "name": "different group number -> distinct key from group '20'",
+      "src": "DK5EN-9",
+      "dst": "21",
+      "server_key": "21"
+    },
+    {
+      "name": "empty dst -> no conversation key at all",
+      "src": "DK5EN-9",
+      "dst": "",
+      "server_key": null
+    }
+  ]
+}

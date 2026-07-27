@@ -1,0 +1,149 @@
+{
+  "version": 1,
+  "description": "Canonical cross-repo truth table for the ':ack<N>' message-classification predicate (docs/code-simpl-v2.md item 4c). This predicate is NOT one invariant -- it is two semantic tiers that happen to share a name:\n\n  is_ack_strict       -- the digit-REQUIRING classification: webapp isAckMessage (src/stores/messages/predicates.ts:27-29, /:ack\\d/), mc-chat decoder.py's inline-ack regex (meshcom_mock/decoder.py:598, re.search(r':ack(\\d+)', message)), and MCProxy ingest.py's inline-ack regex (src/mcapp/storage/ingest.py:695, the identical re.search(r':ack(\\d+)', msg) pattern -- no clean seam to unit-test that call site in isolation without touching ingest.py, see MCProxy's query_tests.py for how that gap is covered/documented instead).\n\n  contains_ack_marker -- the substring-only classification: MCProxy query.py's SQL exclusion (\"... AND msg NOT LIKE '%:ack%'\", ~7 call sites) and webapp messageProcessor.ts's raw.msg?.includes(':ack') (~line 393).\n\n  These two tiers are DIFFERENT ON PURPOSE (a bare ':ack' with no digit, or 'did you ack that?', land on opposite sides for some vectors) -- do not attempt to unify them. Each implementation replays only the column matching its own semantics; divergence WITHIN a column across implementations that claim the same semantics is a real bug, documented below (see informational_divergences) rather than silently forced into agreement.\n\n  ack_number is a STRING, not a number -- ':ack042' must extract '042' with the leading zero preserved (matches mc-chat decoder.py's existing DecodedText.ack_id contract, see TestStructuredDecode.test_decoded_text_ack_response in tests/test_decoder.py). null when is_ack_strict is false.\n\n  Some vectors carry a `runtime_overrides` object: for those, the top-level is_ack_strict/ack_number are the Python (`py`) behavior (the majority implementation -- both backends use Python's `re` module and agree with each other); a `js` override documents where ECMAScript's RegExp genuinely disagrees with Python's `re`, e.g. \\d's character class. Every replaying test MUST check for its own runtime key in `runtime_overrides` before falling back to the generic field -- that is the honest seam, not a fixture bug.",
+  "canonical": "mc-chat/tests/fixtures/ack_predicate_vectors.json",
+  "semantics": {
+    "is_ack_strict": "Digit-requiring tier. Case-sensitive literal ':ack' (lowercase only -- no implementation uses re.IGNORECASE or a JS /i flag) immediately followed by at least one digit, no separator allowed. The digit CLASS differs by regex engine: ECMAScript RegExp \\d is ASCII 0-9 only; Python re's \\d matches any Unicode category-Nd decimal digit by default (confirmed empirically: re.search(r':ack(\\d+)', ':ack\\u0661') matches, capturing '\\u0661'; the equivalent JS /:ack\\d/.test(':ack\\u0661') is false). This is a genuine, previously-undocumented cross-repo divergence within this single tier -- see the unicode_digit_divergence vector's runtime_overrides.",
+    "contains_ack_marker": "Substring-only tier, as evaluated by the REAL SQL predicate this fixture's MCProxy test replays (query.py's 'NOT LIKE %:ack%'). SQLite's LIKE operator is case-INSENSITIVE for ASCII by default (undocumented-to-most-readers but per SQLite's own docs), so this column is TRUE for ':ACK5' and ':ACK' (bare, uppercase, no digit). webapp messageProcessor.ts's raw.msg?.includes(':ack') implements the same nominal tier but IS case-sensitive, so it disagrees with MCProxy's SQL predicate on those two vectors. messageProcessor.ts has no assigned test file in this campaign item (read-only site) so that disagreement is not asserted here -- see informational_divergences.",
+    "ack_number": "string extracted by the digit-requiring regex's capture group (Python (\\d+), matched conceptually by webapp's boolean-only isAckMessage which does not itself extract a number). null whenever is_ack_strict is false for that runtime. NOT the same algorithm as messageProcessor.ts's raw.msg.split(':ack')[1] (a substring-split, not a digit-anchored capture) -- see informational_divergences."
+  },
+  "vectors": [
+    {
+      "name": "canonical_standalone",
+      "text": ":ack123",
+      "is_ack_strict": true,
+      "contains_ack_marker": true,
+      "ack_number": "123"
+    },
+    {
+      "name": "prefixed_trailing_digit",
+      "text": "msg:ack1",
+      "is_ack_strict": true,
+      "contains_ack_marker": true,
+      "ack_number": "1"
+    },
+    {
+      "name": "bare_no_digit",
+      "text": ":ack",
+      "is_ack_strict": false,
+      "contains_ack_marker": true,
+      "ack_number": null
+    },
+    {
+      "name": "no_colon_form",
+      "text": "did you ack that?",
+      "is_ack_strict": false,
+      "contains_ack_marker": false,
+      "ack_number": null
+    },
+    {
+      "name": "uppercase_with_digit",
+      "text": ":ACK5",
+      "is_ack_strict": false,
+      "contains_ack_marker": true,
+      "ack_number": null,
+      "note": "SQLite LIKE (MCProxy query.py, the predicate this fixture's contains_ack_marker column is replayed against) is case-insensitive for ASCII, so this IS excluded by 'NOT LIKE %:ack%' -> contains_ack_marker=true. webapp messageProcessor.ts's case-sensitive .includes(':ack') would NOT flag this text -- a real cross-repo divergence in the substring tier; see informational_divergences (that site is read-only / out of scope here)."
+    },
+    {
+      "name": "mid_text_trailing_letters",
+      "text": ":ack7x",
+      "is_ack_strict": true,
+      "contains_ack_marker": true,
+      "ack_number": "7"
+    },
+    {
+      "name": "empty_string",
+      "text": "",
+      "is_ack_strict": false,
+      "contains_ack_marker": false,
+      "ack_number": null
+    },
+    {
+      "name": "trailing_punctuation",
+      "text": ":ack55!",
+      "is_ack_strict": true,
+      "contains_ack_marker": true,
+      "ack_number": "55"
+    },
+    {
+      "name": "leading_zero_digits",
+      "text": ":ack042",
+      "is_ack_strict": true,
+      "contains_ack_marker": true,
+      "ack_number": "042"
+    },
+    {
+      "name": "false_positive_feedback",
+      "text": "Feedback: super Idee, danke!",
+      "is_ack_strict": false,
+      "contains_ack_marker": false,
+      "ack_number": null,
+      "note": "Named directly in predicates.ts's own doc-comment as the false-positive isAckMessage must NOT match: contains the substring 'ack:' (from 'Feedback:') but never ':ack'."
+    },
+    {
+      "name": "false_positive_rucksack",
+      "text": "Rucksack: bitte mitbringen",
+      "is_ack_strict": false,
+      "contains_ack_marker": false,
+      "ack_number": null,
+      "note": "Same false-positive shape as 'Rucksack: ...' called out alongside 'Feedback: ...' in predicates.ts's doc-comment ('ack:' substring, never ':ack')."
+    },
+    {
+      "name": "mid_multiline",
+      "text": "Status:\nreceived, :ack77\nend of report",
+      "is_ack_strict": true,
+      "contains_ack_marker": true,
+      "ack_number": "77"
+    },
+    {
+      "name": "double_colon",
+      "text": "::ack9",
+      "is_ack_strict": true,
+      "contains_ack_marker": true,
+      "ack_number": "9"
+    },
+    {
+      "name": "uppercase_bare_no_digit",
+      "text": ":ACK",
+      "is_ack_strict": false,
+      "contains_ack_marker": true,
+      "ack_number": null,
+      "note": "Combines the case-insensitive-LIKE finding (see uppercase_with_digit) with the no-digit case: SQL still excludes it (contains_ack_marker=true) even with no digit at all, since the substring tier never required one."
+    },
+    {
+      "name": "two_ack_markers_first_wins",
+      "text": ":ack1:ack2",
+      "is_ack_strict": true,
+      "contains_ack_marker": true,
+      "ack_number": "1",
+      "note": "Both JS RegExp#test/leftmost-match and Python re.search return the FIRST match -- sanity check that all engines agree on match ordering, not just match/no-match."
+    },
+    {
+      "name": "unicode_digit_divergence",
+      "text": ":ack١",
+      "is_ack_strict": true,
+      "contains_ack_marker": true,
+      "ack_number": "١",
+      "runtime_overrides": {
+        "js": {
+          "is_ack_strict": false,
+          "ack_number": null
+        }
+      },
+      "note": "U+0661 ARABIC-INDIC DIGIT ONE. Python re's \\d matches any Unicode Nd digit by default (webapp is NOT Python -- top-level fields here are the Python/'py' behavior shared by mc-chat decoder.py and, informationally, MCProxy ingest.py). ECMAScript RegExp's \\d is ASCII-only, so webapp's isAckMessage (/:ack\\d/) does NOT match this text -- a genuine, previously-undocumented divergence WITHIN the is_ack_strict tier itself (not a false-uniformity artifact). contains_ack_marker is unaffected (true either way): the literal substring ':ack' precedes the digit and is matched independently of what follows."
+    }
+  ],
+  "informational_divergences": [
+    {
+      "topic": "case sensitivity of the contains_ack_marker (substring) tier",
+      "vectors": [":ACK5", ":ACK"],
+      "finding": "MCProxy query.py's SQL predicate (\"... AND msg NOT LIKE '%:ack%'\", ~7 call sites) is case-INSENSITIVE for ASCII (SQLite's documented LIKE default), so a message containing ':ACK5' or bare ':ACK' IS excluded from normal chat/history queries and routed to the acks bucket. webapp messageProcessor.ts's raw.msg?.includes(':ack') (~line 393) is case-SENSITIVE and would NOT treat either as an ack marker -- the message stays in the normal stream and is never matched against a pending outbound message via findAckMessage. Both implement the same nominal 'contains_ack_marker' substring tier and are expected to agree; they do not. messageProcessor.ts is read-only / has no assigned test file in this campaign item (docs/code-simpl-v2.md item 4c), so this is reported here for human follow-up, not patched.",
+      "status": "OPEN -- needs human follow-up; predicate-seam-pinning task only, no production changes made."
+    },
+    {
+      "topic": "ack_number extraction algorithm in messageProcessor.ts differs structurally from the regex-based is_ack_strict tier",
+      "finding": "messageProcessor.ts derives its ack number via raw.msg.split(':ack')[1] (~line 394) -- the ENTIRE remainder of the string after the first ':ack' substring, not a digit-anchored regex capture. For an input like ':ack7x' this yields '7x', not '7' as the regex-based tier (webapp isAckMessage's sibling intent, mc-chat decoder.py, and MCProxy ingest.py's re.search(r\":ack(\\d+)\")) would extract. This is a pre-existing, separate code path (used only to look up a pending outbound message by echo id via findAckMessage, not for is_ack_strict classification) and is out of scope/read-only for this fixture; flagged for awareness only, not asserted against any vector here.",
+      "status": "INFORMATIONAL -- pre-existing behavior, not a regression, no assigned test file."
+    }
+  ]
+}

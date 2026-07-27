@@ -20,6 +20,9 @@ call happens in either.
 from __future__ import annotations
 
 import asyncio
+import json
+from collections.abc import Callable
+from pathlib import Path
 from typing import Any
 
 from .commands.constants import has_console
@@ -83,6 +86,54 @@ async def _resolve_and_capture(src: str, dst: str, msg: str) -> list[str]:
             break
         await asyncio.sleep(0.02)
     return transmitted
+
+
+def _run_blocklist_contract_vectors(record: Callable[[str, bool], None]) -> None:
+    """Replay every canonical vector in blocklist_decision_vectors.json through the
+    real (synchronous) blocklist_decision, one fresh router+handler per vector so
+    each case's blocklist can't leak into the next.
+
+    This is the AUTHORITATIVE side of a shared fixture also vendored (parsed-equal,
+    byte copy) into the webapp repo (src/services/__tests__/blocklist_decision_vectors.json),
+    which replays the same vectors through its own independent mirror
+    (messageProcessor.blocklist.spec.ts) so both implementations stay pinned to one
+    behavioral contract instead of drifting via comment-only parity (docs/
+    code-simpl-v2.md item 4d). Each vector's `decision` is this function's own live
+    output. A few vectors also carry a `webapp_decision` + `note` documenting a
+    known src/webapp divergence (the webapp's isGroupDst has no 1..99999 range
+    check, unlike this file's is_group) — this loop asserts only the canonical
+    `decision`; the webapp spec asserts `webapp_decision` for those.
+
+    Factored out of run_send_path_tests() to keep that function under ruff's
+    PLR0915 statement-count limit rather than suppressing the check.
+    """
+    vectors_path = Path(__file__).parent / "blocklist_decision_vectors.json"
+    vectors_data = json.loads(vectors_path.read_text(encoding="utf-8"))
+    contract_vectors = vectors_data["vectors"]
+    record(
+        "blocklist_decision_vectors.json: carries vectors to replay (guards an empty loop)",
+        len(contract_vectors) > 0,
+    )
+    for vector in contract_vectors:
+        vector_router = MessageRouter(None)
+        vector_router.set_callsign("DK5EN")
+        vector_handler = create_command_handler(
+            vector_router,
+            None,
+            "DK5EN",
+            lat=48.15,
+            lon=11.58,
+            stat_name="TestStation",
+            user_info_text="MeshCom Test Node",
+        )
+        vector_router.register_protocol("commands", vector_handler)
+        vector_handler.blocked_callsigns.update(vector["blocklist"])
+
+        actual = vector_router.blocklist_decision({"src": vector["src"], "dst": vector["dst"]})
+        record(
+            f"blocklist_decision_vectors.json: {vector['name']}",
+            actual == vector["decision"],
+        )
 
 
 async def _drive(router: MessageRouter, src: str, dst: str, msg: str) -> list[dict[str, Any]]:
@@ -214,6 +265,12 @@ async def run_send_path_tests() -> bool:
         "admin_callsign_base is upper-cased even for a lower-case CALL_SIGN",
         lower_handler.admin_callsign_base == "DK5EN",
     )
+
+    # 10. CONTRACT: replay every canonical vector in blocklist_decision_vectors.json
+    #     through the real blocklist_decision — see _run_blocklist_contract_vectors's
+    #     docstring for the full rationale (shared fixture with the webapp mirror,
+    #     docs/code-simpl-v2.md item 4d).
+    _run_blocklist_contract_vectors(_record)
 
     passed = sum(1 for _, ok in results if ok)
     total = len(results)
