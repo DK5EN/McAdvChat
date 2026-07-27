@@ -9,7 +9,7 @@ router_tests.run_suppression_tests(): a results list, PASS/FAIL lines, a summary
 and a bool return.
 
 In addition to the hand-written cases below, this suite replays the vendored
-cross-repo contract at ./conversation_key_vectors.json (v2 — drift-resolution
+cross-repo contract at ./conversation_key_vectors.json (v3 — drift-resolution
 campaign 2026-07-27; originally docs/code-simpl-v2.md item 4b in the webapp
 repo). THIS file is the canonical copy — compute_conversation_key is
 authoritative here. The webapp vendors a parse-equal copy at
@@ -20,8 +20,10 @@ tests/fixtures/conversation_key_vectors.json, replayed against its
 _conversation_key mirror in meshcom_mock/storage.py. See the JSON's own
 "description" field for exactly which invariant is pinned — including the v2
 rule that an all-ASCII-digit target outside the unified group range 1..99999
-yields None — and which intentional divergence (self-DM handling) is documented
-rather than silently papered over.
+yields None. v3 (webapp decision D4, Wave C) RESOLVED the former self-DM
+divergence: the webapp adopted self-pairs, so the degenerate 'X<>X' key this
+function has always produced for a self-DM is now pinned as the ONE unified
+result (two self-DM vectors added; this function's behavior is unchanged).
 """
 
 import json
@@ -39,8 +41,8 @@ def _load_conversation_key_vectors() -> list[dict[str, str | None]]:
     parse-equal to this one (the webapp's Prettier may reformat it)."""
     with _VECTORS_PATH.open(encoding="utf-8") as f:
         contract = json.load(f)
-    if contract["version"] != 2:
-        msg = f"conversation_key_vectors.json version {contract['version']!r} != 2"
+    if contract["version"] != 3:
+        msg = f"conversation_key_vectors.json version {contract['version']!r} != 3"
         raise AssertionError(msg)
     vectors: list[dict[str, str | None]] = contract["vectors"]
     return vectors
