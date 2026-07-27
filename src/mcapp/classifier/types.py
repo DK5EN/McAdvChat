@@ -34,6 +34,31 @@ EMOJI_RE: re.Pattern[str] = re.compile(
     "\ufe0f?"  # optional variation selector -- consumed as part of the preceding match
 )
 
+# -- Directed-destination predicate ---------------------------------------
+# "Directed" is a property of the ROUTING, not of the text: a message is
+# directed when its destination resolves to a personal callsign rather than
+# to a group / broadcast / time channel. Pinned across all three repos by
+# directed_dst_vectors.json (canonical copy sits beside this module and
+# rides the classifier subtree into MCProxy; the webapp vendors a
+# parse-equal copy and replays it against classifyDst()).
+#
+# The pattern is applied with .search() to the RAW dst, so it resolves
+# via-routing itself: `(?:^|,)` plus the `$` anchor and a comma-free
+# character class force the match onto the LAST comma component, which is
+# the real target ('DJ8MEH-82,DJ8MEH-8' -> 'DJ8MEH-8'). This mirrors the
+# webapp's effectiveDst(). The rest:
+#   (?!(?:ALL|TEST|TIME)\s*$)  broadcast alias / group 'TEST' / time channel
+#   (?=[^,]*[A-Z])             must contain a letter -- rejects every numeric
+#                              group id, in or out of the 1..99999 range, and
+#                              '*' (which the character class rejects anyway)
+#   [A-Z0-9./-]+               callsign with an OPTIONAL -SSID, so a bare
+#                              'DL1EEN' is directed too; '.' and '/' keep
+#                              portable//P-style suffixes on the person side
+# `(?i)` must stay leading -- Python rejects a mid-pattern global flag.
+DIRECTED_DST_PATTERN: str = r"(?i)(?:^|,)\s*(?!(?:ALL|TEST|TIME)\s*$)(?=[^,]*[A-Z])[A-Z0-9./-]+\s*$"
+
+DIRECTED_DST_RE: re.Pattern[str] = re.compile(DIRECTED_DST_PATTERN)
+
 # -- Category vocabulary ---------------------------------------------------
 # ``other`` is the fallback when no rule matches.
 

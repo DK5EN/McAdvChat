@@ -12,7 +12,7 @@ shows which signals dominate.
     Weight  Signal          Direction
     ------  --------------  ---------
     +0.30   len_factor      length in words (caps at 15)
-    +0.20   directed        category == 'directed'
+    +0.20   directed        category or 'directed' tag
     +0.20   group_chat      category in ('qso', 'other')
     +0.15   freshness       1 / (1 + template_count)
     -0.25   emoji_density   emoji chars / text length
@@ -65,7 +65,7 @@ def compute(
     Weighted blend::
 
         + 0.30 * len_factor       # min(word_count / 15, 1.0)
-        + 0.20 * directed         # 1.0 if category == 'directed' else 0.0
+        + 0.20 * directed         # 1.0 if directed by category OR tag
         + 0.20 * group_chat       # 1.0 if category in ('qso', 'other') else 0.0
         + 0.15 * freshness        # 1.0 / (1 + template_count)
         - 0.25 * emoji_density    # emoji_count / max(len(text), 1)
@@ -82,7 +82,11 @@ def compute(
     # Positive contributors
     word_count: int = len(re.findall(r"\w+", text))
     len_factor: float = min(word_count / _LEN_CAP, 1.0)
-    directed: float = 1.0 if category == "directed" else 0.0
+    # Read the TAG, not just the category: `category` is single-valued and
+    # first-match-wins, so a DM whose text also matched a content rule is
+    # categorised 'greeting'/'test_msg'/... and would otherwise lose the
+    # directedness bonus. seed.py's "Direct callsign" rule emits both.
+    directed: float = 1.0 if category == "directed" or "directed" in tag_set else 0.0
     group_chat: float = 1.0 if category in ("qso", "other") else 0.0
     freshness: float = 1.0 / (1 + template_count)
 
