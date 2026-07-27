@@ -691,8 +691,12 @@ class IngestMixin(StorageBase):
         conversation_key = compute_conversation_key(callsign, dst) if msg_type == "msg" else None
 
         # --- Inline ACK matching (:ackNNN → set acked on original) ---
+        # Strict marker (ack_predicate_vectors.json v2): case-sensitive ':ack'
+        # + ASCII digits. [0-9], not \d — Python's \d matches any Unicode Nd
+        # digit, which the firmware ('%-9.9s:ack%03i') never emits. The
+        # `":ack" in msg` check is only a cheap prefilter; the regex re-checks.
         if msg and ":ack" in msg:
-            ack_match = re.search(r":ack(\d+)", msg)
+            ack_match = re.search(r":ack([0-9]+)", msg)
             if ack_match:
                 ack_num = ack_match.group(1)
                 await self._mutate(

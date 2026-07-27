@@ -22,15 +22,24 @@ Coverage:
       8-day pos cutoff by ±30 min are seeded; the correct ones must survive. A
       naive-local cutoff (non-zero UTC offset ≥ 1 h) would shift the boundary
       past both rows and fail this test.
-  (d) The ':ack<N>' predicate seam (docs/code-simpl-v2.md item 4c) — replays
-      the vendored ack_predicate_vectors.json's `contains_ack_marker` column
-      against the REAL SQL exclusion clause query.py's read paths use
-      ("... AND msg NOT LIKE '%:ack%'"), and its `is_ack_strict`/`ack_number`
-      columns against a documented literal mirror of ingest.py:695's regex
-      (see the comment above _INGEST_ACK_REGEX_MIRROR for why it's a mirror,
-      not a call into ingest.py — that call site has no clean seam to unit
-      test in isolation without touching ingest.py, which is out of scope
-      here).
+  (d) The ':ack<N>' predicate seam (ack_predicate_vectors.json v2, single
+      strict tier) — replays the vendored fixture's `is_ack` column against
+      BOTH directions of the REAL SQL clause pair query.py's read paths use
+      (exclusion "... AND msg NOT GLOB '*:ack[0-9]*'", acks query
+      "msg GLOB '*:ack[0-9]*'" — asserting they are exact complements per
+      vector), and its `is_ack`/`ack_number` columns against a documented
+      literal mirror of ingest.py's regex (see the comment above
+      _INGEST_ACK_REGEX_MIRROR for why it's a mirror, not a call into
+      ingest.py — that call site has no clean seam to unit test in isolation
+      without a much larger harness).
+  (e) Case-sensitivity drift, behaviorally — a human message containing
+      ':ACK99' and a real firmware ack ':ack931' are inserted, then the REAL
+      client-facing query methods (get_messages_page,
+      get_smart_initial_with_summary) are asserted on: the ':ACK99' row must
+      come back as a normal message and NOT as an ack. Under the pre-v2
+      case-insensitive `LIKE '%:ack%'` SQL it silently vanished from history
+      sync (SQLite LIKE is case-insensitive for ASCII) while the webapp
+      showed it live.
 
 All timestamps are MILLISECONDS (project-wide DB convention).
 """
@@ -53,27 +62,28 @@ _MS_PER_HOUR = 3600 * 1000
 _MS_PER_DAY = 24 * _MS_PER_HOUR
 _POS_RETENTION_MS = DEFAULT_POS_RETENTION_HOURS * _MS_PER_HOUR  # 8 days
 
-# Vendored copy of the cross-repo ':ack<N>' predicate truth table (docs/code-
-# simpl-v2.md item 4c). mc-chat is upstream/canonical
-# (tests/fixtures/ack_predicate_vectors.json); this copy must stay
-# byte-identical (webapp's predicates.spec.ts drift-checks its own copy,
-# parsed, against both this file and mc-chat's).
+# Vendored copy of the cross-repo ':ack<N>' predicate truth table (v2, single
+# strict tier: case-sensitive ':ack' + ASCII digit [0-9]). mc-chat is
+# upstream/canonical (tests/fixtures/ack_predicate_vectors.json); this copy
+# must stay byte-identical (webapp's predicates.spec.ts drift-checks its own
+# copy, parsed, against both this file and mc-chat's).
 _ACK_VECTORS_PATH = Path(__file__).parent / "ack_predicate_vectors.json"
 
-# Mirrors ingest.py:695's inline ack-number regex BYTE FOR BYTE. That call
-# site (`if msg and ":ack" in msg: ack_match = re.search(r":ack(\d+)", msg)`)
+# Mirrors ingest.py's inline ack-number regex BYTE FOR BYTE. That call
+# site (`if msg and ":ack" in msg: ack_match = re.search(r":ack([0-9]+)", msg)`)
 # sits inside store_message(), a large function that also does echo_id
 # lookup, time-windowed dedup, and a DB mutation — there is no clean seam to
-# import or call it in isolation without either touching ingest.py (out of
-# scope for this campaign item) or building a much larger integration
+# import or call it in isolation without building a much larger integration
 # harness around store_message's full side effects. This constant is an
 # explicitly-flagged, honest substitute: it pins the PATTERN so a future
 # unreviewed edit to ingest.py's regex is at least visible as a diff here,
 # but it is NOT proof the production code path still behaves identically.
 # mc-chat's decoder.py uses the textually identical pattern and IS exercised
 # through real production code in mc-chat/tests/test_decoder.py — that is
-# the actual regex-engine coverage for this exact pattern.
-_INGEST_ACK_REGEX_MIRROR = re.compile(r":ack(\d+)")
+# the actual regex-engine coverage for this exact pattern. [0-9], not \d:
+# Python's \d matches any Unicode Nd digit, which the firmware
+# ('%-9.9s:ack%03i') never emits — see the fixture's unicode_digit_rejected.
+_INGEST_ACK_REGEX_MIRROR = re.compile(r":ack([0-9]+)")
 
 
 def _load_ack_vectors() -> list[dict[str, Any]]:
@@ -281,7 +291,7 @@ async def run_query_tests() -> bool:  # noqa: PLR0915 - test suite lists one cas
                 )
             )
 
-            # --- (d) ':ack<N>' predicate seam (docs/code-simpl-v2.md item 4c) -----
+            # --- (d) ':ack<N>' predicate seam (ack_predicate_vectors.json v2) -----
             ack_vectors = _load_ack_vectors()
             ack_vectors_present_label = (
                 "ack predicate: vendored fixture carries vectors to replay"
@@ -290,60 +300,143 @@ async def run_query_tests() -> bool:  # noqa: PLR0915 - test suite lists one cas
             results.append((ack_vectors_present_label, len(ack_vectors) > 0))
 
             for i, vector in enumerate(ack_vectors):
-                # (d1) contains_ack_marker, replayed against the REAL SQL predicate
-                # query.py's read paths use (get_smart_initial_with_summary,
-                # get_messages_page, etc.: "... AND msg NOT LIKE '%:ack%'").
+                # (d1) is_ack, replayed against BOTH directions of the REAL SQL
+                # clause pair query.py's read paths use
+                # (get_smart_initial_with_summary, get_messages_page, etc.):
+                # exclusion "... AND msg NOT GLOB '*:ack[0-9]*'" on every
+                # message/history query, positive "msg GLOB '*:ack[0-9]*'" on
+                # the acks query. Asserting both per vector pins that the pair
+                # stays an exact complement — every non-NULL msg lands on
+                # exactly one side of the messages/acks partition.
                 msg_id = f"ACKVEC-{i}"
                 await storage._mutate(
                     "INSERT INTO messages (msg_id, src, dst, msg, type, timestamp, src_type)"
                     " VALUES (?, ?, ?, ?, ?, ?, ?)",
                     (msg_id, "TESTCALL-1", "232", vector["text"], "msg", now_ms() + i, "lora"),
                 )
-                not_like_rows = await storage._query(
-                    "SELECT COUNT(*) AS c FROM messages WHERE msg_id = ? AND msg NOT LIKE '%:ack%'",
+                not_glob_rows = await storage._query(
+                    "SELECT COUNT(*) AS c FROM messages"
+                    " WHERE msg_id = ? AND msg NOT GLOB '*:ack[0-9]*'",
                     (msg_id,),
                 )
-                survives_not_like_filter = not_like_rows[0]["c"] == 1
-                expected_excluded = bool(vector["contains_ack_marker"])
-                # contains_ack_marker=true means the real exclusion clause must
-                # filter this row OUT (i.e. it must NOT survive NOT LIKE) — so
-                # "survives" and "expected_excluded" must always disagree.
-                excluded_word = "excluded" if expected_excluded else "kept"
-                sql_check_label = (
-                    f"ack predicate SQL 'NOT LIKE %:ack%': {vector['name']}"
-                    f" ({excluded_word} as expected)"
+                glob_rows = await storage._query(
+                    "SELECT COUNT(*) AS c FROM messages"
+                    " WHERE msg_id = ? AND msg GLOB '*:ack[0-9]*'",
+                    (msg_id,),
                 )
-                results.append((sql_check_label, survives_not_like_filter != expected_excluded))
+                survives_exclusion = not_glob_rows[0]["c"] == 1
+                matches_acks_query = glob_rows[0]["c"] == 1
+                is_ack = bool(vector["is_ack"])
+                side_word = "ack side" if is_ack else "message side"
+                glob_pair_label = (
+                    f"ack predicate SQL GLOB pair: {vector['name']} (partitions to the {side_word})"
+                )
+                results.append(
+                    (
+                        glob_pair_label,
+                        survives_exclusion == (not is_ack) and matches_acks_query == is_ack,
+                    )
+                )
 
-                # (d2) is_ack_strict / ack_number, replayed against the literal
-                # mirror of ingest.py:695's regex (see _INGEST_ACK_REGEX_MIRROR's
-                # docstring-comment for why this is a mirror, not a direct call).
-                # No "py" runtime_overrides exist in the fixture today, so this
-                # always falls back to the vector's generic (Python-default)
-                # fields — the fallback chain is kept anyway so a future fixture
-                # update that DOES add a "py" override is honored automatically.
-                py_override = vector.get("runtime_overrides", {}).get("py", {})
-                expected_strict = py_override.get("is_ack_strict", vector["is_ack_strict"])
-                expected_number = py_override.get("ack_number", vector["ack_number"])
+                # (d2) is_ack / ack_number, replayed against the literal mirror
+                # of ingest.py's regex (see _INGEST_ACK_REGEX_MIRROR's
+                # docstring-comment for why this is a mirror, not a direct
+                # call). v2 has no runtime_overrides — the strict semantics is
+                # engine-independent, so the vector's fields are the expectation
+                # for every runtime.
                 match = (
                     _INGEST_ACK_REGEX_MIRROR.search(vector["text"])
                     if vector["text"] and ":ack" in vector["text"]
                     else None
-                )  # mirrors ingest.py:694's short-circuit guard exactly
+                )  # mirrors ingest.py's short-circuit guard exactly
                 actual_strict = match is not None
                 actual_number = match.group(1) if match else None
                 results.append(
                     (
-                        f"ack predicate ingest.py-mirror regex: {vector['name']} is_ack_strict",
-                        actual_strict == expected_strict,
+                        f"ack predicate ingest.py-mirror regex: {vector['name']} is_ack",
+                        actual_strict == vector["is_ack"],
                     )
                 )
                 results.append(
                     (
                         f"ack predicate ingest.py-mirror regex: {vector['name']} ack_number",
-                        actual_number == expected_number,
+                        actual_number == vector["ack_number"],
                     )
                 )
+
+            # --- (e) case-sensitivity drift, behaviorally (what reaches the client) --
+            # A human GROUP message containing ':ACK99' (uppercase — NOT a
+            # firmware ack; the firmware only emits lowercase ':ack' + 3 ASCII
+            # digits) and a real ack ':ack931' go through the REAL client-facing
+            # query methods. Pre-v2, the case-insensitive `LIKE '%:ack%'` SQL
+            # silently dropped the ':ACK99' row from history sync (messages page
+            # AND smart-initial messages) and mis-filed it in the acks payload,
+            # while the webapp's case-sensitive live path showed it — the exact
+            # cross-repo drift ack_predicate_vectors.json v2 unifies away.
+            drift_ts = now_ms()
+            await storage._mutate(
+                "INSERT INTO messages"
+                " (msg_id, src, dst, msg, type, timestamp, src_type, conversation_key)"
+                " VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    "DRIFT-HUMAN",
+                    "OE1ABC-1",
+                    "232",
+                    "Sag mal, kam der Test :ACK99 bei dir durch?",
+                    "msg",
+                    drift_ts,
+                    "lora",
+                    "232",
+                ),
+            )
+            await storage._mutate(
+                "INSERT INTO messages"
+                " (msg_id, src, dst, msg, type, timestamp, src_type, conversation_key)"
+                " VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    "DRIFT-ACK",
+                    "OE9XYZ-1",
+                    "232",
+                    "OE1ABC-1 :ack931",
+                    "msg",
+                    drift_ts + 1,
+                    "lora",
+                    "232",
+                ),
+            )
+            page = await storage.get_messages_page("232")
+            page_msgs = page["messages"]
+            results.append(
+                (
+                    "drift: human ':ACK99' message IS returned by the messages page",
+                    any(":ACK99" in m for m in page_msgs),
+                )
+            )
+            results.append(
+                (
+                    "drift: real ':ack931' ack is NOT returned by the messages page",
+                    not any(":ack931" in m for m in page_msgs),
+                )
+            )
+            initial, _ = await storage.get_smart_initial_with_summary()
+            results.append(
+                (
+                    "drift: human ':ACK99' message IS in smart-initial messages",
+                    any(":ACK99" in m for m in initial["messages"]),
+                )
+            )
+            results.append(
+                (
+                    "drift: human ':ACK99' message is NOT in the smart-initial acks payload",
+                    not any(":ACK99" in m for m in initial["acks"]),
+                )
+            )
+            results.append(
+                (
+                    "drift: real ':ack931' ack IS in the smart-initial acks payload",
+                    any(":ack931" in m for m in initial["acks"]),
+                )
+            )
         finally:
             await storage.close()
 

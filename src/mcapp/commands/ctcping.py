@@ -23,12 +23,14 @@ PING_INTERVAL_SECONDS = 20.0
 PING_TEST_MAX_WAIT_SECONDS = 300
 
 # CMD-10: compiled once at import instead of per-call re.search(pattern_str, ...).
-_ACK_SUFFIX_RE = re.compile(r"\s*:ack\d{3}$")  # _is_ack_message: boolean check
+# Ack patterns use [0-9], not \d (ack_predicate_vectors.json v2): Python's \d
+# matches any Unicode Nd digit, which the firmware ('%-9.9s:ack%03i') never emits.
+_ACK_SUFFIX_RE = re.compile(r"\s*:ack[0-9]{3}$")  # _is_ack_message: boolean check
 _ECHO_SUFFIX_RE = re.compile(r"\{\d{3}$")  # _is_echo_message: boolean check
 _PING_TEST_SEQUENCE_RE = re.compile(r"ping test \d+/\d+")  # _is_ping_message: boolean check
 _PING_TEST_SEQUENCE_CAPTURE_RE = re.compile(r"ping test (\d+)/(\d+)")  # _extract_sequence_info
 _ECHO_ID_RE = re.compile(r"\{(\d{3})$")  # _handle_echo_message: extracts message id
-_ACK_ID_RE = re.compile(r"\s*:ack(\d{3})$")  # _handle_ack_message: extracts ack id
+_ACK_ID_RE = re.compile(r"\s*:ack([0-9]{3})$")  # _handle_ack_message: extracts ack id
 
 logger = get_logger(__name__)
 

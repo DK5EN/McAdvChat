@@ -339,7 +339,7 @@ class QueryMixin(StorageBase):
                     f"    PARTITION BY COALESCE(conversation_key, dst)"
                     f"    ORDER BY timestamp DESC"
                     f"  ) AS rn FROM messages"
-                    f"  WHERE type = 'msg' AND msg NOT LIKE '%:ack%' AND timestamp >= ?"
+                    f"  WHERE type = 'msg' AND msg NOT GLOB '*:ack[0-9]*' AND timestamp >= ?"
                     f") ranked WHERE rn <= ?"
                     f" ORDER BY timestamp ASC",
                     (window_cutoff_ms, limit_per_dst),
@@ -356,10 +356,18 @@ class QueryMixin(StorageBase):
                     json.dumps(build_pos(dict(row)), ensure_ascii=False) for row in pos_rows
                 ]
 
-                # 3. ACK messages
+                # 3. ACK messages. GLOB, not LIKE, and the EXACT complement of
+                # the `msg NOT GLOB '*:ack[0-9]*'` exclusion every message/
+                # history query in this file applies, so messages and acks
+                # partition cleanly. SQLite GLOB is case-sensitive and [0-9]
+                # is ASCII-only — that is the point: the firmware emits
+                # '%-9.9s:ack%03i' (lowercase, 3 ASCII digits), while LIKE's
+                # ASCII case-insensitivity silently swallowed human messages
+                # containing ':ACK99' from history sync
+                # (ack_predicate_vectors.json v2, strict tier).
                 ack_rows = conn.execute(
                     f"SELECT {_MSG_SELECT} FROM messages"  # noqa: S608 - identifiers from fixed set; values parameterized
-                    " WHERE type = 'msg' AND msg LIKE '%:ack%'"
+                    " WHERE type = 'msg' AND msg GLOB '*:ack[0-9]*'"
                     f" ORDER BY timestamp DESC LIMIT {INITIAL_ACK_LIMIT}",
                 ).fetchall()
                 acks = [json.dumps(build_msg(dict(row)), ensure_ascii=False) for row in ack_rows]
@@ -368,7 +376,7 @@ class QueryMixin(StorageBase):
                 summary_rows = conn.execute(
                     "SELECT COALESCE(conversation_key, dst) AS key, COUNT(*) as cnt"
                     " FROM messages"
-                    " WHERE type = 'msg' AND msg NOT LIKE '%:ack%' AND timestamp >= ?"
+                    " WHERE type = 'msg' AND msg NOT GLOB '*:ack[0-9]*' AND timestamp >= ?"
                     " GROUP BY key",
                     (window_cutoff_ms,),
                 ).fetchall()
@@ -435,7 +443,7 @@ class QueryMixin(StorageBase):
             # belong to the virtual Time chat
             query = (
                 f"SELECT {_MSG_SELECT} FROM messages"  # noqa: S608 - identifiers from fixed set; values parameterized
-                " WHERE type = 'msg' AND msg NOT LIKE '%:ack%'"
+                " WHERE type = 'msg' AND msg NOT GLOB '*:ack[0-9]*'"
                 # (msg IS NULL OR ...) mirrors delete_messages_by_dst: in SQLite
                 # `NULL NOT LIKE x` is NULL, not true, so a NULL-msg broadcast row was
                 # invisible on this page while the '*' DELETE happily removed it.
@@ -458,7 +466,7 @@ class QueryMixin(StorageBase):
             # (dst 'VIA,232' → key '232') are included in the page
             query = (
                 f"SELECT {_MSG_SELECT} FROM messages"  # noqa: S608 - identifiers from fixed set; values parameterized
-                " WHERE type = 'msg' AND msg NOT LIKE '%:ack%'"
+                " WHERE type = 'msg' AND msg NOT GLOB '*:ack[0-9]*'"
                 " AND conversation_key = ? AND timestamp < ?"
                 " ORDER BY timestamp DESC LIMIT ?"
             )
@@ -472,7 +480,7 @@ class QueryMixin(StorageBase):
             # remains for rows a pre-v18 mcdump import left unkeyed.
             query = (
                 f"SELECT {_MSG_SELECT} FROM messages"  # noqa: S608 - identifiers from fixed set; values parameterized
-                " WHERE type = 'msg' AND msg NOT LIKE '%:ack%'"
+                " WHERE type = 'msg' AND msg NOT GLOB '*:ack[0-9]*'"
                 " AND dst = ? AND timestamp < ?"
                 " ORDER BY timestamp DESC LIMIT ?"
             )
@@ -480,7 +488,7 @@ class QueryMixin(StorageBase):
         else:
             query = (
                 f"SELECT {_MSG_SELECT} FROM messages"  # noqa: S608 - identifiers from fixed set; values parameterized
-                " WHERE type = 'msg' AND msg NOT LIKE '%:ack%'"
+                " WHERE type = 'msg' AND msg NOT GLOB '*:ack[0-9]*'"
                 " AND timestamp < ?"
                 " ORDER BY timestamp DESC LIMIT ?"
             )

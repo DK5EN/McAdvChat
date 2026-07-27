@@ -142,11 +142,15 @@ def _is_node_local_noise(payload: dict[str, Any]) -> bool:
     each `{CET}` time broadcast — which `storage._should_filter_message` refuses
     to even persist.
 
-    The `":ack"` substring test is deliberately as broad as the
-    `msg NOT LIKE '%:ack%'` exclusion every message query in `storage/query.py`
-    already applies: a push must never announce a message that no conversation
-    view will show. See the contract's `eligibility_noise_semantics` for the
-    accepted false positive.
+    The `":ack"` substring test is push_contract-governed and deliberately
+    broad — broader than the strict ack marker every other predicate now uses
+    (case-sensitive ':ack' + ASCII digit; ack_predicate_vectors.json v2, and
+    `storage/query.py`'s `msg NOT GLOB '*:ack[0-9]*'` exclusion). Residual,
+    deliberate width difference: a bare ':ack' with no digit is push-silent
+    here but IS history-visible as an ordinary message. A push must never
+    announce a message that no conversation view will show — the converse
+    (this one visible-but-silent case) is the accepted cost. See the
+    contract's `eligibility_noise_semantics` for the accepted false positive.
     """
     text = _push_text(payload)
     return ":ack" in text or text.startswith("{CET}")
