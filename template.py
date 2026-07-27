@@ -16,7 +16,7 @@ import re
 from dataclasses import dataclass
 from typing import Any
 
-from .types import EMOJI_RE, TEMPLATE_HASH_LEN, URL_RE
+from .types import DIRECTED_DST_RE, EMOJI_RE, TEMPLATE_HASH_LEN, URL_RE
 from .types import StorageProtocol as Storage
 
 # ── Tunable constants ────────────────────────────────────────────────────
@@ -39,9 +39,11 @@ AUTO_BEACON_RULES: tuple[tuple[int, int | None], ...] = (
 # conversational replies ("heb je dmr?") are caught by the directed check.
 _AUTO_BEACON_MIN_TOKENS: int = 2
 
-# Directed messages (dst is a callsign-SSID) are by definition not beacons,
-# which are broadcast.  Skip auto-beacon promotion for them.
-_DIRECTED_DST_RE: re.Pattern[str] = re.compile(r"^[A-Z0-9]+-\d+$")
+# Directed messages (dst resolves to a personal callsign) are by definition
+# not beacons, which are broadcast.  Skip auto-beacon promotion for them.
+# The predicate is DIRECTED_DST_RE from types.py -- this module used to
+# compile its own `^[A-Z0-9]+-\d+$`, a third definition of "directed" that
+# missed SSID-less and via-routed DMs (directed_dst_vectors.json).
 
 # Human-oriented categories that should not auto-promote to beacons.
 _HUMAN_CATEGORIES: frozenset[str] = frozenset({"greeting", "directed", "alert"})
@@ -103,7 +105,7 @@ def is_exempt(tokens: list[str], category: str, dst: str) -> bool:
       - too short (<= _AUTO_BEACON_MIN_TOKENS tokens): conversational fillers
         whose hashes collide across unrelated QSOs
       - a human-oriented category (greeting/directed/alert): never auto-promote
-      - directed (dst is a callsign-SSID): beacons are broadcast, not directed
+      - directed (dst resolves to a personal callsign): beacons are broadcast
 
     Public Layer-2 API — the single source of truth for this decision, used
     by update_and_check() (live-ingest path) and classify.py's reclassify
@@ -113,7 +115,10 @@ def is_exempt(tokens: list[str], category: str, dst: str) -> bool:
     """
     is_short = len(tokens) <= _AUTO_BEACON_MIN_TOKENS
     is_human_category = category in _HUMAN_CATEGORIES
-    is_directed = _DIRECTED_DST_RE.match(dst.strip().upper()) is not None
+    # .search (not .match): the pattern carries its own `(?:^|,)` anchor so
+    # it lands on the last comma component of a via-routed dst, and its own
+    # `(?i)` so the caller must not pre-upper the value.
+    is_directed = DIRECTED_DST_RE.search(dst) is not None
     return is_short or is_human_category or is_directed
 
 

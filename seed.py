@@ -11,6 +11,8 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING, Any
 
+from .types import DIRECTED_DST_PATTERN
+
 if TYPE_CHECKING:
     from .types import StorageProtocol
 
@@ -364,12 +366,21 @@ DEFAULT_RULES: list[dict[str, Any]] = [
         "extra_tags": [],
     },
     {
+        # Routing, not content. This rule sits LAST on purpose: a directed
+        # message that also says something ("73", "Hello", "-ping") should
+        # keep the more specific CONTENT category. Because `category` is
+        # single-valued and first-match-wins, that used to silently lose the
+        # directedness entirely -- which is why directedness is now carried
+        # by the `directed` extra_tag as well. extra_tags accumulate across
+        # ALL matching rules (see rules.match_rules), so the tag survives no
+        # matter which content rule won the category slot; consumers that
+        # need "is this a DM?" must read the TAG, not the category.
         "priority": 90,
         "name": "Direct callsign",
         "scope": "dst",
-        "pattern": r"^[A-Z0-9]+-\d+$",
+        "pattern": DIRECTED_DST_PATTERN,
         "category": "directed",
-        "extra_tags": [],
+        "extra_tags": ["directed"],
     },
 ]
 

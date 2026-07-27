@@ -34,7 +34,7 @@ from .rules import load_rules, match_rules
 from .score import compute as score_compute
 from .seed import DEFAULT_RULES
 from .template import check_only, fingerprint, is_exempt, update_and_check
-from .types import CATEGORIES, StorageProtocol
+from .types import CATEGORIES, DIRECTED_DST_PATTERN, DIRECTED_DST_RE, StorageProtocol
 
 
 async def _make_storage(db_path: str) -> StorageProtocol:
@@ -153,9 +153,76 @@ async def _run_suite(storage: StorageProtocol, results: list[tuple[str, bool]]) 
     lint budget; they all share the single tempfile-backed ``storage``.
     """
     await _suite_rules(storage, results)
+    await _suite_directed_dst(results)
     await _suite_template(storage, results)
     await _suite_score(results)
     await _suite_orchestrator(storage, results)
+
+
+async def _suite_directed_dst(results: list[tuple[str, bool]]) -> None:
+    """Replay directed_dst_vectors.json — the cross-repo DIRECTED contract.
+
+    Storage-free on purpose: it pins the PREDICATE and the seed rule that
+    carries it, so it can run identically in every host repo. The webapp
+    replays the same vectors against its own isDirectedDst().
+    """
+    vectors_path = Path(__file__).with_name("directed_dst_vectors.json")
+    contract: dict[str, Any] = json.loads(vectors_path.read_text(encoding="utf-8"))
+    vectors: list[dict[str, Any]] = contract["vectors"]
+
+    results.append(("directed: vectors file is non-empty", len(vectors) > 0))
+
+    mismatches = [
+        v["name"]
+        for v in vectors
+        if (DIRECTED_DST_RE.search(v["dst"]) is not None) != v["is_directed"]
+    ]
+    results.append(
+        (
+            f"directed: DIRECTED_DST_RE replays all {len(vectors)} vectors"
+            + (f" (failed: {mismatches})" if mismatches else ""),
+            mismatches == [],
+        )
+    )
+
+    # The rule stored in the DB and the predicate compiled in types.py must
+    # be the same string, or the live SSE path and is_exempt() drift apart.
+    seed_rule = next((r for r in DEFAULT_RULES if r["name"] == "Direct callsign"), None)
+    results.append(
+        ("directed: seed.py still defines the 'Direct callsign' rule", seed_rule is not None)
+    )
+    if seed_rule is not None:
+        results.append(
+            (
+                "directed: seed rule pattern IS types.DIRECTED_DST_PATTERN",
+                seed_rule["pattern"] == DIRECTED_DST_PATTERN,
+            )
+        )
+        results.append(
+            (
+                (
+                    "directed: seed rule emits the 'directed' extra_tag "
+                    "(survives the single-valued category slot)"
+                ),
+                "directed" in (seed_rule["extra_tags"] or ()),
+            )
+        )
+
+    # template.is_exempt must read the same predicate: a long, non-human
+    # message is exempt from auto-beacon promotion iff its dst is directed.
+    long_tokens = ["a", "longer", "conversational", "message", "body"]
+    exempt_mismatches = [
+        v["name"]
+        for v in vectors
+        if v["dst"] and is_exempt(long_tokens, category="qso", dst=v["dst"]) != v["is_directed"]
+    ]
+    results.append(
+        (
+            "directed: is_exempt agrees with the vectors on every dst"
+            + (f" (failed: {exempt_mismatches})" if exempt_mismatches else ""),
+            exempt_mismatches == [],
+        )
+    )
 
 
 async def _suite_rules(storage: StorageProtocol, results: list[tuple[str, bool]]) -> None:
