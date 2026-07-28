@@ -31,7 +31,7 @@ All four are enforced by CI (`.github/workflows/tests.yml`, Python 3.11) and mus
 ## Code Quality
 
 - `uvx ruff check` and `uvx ruff format --check .` are mandatory — zero tolerance for errors and warnings
-- **Ruff config** in `pyproject.toml`: `line-length = 100`, `target-version = "py311"`, strict rule set — see `[tool.ruff.lint]` for the full list and documented ignores
+- **Ruff config** lives in `pyproject.toml` — see `[tool.ruff]` / `[tool.ruff.lint]` for line length, target version, the full rule set and documented ignores
 - **Keep all `[tool.ruff*]` sections identical** across `pyproject.toml`, `ble_service/pyproject.toml` and mc-chat's `pyproject.toml` — the classifier subtree must lint clean under the same rules in both repos
 - New `# noqa` markers need a trailing reason comment and should stay rare — prefer a real fix
 - **Git branches**: `development` (default), `main` (production)
@@ -41,7 +41,7 @@ All four are enforced by CI (`.github/workflows/tests.yml`, Python 3.11) and mus
 
 No pytest. **The canonical, authoritative test runner is `scripts/run_startup_tests.py`** — it runs every suite with isolated/ephemeral state, is exit-code gated (0 = all passed), and is fully offline (the command suite stubs the weather fetch). It needs no TTY and no `/etc/mcapp`. CI and releases must trust this runner, not the in-app run.
 
-Suites are registered in `main()` of that script (~19 of them: suppression, send_path, contract_parity, udp, storage, sse, classifier, parsing, dedup, routing, query, migration_chain, meteo, push, ble_protocol, update_runner, commands, …). **Add new suites there** — a suite not wired into that `main()` is not gated by anything.
+Suites are registered in `main()` of that script. **Add new suites there** — a suite not wired into that `main()` is not gated by anything.
 
 The in-app startup path (when `has_console()` is true) runs only a **non-fatal smoke check**: the suppression suite (read-only, pure `router.validator` logic). It proceeds on failure because the service is a resilient always-on proxy. The command suite is deliberately **not** run in-app — `run_all_tests()` mutates the live handler (blocked_callsigns, group responses, active pings, beacons) while UDP/BLE are already listening, so it belongs only in the isolated headless runner.
 
@@ -84,7 +84,7 @@ upstream, so a contract edit starts there and reaches this repo by split + pull.
 
 ## Schema Migrations
 
-Add columns/tables via a `current_version < N` block in the chain in `storage/migrations.py` (driven from `sqlite_storage.initialize()`) and bump `FINAL_SCHEMA_VERSION`. Current schema: **v21** (`push_subscriptions`).
+Add columns/tables via a `current_version < N` block in the chain in `storage/migrations.py` (driven from `sqlite_storage.initialize()`) and bump `FINAL_SCHEMA_VERSION`.
 
 ## Web Push
 
