@@ -12,6 +12,7 @@ from __future__ import annotations
 
 from typing import Any
 
+from .constants import CALLSIGN_STRICT_RE, CALLSIGN_TARGET_RE, DST_CALLSIGN_RE
 from .parsing import (
     _parse_topic,
     extract_target_callsign,
@@ -191,6 +192,105 @@ def _test_parse_command(results: list[tuple[str, bool]]) -> None:
         _record(results, f"parse_command: {label}", parse_command(msg), expected)
 
 
+def _test_callsign_strict_re(results: list[tuple[str, bool]]) -> None:
+    """CALLSIGN_STRICT_RE must accept every allocated ITU prefix shape.
+
+    This one pattern gates node-identity auto-detection (`main.py`), `!kb`
+    kickban (`admin_commands.py`) and ctcping targets (`ctcping.py`), so a
+    prefix it rejects locks those operators out of all three at once. An ITU
+    call sign series is one or two characters and only the two-DIGIT
+    combination is unallocated, so letter-only, digit-first AND letter+digit
+    prefixes are all ordinary national allocations. All three are exercised
+    below; the digit-bearing ones were rejected outright until this widening.
+
+    Every accepted vector is additionally asserted against the two sibling
+    patterns: CALLSIGN_STRICT_RE must stay a strict subset of both, or a
+    callsign could validate here and then fail target extraction or the
+    destination check downstream.
+    """
+    cases: list[tuple[str, bool, str]] = [
+        # Two-letter and one-letter prefixes — the shapes that always worked.
+        ("DK5EN", True, "two-letter prefix"),
+        ("DK5EN-98", True, "two-letter prefix with SSID"),
+        ("OE1XAR-33", True, "two-letter prefix, 3-letter suffix"),
+        ("M0ABC", True, "one-letter prefix (UK)"),
+        ("W1AW", True, "one-letter prefix (US)"),
+        ("K1A", True, "shortest accepted shape"),
+        # Digit-first ITU prefixes — the regression this test exists for.
+        ("2E0ABC", True, "digit-first prefix (UK)"),
+        ("2M0XYZ", True, "digit-first prefix (Scotland)"),
+        ("9A1CD", True, "digit-first prefix (Croatia)"),
+        ("4X1AB", True, "digit-first prefix (Israel)"),
+        ("3Z0ABC", True, "digit-first prefix (Poland)"),
+        ("4U1ITU", True, "digit-first prefix (UN, 3-letter suffix)"),
+        ("4O3A", True, "digit-first prefix, 1-letter suffix (Montenegro)"),
+        ("2E0ABC-7", True, "digit-first prefix with SSID"),
+        ("3DA0XX", True, "digit + two-letter prefix (Eswatini)"),
+        # Letter+digit ITU prefixes — the second half of the same defect. These
+        # put TWO digits in a row (series digit + separating digit), which the
+        # letter-only and digit-first branches cannot express.
+        ("S57DX", True, "letter+digit prefix (Slovenia)"),
+        ("E71ABC", True, "letter+digit prefix (Bosnia)"),
+        ("Z35M", True, "letter+digit prefix (North Macedonia)"),
+        ("T77XX", True, "letter+digit prefix (San Marino)"),
+        ("A61BK", True, "letter+digit prefix (UAE)"),
+        ("V51ABC-9", True, "letter+digit prefix with SSID (Namibia)"),
+        # Still rejected.
+        ("INVALID", False, "no separating digit"),
+        ("12ABC", False, "two-digit prefix is not an allocated ITU series"),
+        ("TOO-LONG-123", False, "not a callsign shape"),
+        ("", False, "empty"),
+        ("DK5EN-100", False, "SSID above 99 (MeshCom firmware limit)"),
+        ("dk5en-98", False, "lower case (callers upper-case before matching)"),
+        ("VK3FABC", False, "4-char suffix: firmware caps the suffix at 3"),
+        ("DK5EN/P", False, "portable suffix: MeshCom carries -SSID, never '/'"),
+        # `$` also matches before a trailing newline; the pattern uses `\Z` so
+        # a stray newline cannot smuggle a string past a validator. Reachable
+        # today only if a caller stops pre-stripping — which is exactly the
+        # regression this pins. A newline-suffixed callsign accepted here would
+        # ALSO defeat handle_kickban's self-block guard
+        # (`callsign.split("-")[0] == admin_callsign_base`), because the
+        # trailing newline survives the split and makes the compare unequal.
+        ("DK5EN\n", False, "trailing newline is not a valid callsign"),
+        ("2E0ABC-7\n", False, "trailing newline after SSID"),
+        # Group ids and the firmware's reserved tokens must never look like a
+        # callsign: they share the dst namespace with kickban/ping targets.
+        ("9999", False, "spam group id is not a callsign"),
+        ("232", False, "numeric group id is not a callsign"),
+        ("TEST", False, "'TEST' is a group, not a callsign"),
+        ("WLNK-1", False, "firmware reserved token (passes CALLSIGN_TARGET_RE)"),
+        ("NONE", False, "unconfigured-node sentinel"),
+        # KNOWN, DELIBERATE non-responsibility: this is a pure SHAPE check, and
+        # "XX0XXX-00" — the firmware factory default (esp32_flash.h node_call) —
+        # is a well-formed shape. Filtering the placeholder is the job of the
+        # identity-adoption caller in main.py, not of this pattern. Pinned so
+        # that moving the gate is a deliberate edit, not an accident.
+        ("XX0XXX-00", True, "firmware placeholder is shape-valid (gated elsewhere)"),
+    ]
+    for callsign, expected, label in cases:
+        _record(
+            results,
+            f"CALLSIGN_STRICT_RE: {label} ({callsign!r})",
+            bool(CALLSIGN_STRICT_RE.match(callsign)),
+            expected,
+        )
+        if not expected:
+            continue
+        # Subset invariant against the siblings in constants.py.
+        _record(
+            results,
+            f"CALLSIGN_STRICT_RE subset of CALLSIGN_TARGET_RE ({callsign!r})",
+            bool(CALLSIGN_TARGET_RE.match(callsign)),
+            True,
+        )
+        _record(
+            results,
+            f"CALLSIGN_STRICT_RE subset of DST_CALLSIGN_RE ({callsign!r})",
+            bool(DST_CALLSIGN_RE.match(callsign)),
+            True,
+        )
+
+
 def run_parsing_tests() -> bool:
     """Run the parsing helper test suite. Return True iff every case passed."""
     print("Testing commands.parsing helpers:")
@@ -203,6 +303,7 @@ def run_parsing_tests() -> bool:
     _test_msgid_stripping(results)
     _test_parse_topic(results)
     _test_parse_command(results)
+    _test_callsign_strict_re(results)
 
     passed = sum(1 for _, ok in results if ok)
     total = len(results)

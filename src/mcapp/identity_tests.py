@@ -607,6 +607,19 @@ async def _test_ble_identity_detection_end_to_end(record: Callable[[str, bool], 
             "BLE identity detection: implausible CALL value is ignored",
             router.my_callsign == "DK5EN-98" and saved == [],
         )
+
+        # A factory-fresh / reset node reports the firmware placeholder. It IS a
+        # valid callsign shape, so the regex cannot catch it — without an explicit
+        # gate the proxy would rename itself to a placeholder, persist it and
+        # announce it, just because an unconfigured node was paired.
+        for placeholder in ("XX0XXX-00", "XX0XXX", "DK0XXX-99", "DX0XXX-99"):
+            await router.publish("ble", "ble_notification", {"TYP": "I", "CALL": placeholder})
+            record(
+                f"BLE identity detection: placeholder {placeholder} is never adopted",
+                router.my_callsign == "DK5EN-98"
+                and handler.my_callsign == "DK5EN-98"
+                and saved == [],
+            )
     finally:
         setattr(main_module, "save_runtime_state", original_save)  # noqa: B010 - deliberate monkeypatch
 

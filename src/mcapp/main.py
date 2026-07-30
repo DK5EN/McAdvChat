@@ -81,6 +81,15 @@ SHUTDOWN_TIMEOUT_SSE_S = 3.0
 # Registers the device auto-sends on BLE connect; cached for serving on SSE reconnect.
 BLE_REGISTER_TYPES = ("I", "SN", "G", "SA", "SE", "S1", "SW", "S2", "W", "AN", "IO", "TM")
 
+# Callsign bases that mean "nobody has configured this yet". Each is a valid
+# callsign SHAPE, so CALLSIGN_STRICT_RE accepts them and only an explicit list can
+# tell them apart from a real station. Compared against the SSID-stripped base, so
+# XX0XXX-00 and XX0XXX-12 are both caught.
+#   XX0XXX  MeshCom firmware factory default (esp32/esp32_flash.h node_call)
+#   DK0XXX  CommandHandler's own my_callsign default (commands/handler.py)
+#   DX0XXX  UDPConfig's default target (config_loader.py)
+PLACEHOLDER_CALLSIGN_BASES = frozenset({"XX0XXX", "DK0XXX", "DX0XXX"})
+
 VERSION = f"v{__version__}"
 
 # Global state
@@ -1328,6 +1337,21 @@ def _wire_node_identity_detection(message_router: MessageRouter) -> None:
         if not detected or not CALLSIGN_STRICT_RE.match(detected):
             if detected:
                 logger.debug("Ignoring implausible CALL register value: %r", detected)
+            return
+        # A factory-fresh or reset node reports the firmware's placeholder call
+        # (esp32_flash.h ships node_call = "XX0XXX-00", and the firmware itself
+        # treats XX0XXX as "not configured yet"). It is a perfectly valid callsign
+        # SHAPE, so CALLSIGN_STRICT_RE cannot reject it — but adopting it would
+        # rename the proxy to a placeholder, persist that to runtime.json and
+        # announce it to every SSE client, purely because an unconfigured node was
+        # paired. Keep whatever identity we already have and say why.
+        if detected.split("-", maxsplit=1)[0] in PLACEHOLDER_CALLSIGN_BASES:
+            logger.warning(
+                "Node reports the unconfigured placeholder callsign %s — keeping %s. "
+                "Set the node's own callsign with --setcall.",
+                detected,
+                message_router.my_callsign,
+            )
             return
         if detected == message_router.my_callsign:
             return
