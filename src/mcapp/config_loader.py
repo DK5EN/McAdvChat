@@ -7,6 +7,7 @@ Supports environment variable overrides for deployment flexibility.
 """
 
 import json
+import math
 import os
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -24,13 +25,88 @@ from .runtime_state import (
 logger = get_logger(__name__)
 
 # Keys the persisted runtime overlay (auto-detected facts, e.g. the node's real
-# callsign learned from its BLE "I" register) is allowed to feed into
-# `_from_dict`'s mapping. `runtime.json` may also carry `BLE_DEVICE_NAME` and
-# `detected_at` (see `runtime_state.py`), but those aren't consumed by Config
-# yet, so they are deliberately filtered out here rather than spread in
-# unchecked — `_from_dict` ignores unknown keys anyway, but an explicit
-# allowlist keeps the overlay's blast radius limited to what it should affect.
-_RUNTIME_OVERLAY_KEYS = frozenset({"CALL_SIGN", "MESHCOM_IOT_TARGET"})
+# callsign learned from its BLE "I" register, or its last-known GPS position)
+# is allowed to feed into `_from_dict`'s mapping. `runtime.json` may also carry
+# `BLE_DEVICE_NAME` and `detected_at` (see `runtime_state.py`), but those
+# aren't consumed by Config yet, so they are deliberately filtered out here
+# rather than spread in unchecked — `_from_dict` ignores unknown keys anyway,
+# but an explicit allowlist keeps the overlay's blast radius limited to what
+# it should affect. LAT/LONG reuse config.json's own key spelling (not e.g.
+# GPS_LAT) so they flow through the exact same `_pluck_present` mapping below
+# with no extra wiring.
+_RUNTIME_OVERLAY_KEYS = frozenset({"CALL_SIGN", "MESHCOM_IOT_TARGET", "LAT", "LONG"})
+
+# Coordinate bounds for LAT/LONG overlay entries — see `_sanitize_overlay_value`.
+_LAT_BOUNDS = (-90.0, 90.0)
+_LON_BOUNDS = (-180.0, 180.0)
+
+# LAT/LONG are ONE fact (a position), not two independent scalars — see
+# `_apply_position_pair_rule`. Kept as a tuple, not a set, so the ordering in
+# log/error text is stable.
+_POSITION_KEYS = ("LAT", "LONG")
+
+
+def _sanitize_overlay_value(key: str, value: Any) -> Any | None:
+    """Per-key validation for one persisted runtime-overlay entry, returning
+    the sanitized value or `None` if it must be dropped (see `Config.load`'s
+    overlay docstring for why this exists at all — `runtime.json` is a plain
+    file that can be hand-edited or half-written).
+
+    CALL_SIGN / MESHCOM_IOT_TARGET stay string-only, exactly as before this
+    function existed. LAT / LONG are new (Wave 3, GPS cold-start seed): a
+    *numeric* overlay value the old blanket `isinstance(value, str)` check
+    would have silently dropped, so each key gets its own predicate instead
+    of loosening the check for everything. `bool` is rejected before the
+    `int`/`float` check because `bool` is a subclass of `int` in Python.
+    NaN/inf and out-of-range coordinates are rejected so a corrupt
+    hand-edited runtime.json can never poison the weather seed the way it
+    already can't poison the callsign.
+    """
+    if key in ("CALL_SIGN", "MESHCOM_IOT_TARGET"):
+        return value.strip() if isinstance(value, str) and value.strip() else None
+    if key in ("LAT", "LONG"):
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            return None
+        numeric = float(value)
+        if not math.isfinite(numeric):
+            return None
+        lo, hi = _LAT_BOUNDS if key == "LAT" else _LON_BOUNDS
+        return numeric if lo <= numeric <= hi else None
+    return None
+
+
+def _apply_position_pair_rule(overlay: dict[str, Any]) -> None:
+    """Drop a half-valid position from `overlay` in place: either BOTH LAT and
+    LONG survived `_sanitize_overlay_value` and both are adopted, or neither is.
+
+    LAT and LONG are one fact, and validating them independently FABRICATES a
+    third location that neither input ever claimed. Observed shape of the bug:
+    config.json seeds 48.402/11.749 (Freising, DE), a half-written runtime.json
+    carries LAT 999.0 (dropped) plus LONG 17.321 (kept) — and per-key merging
+    then produced 48.402/17.321, Freising's latitude fused with Bratislava's
+    longitude, a point ~430 km east of the station in open Slovak farmland.
+    Weather for that point is not "slightly off", it is a different country's
+    weather served as if it were the station's — precisely the failure Wave 3
+    exists to end. A half-position is therefore no position at all: the
+    config.json seed survives intact, which is at least a location a human
+    once wrote down.
+
+    Deliberately NOT applied to CALL_SIGN / MESHCOM_IOT_TARGET: those really
+    are independent scalars, and dropping a good callsign because an unrelated
+    key was corrupt would be the opposite mistake.
+    """
+    if all(key in overlay for key in _POSITION_KEYS):
+        return
+    dropped = [key for key in _POSITION_KEYS if key in overlay]
+    for key in dropped:
+        del overlay[key]
+    if dropped:
+        logger.warning(
+            "Runtime overlay carries a half position (%s without its partner); "
+            "ignoring both and keeping config.json's LAT/LONG seed",
+            ", ".join(dropped),
+        )
+
 
 # ── Protocol constants (fixed by hardware / architecture) ─────────────
 
@@ -73,12 +149,25 @@ class StorageConfig:
 class LocationConfig:
     """Geographic location configuration.
 
-    DEPRECATED: latitude/longitude are now obtained from the GPS device at runtime.
-    Only station_name is used from config. LAT/LONG keys in config.json are ignored.
+    latitude/longitude ARE read from config.json's LAT/LONG keys (the bash
+    installer always writes them — bootstrap/lib/config.sh) and used as
+    WeatherService's cold-start seed. An earlier version of this docstring
+    claimed they were ignored; they are not — `_from_dict` plucks them
+    straight into these fields, and that seed is served as real weather
+    until something better arrives. It IS refined at runtime, two ways: the
+    paired node's own BLE "G" register overwrites it via
+    `WeatherService.update_location()` as soon as a fix arrives, and that
+    live position is itself persisted to the runtime overlay (this module's
+    LAT/LONG overlay keys, written by `main.py`'s `_cache_gps`) so the NEXT
+    boot seeds from the node's last-known real position instead of
+    config.json's guess again. A wrong config.json seed (transposed
+    coordinates, a copied example) is otherwise served as real weather for
+    up to 5 minutes on every cold start — check the "WX Service for ..."
+    startup log line, which logs the seed actually in use.
     """
 
-    latitude: float | None = None  # deprecated — use GPS device
-    longitude: float | None = None  # deprecated — use GPS device
+    latitude: float | None = None  # config.json LAT — cold-start seed, refined by GPS
+    longitude: float | None = None  # config.json LONG — cold-start seed, refined by GPS
     station_name: str = ""
 
 
@@ -150,14 +239,22 @@ class Config:
         # `MessageRouter.set_callsign`, where `None.strip()` raised
         # AttributeError on the uncaught boot path and took the whole proxy
         # down; an empty/blank string silently overrode a perfectly good
-        # config.json callsign with "". Anything that is not a non-blank string
-        # is dropped so the config.json value survives — same never-raise
-        # posture as `load_runtime_state` itself.
-        overlay = {
-            key: value.strip()
-            for key, value in load_runtime_state().items()
-            if key in _RUNTIME_OVERLAY_KEYS and isinstance(value, str) and value.strip()
-        }
+        # config.json callsign with "". `_sanitize_overlay_value` drops
+        # anything invalid FOR ITS OWN KEY (a non-blank string for
+        # CALL_SIGN/MESHCOM_IOT_TARGET, a finite in-range number for
+        # LAT/LONG) so the config.json value survives instead — same
+        # never-raise posture as `load_runtime_state` itself. LAT/LONG then get
+        # a second, PAIRWISE gate (`_apply_position_pair_rule`): per-key
+        # sanitisation alone would happily fuse a surviving overlay LONG with
+        # config.json's LAT into a position neither file ever claimed.
+        overlay: dict[str, Any] = {}
+        for key, raw_value in load_runtime_state().items():
+            if key not in _RUNTIME_OVERLAY_KEYS:
+                continue
+            sanitized = _sanitize_overlay_value(key, raw_value)
+            if sanitized is not None:
+                overlay[key] = sanitized
+        _apply_position_pair_rule(overlay)
         data = {**file_data, **overlay}
         return cls._from_dict(data)
 

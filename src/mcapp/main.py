@@ -2,6 +2,7 @@
 import asyncio
 import contextlib
 import json
+import math
 import os
 import signal
 import socket
@@ -31,6 +32,7 @@ from .config_loader import (
 # New modular imports
 from .logging_setup import get_logger, setup_logging
 from .logging_setup import has_console as check_console
+from .meteo import is_valid_position
 from .router_tests import run_suppression_tests
 
 # Re-exported (import-as-itself) so identity_tests.py can monkeypatch
@@ -101,6 +103,34 @@ BLE_HELLO_WAIT = 1.0  # Wait after hello handshake before queries
 BLE_QUERY_DELAY_STANDARD = 0.8  # Delay between standard register queries
 BLE_QUERY_DELAY_MULTIPART = 1.2  # Delay for multi-part responses (SE+S1, SW+S2)
 BLE_RETRY_BASE_DELAY = 0.5  # Base delay for exponential backoff retries
+# Ceiling for the one-shot register re-query fired at startup against a BLE
+# connection the ble_service kept alive across an mcapp restart. Nominal cost is
+# 3 * BLE_QUERY_DELAY_STANDARD (2.4 s) plus three loopback HTTP calls; the
+# unbounded worst case is 3 commands * BLE_CMD_MAX_RETRIES * the remote client's
+# 30 s request timeout ≈ 4.5 minutes of a build_app() that has not started the
+# SSE server yet. This is a GPS nicety, not a startup dependency — see
+# requery_reused_ble_connection.
+BLE_REQUERY_TIMEOUT_S = 10.0
+
+# Minimum movement, in degrees, before the node's live GPS position is written
+# back to the runtime overlay. NOT a debounce against jitter alone: MeshCom
+# firmware rounds the fix to 4 decimals (`cround4` in gps_functions.cpp, ~11 m),
+# and ordinary GPS noise moves that last decimal on most beacons, so an
+# exact-equality check never fires and a stationary node would rewrite
+# runtime.json on every ~300 s keepalive — ~288 SD-card writes a day on a Pi
+# Zero, forever, to persist a number that did not change. 0.01° is ~1.1 km N/S
+# (~0.75 km E/W at 48°N), which is below the resolution the persisted value is
+# used at: it is only a cold-start weather SEED, and both upstreams resolve to a
+# nearest-station / ~1-11 km grid anyway. The live position handed to
+# WeatherService is never rounded — only the persisted copy is coarse.
+GPS_PERSIST_MIN_DELTA_DEG = 0.01
+
+# Absolute coordinate limits, mirroring config_loader's _LAT_BOUNDS/_LON_BOUNDS.
+# Duplicated rather than imported so the two validations stay in their own
+# modules; they must agree, because _cache_gps must never persist a value
+# Config.load would then reject on the next boot.
+_LAT_LIMIT_DEG = 90.0
+_LON_LIMIT_DEG = 180.0
 
 # Module logger
 logger = get_logger(__name__)
@@ -717,12 +747,29 @@ class MessageRouter:
         self, wait_for_hello: bool = True, sync_time: bool = True
     ) -> None:
         """
-        Query BLE device registers NOT auto-sent by the device on connect.
+        Query BLE device registers this proxy cannot rely on the device to
+        (re-)send by itself for every caller of this method.
 
-        The device auto-sends 8 registers on BLE connection:
-        I, SN, G, SA, SE+S1, SW+S2, W, AN
+        The device DOES auto-send 8 registers — I, SN, G, SA, SE+S1, SW+S2,
+        W, AN — but only as part of its own post-hello config-push batch
+        (confirmed in firmware: esp32_main.cpp/nrf52_main.cpp's `config_cmds`,
+        which literally includes "--pos", the source of "G"). That auto-send
+        fires once per genuine hello handshake — which is exactly what does
+        NOT happen when this process (mcapp) restarts while the remote
+        `ble_service` kept its BLE session alive across the restart:
+        `BLEClientRemote.start()` finds the device already `connected` and
+        never redoes connect()/hello, so the firmware never re-sends "G"
+        either. `cached_gps` resets to `None` on every mcapp restart
+        (build_app), so without an explicit re-query GPS — and therefore
+        weather location — stays stale until either the webapp explicitly
+        reconnects or the BLE service's ~300s keepalive `--pos` eventually
+        lands (see ble_service/src/ble_adapter.py's KEEPALIVE_INTERVAL_S).
+        `--pos` is therefore included below too: redundant (and cheap/
+        idempotent) on a connect that just auto-sent everything, load-bearing
+        on a reused connection.
 
-        This method only queries the remaining registers:
+        This method also queries the two registers never auto-sent by any
+        connect, fresh or reused:
         - --io: TYP: IO (GPIO status)
         - --tel: TYP: TM (telemetry config)
 
@@ -753,9 +800,10 @@ class MessageRouter:
                 except Exception as e:
                     logger.warning("Time sync failed (non-critical): %s", e)
 
-        # Only query registers NOT auto-sent by device on connect.
-        # Device auto-sends: I, SN, G, SA, SE+S1, SW+S2, W, AN
+        # --pos first (cheapest way to close the cold-start GPS gap — see the
+        # docstring above), then the two registers no connect ever auto-sends.
         non_auto_registers = [
+            ("--pos", BLE_QUERY_DELAY_STANDARD),  # TYP: G (GPS) — see docstring
             ("--io", BLE_QUERY_DELAY_STANDARD),  # TYP: IO (GPIO status)
             ("--tel", BLE_QUERY_DELAY_STANDARD),  # TYP: TM (telemetry config)
         ]
@@ -766,7 +814,57 @@ class MessageRouter:
                 logger.warning("Register query %s failed (non-critical)", cmd)
             await asyncio.sleep(delay)
 
-        logger.debug("Register queries complete (IO + TM)")
+        logger.debug("Register queries complete (POS + IO + TM)")
+
+    async def requery_reused_ble_connection(self) -> None:
+        """Fire the same one-shot register query a fresh BLE connect gets, for
+        the case where this process (mcapp) starts up and finds the remote
+        `ble_service` already holding a connection from BEFORE the restart.
+
+        `ble_service` is a separate, long-lived process; a plain `mcapp`
+        restart never re-triggers the device's own hello handshake, so the
+        firmware's auto-config push (which is what normally delivers a fresh
+        "G" GPS register — see `_query_ble_registers`'s docstring) never
+        fires either. Called once from `build_app()` right after
+        `ble_client.start()`; a no-op when nothing is connected yet (e.g.
+        disabled BLE mode, or the device just isn't paired right now).
+
+        SELF-CONTAINED BY CONSTRUCTION, because the caller cannot afford
+        either failure mode:
+
+        * Bounded by BLE_REQUERY_TIMEOUT_S. `build_app()` awaits this inline
+          and only starts the SSE server afterwards, so an unbounded wait
+          here is an unbounded wait before the proxy answers on :8080 at all.
+          A ble_service that reported "connected" and then wedged would
+          otherwise hold startup for minutes (see BLE_REQUERY_TIMEOUT_S).
+        * Never raises. The call site sits inside `build_app()`'s
+          "Failed to initialize BLE client" handler, whose recovery is to
+          tear the working remote client down and fall back to DISABLED BLE
+          mode for the entire process lifetime. Letting a failed GPS nicety
+          reach that handler would trade the mesh link for a weather seed.
+
+        `client.status` is the local cache, deliberately, not an
+        `await refresh_status()`: `start()` has just refreshed it from the
+        remote service one statement earlier, so a second HTTP round trip
+        would only add a way for startup to hang.
+        """
+        try:
+            client = self._get_ble_client()
+            # `client` is deliberately `Any` (the protocol registry is untyped),
+            # so the connection probe lives inside the guard too rather than
+            # trusting a duck-typed object's `.status` not to blow up.
+            if client is None or client.status.state != ConnectionState.CONNECTED:
+                return
+            async with asyncio.timeout(BLE_REQUERY_TIMEOUT_S):
+                await self._query_ble_registers(wait_for_hello=False)
+        except TimeoutError:
+            logger.warning(
+                "Startup register re-query on the reused BLE connection timed out after %.0fs "
+                "(non-critical: GPS/weather will refresh on the next keepalive)",
+                BLE_REQUERY_TIMEOUT_S,
+            )
+        except Exception:
+            logger.exception("Startup register re-query on the reused BLE connection failed")
 
     async def _handle_ble_scan_command(self) -> None:
         """Handle BLE scan command"""
@@ -1252,6 +1350,27 @@ class _ClassifierBus:
         await self._mgr.broadcast_event(event.event_type, event.data)
 
 
+def _coordinate(value: Any, limit: float) -> float | None:
+    """One coordinate out of a BLE "G" frame, or None if it is not usable.
+
+    The frame is JSON straight off the wire, so the value is `Any`; the
+    firmware writes a double (`pdoc["LAT"] = d_lat`), but nothing between here
+    and the radio enforces that. `None` (key absent from a truncated frame),
+    a string, NaN/inf, and anything outside ±`limit` are all rejected, because
+    every one of them survives the downstream `is_valid_position` check —
+    `"48.4" == 0` and `nan == 0` are both False — and would then be handed to
+    `WeatherService.update_location` and written into runtime.json, where a
+    NaN is not even valid JSON. `bool` is excluded explicitly: it is a subclass
+    of `int`, so `True` would otherwise arrive as latitude 1.0.
+    """
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    coordinate = float(value)
+    if not math.isfinite(coordinate) or abs(coordinate) > limit:
+        return None
+    return coordinate
+
+
 def _wire_ble_caches(message_router: MessageRouter) -> None:
     """Subscribe the BLE-register/GPS caching handlers used to serve SSE
     reconnects instantly instead of re-querying the device."""
@@ -1275,22 +1394,77 @@ def _wire_ble_caches(message_router: MessageRouter) -> None:
 
     message_router.subscribe("ble_status", _clear_ble_cache_on_disconnect)
 
+    # Last position actually written to runtime.json by _cache_gps, or None
+    # when this process has not written one yet. Deliberately the PERSISTED
+    # position, not the last cached one: debouncing against the previous
+    # reading lets a node drifting by less than the threshold per beacon walk
+    # arbitrarily far without ever persisting, because each individual step
+    # looks like noise. Starting at None means the first valid fix after a
+    # restart always persists, which is what refreshes a stale seed.
+    last_persisted_gps: dict[str, float] | None = None
+
     async def _cache_gps(routed_message: dict[str, Any]) -> None:
-        """Cache GPS from BLE device and update weather service."""
+        """Cache GPS from BLE device, update the weather service, and persist
+        the position to the runtime overlay so a restart seeds from the
+        node's last-known real position instead of config.json's installer-
+        written LAT/LONG guess (the Bratislava-seed cold-start bug — see
+        `config_loader.LocationConfig`'s docstring).
+
+        `is_valid_position` rejects BOTH `None` and the literal `0/0`
+        no-fix sentinel a disconnected GPS module reports — a `0/0` used to
+        pass this method's old `lat != 0 and lon != 0` check just fine
+        individually, but is unified with meteo.py's/sse_routes/weather.py's
+        copies of the same guard now.
+
+        LAT and LON are read as a PAIR through `_coordinate`, with no `0`
+        default. A `.get("LAT", 0)` default is what makes a truncated "G"
+        frame dangerous under the unified sentinel: a frame carrying LAT but
+        no LON becomes (48.40, 0.0), which `is_valid_position` correctly
+        accepts — a station really can sit on the prime meridian — and the
+        node is then placed in the Gulf of Guinea, persisted there, and
+        seeded from there on the next boot. Same rule as
+        `config_loader._apply_position_pair_rule`: half a position is no
+        position.
+        """
+        nonlocal last_persisted_gps
         data = routed_message["data"]
         if data.get("TYP") != "G":
             return
-        lat = data.get("LAT", 0)
-        lon = data.get("LON", 0)
-        if lat != 0 and lon != 0:
-            message_router.cached_gps = {"lat": lat, "lon": lon}
-            # Update weather service if available
-            cmd_handler = message_router.get_protocol("commands")
-            if cmd_handler:
-                cmd_handler.lat = lat
-                cmd_handler.lon = lon
-                if cmd_handler.weather_service:
-                    cmd_handler.weather_service.update_location(lat, lon)
+        lat = _coordinate(data.get("LAT"), _LAT_LIMIT_DEG)
+        lon = _coordinate(data.get("LON"), _LON_LIMIT_DEG)
+        # The `is None` arms are redundant with is_valid_position's own None
+        # check and are kept only so mypy narrows both to `float` for the
+        # arithmetic below — same pattern as meteo.py's _is_daytime.
+        if lat is None or lon is None or not is_valid_position(lat, lon):
+            return
+
+        message_router.cached_gps = {"lat": lat, "lon": lon}
+        cmd_handler = message_router.get_protocol("commands")
+        if cmd_handler:
+            cmd_handler.lat = lat
+            cmd_handler.lon = lon
+            if cmd_handler.weather_service:
+                cmd_handler.weather_service.update_location(lat, lon)
+
+        # Movement gate: a stationary node re-reports an almost-identical fix
+        # on every ~300 s BLE keepalive --pos (ble_service's
+        # KEEPALIVE_INTERVAL_S), jittering in the 4th decimal the firmware
+        # rounds to, so only rewrite runtime.json once the node has actually
+        # moved — see GPS_PERSIST_MIN_DELTA_DEG. Off-thread, same posture as
+        # _detect_node_identity's persist below: this runs inline with mesh
+        # ingest, and synchronous SD-card I/O here would stall SSE heartbeats
+        # and UDP ingest the same way meteo.py's update_location docstring
+        # documents for its own cache lock.
+        if last_persisted_gps is not None and (
+            abs(lat - last_persisted_gps["lat"]) < GPS_PERSIST_MIN_DELTA_DEG
+            and abs(lon - last_persisted_gps["lon"]) < GPS_PERSIST_MIN_DELTA_DEG
+        ):
+            return
+        await asyncio.to_thread(save_runtime_state, {"LAT": lat, "LONG": lon})
+        # Only after a successful hand-off: save_runtime_state swallows OSError
+        # internally, so this is "we asked for it to be written", which is the
+        # best signal available without changing that function's contract.
+        last_persisted_gps = {"lat": lat, "lon": lon}
 
     message_router.subscribe("ble_notification", _cache_gps)
 
@@ -1503,6 +1677,10 @@ async def build_app(cfg: Config) -> AppContext:  # noqa: PLR0915 - sequential wi
             )
             message_router.register_protocol("ble_client", ble_client)
             await ble_client.start()
+            # Closes the cold-start GPS gap: if ble_service already held a
+            # connection from before this restart, no-op otherwise. See
+            # requery_reused_ble_connection's docstring.
+            await message_router.requery_reused_ble_connection()
         except Exception:
             logger.exception("Failed to initialize BLE client")
             logger.info("Falling back to disabled BLE mode")
@@ -1917,9 +2095,17 @@ def run() -> None:
     # Load configuration using new config loader
     cfg = Config.load()
 
-    # Log configuration summary
+    # Log configuration summary. Logs the ACTUAL seed coordinates (config.json's
+    # LAT/LONG, or the persisted GPS overlay if one already landed) rather than
+    # a vague "location from GPS device" — a wrong config.json seed (transposed
+    # coordinates, a copied example) is otherwise served as real weather
+    # silently for up to 5 minutes on every cold start, and this line is the
+    # only place that would surface it. See LocationConfig's docstring.
     logger.info(
-        "WX Service for %s (location from GPS device)", cfg.location.station_name or "unnamed"
+        "WX Service for %s: seed %s/%s (refined by the node's own GPS once connected)",
+        cfg.location.station_name or "unnamed",
+        cfg.location.latitude,
+        cfg.location.longitude,
     )
     logger.info(
         "Retention: msgs %s, pos/ack %s",

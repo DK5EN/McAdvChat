@@ -9,6 +9,7 @@ from typing import TYPE_CHECKING, Any, cast
 
 from fastapi import APIRouter, HTTPException
 
+from ..meteo import is_valid_position
 from ..util import now_ms
 
 if TYPE_CHECKING:
@@ -42,9 +43,12 @@ def build_weather_router(manager: SSEManager) -> APIRouter:
             raise HTTPException(status_code=503, detail="Weather service not available")
 
         # If no GPS yet, try cached GPS or trigger BLE query
-        if manager.weather_service.lat is None and manager.message_router:
+        if (
+            not is_valid_position(manager.weather_service.lat, manager.weather_service.lon)
+            and manager.message_router
+        ):
             cached = getattr(manager.message_router, "cached_gps", None)
-            if cached:
+            if cached and is_valid_position(cached.get("lat"), cached.get("lon")):
                 manager.weather_service.update_location(cached["lat"], cached["lon"])
             else:
                 # Query BLE device for GPS (one-shot)
@@ -64,7 +68,7 @@ def build_weather_router(manager: SSEManager) -> APIRouter:
         if not manager.weather_service:
             raise HTTPException(status_code=503, detail="Weather service not available")
 
-        if manager.weather_service.lat is None:
+        if not is_valid_position(manager.weather_service.lat, manager.weather_service.lon):
             return {"preview": "WX: Warte auf GPS..."}
 
         data = await asyncio.to_thread(manager.weather_service.get_weather_data)

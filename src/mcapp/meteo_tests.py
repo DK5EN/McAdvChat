@@ -12,16 +12,36 @@ data-source fusion precedence, data-age validation, dewpoint→humidity (Magnus
 formula), cloud-cover percent→okta conversion, 16-point compass bucketing, and
 the LoRa message formatter (including its length-based fallback format).
 
+Also covers the Wave 3 (2026-07-30) cold-start-seed fix: the unified
+`is_valid_position` "no position" sentinel (None AND 0/0), that a 0/0 or
+missing position defers weather without ever reaching the network,
+`update_location`'s cache-invalidation contract, and `_make_request`'s
+retry policy (permanent 4xx fails fast, transient 408/429 and 5xx/timeout
+still retry, `Retry-After` honoured but clamped) — offline via a stubbed
+`httpx.get`/`time.sleep`, never a real request.
+
 Only tz handling (_messzeitpunkt_to_utc / _is_daytime) and the negative-cache
 behaviour of get_weather_data() are covered elsewhere, in
 commands/tests.py::test_meteo_timezone_validators/test_meteo_negative_cache.
 """
 
+import contextlib
 import sys
+import time
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
-from .meteo import _MAX_LORA_MSG_LEN, WeatherService
+import httpx
+
+from .meteo import (
+    _MAX_LORA_MSG_LEN,
+    RETRY_AFTER_MAX_S,
+    RETRY_DELAY_S,
+    WeatherService,
+    WeatherServiceError,
+    _retry_delay_s,
+    is_valid_position,
+)
 
 results: list[tuple[str, str]] = []
 
@@ -387,6 +407,375 @@ def _test_format_for_lora() -> None:
     )
 
 
+def _test_is_valid_position() -> None:
+    _check("is_valid_position: None/None is invalid", is_valid_position(None, None), False)
+    _check("is_valid_position: lat None, lon set is invalid", is_valid_position(None, 11.75), False)
+    _check("is_valid_position: lat set, lon None is invalid", is_valid_position(48.4, None), False)
+    _check(
+        "is_valid_position: 0/0 (no-fix GPS sentinel) is invalid",
+        is_valid_position(0, 0),
+        False,
+    )
+    _check(
+        "is_valid_position: 0.0/0.0 (float sentinel) is invalid",
+        is_valid_position(0.0, 0.0),
+        False,
+    )
+    _check(
+        "is_valid_position: a real position is valid",
+        is_valid_position(48.4031, 11.7497),
+        True,
+    )
+    _check(
+        "is_valid_position: lat==0 alone (equator) is valid — only the (0,0) PAIR is the sentinel",
+        is_valid_position(0, 11.75),
+        True,
+    )
+    _check(
+        "is_valid_position: lon==0 alone (prime meridian) is valid",
+        is_valid_position(48.4, 0),
+        True,
+    )
+
+
+def _test_no_position_defers_without_network() -> None:
+    """0/0 and None must both defer (return the 'no GPS' error) and never
+    reach the network. Verified by stubbing `_get_brightsky_weather` /
+    `_get_openmeteo_weather` to raise if called at all — the early-return
+    guard in `_fetch_weather_data` must trip before either is invoked.
+    """
+    for lat, lon, label in ((0, 0, "0/0"), (None, None, "None/None"), (0.0, 0.0, "0.0/0.0")):
+        ws = WeatherService(lat=lat, lon=lon, stat_name="NoPosTest")
+
+        def _unreachable() -> dict[str, Any]:
+            raise AssertionError("network fetch must not be attempted without a valid position")
+
+        ws._get_brightsky_weather = _unreachable  # type: ignore[method-assign]  # offline test double
+        ws._get_openmeteo_weather = _unreachable  # type: ignore[method-assign]  # offline test double
+
+        result = ws.get_weather_data()
+        _check(
+            f"no-position ({label}): get_weather_data returns an error, not weather",
+            "error" in result,
+            True,
+        )
+        _check(
+            f"no-position ({label}): the error names the missing GPS, not an API failure",
+            "GPS" in result.get("error", ""),
+            True,
+        )
+
+
+def _test_update_location_bumps_generation_and_invalidates_cache() -> None:
+    """REGRESSION guard for the incident meteo.py's update_location docstring
+    documents: a stale cache must not keep serving weather for the OLD
+    location after a GPS update. update_location() is deliberately
+    lock-free (bumps `_cache_generation`), so this proves the counter
+    actually invalidates a populated cache rather than just changing.
+    """
+    ws = WeatherService(lat=48.15, lon=11.58, stat_name="GenTest")
+    fetch_count = 0
+    seen_positions: list[tuple[float | None, float | None]] = []
+
+    def fake_fetch() -> dict[str, Any]:
+        nonlocal fetch_count
+        fetch_count += 1
+        seen_positions.append((ws.lat, ws.lon))
+        return {"temperatur_celsius": 20.0, "timestamp": "test"}
+
+    ws._fetch_weather_data = fake_fetch  # type: ignore[method-assign] # offline cache-invalidation double
+
+    first = ws.get_weather_data()
+    _check("update_location: initial fetch populates the cache", fetch_count == 1, True)
+    second = ws.get_weather_data()
+    _check(
+        "update_location: a second call before any location change is served from cache",
+        second is first and fetch_count == 1,
+        True,
+    )
+
+    generation_before = ws._cache_generation
+    ws.update_location(48.40, 11.75, "MovedTest")
+    _check(
+        "update_location: bumps _cache_generation",
+        ws._cache_generation == generation_before + 1,
+        True,
+    )
+    _check("update_location: updates lat/lon", (ws.lat, ws.lon), (48.40, 11.75))
+    _check("update_location: updates stat_name", ws.stat_name, "MovedTest")
+
+    third = ws.get_weather_data()
+    _check(
+        "update_location: the next fetch is NOT served from the stale cache "
+        "(a fresh fetch runs for the new location)",
+        third is not first and fetch_count == 2,
+        True,
+    )
+    _check(
+        "update_location: the fresh fetch actually ran against the NEW coordinates",
+        seen_positions[-1] == (48.40, 11.75),
+        True,
+    )
+
+
+def _fake_status_response(
+    status_code: int, headers: dict[str, str] | None = None
+) -> httpx.Response:
+    """A real httpx.Response (not a hand-rolled duck-type) whose
+    raise_for_status() raises a real httpx.HTTPStatusError with
+    `.response.status_code` set — so `_make_request`'s except clauses see
+    exactly what production sees, built entirely offline.
+    """
+    request = httpx.Request("GET", "https://example.invalid/weather")
+    return httpx.Response(status_code=status_code, headers=headers, request=request)
+
+
+def _count_requests_for_status(status_code: int, headers: dict[str, str] | None = None) -> int:
+    """Drive `_make_request` against a stubbed `httpx.get` that always returns
+    `status_code`, and report how many HTTP attempts it made. `time.sleep` is
+    stubbed to a no-op so a retried status costs no wall-clock time here.
+
+    Fully offline: `httpx.get` is replaced for the duration, so no code path —
+    including BrightSky's two-endpoint fallback, which is not exercised here
+    because `_make_request` is called directly — can reach the network.
+    """
+    ws = WeatherService(lat=48.15, lon=11.58, stat_name="RetryTest")
+    original_get = httpx.get
+    original_sleep = time.sleep
+    time.sleep = lambda *_args, **_kwargs: None  # no real delay in tests
+    call_count = 0
+
+    def fake_get(*_args: Any, **_kwargs: Any) -> httpx.Response:
+        nonlocal call_count
+        call_count += 1
+        return _fake_status_response(status_code, headers)
+
+    httpx.get = fake_get  # offline HTTP double
+    try:
+        with contextlib.suppress(WeatherServiceError):
+            ws._make_request("https://example.invalid/weather", {"lat": 1, "lon": 2})
+    finally:
+        httpx.get = original_get  # restore
+        time.sleep = original_sleep  # restore
+    return call_count
+
+
+def _test_make_request_4xx_fails_fast() -> None:
+    """Wave 3 fix: a PERMANENT 4xx status fails fast — the request itself is
+    wrong for this endpoint/params, so retrying an unchanged request cannot
+    succeed. Exactly ONE request, no retry sleep.
+    """
+    ws = WeatherService(lat=48.15, lon=11.58, stat_name="RetryTest")
+    original_get = httpx.get
+    call_count = 0
+
+    def fake_get(*_args: Any, **_kwargs: Any) -> httpx.Response:
+        nonlocal call_count
+        call_count += 1
+        return _fake_status_response(404)
+
+    httpx.get = fake_get  # offline HTTP double
+    try:
+        raised = False
+        try:
+            ws._make_request("https://example.invalid/weather", {"lat": 1, "lon": 2})
+        except WeatherServiceError:
+            raised = True
+        _check("_make_request: a 404 raises (no silent success)", raised, True)
+        _check(
+            "_make_request: a 404 makes exactly ONE request (fails fast, no retry)",
+            call_count,
+            1,
+        )
+    finally:
+        httpx.get = original_get  # restore
+
+    # ADVISOR REGRESSION (Wave 3 defect 2): the fast-fail must NOT cover the
+    # whole 4xx band. 408 and 429 mean "not right now", not "not ever", and
+    # both upstreams here (api.brightsky.dev, api.open-meteo.com) are free
+    # public APIs that rate-limit. A 429 that is never retried is simply no
+    # weather. Guarded per code, so a future edit that widens the fast-fail
+    # back to `400 <= code < 500` fails on the exact codes that matter.
+    attempts = WeatherService(lat=0.0, lon=0.0, stat_name="x").max_retries + 1
+    for retryable in (408, 429):
+        _check(
+            f"_make_request: a {retryable} IS retried — it is transient, not a permanent 4xx",
+            _count_requests_for_status(retryable),
+            attempts,
+        )
+    for permanent in (400, 403, 404, 422):
+        _check(
+            f"_make_request: a {permanent} still fails fast (exactly one request)",
+            _count_requests_for_status(permanent),
+            1,
+        )
+
+
+def _test_retry_after_is_honoured_but_bounded() -> None:
+    """A `Retry-After` on a retryable status is honoured — but clamped to
+    RETRY_AFTER_MAX_S, because `_make_request` runs under `_cache_lock` with
+    every queued weather caller parked behind it. A hostile or careless
+    header must not be able to hold that lock for an unbounded time.
+
+    `_retry_delay_s` is exercised directly (pure, no I/O), plus one end-to-end
+    check that `_make_request` actually feeds the header through to sleep.
+    """
+    _check(
+        "_retry_delay_s: no Retry-After header falls back to RETRY_DELAY_S",
+        _retry_delay_s(_fake_status_response(429)),
+        float(RETRY_DELAY_S),
+    )
+    _check(
+        "_retry_delay_s: a server asking for LESS than our floor still waits RETRY_DELAY_S",
+        _retry_delay_s(_fake_status_response(429, {"Retry-After": "0.2"})),
+        float(RETRY_DELAY_S),
+    )
+    _check(
+        "_retry_delay_s: a modest Retry-After is honoured verbatim",
+        _retry_delay_s(_fake_status_response(429, {"Retry-After": "3"})),
+        3.0,
+    )
+    _check(
+        "_retry_delay_s: a long Retry-After is CLAMPED to RETRY_AFTER_MAX_S, never obeyed",
+        _retry_delay_s(_fake_status_response(429, {"Retry-After": "3600"})),
+        RETRY_AFTER_MAX_S,
+    )
+    for junk in ("Wed, 21 Oct 2015 07:28:00 GMT", "soon", "", "-5", "nan", "inf"):
+        _check(
+            f"_retry_delay_s: unusable Retry-After {junk!r} falls back to RETRY_DELAY_S",
+            _retry_delay_s(_fake_status_response(429, {"Retry-After": junk})),
+            float(RETRY_DELAY_S),
+        )
+
+    slept: list[float] = []
+    original_sleep = time.sleep
+    original_get = httpx.get
+
+    def record_sleep(seconds: Any) -> None:
+        slept.append(float(seconds))
+
+    time.sleep = record_sleep  # record instead of blocking
+
+    def fake_get(*_args: Any, **_kwargs: Any) -> httpx.Response:
+        return _fake_status_response(429, {"Retry-After": "900"})
+
+    httpx.get = fake_get  # offline HTTP double
+    try:
+        with contextlib.suppress(WeatherServiceError):
+            ws = WeatherService(lat=48.15, lon=11.58, stat_name="RetryTest")
+            ws._make_request("https://example.invalid/weather", {"lat": 1, "lon": 2})
+    finally:
+        httpx.get = original_get  # restore
+        time.sleep = original_sleep  # restore
+    _check(
+        "_make_request: a 429 asking for a 15-minute backoff never sleeps longer than the cap",
+        bool(slept) and max(slept) <= RETRY_AFTER_MAX_S,
+        True,
+    )
+
+
+def _test_make_request_5xx_retries() -> None:
+    """A persistent 5xx IS retried, up to max_retries + 1 attempts, unlike a
+    4xx. `time.sleep` is stubbed to a no-op so this doesn't actually block
+    the suite for RETRY_DELAY_S per retried attempt.
+    """
+    ws = WeatherService(lat=48.15, lon=11.58, stat_name="RetryTest")
+    original_get = httpx.get
+    original_sleep = time.sleep
+    time.sleep = lambda *_args, **_kwargs: None  # no real delay in tests
+    call_count = 0
+
+    def fake_get(*_args: Any, **_kwargs: Any) -> httpx.Response:
+        nonlocal call_count
+        call_count += 1
+        return _fake_status_response(500)
+
+    httpx.get = fake_get  # offline HTTP double
+    try:
+        raised = False
+        try:
+            ws._make_request("https://example.invalid/weather", {"lat": 1, "lon": 2})
+        except WeatherServiceError:
+            raised = True
+        _check("_make_request: a persistent 500 eventually raises", raised, True)
+        _check(
+            "_make_request: a 500 IS retried (max_retries + 1 attempts, unlike a 4xx)",
+            call_count,
+            ws.max_retries + 1,
+        )
+    finally:
+        httpx.get = original_get  # restore
+        time.sleep = original_sleep  # restore
+
+
+def _test_make_request_timeout_retries() -> None:
+    """A persistent timeout is retried the same way as a 5xx — the 4xx
+    fast-fail change must not affect any other exception path.
+    """
+    ws = WeatherService(lat=48.15, lon=11.58, stat_name="RetryTest")
+    original_get = httpx.get
+    original_sleep = time.sleep
+    time.sleep = lambda *_args, **_kwargs: None  # no real delay in tests
+    call_count = 0
+
+    def fake_get(*_args: Any, **_kwargs: Any) -> httpx.Response:
+        nonlocal call_count
+        call_count += 1
+        raise httpx.TimeoutException("simulated timeout")
+
+    httpx.get = fake_get  # offline HTTP double
+    try:
+        raised = False
+        try:
+            ws._make_request("https://example.invalid/weather", {"lat": 1, "lon": 2})
+        except WeatherServiceError:
+            raised = True
+        _check("_make_request: a persistent timeout eventually raises", raised, True)
+        _check(
+            "_make_request: a timeout IS retried (max_retries + 1 attempts)",
+            call_count,
+            ws.max_retries + 1,
+        )
+    finally:
+        httpx.get = original_get  # restore
+        time.sleep = original_sleep  # restore
+
+
+def _test_make_request_recovers_on_retry() -> None:
+    """A 5xx that recovers on the second attempt proves retrying actually
+    helps recover a transient failure, not just that it's attempted.
+    """
+    ws = WeatherService(lat=48.15, lon=11.58, stat_name="RetryTest")
+    original_get = httpx.get
+    original_sleep = time.sleep
+    time.sleep = lambda *_args, **_kwargs: None  # no real delay in tests
+    call_count = 0
+
+    def fake_get(*_args: Any, **_kwargs: Any) -> httpx.Response:
+        nonlocal call_count
+        call_count += 1
+        if call_count == 1:
+            return _fake_status_response(500)
+        return httpx.Response(
+            status_code=200,
+            json={"weather": {}},
+            request=httpx.Request("GET", "https://example.invalid/weather"),
+        )
+
+    httpx.get = fake_get  # offline HTTP double
+    try:
+        response = ws._make_request("https://example.invalid/weather", {"lat": 1, "lon": 2})
+        _check(
+            "_make_request: a 500 that recovers on retry returns the successful response",
+            response.status_code,
+            200,
+        )
+        _check("_make_request: exactly 2 attempts were made (1 failure + 1 success)", call_count, 2)
+    finally:
+        httpx.get = original_get  # restore
+        time.sleep = original_sleep  # restore
+
+
 def run_meteo_tests() -> bool:
     """Run all pure-logic meteo tests. Returns True iff every case passed."""
     results.clear()  # allow repeated invocations within one process (e.g. re-runs)
@@ -400,6 +789,14 @@ def run_meteo_tests() -> bool:
     _test_okta_conversion()
     _test_compass_conversion()
     _test_format_for_lora()
+    _test_is_valid_position()
+    _test_no_position_defers_without_network()
+    _test_update_location_bumps_generation_and_invalidates_cache()
+    _test_make_request_4xx_fails_fast()
+    _test_retry_after_is_honoured_but_bounded()
+    _test_make_request_5xx_retries()
+    _test_make_request_timeout_retries()
+    _test_make_request_recovers_on_retry()
 
     passed = sum(1 for status, _ in results if status.startswith("✅"))
     total = len(results)

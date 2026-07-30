@@ -10,6 +10,7 @@ import sys
 import threading
 import time
 from datetime import UTC, datetime
+from http import HTTPStatus
 from typing import Any
 from zoneinfo import ZoneInfo
 
@@ -23,6 +24,26 @@ _MAX_LORA_MSG_LEN = 149
 HTTP_TIMEOUT_S = 10
 MAX_RETRIES = 2
 RETRY_DELAY_S = 1
+
+# The 4xx codes that are TRANSIENT, i.e. the identical request can succeed a
+# second later. Everything else in the 4xx band is a permanent statement about
+# the request itself (404 for coordinates outside DWD coverage, 403, 400) and
+# is failed fast — see `_make_request`. Both upstreams here (api.brightsky.dev,
+# api.open-meteo.com) are free public APIs that rate-limit; a 429 that is never
+# retried simply means no weather, which is worse than a one-second wait.
+_RETRYABLE_4XX = frozenset({HTTPStatus.REQUEST_TIMEOUT, HTTPStatus.TOO_MANY_REQUESTS})
+
+# Upper bound on a server-supplied `Retry-After`. `_make_request` runs in a
+# worker thread, but it does so while `get_weather_data` holds `_cache_lock`,
+# so every waiting REST caller is parked in the shared default executor behind
+# it — the ~96 s stall `update_location`'s docstring documents. A hybrid fetch
+# issues up to 3 requests (2 BrightSky endpoints + Open-Meteo) with up to
+# MAX_RETRIES sleeps each, so this cap bounds the added wait at 3*2*5 = 30 s,
+# inside that already-documented envelope. A rate-limit ban asking for 60 s is
+# deliberately truncated rather than honoured: the caller gets the
+# negative-cached error immediately and the next 5-minute cycle retries anyway,
+# which is far cheaper than holding a thread and the cache lock for a minute.
+RETRY_AFTER_MAX_S = 5.0
 WEATHER_CACHE_TTL_S = 300  # SSE-06: 5 min — matches typical weather-update cadence
 # Negative cache: error results are cached briefly so an API outage doesn't make
 # every queued waiter run its own full ~96 s fetch serially under _cache_lock
@@ -99,6 +120,63 @@ def _solar_altitude_deg(lat: float, lon: float, dt_utc: datetime) -> float:
 
 
 logger = get_logger(__name__)
+
+
+def is_valid_position(lat: float | None, lon: float | None) -> bool:
+    """True iff `lat`/`lon` represent a real GPS fix.
+
+    Two "no position" sentinels exist in the wild and both must be treated as
+    absent: `None` (nothing received yet — e.g. no config.json seed and no
+    GPS fix) and the literal `0.0/0.0` pair a disconnected/no-fix GPS module
+    reports. Historically only the `None` check was applied (here and in
+    `sse_routes/weather.py`/`main.py`'s `_cache_gps`), so a `0/0` position
+    was treated as a real coordinate and silently fetched as weather for the
+    Gulf of Guinea. Checked as a PAIR (`lat == 0 and lon == 0`), not
+    individually — a real station can legitimately sit exactly on the
+    equator or the prime meridian on its own; only both at once is the
+    sentinel.
+
+    DELIBERATE TRADE-OFF, not an oversight: this makes Null Island
+    unaddressable. A station genuinely at 0.0000/0.0000 — open Atlantic
+    ~600 km off Ghana, i.e. a ship, and one whose GPS rounded to exactly
+    four zeroed decimals in both axes at that instant — gets "waiting for
+    GPS" instead of weather. That is accepted because the alternative,
+    honouring 0/0, silently mislocates EVERY node whose GPS has no fix yet:
+    a no-fix module reports exactly this pair, MeshCom firmware ships
+    `node_lat = 0.0` as its factory default, and the whole point of this
+    module's Wave 3 changes is to stop serving confidently wrong weather.
+    A no-fix reading is orders of magnitude more common than a mid-Atlantic
+    ham, and the failure mode is honest rather than plausible.
+    """
+    if lat is None or lon is None:
+        return False
+    return not (lat == 0 and lon == 0)
+
+
+def _retry_delay_s(response: httpx.Response) -> float:
+    """How long to wait before retrying `response`'s request.
+
+    Defaults to RETRY_DELAY_S. A `Retry-After` header is honoured when the
+    server asks for LONGER than that (asking for less does not license
+    hammering harder than our own floor), clamped to RETRY_AFTER_MAX_S so a
+    hostile or careless header can never park a worker thread — and, behind
+    `_cache_lock`, every queued weather caller — for an unbounded time.
+
+    Only the delta-seconds form is parsed. RFC 9110 also allows an HTTP-date,
+    but both upstreams here send delta-seconds, and an HTTP-date would need
+    clock-skew handling to be safe; an unparseable value falls back to the
+    fixed delay rather than guessing.
+    """
+    raw = response.headers.get("Retry-After")
+    if not raw:
+        return float(RETRY_DELAY_S)
+    try:
+        requested = float(raw.strip())
+    except (TypeError, ValueError):
+        return float(RETRY_DELAY_S)
+    if not math.isfinite(requested) or requested <= 0:
+        return float(RETRY_DELAY_S)
+    return min(max(requested, float(RETRY_DELAY_S)), RETRY_AFTER_MAX_S)
 
 
 class WeatherServiceError(Exception):
@@ -205,7 +283,7 @@ class WeatherService:
         """
         Hybrid-Methode: DWD primär, OpenMeteo für fehlende Parameter
         """
-        if self.lat is None or self.lon is None:
+        if not is_valid_position(self.lat, self.lon):
             return {
                 "error": "Keine GPS-Position verfügbar (warte auf Gerät)",
                 "timestamp": datetime.now(UTC).isoformat(),
@@ -633,6 +711,25 @@ class WeatherService:
                 if attempt == self.max_retries:
                     raise WeatherServiceError("Request Timeout") from e
                 time.sleep(RETRY_DELAY_S)
+            except httpx.HTTPStatusError as e:
+                status = e.response.status_code
+                if (
+                    HTTPStatus.BAD_REQUEST <= status < HTTPStatus.INTERNAL_SERVER_ERROR
+                    and status not in _RETRYABLE_4XX
+                ):
+                    # PERMANENT 4xx (e.g. the observed 404 for coordinates
+                    # outside DWD coverage): the request is wrong for this
+                    # endpoint/params, and retrying an UNCHANGED request
+                    # against an unchanged endpoint cannot succeed. Fail fast
+                    # instead of burning 2 more attempts + 2*RETRY_DELAY_S of
+                    # blocking sleep on every fetch — BrightSky alone tries two
+                    # endpoints, twice per weather cycle (live + negative-cache
+                    # refetch). 408/429 are excluded from this fast-fail: they
+                    # say "not right now", not "not ever" — see _RETRYABLE_4XX.
+                    raise WeatherServiceError(f"HTTP-Fehler (4xx, kein Retry): {e}") from e
+                if attempt == self.max_retries:
+                    raise WeatherServiceError(f"HTTP-Fehler: {e}") from e
+                time.sleep(_retry_delay_s(e.response))
             except httpx.HTTPError as e:
                 if attempt == self.max_retries:
                     raise WeatherServiceError(f"HTTP-Fehler: {e}") from e
@@ -662,7 +759,12 @@ class WeatherService:
         time is the measurement timestamp when parseable, else now; without a
         location we cannot compute it and assume day.
         """
-        if self.lat is None or self.lon is None:
+        # The `is None` checks are redundant with is_valid_position()'s own None
+        # check, but kept explicit here (unlike _fetch_weather_data's guard) so
+        # mypy narrows self.lat/self.lon to `float` below — _solar_altitude_deg
+        # requires non-Optional floats and a bare `not is_valid_position(...)`
+        # guard doesn't narrow through an opaque function call.
+        if self.lat is None or self.lon is None or not is_valid_position(self.lat, self.lon):
             return True
         ref: datetime | None = None
         if timestamp_str and timestamp_str != "unbekannt":

@@ -49,6 +49,7 @@ from typing import Any
 
 from . import config_loader
 from . import main as main_module
+from .ble_client import ConnectionState
 from .commands.constants import has_console
 from .commands.handler import create_command_handler
 from .config_loader import Config
@@ -269,6 +270,116 @@ def _test_overlay_rejects_malformed_values(record: Callable[[str, bool], None]) 
         record(
             "boot: a null overlay CALL_SIGN no longer raises, the config.json identity is kept",
             booted.my_callsign == "DK5EN-14",
+        )
+
+
+def _test_gps_overlay_round_trip_and_validation(record: Callable[[str, bool], None]) -> None:
+    """Wave 3 (2026-07-30): the persisted GPS overlay (LAT/LONG) must round-trip
+    through Config.load exactly like CALL_SIGN does, but with NUMERIC per-key
+    validation instead of CALL_SIGN's string check (see
+    config_loader._sanitize_overlay_value). The bug this guards: production
+    config.json carried LAT: 48.123, LONG: 17.321 under STAT_NAME "Freising" —
+    actually Bratislava, ~600 km away — so on every cold start the proxy
+    fetched weather for the wrong country until the node's own GPS silently
+    corrected it. A real GPS overlay position must be able to override that
+    wrong seed, while a corrupt/out-of-range overlay value must never be able
+    to replace a perfectly good config.json seed with garbage.
+    """
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        config_path = Path(tmp_dir) / "config.json"
+        config_path.write_text(
+            json.dumps(
+                {"CALL_SIGN": "DK5EN-14", "LAT": 48.123, "LONG": 17.321, "STAT_NAME": "Freising"}
+            ),
+            encoding="utf-8",
+        )
+        original = config_loader.load_runtime_state
+
+        def _load_with(overlay: dict[str, Any]) -> Config:
+            try:
+                setattr(  # noqa: B010 - deliberate monkeypatch
+                    config_loader, "load_runtime_state", lambda: overlay
+                )
+                return Config.load(config_path)
+            finally:
+                setattr(config_loader, "load_runtime_state", original)  # noqa: B010 - deliberate monkeypatch
+
+        # A real GPS fix in the overlay wins over the installer's wrong seed.
+        cfg = _load_with({"LAT": 48.40, "LONG": 11.75})
+        record(
+            "Config.load: overlay LAT/LONG (real GPS) win over config.json's wrong installer seed",
+            cfg.location.latitude == 48.40 and cfg.location.longitude == 11.75,
+        )
+        record(
+            "Config.load: an int overlay LAT/LONG is accepted too, not just float",
+            _load_with({"LAT": 48, "LONG": 12}).location.latitude == 48.0,
+        )
+
+        # Out-of-range / non-finite / non-numeric / bool values are dropped —
+        # the config.json seed must survive every one of them, on BOTH axes.
+        # Each case carries only the deliberately-bad key, which makes it a
+        # half position, which `_apply_position_pair_rule` then drops whole.
+        bad_overlays: list[dict[str, Any]] = [
+            {"LAT": 91.0},  # > 90
+            {"LAT": -91.0},  # < -90
+            {"LONG": 181.0},  # > 180
+            {"LONG": -181.0},  # < -180
+            {"LAT": float("nan")},
+            {"LAT": float("inf")},
+            {"LAT": "48.40"},  # numeric-looking string, still rejected
+            {"LAT": True},  # bool is an int subclass — must not pass as numeric
+        ]
+        for bad_overlay in bad_overlays:
+            cfg_bad = _load_with(bad_overlay)
+            record(
+                f"Config.load: invalid overlay {bad_overlay!r} is dropped, "
+                "config.json seed survives",
+                cfg_bad.location.latitude == 48.123 and cfg_bad.location.longitude == 17.321,
+            )
+
+        # ADVISOR REGRESSION (Wave 3 defect 1): LAT and LONG are ONE fact.
+        # Per-key sanitisation on its own fused the surviving overlay LONG
+        # with config.json's LAT and produced 48.123/11.75 — Bratislava's
+        # latitude on Freising's longitude, a location NEITHER file ever
+        # claimed and ~120 km from either. Both must fall back together.
+        for half_overlay, bad_axis in (
+            ({"LAT": 91.0, "LONG": 11.75}, "LAT"),
+            ({"LAT": 48.40, "LONG": 181.0}, "LONG"),
+            ({"LAT": 48.40}, "LONG"),  # partner key simply absent
+            ({"LONG": 11.75}, "LAT"),
+            ({"LAT": None, "LONG": 11.75}, "LAT"),  # half-written runtime.json
+        ):
+            cfg_half = _load_with(half_overlay)
+            record(
+                f"Config.load: a half position ({bad_axis} unusable) never fuses with the "
+                f"config.json seed — {half_overlay!r} keeps BOTH seed coordinates",
+                cfg_half.location.latitude == 48.123 and cfg_half.location.longitude == 17.321,
+            )
+
+        # The pair rule must not leak into the unrelated string keys: a
+        # corrupt position must still let a good CALL_SIGN overlay through.
+        cfg_call = _load_with({"CALL_SIGN": "OE1ABC-7", "LAT": 91.0, "LONG": 11.75})
+        record(
+            "Config.load: a dropped half position does not take a valid CALL_SIGN down with it",
+            cfg_call.call_sign == "OE1ABC-7"
+            and cfg_call.location.latitude == 48.123
+            and cfg_call.location.longitude == 17.321,
+        )
+
+        # A missing overlay is a complete no-op for location too.
+        cfg_noop = _load_with({})
+        record(
+            "Config.load: no GPS overlay leaves config.json's LAT/LONG untouched",
+            cfg_noop.location.latitude == 48.123 and cfg_noop.location.longitude == 17.321,
+        )
+
+        # A partial overlay carrying ONLY a string key must not disturb the seed.
+        cfg_call_only = _load_with({"CALL_SIGN": "OE1ABC-7"})
+        record(
+            "Config.load: a CALL_SIGN-only overlay leaves config.json's LAT/LONG untouched",
+            cfg_call_only.call_sign == "OE1ABC-7"
+            and cfg_call_only.location.latitude == 48.123
+            and cfg_call_only.location.longitude == 17.321,
         )
 
 
@@ -622,6 +733,251 @@ async def _test_ble_identity_detection_end_to_end(record: Callable[[str, bool], 
             )
     finally:
         setattr(main_module, "save_runtime_state", original_save)  # noqa: B010 - deliberate monkeypatch
+
+
+async def _test_ble_gps_detection_persists_and_debounces(
+    record: Callable[[str, bool], None],
+) -> None:
+    """Drives the REAL `_cache_gps` subscriber (Wave 3, main.py's
+    `_wire_ble_caches`) through BLE "G" register notifications — the exact
+    trigger for the cold-start-seed fix: config.json seeds a wrong LAT/LONG
+    (the Bratislava-under-a-"Freising"-label bug), and the node's own GPS
+    position must both take effect immediately AND persist so the NEXT boot
+    seeds from it instead of the installer's guess again.
+
+    `save_runtime_state` is monkeypatched to an in-memory recorder for the
+    duration of this test so it never touches the real
+    /var/lib/mcapp/runtime.json.
+    """
+    router = MessageRouter(None)
+    router.set_callsign("DK5EN-14")
+    handler = create_command_handler(
+        router,
+        None,
+        "DK5EN-14",
+        lat=48.123,
+        lon=17.321,
+        stat_name="Freising",
+        user_info_text=None,
+    )
+    router.register_protocol("commands", handler)
+
+    saved: list[dict[str, Any]] = []
+    original_save = main_module.save_runtime_state
+    setattr(main_module, "save_runtime_state", saved.append)  # noqa: B010 - deliberate monkeypatch
+    try:
+        main_module._wire_ble_caches(router)  # white-box startup test: exercise the real wiring
+
+        # 0/0 (no-fix sentinel) must be ignored outright: no cache update, no persist.
+        await router.publish("ble", "ble_notification", {"TYP": "G", "LAT": 0, "LON": 0})
+        record(
+            "GPS detection: a 0/0 no-fix position is ignored (cached_gps untouched)",
+            router.cached_gps is None and saved == [],
+        )
+        record(
+            "GPS detection: a 0/0 no-fix position never reaches the weather service",
+            handler.weather_service is not None
+            and handler.weather_service.lat == 48.123
+            and handler.weather_service.lon == 17.321,
+        )
+
+        # A real GPS fix updates the cache, the weather service, AND persists.
+        await router.publish("ble", "ble_notification", {"TYP": "G", "LAT": 48.40, "LON": 11.75})
+        record(
+            "GPS detection: a real position updates router.cached_gps",
+            router.cached_gps == {"lat": 48.40, "lon": 11.75},
+        )
+        record(
+            "GPS detection: a real position updates the live weather service location",
+            handler.weather_service is not None
+            and handler.weather_service.lat == 48.40
+            and handler.weather_service.lon == 11.75,
+        )
+        record(
+            "GPS detection: a real position persists LAT/LONG via save_runtime_state",
+            len(saved) == 1 and saved[0] == {"LAT": 48.40, "LONG": 11.75},
+        )
+
+        # Debounce: the SAME position replayed (e.g. the 300s BLE keepalive on
+        # a stationary node) must not rewrite runtime.json again.
+        saved.clear()
+        await router.publish("ble", "ble_notification", {"TYP": "G", "LAT": 48.40, "LON": 11.75})
+        record(
+            "GPS detection: an unchanged position on a later beacon writes nothing (debounced)",
+            saved == [],
+        )
+
+        # ADVISOR REGRESSION: exact equality is NOT enough. MeshCom firmware
+        # rounds the fix to 4 decimals (cround4), and ordinary GPS noise moves
+        # that decimal on nearly every beacon, so a stationary node would
+        # rewrite runtime.json on every ~300 s keepalive — ~288 SD-card writes
+        # a day to persist a position that has not changed.
+        saved.clear()
+        for jitter_lat, jitter_lon in ((48.4001, 11.7499), (48.3998, 11.7502), (48.4003, 11.7501)):
+            await router.publish(
+                "ble", "ble_notification", {"TYP": "G", "LAT": jitter_lat, "LON": jitter_lon}
+            )
+        record(
+            "GPS detection: 4th-decimal GPS jitter on a stationary node writes nothing",
+            saved == [],
+        )
+        record(
+            "GPS detection: jitter still refreshes the LIVE cache (only the persist is gated)",
+            router.cached_gps == {"lat": 48.4003, "lon": 11.7501},
+        )
+
+        # ADVISOR REGRESSION: the gate compares against the last PERSISTED
+        # position, not the last seen one. Debouncing against the previous
+        # reading would let a node creeping just under the threshold per
+        # beacon walk arbitrarily far and never persist — every single step
+        # looks like noise. Twelve sub-threshold steps of 0.008° cover ~0.1°
+        # (~10 km), which must trigger exactly one write on the step that
+        # crosses the threshold, not zero.
+        saved.clear()
+        for step in range(1, 13):
+            await router.publish(
+                "ble",
+                "ble_notification",
+                {"TYP": "G", "LAT": 48.4003 + 0.008 * step, "LON": 11.7501},
+            )
+        record(
+            "GPS detection: accumulated sub-threshold drift eventually persists "
+            "(gate is against the last PERSISTED fix, not the last seen one)",
+            len(saved) >= 1,
+        )
+
+        # A genuine move DOES persist again, immediately.
+        saved.clear()
+        await router.publish("ble", "ble_notification", {"TYP": "G", "LAT": 47.50, "LON": 12.50})
+        record(
+            "GPS detection: a position that actually moved persists again",
+            saved == [{"LAT": 47.50, "LONG": 12.50}],
+        )
+
+        # ADVISOR REGRESSION (Wave 3 defect 1, persist side): half a position
+        # is no position. A "G" frame carrying LAT but no LON used to become
+        # (lat, 0.0) via `.get("LON", 0)`, which is_valid_position ACCEPTS —
+        # a station really can sit on the prime meridian — placing the node in
+        # the Gulf of Guinea and persisting it there. Nothing may change.
+        saved.clear()
+        for truncated in (
+            {"TYP": "G", "LAT": 48.40},
+            {"TYP": "G", "LON": 11.75},
+            {"TYP": "G", "LAT": 48.40, "LON": None},
+            {"TYP": "G", "LAT": "48.40", "LON": "11.75"},
+            {"TYP": "G", "LAT": float("nan"), "LON": 11.75},
+            {"TYP": "G", "LAT": 480.0, "LON": 11.75},
+        ):
+            await router.publish("ble", "ble_notification", truncated)
+        record(
+            "GPS detection: a truncated/garbled 'G' frame is ignored entirely — "
+            "no half position is cached, published or persisted",
+            saved == [] and router.cached_gps == {"lat": 47.50, "lon": 12.50},
+        )
+        record(
+            "GPS detection: a truncated 'G' frame never reaches the weather service either",
+            handler.weather_service is not None
+            and handler.weather_service.lat == 47.50
+            and handler.weather_service.lon == 12.50,
+        )
+    finally:
+        setattr(main_module, "save_runtime_state", original_save)  # noqa: B010 - deliberate monkeypatch
+
+
+class _StubBLEClient:
+    """Minimal duck-type of the registered `ble_client` protocol, recording the
+    commands `_query_ble_registers` sends. `hang` makes `send_command` block
+    forever, standing in for a `ble_service` that answered "connected" and then
+    wedged; `raising` makes even the connection probe explode.
+    """
+
+    def __init__(self, state: Any, *, hang: bool = False, raising: bool = False) -> None:
+        self._state = state
+        self._hang = hang
+        self._raising = raising
+        self.commands: list[str] = []
+
+    @property
+    def status(self) -> Any:
+        if self._raising:
+            raise RuntimeError("simulated status failure")
+        return type("Status", (), {"state": self._state})()
+
+    async def send_command(self, cmd: str) -> bool:
+        self.commands.append(cmd)
+        if self._hang:
+            await asyncio.Event().wait()  # never completes
+        return True
+
+
+async def _test_requery_reused_ble_connection(record: Callable[[str, bool], None]) -> None:
+    """Wave 3: on a plain `mcapp` restart the remote `ble_service` may still be
+    holding the BLE session from before, so `BLEClientRemote.start()` skips
+    connect()/hello and the firmware never re-sends its post-hello config push
+    — including the "G" GPS register. `requery_reused_ble_connection` asks for
+    it explicitly.
+
+    ADVISOR REGRESSION: `build_app()` awaits this INSIDE the `except Exception`
+    handler that falls back to DISABLED BLE mode for the whole process, and
+    before the SSE server binds. So the method must never raise and must never
+    run unbounded, whatever the client does.
+    """
+    original_delay = main_module.BLE_QUERY_DELAY_STANDARD
+    original_timeout = main_module.BLE_REQUERY_TIMEOUT_S
+    main_module.BLE_QUERY_DELAY_STANDARD = 0.0  # keep the suite fast
+    main_module.BLE_REQUERY_TIMEOUT_S = 0.1  # exercise the bound without a 10s test
+    try:
+        # No BLE client registered at all (disabled mode never registers one
+        # before this point on the failure path) — a clean no-op.
+        bare = MessageRouter(None)
+        await bare.requery_reused_ble_connection()
+        record("requery: no registered BLE client is a silent no-op", True)
+
+        # Registered but not connected: nothing is asked of the device.
+        router = MessageRouter(None)
+        idle = _StubBLEClient(ConnectionState.DISCONNECTED)
+        router.register_protocol("ble_client", idle)
+        await router.requery_reused_ble_connection()
+        record("requery: a DISCONNECTED client is never queried", idle.commands == [])
+
+        # Connected: the GPS register is re-requested, alongside the two
+        # registers no connect ever auto-sends.
+        router = MessageRouter(None)
+        live = _StubBLEClient(ConnectionState.CONNECTED)
+        router.register_protocol("ble_client", live)
+        await router.requery_reused_ble_connection()
+        record(
+            "requery: a reused CONNECTED session re-requests --pos (the 'G' GPS register)",
+            live.commands == ["--pos", "--io", "--tel"],
+        )
+
+        # A wedged ble_service must not hold startup hostage.
+        router = MessageRouter(None)
+        wedged = _StubBLEClient(ConnectionState.CONNECTED, hang=True)
+        router.register_protocol("ble_client", wedged)
+        started = time.monotonic()
+        await router.requery_reused_ble_connection()
+        elapsed = time.monotonic() - started
+        record(
+            "requery: a wedged BLE service is cut off at BLE_REQUERY_TIMEOUT_S, "
+            "it cannot stall build_app() before the SSE server binds",
+            elapsed < 1.0,
+        )
+
+        # A raising client must not reach build_app's handler, whose recovery
+        # is to drop BLE to disabled mode for the rest of the process.
+        router = MessageRouter(None)
+        broken = _StubBLEClient(ConnectionState.CONNECTED, raising=True)
+        router.register_protocol("ble_client", broken)
+        raised = False
+        try:
+            await router.requery_reused_ble_connection()
+        except Exception:  # the whole point of this case is that nothing escapes
+            raised = True
+        record("requery: a client that raises never propagates out of the method", not raised)
+    finally:
+        main_module.BLE_QUERY_DELAY_STANDARD = original_delay
+        main_module.BLE_REQUERY_TIMEOUT_S = original_timeout
 
 
 async def _test_identity_persist_is_serialised_and_off_thread(
@@ -1017,6 +1373,7 @@ async def run_identity_tests() -> bool:
     _test_save_cleans_up_temp_file_on_programming_error(_record)
     _test_missing_config_still_honours_ble_env_overrides(_record)
     _test_overlay_rejects_malformed_values(_record)
+    _test_gps_overlay_round_trip_and_validation(_record)
     _test_boot_order_reaches_both_holders(_record)
     _test_overlay_precedence_and_noop_in_config_load(_record)
     _test_apply_callsign_fans_out(_record)
@@ -1024,6 +1381,8 @@ async def run_identity_tests() -> bool:
     _test_user_info_text_regenerates_for_lowercase_config_callsign(_record)
     _test_same_callsign_is_noop(_record)
     await _test_ble_identity_detection_end_to_end(_record)
+    await _test_ble_gps_detection_persists_and_debounces(_record)
+    await _test_requery_reused_ble_connection(_record)
     await _test_identity_persist_is_serialised_and_off_thread(_record)
     await _test_status_endpoint_reports_live_callsign(_record)
     await _test_status_endpoint_reports_udp_source_state(_record)
