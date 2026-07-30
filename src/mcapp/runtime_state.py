@@ -27,7 +27,39 @@ from .logging_setup import get_logger
 
 logger = get_logger(__name__)
 
-RUNTIME_PATH = Path("/var/lib/mcapp/runtime.json")
+DEFAULT_RUNTIME_PATH = Path("/var/lib/mcapp/runtime.json")
+
+# Env override name, matching the repo's existing `MCAPP_*` convention
+# (`MCAPP_ENV`, `MCAPP_BLE_MODE`, `MCAPP_BLE_API_KEY`).
+RUNTIME_STATE_ENV = "MCAPP_RUNTIME_STATE"
+
+
+def resolve_runtime_path() -> Path:
+    """Where the persisted runtime overlay lives.
+
+    `MCAPP_RUNTIME_STATE` relocates it. Two reasons this lever exists:
+    an operator who does not run the service out of `/var/lib/mcapp` can
+    point it somewhere writable, and — the safety-net reason — ANY harness
+    (CI, a headless test run, a dry-run deploy) gets a single process-wide
+    switch that redirects auto-detected state away from real production
+    state, without having to know which code paths persist.
+
+    Presence-checked like `config_loader`'s BLE overrides rather than
+    `or`-chained, with one deliberate difference: an empty/blank value is
+    NOT honoured. `Path("")` is `.`, which would silently write a
+    `runtime.json` into the process CWD — worse than the default, not
+    safer — so a blank override falls back to `DEFAULT_RUNTIME_PATH`.
+    """
+    if RUNTIME_STATE_ENV in os.environ and os.environ[RUNTIME_STATE_ENV].strip():
+        return Path(os.environ[RUNTIME_STATE_ENV].strip())
+    return DEFAULT_RUNTIME_PATH
+
+
+# Resolved once at import: the override is a deployment/harness-level lever
+# (systemd `Environment=`, a CI job env), set before the process starts. This
+# is also what makes `load_runtime_state`/`save_runtime_state`'s default
+# argument and `main.build_app`'s explicit pass agree on one path.
+RUNTIME_PATH = resolve_runtime_path()
 
 
 def load_runtime_state(path: Path = RUNTIME_PATH) -> dict[str, Any]:

@@ -33,11 +33,14 @@ otherwise execute through `config_loader`'s or `main`'s module-level default.
 
 from __future__ import annotations
 
+import ast
 import asyncio
+import inspect
 import json
 import os
 import stat
 import tempfile
+import textwrap
 import threading
 import time
 from collections.abc import Callable
@@ -50,8 +53,20 @@ from .commands.constants import has_console
 from .commands.handler import create_command_handler
 from .config_loader import Config
 from .main import MessageRouter
-from .runtime_state import load_runtime_state, save_runtime_state
+from .runtime_state import (
+    DEFAULT_RUNTIME_PATH,
+    RUNTIME_PATH,
+    RUNTIME_STATE_ENV,
+    load_runtime_state,
+    resolve_runtime_path,
+    save_runtime_state,
+)
 from .sse_routes.stream import build_stream_router
+from .udp_handler import UDPHandler
+
+# Mirrors the stub `source_ip_status()` payload below; named so the
+# no-magic-numbers house style of these suites is preserved.
+_EXPECTED_SUPPRESSED_CHANGES = 3
 
 
 def _test_overlay_round_trip(record: Callable[[str, bool], None]) -> None:
@@ -708,6 +723,269 @@ async def _test_status_endpoint_reports_live_callsign(
     )
 
 
+async def _test_status_endpoint_reports_udp_source_state(
+    record: Callable[[str, bool], None],
+) -> None:
+    """`GET /api/status` was widened to surface UDP source-IP learning state
+    (`udp_target` / `udp_target_kind` / `udp_known_source_ips` /
+    `udp_multiple_sources`) so the operator can notice a second node feeding
+    this proxy — see `UDPHandler.source_ip_status` in `udp_handler.py`. This
+    only exercises the STREAM.PY wiring (a stub double stands in for the
+    real UDPHandler, whose own learning logic is unit-tested in
+    `udp_handler.py`'s `run_startup_tests`).
+    """
+
+    class _StubUDPHandler:
+        """Only what /api/status's UDP fields touch — `source_ip_status()`."""
+
+        def __init__(self, status: dict[str, Any]) -> None:
+            self._status = status
+
+        def source_ip_status(self) -> dict[str, Any]:
+            return self._status
+
+    class _StubSSEManager:
+        """Only what build_stream_router's /api/status handler touches."""
+
+        def __init__(self, message_router: MessageRouter) -> None:
+            self.clients_lock = asyncio.Lock()
+            self.clients: dict[str, Any] = {}
+            self.message_router = message_router
+
+    router = MessageRouter(None)
+    router.set_callsign("DK5EN-14")
+    router.register_protocol(
+        "udp",
+        _StubUDPHandler(
+            {
+                "target": "192.168.68.57",
+                "target_kind": "identified",
+                "known_source_ips": ["192.168.68.57", "192.168.68.58"],
+                "multiple_sources": True,
+                "suppressed_target_changes": 3,
+                "untrusted_source_ips": ["fe80::1"],
+            }
+        ),
+    )
+    manager: Any = _StubSSEManager(router)
+
+    routes: list[Any] = list(build_stream_router(manager, "vTest").routes)
+    status_route = next(route for route in routes if route.path == "/api/status")
+    result: dict[str, Any] = await status_route.endpoint()
+
+    record(
+        "/api/status: exposes the active UDP target and its confidence kind",
+        result.get("udp_target") == "192.168.68.57"
+        and result.get("udp_target_kind") == "identified",
+    )
+    record(
+        "/api/status: exposes every known UDP source IP and the multi-source flag",
+        result.get("udp_known_source_ips") == ["192.168.68.57", "192.168.68.58"]
+        and result.get("udp_multiple_sources") is True,
+    )
+
+    record(
+        "/api/status: exposes the two conditions that only log once — target contention "
+        "and rejected sources",
+        result.get("udp_suppressed_target_changes") == _EXPECTED_SUPPRESSED_CHANGES
+        and result.get("udp_untrusted_source_ips") == ["fe80::1"],
+    )
+
+    # No "udp" protocol registered at all (e.g. UDP unavailable) must degrade
+    # gracefully, not crash the endpoint.
+    bare_router = MessageRouter(None)
+    bare_router.set_callsign("DK5EN-14")
+    bare_manager: Any = _StubSSEManager(bare_router)
+    bare_routes: list[Any] = list(build_stream_router(bare_manager, "vTest").routes)
+    bare_status_route = next(route for route in bare_routes if route.path == "/api/status")
+    bare_result: dict[str, Any] = await bare_status_route.endpoint()
+    record(
+        "/api/status: no UDP protocol registered degrades gracefully (no crash, sane defaults)",
+        bare_result.get("udp_target") is None
+        and bare_result.get("udp_multiple_sources") is False
+        and bare_result.get("udp_suppressed_target_changes") == 0
+        and bare_result.get("udp_untrusted_source_ips") == [],
+    )
+
+
+def _test_runtime_path_env_override(record: Callable[[str, bool], None]) -> None:
+    """`MCAPP_RUNTIME_STATE` relocates the persisted overlay.
+
+    This is the global safety net behind `UDPHandler`'s opt-in
+    `runtime_state_path`: one process-wide lever that redirects auto-detected
+    state away from real production state, for an operator who does not run
+    out of `/var/lib/mcapp` and for any future harness.
+    """
+    original = os.environ.get(RUNTIME_STATE_ENV)
+
+    def _restore() -> None:
+        if original is None:
+            os.environ.pop(RUNTIME_STATE_ENV, None)
+        else:
+            os.environ[RUNTIME_STATE_ENV] = original
+
+    try:
+        os.environ.pop(RUNTIME_STATE_ENV, None)
+        record(
+            "runtime path: unset env falls back to the packaged default",
+            resolve_runtime_path() == DEFAULT_RUNTIME_PATH,
+        )
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            override = Path(tmp_dir) / "elsewhere.json"
+            os.environ[RUNTIME_STATE_ENV] = str(override)
+            record(
+                "runtime path: MCAPP_RUNTIME_STATE relocates the persisted overlay",
+                resolve_runtime_path() == override,
+            )
+
+        # A blank value must NOT be honoured: Path("") is ".", which would
+        # silently drop a runtime.json into the process CWD — worse than the
+        # default, not safer.
+        os.environ[RUNTIME_STATE_ENV] = "   "
+        record(
+            "runtime path: a blank override falls back to the default, never to CWD",
+            resolve_runtime_path() == DEFAULT_RUNTIME_PATH,
+        )
+    finally:
+        _restore()
+
+    record(
+        "runtime path: the module-level RUNTIME_PATH is the resolved path, so "
+        "load/save defaults and main's explicit pass agree",
+        resolve_runtime_path() == RUNTIME_PATH,
+    )
+
+
+def _test_build_app_opts_into_runtime_persistence(record: Callable[[str, bool], None]) -> None:
+    """PRODUCTION WIRING: `UDPHandler`'s `runtime_state_path` defaults to None
+    ("learn, but never write"), so persistence only happens where a caller
+    opts in. Exactly one caller may: `build_app`.
+
+    Asserted against the REAL source of `build_app` (parsed with `ast`), not
+    against a re-implementation of the wiring — a test that rebuilt the call
+    itself would pass even if `build_app` stopped passing the path, which is
+    precisely the regression that would silently stop a learned target from
+    surviving a restart.
+    """
+    tree = ast.parse(textwrap.dedent(inspect.getsource(main_module.build_app)))
+    udp_calls = [
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id == "UDPHandler"
+    ]
+    record(
+        "build_app: constructs exactly one UDPHandler",
+        len(udp_calls) == 1,
+    )
+    if not udp_calls:
+        return
+    keyword = next(
+        (kw for kw in udp_calls[0].keywords if kw.arg == "runtime_state_path"),
+        None,
+    )
+    record(
+        "build_app: opts into runtime-state persistence explicitly (runtime_state_path=...)",
+        keyword is not None,
+    )
+    record(
+        "build_app: opts in with the real RUNTIME_PATH, not an ad-hoc literal",
+        keyword is not None
+        and isinstance(keyword.value, ast.Name)
+        and keyword.value.id == "RUNTIME_PATH"
+        # Resolve that AST Name the way Python will at runtime — in `main`'s
+        # own module namespace — so a local shadow named RUNTIME_PATH could
+        # not satisfy the check above while pointing somewhere else.
+        and vars(main_module).get("RUNTIME_PATH") == RUNTIME_PATH,
+    )
+
+
+async def _test_learned_target_survives_restart(record: Callable[[str, bool], None]) -> None:
+    """THE RESTART LOOP, end to end: a target learned from an inbound datagram
+    must come back as `cfg.udp.target` on the next boot.
+
+    learned IP → `UDPHandler._persist_learned_target` → runtime.json
+    `MESHCOM_IOT_TARGET` → `Config.load`'s overlay (which sanity-checks values,
+    so an IP string has to survive that filter) → `cfg.udp.target` →
+    `UDPHandler(target_host=...)`. Every hop is the real code; only
+    `config_loader.load_runtime_state` is redirected at the temp file, because
+    `Config.load` calls it with no `path=` argument.
+    """
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        runtime_path = Path(tmp_dir) / "runtime.json"
+        config_path = Path(tmp_dir) / "config.json"
+        config_path.write_text(
+            json.dumps({"CALL_SIGN": "DK5EN-14", "MESHCOM_IOT_TARGET": "dk5en-14.local"}),
+            encoding="utf-8",
+        )
+
+        # --- boot 1: the configured hostname is dead, a datagram teaches us ---
+        handler = UDPHandler(
+            listen_port=0,
+            target_host="dk5en-14.local",
+            target_port=1799,
+            runtime_state_path=runtime_path,
+        )
+        try:
+            await handler._process_received_message(b"{}", ("192.168.68.57", 1799))
+        finally:
+            handler.send_socket.close()
+
+        record(
+            "restart loop: the learned target is written to runtime.json as MESHCOM_IOT_TARGET",
+            load_runtime_state(runtime_path).get("MESHCOM_IOT_TARGET") == "192.168.68.57",
+        )
+
+        # --- boot 2: Config.load layers the overlay back on top of config.json ---
+        original = config_loader.load_runtime_state
+        try:
+            setattr(  # noqa: B010 - deliberate monkeypatch
+                config_loader,
+                "load_runtime_state",
+                lambda: load_runtime_state(runtime_path),
+            )
+            cfg = Config.load(config_path)
+        finally:
+            setattr(config_loader, "load_runtime_state", original)  # noqa: B010 - deliberate monkeypatch
+
+        record(
+            "restart loop: an IP string survives Config.load's overlay sanity check and "
+            "beats the dead hostname from config.json",
+            cfg.udp.target == "192.168.68.57",
+        )
+
+        restarted = UDPHandler(
+            listen_port=0,
+            target_host=cfg.udp.target,
+            target_port=1799,
+            runtime_state_path=runtime_path,
+        )
+        try:
+            status = restarted.source_ip_status()
+            record(
+                "restart loop: the next boot's handler sends to the learned address",
+                restarted.target_address == ("192.168.68.57", 1799),
+            )
+            # DELIBERATE, and the reason it is pinned here: `target_kind` is
+            # "config" again after a restart, because the overlay IS config as
+            # far as this process knows. That makes the very first trusted
+            # datagram able to re-learn — which is what heals a node whose
+            # DHCP address changed while the proxy was down. Carrying the
+            # "identified" lock across restarts would instead freeze the proxy
+            # on a dead address until someone edited a file by hand.
+            record(
+                "restart loop: target_kind starts honest ('config') so a moved node can "
+                "still re-teach us on the first datagram",
+                status["target_kind"] == "config"
+                and status["known_source_ips"] == []
+                and status["suppressed_target_changes"] == 0,
+            )
+        finally:
+            restarted.send_socket.close()
+
+
 async def run_identity_tests() -> bool:
     """Return True iff every node-identity persistence/fan-out guard passes."""
     if has_console:
@@ -735,6 +1013,10 @@ async def run_identity_tests() -> bool:
     await _test_ble_identity_detection_end_to_end(_record)
     await _test_identity_persist_is_serialised_and_off_thread(_record)
     await _test_status_endpoint_reports_live_callsign(_record)
+    await _test_status_endpoint_reports_udp_source_state(_record)
+    _test_runtime_path_env_override(_record)
+    _test_build_app_opts_into_runtime_persistence(_record)
+    await _test_learned_target_survives_restart(_record)
 
     passed = sum(1 for _, ok in results if ok)
     total = len(results)

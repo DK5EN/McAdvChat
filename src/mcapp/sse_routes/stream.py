@@ -166,9 +166,9 @@ def build_stream_router(manager: SSEManager, version: str) -> APIRouter:  # noqa
     # Returns version, connected client count, and uptime.
     # Not called by the frontend UI, but useful for ops monitoring and debugging.
     @router.get("/api/status")
-    async def get_status() -> dict[str, int | str]:
-        """Get SSE server status (version, client count, uptime, node identity).
-        Health endpoint."""
+    async def get_status() -> dict[str, int | str | bool | list[str] | None]:
+        """Get SSE server status (version, client count, uptime, node identity,
+        UDP source-IP learning state). Health endpoint."""
         async with manager.clients_lock:
             client_count = len(manager.clients)
 
@@ -180,12 +180,42 @@ def build_stream_router(manager: SSEManager, version: str) -> APIRouter:  # noqa
         # a runtime node swap — see MessageRouter.apply_callsign — is visible here.
         call_sign = (message_router.my_callsign if message_router is not None else None) or ""
 
+        # UDP source-IP learning state (target-learning wave): lets the operator
+        # notice a second node feeding this proxy on :1799 — a misconfiguration
+        # worth surfacing here, not just a log line that scrolls away. Degrades
+        # to safe defaults if no "udp" protocol is registered (defensive — UDP
+        # is always wired in production, see build_app).
+        udp_handler = message_router.get_protocol("udp") if message_router is not None else None
+        udp_status: dict[str, Any] = (
+            udp_handler.source_ip_status()
+            if udp_handler is not None and hasattr(udp_handler, "source_ip_status")
+            else {
+                "target": None,
+                "target_kind": "unknown",
+                "known_source_ips": [],
+                "multiple_sources": False,
+                "suppressed_target_changes": 0,
+                "untrusted_source_ips": [],
+            }
+        )
+
         return {
             "status": "ok",
             "version": version,
             "clients": client_count,
             "uptime_seconds": int(time.time() - getattr(manager, "_start_time", time.time())),
             "call_sign": call_sign,
+            "udp_target": udp_status["target"],
+            "udp_target_kind": udp_status["target_kind"],
+            "udp_known_source_ips": udp_status["known_source_ips"],
+            "udp_multiple_sources": udp_status["multiple_sources"],
+            # Non-zero = two senders are fighting over the outbound target;
+            # non-empty = something reached :1799 from an address that is not
+            # eligible for target learning. Both conditions log once and would
+            # otherwise scroll away — see UDPHandler._adopt_target /
+            # _note_untrusted_source.
+            "udp_suppressed_target_changes": udp_status["suppressed_target_changes"],
+            "udp_untrusted_source_ips": udp_status["untrusted_source_ips"],
         }
 
     # Health check endpoint

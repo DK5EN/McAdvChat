@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import socket
 from collections.abc import Callable
 from pathlib import Path
 from typing import Any
@@ -136,6 +137,58 @@ def _run_blocklist_contract_vectors(record: Callable[[str, bool], None]) -> None
             f"blocklist_decision_vectors.json: {vector['name']}",
             actual == vector["decision"],
         )
+
+
+class _FailingUDPHandler:
+    """Stand-in whose `send_message` always raises `socket.gaierror` —
+    simulating the DNS-drift failure this wave fixes (unresolvable
+    `MESHCOM_IOT_TARGET`). `udp_handler.send_message` now propagates such
+    failures instead of swallowing them (see `udp_handler.py`)."""
+
+    async def send_message(self, message_data: dict[str, Any]) -> None:
+        raise socket.gaierror("simulated: nodename nor servname provided, or not known")
+
+
+async def _test_udp_send_failure_surfaces_and_preserves_fanout(
+    record: Callable[[str, bool], None],
+) -> None:
+    """A failing UDP send must (a) surface to the operator via the existing
+    `websocket_message` SSE error event — `main.py`'s `_send_via_udp` already
+    has a try/except around `udp_handler.send_message` that publishes this,
+    but it was unreachable dead code as long as `send_message` never raised
+    — and (b) NOT break `MessageRouter.publish`'s per-handler isolation:
+    other `udp_message` subscribers still run despite the failure.
+    """
+    router = MessageRouter(None)
+    router.set_callsign("DK5EN")
+    router.register_protocol("udp", _FailingUDPHandler())
+
+    errors: list[dict[str, Any]] = []
+
+    async def _capture_error(routed: dict[str, Any]) -> None:
+        if routed["data"].get("type") == "error":
+            errors.append(routed["data"])
+
+    router.subscribe("websocket_message", _capture_error)
+
+    other_calls: list[dict[str, Any]] = []
+
+    async def _other_subscriber(routed: dict[str, Any]) -> None:
+        other_calls.append(routed["data"])
+
+    router.subscribe("udp_message", _other_subscriber)
+
+    outbound = {"src": router.my_callsign, "dst": "20", "msg": "hi"}
+    await router.publish("sse", "udp_message", outbound)
+
+    record(
+        "UDP send failure: still surfaces a websocket_message error to the operator",
+        len(errors) == 1 and "Failed to send UDP message" in str(errors[0].get("msg", "")),
+    )
+    record(
+        "UDP send failure: OTHER udp_message subscribers still run (router fan-out survives)",
+        other_calls == [outbound],
+    )
 
 
 async def _drive(router: MessageRouter, src: str, dst: str, msg: str) -> list[dict[str, Any]]:
@@ -273,6 +326,10 @@ async def run_send_path_tests() -> bool:
     #     docstring for the full rationale (shared fixture with the webapp mirror,
     #     docs/code-simpl-v2.md item 4d).
     _run_blocklist_contract_vectors(_record)
+
+    # 11. A failing UDP send (DNS-drift fix) surfaces to the operator and does
+    #     not break MessageRouter.publish's per-handler fan-out isolation.
+    await _test_udp_send_failure_surfaces_and_preserves_fanout(_record)
 
     passed = sum(1 for _, ok in results if ok)
     total = len(results)

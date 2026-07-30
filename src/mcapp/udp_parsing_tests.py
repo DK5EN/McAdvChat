@@ -24,6 +24,8 @@ All timestamps in the wire format are milliseconds.
 from __future__ import annotations
 
 import json
+import tempfile
+from pathlib import Path
 from typing import Any
 
 from .udp_handler import (
@@ -187,37 +189,61 @@ def _test_normalize_altitude() -> list[tuple[str, bool]]:
 
 
 async def _test_pseudo_callsign() -> list[tuple[str, bool]]:
+    """`_process_received_message` also runs the outbound-target LEARNING path
+    (`udp_handler._learn_target_from_source`), and `192.168.68.88` below is a
+    trusted private IPv4 inside the operator's real subnet — so these two
+    fixtures reach the code that persists `MESHCOM_IOT_TARGET`.
+
+    `runtime_state_path` is therefore passed explicitly into a temp dir. It is
+    belt-and-braces since `UDPHandler`'s default is now `None` = "never
+    persist", but the seam is spelled out at the call site so the next reader
+    does not have to know that to see this is safe: a test must never be able
+    to write real production state (`/var/lib/mcapp/runtime.json`).
+    """
     results: list[tuple[str, bool]] = []
 
     tele = json.dumps({"type": "tele", "value": 1}).encode()
 
-    # IPv4 sender without src → NODE-<last octet>, telemetry published.
-    ipv4_router = _CaptureRouter()
-    handler4 = UDPHandler(
-        listen_port=0, target_host="127.0.0.1", target_port=0, message_router=ipv4_router
-    )
-    ipv4_addr = ("192.168.68.88", _SENDER_PORT)
-    try:
-        # White-box: drive the embedded NODE-<octet> derivation directly.
-        await handler4._process_received_message(tele, ipv4_addr)
-        derived_ok = bool(ipv4_router.calls) and ipv4_router.calls[-1][2].get("src") == "NODE-88"
-    finally:
-        handler4.send_socket.close()
-    results.append(("pseudo-callsign: IPv4 sender without src -> NODE-<octet>", derived_ok))
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        runtime_path = Path(tmp_dir) / "runtime.json"
 
-    # IPv6 sender → no last octet, telemetry skipped (nothing published).
-    ipv6_router = _CaptureRouter()
-    handler6 = UDPHandler(
-        listen_port=0, target_host="127.0.0.1", target_port=0, message_router=ipv6_router
-    )
-    ipv6_addr = ("fe80::1", _SENDER_PORT)
-    try:
-        # White-box: drive the IPv6 skip path directly.
-        await handler6._process_received_message(tele, ipv6_addr)
-        skipped_ok = not ipv6_router.calls
-    finally:
-        handler6.send_socket.close()
-    results.append(("pseudo-callsign: IPv6 sender skipped (no publish)", skipped_ok))
+        # IPv4 sender without src → NODE-<last octet>, telemetry published.
+        ipv4_router = _CaptureRouter()
+        handler4 = UDPHandler(
+            listen_port=0,
+            target_host="127.0.0.1",
+            target_port=0,
+            message_router=ipv4_router,
+            runtime_state_path=runtime_path,
+        )
+        ipv4_addr = ("192.168.68.88", _SENDER_PORT)
+        try:
+            # White-box: drive the embedded NODE-<octet> derivation directly.
+            await handler4._process_received_message(tele, ipv4_addr)
+            derived_ok = (
+                bool(ipv4_router.calls) and ipv4_router.calls[-1][2].get("src") == "NODE-88"
+            )
+        finally:
+            handler4.send_socket.close()
+        results.append(("pseudo-callsign: IPv4 sender without src -> NODE-<octet>", derived_ok))
+
+        # IPv6 sender → no last octet, telemetry skipped (nothing published).
+        ipv6_router = _CaptureRouter()
+        handler6 = UDPHandler(
+            listen_port=0,
+            target_host="127.0.0.1",
+            target_port=0,
+            message_router=ipv6_router,
+            runtime_state_path=runtime_path,
+        )
+        ipv6_addr = ("fe80::1", _SENDER_PORT)
+        try:
+            # White-box: drive the IPv6 skip path directly.
+            await handler6._process_received_message(tele, ipv6_addr)
+            skipped_ok = not ipv6_router.calls
+        finally:
+            handler6.send_socket.close()
+        results.append(("pseudo-callsign: IPv6 sender skipped (no publish)", skipped_ok))
     return results
 
 

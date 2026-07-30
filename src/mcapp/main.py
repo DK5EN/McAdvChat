@@ -36,6 +36,7 @@ from .router_tests import run_suppression_tests
 # Re-exported (import-as-itself) so identity_tests.py can monkeypatch
 # main.save_runtime_state as a module attribute under mypy --strict's
 # no_implicit_reexport.
+from .runtime_state import RUNTIME_PATH
 from .runtime_state import (
     save_runtime_state as save_runtime_state,  # noqa: PLC0414 - explicit re-export for mypy
 )
@@ -1424,11 +1425,19 @@ async def build_app(cfg: Config) -> AppContext:  # noqa: PLR0915 - sequential wi
     await command_handler.load_persisted_kickbans()
 
     # UDP Handler
+    # `runtime_state_path` is opt-in, and this is the ONE place that opts in:
+    # UDPHandler's default is None ("learn, but never write to disk"), so a
+    # test/harness that forgets the seam cannot poison real production state.
+    # Passing RUNTIME_PATH here is what closes the restart loop — a target
+    # learned from inbound traffic lands in runtime.json as
+    # MESHCOM_IOT_TARGET, which Config.load layers back over config.json into
+    # cfg.udp.target on the next boot (see config_loader._RUNTIME_OVERLAY_KEYS).
     udp_handler = UDPHandler(
         listen_port=MESHCOM_UDP_PORT,
         target_host=cfg.udp.target,
         target_port=MESHCOM_UDP_PORT,
         message_router=message_router,
+        runtime_state_path=RUNTIME_PATH,
     )
     message_router.register_protocol("udp", udp_handler)
 
