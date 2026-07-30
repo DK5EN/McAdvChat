@@ -787,8 +787,20 @@ async def connect(request: ConnectRequest, _: bool = Depends(verify_api_key)) ->
         success = await _connect_and_initialize(mac)
         if success:
             state.last_connected_mac = mac
-            state.last_connected_name = request.device_name
-            _save_ble_state(mac, request.device_name)
+            # The webapp's connect request sends only device_address, so
+            # request.device_name is normally None here. adapter.connect()
+            # (called via _connect_and_initialize above) has already resolved
+            # the live name from BlueZ D-Bus into status.device.name by this
+            # point — fall back to it so ble_state.json and this log line
+            # don't end up with "(no name)" while /api/ble/status correctly
+            # reports the real name (observed on the live Pi).
+            resolved_name = request.device_name
+            if not resolved_name:
+                connected_device = _adapter().status.device
+                if connected_device is not None and connected_device.name:
+                    resolved_name = connected_device.name
+            state.last_connected_name = resolved_name
+            _save_ble_state(mac, resolved_name)
             _log_activity("connect_success", f"Connected to {mac}", "info")
             return ResultResponse(success=True, message=f"Connected to {mac}")
         _log_activity("connect_failed", f"Failed to connect to {mac}", "error")

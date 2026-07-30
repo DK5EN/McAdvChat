@@ -55,6 +55,9 @@ CLIENT_QUEUE_SIZE = 2000  # SCR-04: per-SSE-client queue cap (was unbounded, so 
 # fresh queue's capacity. If this ever broke, replay would deadlock the whole bus.
 assert EVENT_HISTORY_SIZE <= CLIENT_QUEUE_SIZE, "history replay must fit in a fresh client queue"  # noqa: S101 - module-load invariant, not a runtime test assertion
 MCAPP_SSE_HEALTH_URL = "http://localhost:2981/health"  # mcapp's own health endpoint
+MCAPP_CONFIG_PATH = "/etc/mcapp/config.json"
+BLE_STATUS_URL = "http://127.0.0.1:8081/api/ble/status"  # the local BLE service
+BLE_UNIT_PATH = "/etc/systemd/system/mcapp-ble.service"
 
 # Paths (resolved at runtime from slot layout)
 SLOTS_DIR = None  # ~/mcapp-slots
@@ -315,6 +318,8 @@ def run_health_checks(bus: EventBus) -> bool:
         ("sse_health", lambda: _check_http(MCAPP_SSE_HEALTH_URL)),
         ("lighttpd_proxy", lambda: _check_http("http://localhost/health")),
     ]
+    if _ble_is_expected():
+        checks.append(("ble_service", _check_ble))
 
     all_passed = True
     for name, check_fn in checks:
@@ -347,7 +352,61 @@ def _check_http(url: str) -> bool:
     try:
         req = urllib.request.Request(url, method="GET")  # noqa: S310 - fixed https URL
         with urllib.request.urlopen(req, timeout=5) as resp:  # noqa: S310 - fixed https URL
-            return resp.status == HTTPStatus.OK
+            return bool(resp.status == HTTPStatus.OK)
+    except (urllib.error.URLError, OSError):
+        return False
+
+
+def _read_config() -> "dict[str, object]":
+    """`/etc/mcapp/config.json`, or `{}` if it is missing or unreadable.
+
+    Never raises: a health check must not be the thing that crashes an update.
+    """
+    try:
+        with Path(MCAPP_CONFIG_PATH).open(encoding="utf-8") as handle:
+            loaded = json.load(handle)
+    except (OSError, ValueError):
+        return {}
+    return loaded if isinstance(loaded, dict) else {}
+
+
+def _ble_is_expected() -> bool:
+    """Whether this install is supposed to have a working BLE service.
+
+    `mcapp-ble.service` is optional — `configure_systemd_service` only installs
+    it when the template exists, and an operator can set BLE_MODE to "disabled".
+    Gating on both keeps the check from failing a deploy on a UDP-only box that
+    never had a BLE service to begin with.
+    """
+    if not Path(BLE_UNIT_PATH).exists():
+        return False
+    return str(_read_config().get("BLE_MODE", "remote")).lower() != "disabled"
+
+
+def _check_ble() -> bool:
+    """The BLE service is up AND mcapp's key still opens it.
+
+    Two failures, one check. The unit being active is not enough: the API key
+    lives in the unit file as an Environment= line, so if the key is rotated in
+    config.json (migrate_config does this for a weak key) and the service is not
+    restarted, the process keeps the OLD key in its environment. It stays
+    happily "active" while every /api/ble/* call from mcapp gets 401 — BLE dies
+    silently and stays dead until someone reboots. Sending the configured key
+    and requiring 200 is what actually catches that; a 401 fails the check and
+    lets the runner roll back.
+
+    An empty or "disabled" key means the service intentionally accepts anything
+    (see `_api_key_valid` in ble_service), so the same request still returns 200.
+    """
+    if not _check_systemd("mcapp-ble"):
+        return False
+    api_key = str(_read_config().get("BLE_API_KEY", ""))
+    try:
+        req = urllib.request.Request(BLE_STATUS_URL, method="GET")
+        if api_key:
+            req.add_header("X-API-Key", api_key)
+        with urllib.request.urlopen(req, timeout=5) as resp:  # noqa: S310 - fixed localhost URL
+            return bool(resp.status == HTTPStatus.OK)
     except (urllib.error.URLError, OSError):
         return False
 

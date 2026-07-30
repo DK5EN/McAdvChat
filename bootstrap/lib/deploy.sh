@@ -68,7 +68,7 @@ read_slot_meta() {
   if [[ -f "$meta_file" ]]; then
     cat "$meta_file"
   else
-    echo '{"slot":'$slot_id',"version":null,"status":"empty","deployed_at":null}'
+    echo '{"slot":'"$slot_id"',"version":null,"status":"empty","deployed_at":null}'
   fi
 }
 
@@ -130,6 +130,11 @@ get_target_slot() {
     [[ "$i" == "$active" ]] && continue
     local date
     date=$(jq -r '.deployed_at // "0"' "${META_DIR}/slot-${i}.json" 2>/dev/null)
+    # String comparison is INTENDED here and `-lt` would be wrong: these are
+    # ISO-8601 timestamps ("2026-07-30T21:15:04Z") plus the "9999"/"0"
+    # sentinels, none of which are integers. ISO-8601 sorts correctly
+    # lexicographically, which is the whole point of that format.
+    # shellcheck disable=SC2071
     if [[ "$date" < "$oldest_date" ]]; then
       oldest_date="$date"
       oldest_slot="$i"
@@ -165,6 +170,9 @@ snapshot_etc_files() {
   local archive="${META_DIR}/slot-${slot_id}.etc.tar.gz"
   local -a files_to_backup=()
 
+  # Same leak class as migrate_config()'s `key`: these libs are sourced into
+  # mcapp.sh's shell, so an undeclared loop variable clobbers the caller's.
+  local path
   for path in \
     /etc/mcapp/config.json \
     /etc/systemd/system/mcapp.service \
@@ -653,14 +661,25 @@ setup_python_env() {
     fi
   fi
 
-  # Run uv sync --all-packages as the real user (not root)
+  # Run uv sync --all-packages as the real user (not root).
+  #
+  # The `|| sync_ok=false` is load-bearing twice over. (1) mcapp.sh runs under
+  # `set -eo pipefail`, and a bare failing command in an if-BRANCH is fatal
+  # (only the if-CONDITION is exempt) — so a failed sync used to abort the
+  # whole bootstrap on the spot and the log_error below was unreachable dead
+  # code. Putting it in a `||` list makes the failure handled, so the
+  # diagnostic actually prints before we return 1. (2) It replaces the old
+  # `if [[ $? -eq 0 ]]` (SC2181), which silently breaks the moment anyone
+  # inserts so much as a log line above it.
+  local sync_ok=true
   if [[ "$run_user" != "root" ]]; then
-    sudo -u "$run_user" bash -c "cd '${deploy_target}' && '${uv_bin}' sync --all-packages"
+    sudo -u "$run_user" bash -c "cd '${deploy_target}' && '${uv_bin}' sync --all-packages" \
+      || sync_ok=false
   else
-    (cd "$deploy_target" && "$uv_bin" sync --all-packages)
+    (cd "$deploy_target" && "$uv_bin" sync --all-packages) || sync_ok=false
   fi
 
-  if [[ $? -eq 0 ]]; then
+  if [[ "$sync_ok" == "true" ]]; then
     log_ok "  Python environment ready (including workspace members)"
   else
     log_error "  uv sync --all-packages failed"
@@ -809,6 +828,7 @@ enable_and_start_services() {
   local old_version="${MCAPP_OLD_VERSION:-unknown}"
   local new_version="${MCAPP_NEW_VERSION:-unknown}"
 
+  local svc
   for svc in "${services[@]}"; do
     # Enable service
     log_info "  Enabling ${svc}..."

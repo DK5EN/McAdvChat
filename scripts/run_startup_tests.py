@@ -8,6 +8,12 @@ Usage: uv run python scripts/run_startup_tests.py
 Exit code 0 = all suites passed. Detail output only appears on a TTY
 (wrap with `script -q /dev/null` to force it).
 
+One suite can report SKIPPED rather than PASS/FAIL: `config_migration`
+drives bash-4-only installer code and macOS only ships bash 3.2. A skip
+does not fail the gate, prints a banner on stderr, and is labelled
+"SKIPPED - NOT VERIFIED" so it can never be mistaken for coverage. On
+Linux (CI, production) that suite has no skip path and must pass.
+
 This is the canonical, exit-code-gated test runner (all suites). It is
 fully offline: the command suite stubs the weather fetch, so no network
 is required. The callsign must be the bare admin call (no SSID) and the
@@ -17,6 +23,7 @@ user info text must contain "Node" — the built-in test cases assume both.
 import asyncio
 import sys
 
+from config_migration_tests import run_config_migration_tests
 from update_runner_tests import run_update_runner_tests
 
 from mcapp.ble_protocol_tests import run_ble_protocol_tests
@@ -104,6 +111,12 @@ async def main() -> int:
     update_runner_ok = run_update_runner_tests()
     print(f"update_runner: {'PASS' if update_runner_ok else 'FAIL'}")
 
+    # The only suite that can be legitimately inapplicable: it drives a
+    # bash-4-only installer function and macOS ships bash 3.2. It therefore
+    # returns its own status label so a skip is never printed as "PASS".
+    config_migration_ok, config_migration_status = run_config_migration_tests()
+    print(f"config_migration: {config_migration_status}")
+
     handler = create_command_handler(
         router,
         None,
@@ -138,6 +151,7 @@ async def main() -> int:
         and push_ok
         and ble_protocol_ok
         and update_runner_ok
+        and config_migration_ok
         and commands_ok
     )
     return 0 if all_ok else 1
