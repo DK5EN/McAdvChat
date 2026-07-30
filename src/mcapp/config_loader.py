@@ -14,7 +14,23 @@ from typing import Any
 
 from .logging_setup import get_logger
 
+# Re-exported (import-as-itself) so identity_tests.py can monkeypatch
+# config_loader.load_runtime_state as a module attribute under mypy --strict's
+# no_implicit_reexport.
+from .runtime_state import (
+    load_runtime_state as load_runtime_state,  # noqa: PLC0414 - explicit re-export for mypy
+)
+
 logger = get_logger(__name__)
+
+# Keys the persisted runtime overlay (auto-detected facts, e.g. the node's real
+# callsign learned from its BLE "I" register) is allowed to feed into
+# `_from_dict`'s mapping. `runtime.json` may also carry `BLE_DEVICE_NAME` and
+# `detected_at` (see `runtime_state.py`), but those aren't consumed by Config
+# yet, so they are deliberately filtered out here rather than spread in
+# unchecked — `_from_dict` ignores unknown keys anyway, but an explicit
+# allowlist keeps the overlay's blast radius limited to what it should affect.
+_RUNTIME_OVERLAY_KEYS = frozenset({"CALL_SIGN", "MESHCOM_IOT_TARGET"})
 
 # ── Protocol constants (fixed by hardware / architecture) ─────────────
 
@@ -103,14 +119,46 @@ class Config:
 
         path = Path(path)
 
-        if not path.exists():
+        file_data: dict[str, Any]
+        if path.exists():
+            with path.open(encoding="utf-8") as f:
+                file_data = json.load(f)
+            logger.info("Loaded config from %s", path)
+        else:
+            # DELIBERATE: this branch used to `return cls()` outright, which
+            # skipped `_from_dict` and therefore silently ignored the documented
+            # MCAPP_BLE_MODE / MCAPP_BLE_API_KEY env overrides ("Override BLE
+            # mode without editing config" — doc/operations-reference.md)
+            # whenever the config file was absent. Routing the empty case
+            # through `_from_dict({})` honours them and is otherwise
+            # byte-identical to `cls()` (every other field falls through to its
+            # dataclass default, and `_raw` ends up `{}` either way). Pinned by
+            # identity_tests.py so the difference cannot regress unnoticed.
             logger.warning("Config file not found: %s, using defaults", path)
-            return cls()
+            file_data = {}
 
-        with path.open(encoding="utf-8") as f:
-            data = json.load(f)
-
-        logger.info("Loaded config from %s", path)
+        # Layer the auto-detected runtime overlay (e.g. the callsign the node
+        # itself reported over BLE, which may have changed since config.json
+        # was last written by the installer) on top so overlay keys win. A
+        # missing/empty overlay is a complete no-op — `data` is then exactly
+        # `file_data`, so this flows through the exact same `_from_dict`
+        # mapping (and MESHCOM_IOT_TARGET > UDP_TARGET precedence) as before.
+        #
+        # VALUES are sanity-checked, not just keys: `runtime.json` is a plain
+        # file in /var/lib/mcapp that can be hand-edited or half-written. A
+        # `null` (or numeric) CALL_SIGN used to reach
+        # `MessageRouter.set_callsign`, where `None.strip()` raised
+        # AttributeError on the uncaught boot path and took the whole proxy
+        # down; an empty/blank string silently overrode a perfectly good
+        # config.json callsign with "". Anything that is not a non-blank string
+        # is dropped so the config.json value survives — same never-raise
+        # posture as `load_runtime_state` itself.
+        overlay = {
+            key: value.strip()
+            for key, value in load_runtime_state().items()
+            if key in _RUNTIME_OVERLAY_KEYS and isinstance(value, str) and value.strip()
+        }
+        data = {**file_data, **overlay}
         return cls._from_dict(data)
 
     @staticmethod

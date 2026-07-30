@@ -27,6 +27,7 @@ from mcapp.commands.parsing_tests import run_parsing_tests
 from mcapp.commands.routing_tests import run_routing_tests
 from mcapp.contract_parity_tests import run_contract_parity_tests
 from mcapp.dedup_contract_tests import run_dedup_contract_tests
+from mcapp.identity_tests import run_identity_tests
 from mcapp.main import MessageRouter
 from mcapp.meteo_tests import run_meteo_tests
 from mcapp.push_tests import run_push_tests
@@ -54,6 +55,9 @@ async def main() -> int:
 
     dedup_contract_ok = run_dedup_contract_tests()
     print(f"dedup_contract: {'PASS' if dedup_contract_ok else 'FAIL'}")
+
+    identity_ok = await run_identity_tests()
+    print(f"identity: {'PASS' if identity_ok else 'FAIL'}")
 
     udp_ok = await run_udp_handler_tests()
     print(f"udp_handler: {'PASS' if udp_ok else 'FAIL'}")
@@ -118,6 +122,7 @@ async def main() -> int:
         and send_path_ok
         and contract_parity_ok
         and dedup_contract_ok
+        and identity_ok
         and udp_ok
         and udp_parsing_ok
         and storage_ok

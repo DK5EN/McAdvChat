@@ -17,6 +17,7 @@ from typing import Any
 # BLE client abstraction - supports local, remote, and disabled modes
 from .ble_client import BLEMode, ConnectionState, create_ble_client
 from .commands import create_command_handler
+from .commands.constants import CALLSIGN_STRICT_RE
 from .commands.parsing import is_group, normalize_unified, strip_relay_path
 from .config_loader import (
     BLE_SERVICE_URL,
@@ -31,6 +32,13 @@ from .config_loader import (
 from .logging_setup import get_logger, setup_logging
 from .logging_setup import has_console as check_console
 from .router_tests import run_suppression_tests
+
+# Re-exported (import-as-itself) so identity_tests.py can monkeypatch
+# main.save_runtime_state as a module attribute under mypy --strict's
+# no_implicit_reexport.
+from .runtime_state import (
+    save_runtime_state as save_runtime_state,  # noqa: PLC0414 - explicit re-export for mypy
+)
 from .suppression import get_suppression_reason, should_suppress_outbound
 from .udp_handler import UDPHandler
 
@@ -112,11 +120,66 @@ class MessageRouter:
         self.subscribe("ble_message", self._ble_message_handler)
         self.subscribe("udp_message", self._udp_message_handler)
 
-    def set_callsign(self, callsign: str) -> None:
-        """Set the callsign from config"""
-        self.my_callsign = callsign.upper()
+    def apply_callsign(self, callsign: str) -> bool:
+        """Update the node identity everywhere it is cached.
+
+        `cfg.call_sign` used to be read into TWO independent, never
+        resynchronised copies: this router's own `my_callsign`/`validator`,
+        and a second copy write-once inside `CommandHandler.__init__`
+        (`my_callsign`, `admin_callsign_base`, and the default
+        `user_info_text`). Pairing a different node to the Pi left the second
+        copy silently stale — breaking suppression, self-DM detection,
+        command routing, and Web Push eligibility. This setter fans the new
+        callsign out to both holders in one place.
+
+        An operator-authored `user_info_text` is never touched. Only a text
+        that still matches the auto-generated default for the OLD callsign
+        (mirroring the exact format `CommandHandler.__init__` uses —
+        `commands/handler.py`) is regenerated for the new one.
+
+        Returns True iff the callsign actually changed. Empty/whitespace
+        input is ignored (returns False).
+        """
+        new_callsign = callsign.strip().upper()
+        if not new_callsign or new_callsign == self.my_callsign:
+            return False
+
+        old_callsign = self.my_callsign
+        self.my_callsign = new_callsign
         self.validator = MessageValidator(self.my_callsign)
         self._logger.info("Callsign set to '%s', validator initialized", self.my_callsign)
+
+        cmd_handler = self.get_protocol("commands")
+        if cmd_handler is not None:
+            if old_callsign is not None:
+                old_default = f"{old_callsign} Node | No additional info configured"
+                # casefold, not ==: CommandHandler.__init__ interpolates the RAW
+                # (not-yet-upper-cased) `my_callsign` argument into this default
+                # (handler.py:180-182) while `old_callsign` here is already
+                # UPPER-CASED by this method. A lower/mixed-case CALL_SIGN in
+                # config.json therefore produced a default an exact compare
+                # missed, leaving !userinfo advertising the OLD node's callsign
+                # forever after a swap — the exact staleness class this wave
+                # exists to kill. The only extra text a casefolded compare can
+                # now match is a case-variant of the generated default, which IS
+                # the generated default; operator-authored text still survives.
+                if (cmd_handler.user_info_text or "").casefold() == old_default.casefold():
+                    cmd_handler.user_info_text = (
+                        f"{new_callsign} Node | No additional info configured"
+                    )
+            cmd_handler.my_callsign = new_callsign
+            # Same derivation as CommandHandler.__init__: split the already
+            # UPPER-CASED callsign, not the raw argument (see handler.py:172-176 —
+            # deriving from a not-yet-upper-cased value let a lower-case CALL_SIGN
+            # slip past the "cannot block own callsign" admin guard).
+            cmd_handler.admin_callsign_base = new_callsign.split("-", maxsplit=1)[0]
+
+        return True
+
+    def set_callsign(self, callsign: str) -> None:
+        """Set the callsign from config. Thin wrapper around apply_callsign
+        kept for the boot call site and existing test doubles."""
+        self.apply_callsign(callsign)
 
     # --- Publish Helper Methods ---
     async def publish_ble_status(self, command: str, result: str, msg: str) -> None:
@@ -1220,6 +1283,87 @@ def _wire_ble_caches(message_router: MessageRouter) -> None:
                     cmd_handler.weather_service.update_location(lat, lon)
 
     message_router.subscribe("ble_notification", _cache_gps)
+
+    _wire_node_identity_detection(message_router)
+
+
+def _wire_node_identity_detection(message_router: MessageRouter) -> None:
+    """Subscribe the node-identity resynchronisation handler.
+
+    Split out of `_wire_ble_caches` purely to keep both functions under the
+    statement budget; it is wired from there so a single `_wire_ble_caches`
+    call still installs the complete `ble_notification` handler set.
+    """
+    # Serialises the read-modify-persist critical section below. `publish()`
+    # awaits its subscribers sequentially, but several tasks publish onto
+    # "ble_notification" concurrently (the remote client's SSE-notification
+    # loop and the websocket connect handler that triggers a register
+    # re-query), so two "I" frames CAN interleave at the `await` inside. Without
+    # this, a reconnect storm could let the later apply_callsign() win in memory
+    # while the earlier to_thread write wins on disk — in-memory and persisted
+    # identity permanently disagreeing until the next connect.
+    identity_lock = asyncio.Lock()
+
+    async def _detect_node_identity(routed_message: dict[str, Any]) -> None:
+        """Resynchronise the proxy's identity from the paired node's own BLE
+        "I" register (auto-sent on every connect, see _query_ble_registers's
+        docstring). This is what fixes the pairing-drift bug: config.json is
+        written once by the installer and never again from Python, so pairing
+        a DIFFERENT node to the Pi used to leave the proxy silently believing
+        it was still the old callsign.
+
+        Note: "I".CALL is the callsign baked into the node itself. A node can
+        additionally report a DIFFERENT callsign on its UDP uplink via the
+        device's `--setudpcall` setting — we deliberately only ever adopt
+        CALL here, not that.
+
+        Fires on every BLE connect, so an unchanged callsign is a complete
+        no-op: no log, no state write, no SSE broadcast.
+        """
+        data = routed_message["data"]
+        if data.get("TYP") != "I":
+            return
+        detected = str(data.get("CALL") or "").strip().upper()
+        if not detected or not CALLSIGN_STRICT_RE.match(detected):
+            if detected:
+                logger.debug("Ignoring implausible CALL register value: %r", detected)
+            return
+        if detected == message_router.my_callsign:
+            return
+
+        # Double-checked locking: the cheap guard above keeps the common
+        # every-connect no-op lock-free; the re-check inside the lock is what
+        # actually makes "apply, persist, then announce" atomic against a second
+        # frame that slipped in while this one was awaiting.
+        async with identity_lock:
+            if detected == message_router.my_callsign:
+                return
+
+            old_callsign = message_router.my_callsign
+            logger.info("Node identity changed: %s -> %s", old_callsign, detected)
+            message_router.apply_callsign(detected)
+            # Off-thread: this runs inline with mesh ingest on the single asyncio
+            # thread, and synchronous SD-card I/O there is exactly what stalled
+            # SSE heartbeats and UDP ingest in the weather-cache incident (see
+            # meteo.py's update_location). Same posture as build_app's
+            # `asyncio.to_thread(dump_path.exists)`. Resolved through the module
+            # global so identity_tests.py's monkeypatch still applies.
+            await asyncio.to_thread(
+                save_runtime_state, {"CALL_SIGN": detected, "detected_at": now_ms()}
+            )
+
+            sse = message_router.get_protocol("sse")
+            if sse is not None and hasattr(sse, "broadcast_event"):
+                await sse.broadcast_event(
+                    "proxy:identity_changed",
+                    {
+                        "type": "response",
+                        "msg": "identity_changed",
+                        "call_sign": detected,
+                    },
+                )
+
+    message_router.subscribe("ble_notification", _detect_node_identity)
 
 
 async def build_app(cfg: Config) -> AppContext:  # noqa: PLR0915 - sequential wiring steps kept together (CO-04)

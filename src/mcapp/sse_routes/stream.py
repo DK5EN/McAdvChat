@@ -167,15 +167,25 @@ def build_stream_router(manager: SSEManager, version: str) -> APIRouter:  # noqa
     # Not called by the frontend UI, but useful for ops monitoring and debugging.
     @router.get("/api/status")
     async def get_status() -> dict[str, int | str]:
-        """Get SSE server status (version, client count, uptime). Health endpoint."""
+        """Get SSE server status (version, client count, uptime, node identity).
+        Health endpoint."""
         async with manager.clients_lock:
             client_count = len(manager.clients)
+
+        # NOT named `router`: that is the enclosing APIRouter this very endpoint
+        # is registered on (`@router.get` above), and shadowing it here is a trap
+        # for the next edit that needs the APIRouter inside a handler body.
+        message_router = manager.message_router
+        # Read live off the router (never a boot-time copy of cfg.call_sign) so
+        # a runtime node swap — see MessageRouter.apply_callsign — is visible here.
+        call_sign = (message_router.my_callsign if message_router is not None else None) or ""
 
         return {
             "status": "ok",
             "version": version,
             "clients": client_count,
             "uptime_seconds": int(time.time() - getattr(manager, "_start_time", time.time())),
+            "call_sign": call_sign,
         }
 
     # Health check endpoint
