@@ -1,0 +1,22 @@
+# Prettier is used in this repo for Markdown only.
+#
+# Every JSON file under src/ is a byte-sensitive corpus, not source to format:
+#   - src/mcapp/contract/*.json    shared with mc-chat; push_tests.py pins a
+#                                  sha256 of push_contract.json as a drift
+#                                  tripwire, so reformatting breaks the gate
+#   - src/**/*_vectors.json        parity corpora replayed by the test suites
+# Reformatting any of them is a silent test failure, not a style improvement.
+src/**/*.json
+
+# Published at raw.githubusercontent.com/DK5EN/McApp/main and fetched at runtime
+# by the blocklist loader — reformatting it changes what the Pis download.
+sperrliste.json
+
+# Binary SQLite fixtures.
+tests/fixtures/
+
+# Build and dependency artefacts.
+.venv/
+node_modules/
+dist/
+*.egg-info/
