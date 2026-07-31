@@ -102,6 +102,32 @@ MESHCOM_NAME_PREFIX = "MC-"  # not shared with src/mcapp — ble_service is a se
 
 logger = logging.getLogger(__name__)
 
+
+def _log_dbus_failure(operation: str, error: BaseException) -> None:
+    """Log a BlueZ D-Bus failure with its error NAME, not just its text.
+
+    Diagnostic only — this changes no behaviour and no control flow.
+
+    Every BLE failure currently collapses to "Connection failed after N attempts"
+    (`connect()`), and then to a bare "Connection failed" one layer up in
+    ble_service. The D-Bus error name — `org.bluez.Error.AuthenticationFailed`,
+    `...ConnectionAttemptFailed`, `...Failed` plus kernel text such as
+    `le-connection-abort-by-local` — never reaches the journal, so a node that
+    forgot its bond after a re-flash is indistinguishable from one that is simply
+    out of range.
+
+    Planned automatic stale-bond recovery has to decide, from this signature
+    alone, whether to destroy a BlueZ bond. Getting that wrong on a headless Pi
+    leaves the node reachable only over SSH. BlueZ error texts also shifted
+    across 5.5x-5.6x and nothing in this repo pins the version (bootstrap
+    installs the distro package), so the mapping cannot be written from theory —
+    it has to be measured on the target. This line is what makes that possible.
+    """
+    name = getattr(error, "type", None) or type(error).__name__
+    text = getattr(error, "text", None) or str(error)
+    logger.warning("BLE %s failed: dbus_error=%s text=%r", operation, name, text)
+
+
 # D-Bus constants
 BLUEZ_SERVICE_NAME = "org.bluez"
 AGENT_INTERFACE = "org.bluez.Agent1"
@@ -549,6 +575,7 @@ class BLEAdapter:
             msg = f"Connection timeout after {CONNECT_TIMEOUT_S:.0f} seconds"
             raise ConnectionError(msg) from e
         except DBusError as e:
+            _log_dbus_failure("Device1.Connect", e)
             if "In Progress" in str(e):
                 # BlueZ has a pending connection from a previous attempt
                 logger.warning("Stale 'In Progress' in BlueZ, clearing before retry")
@@ -1228,7 +1255,8 @@ class BLEAdapter:
                 with contextlib.suppress(Exception):
                     await dev_iface.call_disconnect()
 
-            except Exception:
+            except Exception as e:
+                _log_dbus_failure("Device1.Pair", e)
                 logger.exception("Pairing failed")
                 return False
 
@@ -1261,7 +1289,8 @@ class BLEAdapter:
             try:
                 await adapter_iface.call_remove_device(device_path)
                 logger.info("Unpaired device: %s", mac)
-            except DBusError:
+            except DBusError as e:
+                _log_dbus_failure("Adapter1.RemoveDevice", e)
                 logger.exception("Unpair failed")
                 return False
             else:
