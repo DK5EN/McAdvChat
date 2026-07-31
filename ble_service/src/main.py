@@ -224,19 +224,51 @@ def _save_ble_state(mac: str, name: str | None = None) -> None:
         logger.warning("Failed to save BLE state: %s", e)
 
 
-def _load_ble_state() -> str | None:
-    """Load last-connected MAC from disk. Returns None if no state."""
+def _read_ble_state_file() -> dict[str, Any]:
+    """The persisted state as a dict, or `{}` if it is missing or unusable.
+
+    Must never raise, and "never" is load-bearing rather than aspirational:
+    `_load_ble_pin()` calls this from inside `lifespan()` BEFORE the yield, so
+    anything escaping here stops the whole BLE service from starting. A state
+    file the service itself wrote, then corrupted by a power cut or a stray
+    edit, must degrade to "no saved state", never to a dead service. Same
+    never-raise posture as mcapp's `runtime_state.load_runtime_state`.
+
+    The failure modes are wider than they look, which is why this catches
+    `Exception` rather than an enumerated tuple:
+      - `json.JSONDecodeError` — a truncated/garbled write.
+      - valid JSON that is not an object (`null`, `[...]`, `"str"`, bare
+        numbers) parses fine, then blows up on `.get()` with `AttributeError`.
+      - a file that is not valid UTF-8 (raw block garbage after a power cut)
+        raises `UnicodeDecodeError` from `json.load`'s read — a `ValueError`
+        subclass, but NOT a `JSONDecodeError`.
+      - deeply nested JSON raises `RecursionError`, which is not even under
+        `ValueError`/`OSError`.
+    An enumerated tuple has been wrong twice already; the whole point of this
+    helper is that its callers never have to think about the list.
+    """
     try:
         with BLE_STATE_FILE.open() as f:
-            saved_state: dict[str, Any] = json.load(f)
-        mac: str | None = saved_state.get("device_mac")
-        if mac:
-            logger.info("Loaded BLE state: %s (%s)", mac, saved_state.get("device_name", "no name"))
-    except (FileNotFoundError, json.JSONDecodeError, KeyError):
-        return None
+            loaded = json.load(f)
+    except FileNotFoundError:
+        return {}  # nothing persisted yet — the normal first-boot case, not worth a warning
+    except Exception as e:
+        logger.warning("BLE state file %s is unreadable (%s); ignoring it", BLE_STATE_FILE, e)
+        return {}
+    if not isinstance(loaded, dict):
+        logger.warning("BLE state file %s is not a JSON object; ignoring it", BLE_STATE_FILE)
+        return {}
+    return loaded
 
-    else:
-        return mac
+
+def _load_ble_state() -> str | None:
+    """Load last-connected MAC from disk. Returns None if no state."""
+    saved_state = _read_ble_state_file()
+    mac = saved_state.get("device_mac")
+    if not isinstance(mac, str) or not mac:
+        return None
+    logger.info("Loaded BLE state: %s (%s)", mac, saved_state.get("device_name", "no name"))
+    return mac
 
 
 def _clear_ble_state() -> None:
@@ -246,26 +278,47 @@ def _clear_ble_state() -> None:
         logger.info("Cleared BLE state file")
     except FileNotFoundError:
         pass
+    except OSError as e:
+        # Both callers (/api/ble/disconnect, /api/ble/cancel_reconnect) run
+        # this BEFORE cancelling the reconnect tasks and outside their own
+        # try/except, so an unlink error used to abort the handler: 500 to the
+        # webapp AND the auto-reconnect loop left running, still hammering the
+        # device the user just asked to drop. A Raspberry Pi remounting its SD
+        # card read-only after an I/O error is the everyday way to get here.
+        logger.warning("Could not clear BLE state file %s: %s", BLE_STATE_FILE, e)
 
 
 def _load_ble_pin() -> int:
-    """Load persisted BLE PIN from state file. Returns 0 if not set."""
+    """Load persisted BLE PIN from state file. Returns 0 if not set.
+
+    Never raises: this runs from `lifespan()` before the yield, so anything
+    escaping here takes the whole BLE service down at startup.
+    """
     try:
-        with BLE_STATE_FILE.open() as f:
-            saved_state = json.load(f)
-        return int(saved_state.get("ble_pin", 0))
-    except (FileNotFoundError, json.JSONDecodeError, ValueError):
+        return int(_read_ble_state_file().get("ble_pin", 0))
+    except (TypeError, ValueError, OverflowError):
+        # Exhaustive over what `int()` can raise for a JSON scalar: TypeError
+        # for null/list/object, ValueError for a non-numeric string and for
+        # NaN, OverflowError for +/-Infinity — which `json.load` accepts by
+        # default, so `{"ble_pin": Infinity}` is a reachable file shape and
+        # used to raise straight out of ASGI startup.
+        logger.warning("BLE state file %s has an unusable ble_pin; using 0", BLE_STATE_FILE)
         return 0
 
 
 def _save_ble_pin(pin: int) -> None:
     """Persist BLE PIN to state file (atomic write, preserves other fields)."""
     try:
-        try:
-            with BLE_STATE_FILE.open() as f:
-                saved_state = json.load(f)
-        except (FileNotFoundError, json.JSONDecodeError):
-            saved_state = {}
+        # Read via `_read_ble_state_file()`, not raw: the inline read this
+        # replaced caught only (FileNotFoundError, JSONDecodeError), so a
+        # valid-JSON-but-non-dict file (`null`, `[...]`) left `saved_state` a
+        # non-dict and `saved_state["ble_pin"] = pin` raised TypeError into
+        # the outer `except Exception` below. The PIN write was then silently
+        # dropped, the corrupt file stayed corrupt forever, and
+        # `PATCH /api/ble/pin` still answered `{"ok": true}`. Starting from
+        # `{}` makes the write self-heal, exactly as it already did for a
+        # garbled-JSON file.
+        saved_state = _read_ble_state_file()
         saved_state["ble_pin"] = pin
         tmp = BLE_STATE_FILE.with_name(BLE_STATE_FILE.name + ".tmp")
         with tmp.open("w") as f:
@@ -556,13 +609,13 @@ async def _startup_auto_connect() -> None:
         logger.info("No saved BLE state — skipping auto-connect")
         return
 
-    # Also load device name from state file
-    try:
-        with BLE_STATE_FILE.open() as f:  # noqa: ASYNC230 - one-shot state read at startup
-            saved_state = json.load(f)
-        state.last_connected_name = saved_state.get("device_name")
-    except Exception as e:
-        logger.debug("Could not read device name from state: %s", e)
+    # Also load device name from state file. Type-checked the same way
+    # `_load_ble_state` checks the MAC: `StatusResponse.device_name` is
+    # `str | None`, so a non-string here (a corrupted or hand-edited state
+    # file) reached pydantic's response-model validation and turned every
+    # GET /api/ble/status into a 500 until the next successful connect.
+    saved_name = _read_ble_state_file().get("device_name")
+    state.last_connected_name = saved_name if isinstance(saved_name, str) and saved_name else None
 
     state.last_connected_mac = mac
     state.user_disconnected = False

@@ -64,7 +64,7 @@ async def main() -> int:  # noqa: PLR0915 - flat suite registry; one visible lin
     dedup_contract_ok = run_dedup_contract_tests()
     print(f"dedup_contract: {'PASS' if dedup_contract_ok else 'FAIL'}")
 
-    ble_service_ok = run_ble_service_tests()
+    ble_service_ok = await run_ble_service_tests()
     print(f"ble_service: {'PASS' if ble_service_ok else 'FAIL'}")
 
     identity_ok = await run_identity_tests()
