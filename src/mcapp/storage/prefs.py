@@ -12,9 +12,14 @@ from typing import Any, cast
 from ..commands.parsing import is_group
 from ..logging_setup import get_logger
 from ._base import StorageBase
-from .constants import SQLITE_BUSY_TIMEOUT_S, compute_conversation_key
+from .constants import SQLITE_BUSY_TIMEOUT_S, compute_conversation_key, escape_like
 
 logger = get_logger(__name__)
+
+# How many sibling conversation keys to name in the zero-match warning. Enough
+# to spot the intended one at a glance, few enough to keep the journal line
+# readable (a busy dst has one key per partner).
+_ZERO_MATCH_HINT_LIMIT = 3
 
 
 class PrefsMixin(StorageBase):
@@ -34,6 +39,42 @@ class PrefsMixin(StorageBase):
             (dst, count),
         )
 
+    @staticmethod
+    def _zero_match_siblings(conn: sqlite3.Connection, dst: str) -> list[str]:
+        """Conversation keys this dst DOES take part in, for zero-match triage.
+
+        Called only from delete_messages_by_dst's personal/pair arm and only
+        when the delete matched nothing, to tell "own_call is wrong" (rows
+        exist for this dst, just under a different key) from "the conversation
+        was already empty" (no rows at all). Empty list means the latter.
+
+        The dst base is derived exactly as compute_conversation_key derives its
+        `base_dst` — last comma component, then SSID stripped — so the keys
+        found here are directly comparable with the key the delete just missed.
+        DM keys are 'BASE_A<>BASE_B' with the two bases sorted, so this dst can
+        sit on either side; hence the two patterns. SQLite's LIKE is
+        ASCII-case-insensitive by default, which is wanted here: a key stored
+        in another case is exactly the kind of near-miss worth reporting.
+
+        Cost: a scan of the covering index idx_messages_convkey_ts (the
+        trailing-wildcard pattern rules out a range seek). That is confined to
+        an operator-initiated delete that already returned 0, and runs inside
+        the same to_thread as the delete, so it never touches the event loop.
+        """
+        base = dst.rsplit(",", maxsplit=1)[-1].strip().split("-", maxsplit=1)[0]
+        if not base:
+            return []
+        pattern = escape_like(base)
+        rows = conn.execute(
+            "SELECT DISTINCT conversation_key FROM messages"
+            " WHERE type IN ('msg', 'ack') AND conversation_key IS NOT NULL"
+            " AND (conversation_key LIKE ? ESCAPE '\\'"
+            "      OR conversation_key LIKE ? ESCAPE '\\')"
+            " LIMIT ?",
+            (f"{pattern}<>%", f"%<>{pattern}", _ZERO_MATCH_HINT_LIMIT),
+        ).fetchall()
+        return [str(row[0]) for row in rows]
+
     async def delete_messages_by_dst(self, dst: str, own_call: str = "", read_key: str = "") -> int:
         """Delete a whole conversation, mirroring the webapp's client-side
         removal semantics.
@@ -51,10 +92,38 @@ class PrefsMixin(StorageBase):
         never inserts them).
         Also cleans up the read_counts entry — keyed by read_key (the
         frontend sidebar key, e.g. pair 'A~B') when provided, else dst.
+
+        The webapp overloads this call to address a specific third-party pair
+        conversation: for an 'A~B' sidebar bucket it POSTs {dst: A, own_call:
+        B, read_key: "A~B"}. Several distinct pairs can share the same bare
+        dst (e.g. DD7MH<>HB3XTK and DD7MH<>DH1FR both log under dst=DD7MH), so
+        the completion log line below includes own_call and read_key too —
+        dst alone can't tell two such deletes apart. A personal delete that
+        matches zero rows is also triaged (separate from the empty-own_call
+        case below): own_call being merely WRONG — bad case, bad base
+        callsign — is otherwise a silent, permanent no-op, since the route
+        answers 200 either way.
+
+        That triage is deliberately NOT "warn on every zero". Deleting a
+        conversation that is genuinely already empty is normal: the webapp can
+        offer a bucket whose rows the retention prune already removed, or that
+        only ever existed in its IndexedDB offline cache, and it double-deletes
+        on a rapid re-click. The frontend classifies exactly that case as
+        expected and stays silent for it (stores/messages.ts,
+        `hadServerRecord`); if this side warned on it anyway the two halves
+        would disagree about what a failure is, and the journal would fill with
+        warnings nobody can action. So on a zero match we ask the DB which
+        case it is: if rows for this dst exist under a DIFFERENT conversation
+        key, own_call really is wrong (the incident signature) — warn, and name
+        the keys that DO exist, which is the one line that would have solved
+        it. If the dst has no conversation at all, it was simply empty — log
+        it at INFO and move on.
+
         Returns the count of deleted message rows.
         """
 
-        def _run() -> int:
+        def _run() -> tuple[int, bool, list[str]]:
+            personal = False
             with sqlite3.connect(self.db_path, timeout=SQLITE_BUSY_TIMEOUT_S) as conn:
                 if dst == "Time":
                     cursor = conn.execute(
@@ -81,6 +150,7 @@ class PrefsMixin(StorageBase):
                         (dst,),
                     )
                 else:
+                    personal = True
                     if not own_call:
                         # Client bug: personal deletes need own_call (the route
                         # layer falls back to the configured callsign, so this
@@ -100,11 +170,44 @@ class PrefsMixin(StorageBase):
                 deleted = cursor.rowcount
                 # Clean up read_counts for this destination
                 conn.execute("DELETE FROM read_counts WHERE dst = ?", (read_key or dst,))
+                siblings = self._zero_match_siblings(conn, dst) if personal and not deleted else []
                 conn.commit()
-                return deleted
+                return deleted, personal, siblings
 
-        count = await asyncio.to_thread(_run)
-        logger.info("Deleted %d messages for dst=%s", count, dst)
+        count, personal, siblings = await asyncio.to_thread(_run)
+        if personal and count == 0:
+            # Distinct from the empty-own_call warning above: this branch also
+            # covers own_call being PROVIDED but simply not matching anything —
+            # the case that used to be a silent, permanent, HTTP-200 no-op.
+            # `siblings` separates "wrong own_call" from "already empty"; see
+            # the docstring for why the latter must not be a warning.
+            if siblings:
+                logger.warning(
+                    "delete_messages_by_dst: personal delete matched 0 rows for dst=%s"
+                    " own_call=%s read_key=%s, but this dst DOES have stored"
+                    " conversations (%s) — own_call is probably the wrong callsign"
+                    " (wrong base or case), not an empty conversation",
+                    dst,
+                    own_call or "-",
+                    read_key or "-",
+                    ", ".join(siblings),
+                )
+            else:
+                logger.info(
+                    "delete_messages_by_dst: personal delete matched 0 rows for dst=%s"
+                    " own_call=%s read_key=%s; this dst has no stored conversation at"
+                    " all (already empty, pruned, or a repeat delete)",
+                    dst,
+                    own_call or "-",
+                    read_key or "-",
+                )
+        logger.info(
+            "Deleted %d messages for dst=%s own_call=%s read_key=%s",
+            count,
+            dst,
+            own_call or "-",
+            read_key or "-",
+        )
         return count
 
     async def _get_identifier_list(self, table: str, column: str) -> list[str]:

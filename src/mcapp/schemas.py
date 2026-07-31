@@ -63,6 +63,36 @@ class DeleteMessagesRequest(BaseModel):
     # deletes, hence this explicit field.
     read_key: str = ""
 
+    @field_validator("own_call")
+    @classmethod
+    def _normalize_own_call(cls, v: str) -> str:
+        """Uppercase + strip own_call before it reaches storage.delete_messages_by_dst.
+
+        own_call is operator-typed (the Settings screen), so it can arrive in any
+        case or with stray whitespace. storage.constants.compute_conversation_key
+        does no case folding by design — it's pinned by
+        storage/conversation_key_vectors.json, which is explicit that case is
+        deliberately NOT pinned there (real wire traffic is always uppercase
+        already) and shared with mc-chat via the command contract, so it must not
+        change. The webapp's own normalizeCallsign uppercases before building its
+        sidebar keys, so a lowercase/mixed-case own_call here is the one place
+        that would otherwise diverge: the pair key degenerates to something that
+        matches no stored conversation_key, silently deleting 0 rows every time
+        for that Settings entry. Normalize at this request boundary instead.
+
+        dst is deliberately NOT normalized here (see DeleteMessagesRequest.dst /
+        sse_routes/prefs.py::delete_messages): unlike own_call, dst is never
+        operator-typed — the frontend derives it from already-canonical
+        message/sidebar data — and it also carries exact-case sentinels
+        ('Time', '*') and group ids compared verbatim in
+        storage.prefs.delete_messages_by_dst. Group matching is already
+        case-insensitive ('TEST'/'test' both match via is_group()), but
+        uppercasing would turn the 'Time' sentinel into 'TIME' and break its
+        literal `dst == "Time"` branch for no benefit, since dst was never the
+        source of the observed bug.
+        """
+        return v.strip().upper()
+
 
 class SidebarStateRequest(BaseModel):
     """POST /api/mheard/sidebar and /api/wx/sidebar — persist order + hidden."""

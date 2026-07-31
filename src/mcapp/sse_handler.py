@@ -17,7 +17,9 @@ lifecycle (`start_server`/`stop_server`) and the module-level regression test.
 import asyncio
 import contextlib
 import json
+import logging
 import pathlib
+import sqlite3
 import tempfile
 import time
 from collections.abc import AsyncIterator
@@ -776,11 +778,19 @@ async def run_startup_tests() -> bool:  # noqa: PLR0915 - regression suite kept 
        already falls through to the generic `mesh:message` event — the same path BLE
        MHeard signal relies on. This proves that path still fires for a UDP-lora packet
        without needing a dedicated signal SSE event.
-    2. DM delete own_call fallback: POST /api/delete_messages with an empty
-       own_call must resolve the proxy's configured callsign server-side —
-       an empty own_call used to degenerate the conversation key to 'X<>X',
-       silently deleting nothing. Ephemeral tempfile SQLite DB, mirroring the
-       storage test-suite pattern (never touches the live DB).
+    2. DM delete via the real /api/delete_messages route (Wave 6): empty
+       own_call resolves the proxy's configured callsign server-side (used to
+       degenerate the conversation key to 'X<>X', silently deleting nothing);
+       the webapp's pair-overload payload ({dst: A, own_call: B} addressing a
+       third-party 'A~B' bucket) deletes only that pair and leaves the
+       operator's own conversation with A intact; a case-mismatched own_call
+       (operator typed lowercase in Settings) still resolves after
+       DeleteMessagesRequest normalizes it; a genuinely wrong own_call deletes
+       0 rows AND now logs a warning instead of a silent no-op; the info log
+       line disambiguates two pair deletes that share a bare dst; and group/
+       '*'/'Time' deletes are unaffected (regression guard for leaving dst
+       un-normalized). Ephemeral tempfile SQLite DB, mirroring the storage
+       test-suite pattern (never touches the live DB).
     3. D10a: `_get_event_type` mapping-table coverage. Every entry in
        `_SIMPLE_TYPE_MAP`, `_MHEARD_MSG_MAP`, and `_RESPONSE_EVENT_MAP` is
        asserted to map to its exact SSE event name, plus the BLE/resolve-ip
@@ -920,6 +930,304 @@ async def run_startup_tests() -> bool:  # noqa: PLR0915 - regression suite kept 
                     keys == ["OE7FOO<>OE9BAR"],
                 )
             )
+
+            # --- Wave 6 fixtures: reproduces the production incident, where
+            # dst=DD7MH logged three merged delete counts for three distinct
+            # third-party pairs, plus operator-callsign case sensitivity and
+            # the group/'*'/'Time' branches that must stay unaffected.
+            pair_hb3xtk_in = {
+                "msg_id": "CCCC0001",
+                "src": "DD7MH-1",
+                "dst": "HB3XTK-2",
+                "msg": "hi",
+                "type": "msg",
+                "src_type": "node",
+                "timestamp": base_ts + 10,
+            }
+            pair_hb3xtk_out = {
+                "msg_id": "CCCC0002",
+                "src": "HB3XTK-2",
+                "dst": "DD7MH-1",
+                "msg": "reply",
+                "type": "msg",
+                "src_type": "node",
+                "timestamp": base_ts + 11,
+            }
+            pair_dh1fr_in = {
+                "msg_id": "CCCC0003",
+                "src": "DD7MH-1",
+                "dst": "DH1FR-1",
+                "msg": "hi",
+                "type": "msg",
+                "src_type": "node",
+                "timestamp": base_ts + 12,
+            }
+            pair_dh1fr_out = {
+                "msg_id": "CCCC0004",
+                "src": "DH1FR-1",
+                "dst": "DD7MH-1",
+                "msg": "reply",
+                "type": "msg",
+                "src_type": "node",
+                "timestamp": base_ts + 13,
+            }
+            own_dd7mh = {
+                "msg_id": "CCCC0005",
+                "src": "DD7MH-1",
+                "dst": "DK5EN-15",
+                "msg": "to me",
+                "type": "msg",
+                "src_type": "node",
+                "timestamp": base_ts + 14,
+            }
+            case_mismatch_dm = {
+                "msg_id": "CCCC0006",
+                "src": "OE3ZZZ-3",
+                "dst": "DK5EN-77",
+                "msg": "ping",
+                "type": "msg",
+                "src_type": "node",
+                "timestamp": base_ts + 15,
+            }
+            group_msg = {
+                "msg_id": "CCCC0007",
+                "src": "OE1XYZ-1",
+                "dst": "232",
+                "msg": "group chatter",
+                "type": "msg",
+                "src_type": "node",
+                "timestamp": base_ts + 16,
+            }
+            star_msg = {
+                "msg_id": "CCCC0008",
+                "src": "OE1XYZ-1",
+                "dst": "*",
+                "msg": "broadcast",
+                "type": "msg",
+                "src_type": "node",
+                "timestamp": base_ts + 17,
+            }
+            for m in (
+                pair_hb3xtk_in,
+                pair_hb3xtk_out,
+                pair_dh1fr_in,
+                pair_dh1fr_out,
+                own_dd7mh,
+                case_mismatch_dm,
+                group_msg,
+                star_msg,
+            ):
+                await storage.store_message(m, json.dumps(m))
+
+            # A pre-filter legacy '{CET}' row (the webapp's virtual 'Time'
+            # chat): store_message's _should_filter_message drops NEW ones, so
+            # inserting directly mirrors the only rows the 'Time' branch can
+            # still remove.
+            with sqlite3.connect(storage.db_path) as raw_conn:
+                raw_conn.execute(
+                    "INSERT INTO messages"
+                    " (msg_id, src, dst, msg, type, timestamp, conversation_key)"
+                    " VALUES (?, ?, ?, ?, ?, ?, ?)",
+                    ("CCCC0009", "OE1XYZ-1", "*", "{CET}12:00:00", "msg", base_ts + 18, "*"),
+                )
+                raw_conn.commit()
+
+            class _CaptureHandler(logging.Handler):
+                """Collects records emitted by storage.prefs during a delete."""
+
+                def __init__(self) -> None:
+                    super().__init__()
+                    self.records: list[logging.LogRecord] = []
+
+                def emit(self, record: logging.LogRecord) -> None:
+                    self.records.append(record)
+
+            capture = _CaptureHandler()
+            prefs_logger = logging.getLogger("mcapp.storage.prefs")
+            prev_prefs_log_level = prefs_logger.level
+            # This headless runner never calls setup_logging(), so the logger
+            # sits at the library default (WARNING) — raise it for the capture
+            # window or the INFO completion line below is never even built.
+            prefs_logger.setLevel(logging.INFO)
+            prefs_logger.addHandler(capture)
+            try:
+                # Pair overload: {dst: DD7MH, own_call: HB3XTK} must delete
+                # only the DD7MH<>HB3XTK pair, leaving the operator's own
+                # DD7MH<>DK5EN conversation ('A<>me') intact.
+                hb3xtk_pair_size = len((pair_hb3xtk_in, pair_hb3xtk_out))
+                hb3xtk_response = await delete_endpoint(
+                    DeleteMessagesRequest(dst="DD7MH", own_call="HB3XTK", read_key="DD7MH~HB3XTK")
+                )
+                results.append(
+                    (
+                        "pair-overload delete removes exactly the DD7MH<>HB3XTK pair",
+                        hb3xtk_response.get("deleted") == hb3xtk_pair_size,
+                    )
+                )
+
+                own_conv_rows = await storage._query(  # noqa: SLF001 - white-box startup test
+                    "SELECT COUNT(*) AS n FROM messages WHERE conversation_key = 'DD7MH<>DK5EN'"
+                )
+                results.append(
+                    (
+                        (
+                            "pair-overload delete leaves the operator's own"
+                            " DD7MH<>DK5EN conversation intact"
+                        ),
+                        own_conv_rows[0]["n"] == len((own_dd7mh,)),
+                    )
+                )
+
+                # A second pair delete sharing the same bare dst='DD7MH' — the
+                # exact production shape (three merged 'Deleted N for
+                # dst=DD7MH' log lines for three distinct pairs).
+                dh1fr_pair_size = len((pair_dh1fr_in, pair_dh1fr_out))
+                dh1fr_response = await delete_endpoint(
+                    DeleteMessagesRequest(dst="DD7MH", own_call="DH1FR", read_key="DD7MH~DH1FR")
+                )
+                results.append(
+                    (
+                        (
+                            "second pair-overload delete (same bare dst) removes"
+                            " exactly the DD7MH<>DH1FR pair"
+                        ),
+                        dh1fr_response.get("deleted") == dh1fr_pair_size,
+                    )
+                )
+
+                info_lines = [r.getMessage() for r in capture.records if r.levelno == logging.INFO]
+                hb3xtk_lines = [m for m in info_lines if "HB3XTK" in m]
+                dh1fr_lines = [m for m in info_lines if "DH1FR" in m]
+                results.append(
+                    (
+                        "delete log line disambiguates two pair deletes sharing dst=DD7MH",
+                        bool(hb3xtk_lines)
+                        and bool(dh1fr_lines)
+                        and hb3xtk_lines[0] != dh1fr_lines[0],
+                    )
+                )
+
+                # Case-mismatched own_call (operator typed lowercase + a
+                # different SSID in Settings): DeleteMessagesRequest
+                # normalizes it before it reaches compute_conversation_key
+                # (which is never touched), so the delete still resolves.
+                case_response = await delete_endpoint(
+                    DeleteMessagesRequest(dst="OE3ZZZ-3", own_call="dk5en-98", read_key="OE3ZZZ")
+                )
+                results.append(
+                    (
+                        "case-mismatched own_call still deletes after normalization",
+                        case_response.get("deleted") == 1,
+                    )
+                )
+
+                # A genuinely wrong own_call (not just case/SSID) matches no
+                # rows and must be visible in the journal, not a silent,
+                # permanent, HTTP-200 no-op.
+                capture.records.clear()
+                wrong_response = await delete_endpoint(
+                    DeleteMessagesRequest(
+                        dst="OE9BAR-2", own_call="ZZWRONG", read_key="OE9BAR~ZZWRONG"
+                    )
+                )
+                results.append(
+                    ("non-matching own_call deletes 0 rows", wrong_response.get("deleted") == 0)
+                )
+                zero_match_warnings = [
+                    r.getMessage() for r in capture.records if r.levelno == logging.WARNING
+                ]
+                results.append(
+                    (
+                        "non-matching own_call emits a zero-match warning naming dst/own_call",
+                        any("OE9BAR" in m and "ZZWRONG" in m for m in zero_match_warnings),
+                    )
+                )
+                # The warning must also name the conversation key that DOES
+                # exist for this dst ('OE7FOO<>OE9BAR') — that hint is the one
+                # journal line that identifies the real partner callsign.
+                results.append(
+                    (
+                        "zero-match warning names the conversation keys the dst really has",
+                        any("OE7FOO<>OE9BAR" in m for m in zero_match_warnings),
+                    )
+                )
+
+                # Counterpart, and the reason the warning is triaged rather
+                # than unconditional: deleting a conversation that is simply
+                # already empty is NORMAL (retention prune, an offline-cache-
+                # only bucket, or a rapid double-click), and the webapp
+                # deliberately stays silent for it (stores/messages.ts,
+                # `hadServerRecord`). Warning here too would put the two halves
+                # in disagreement and fill the journal with unactionable noise,
+                # so this case is INFO — no WARNING at all.
+                capture.records.clear()
+                empty_response = await delete_endpoint(
+                    DeleteMessagesRequest(dst="OE0NONE-1", own_call="DK5EN", read_key="OE0NONE")
+                )
+                results.append(
+                    (
+                        "delete of a conversation with no stored rows deletes 0",
+                        empty_response.get("deleted") == 0,
+                    )
+                )
+                results.append(
+                    (
+                        "already-empty conversation logs no warning (not journal noise)",
+                        not [r for r in capture.records if r.levelno == logging.WARNING],
+                    )
+                )
+                results.append(
+                    (
+                        "already-empty conversation is still reported at INFO",
+                        any(
+                            "no stored conversation" in r.getMessage()
+                            for r in capture.records
+                            if r.levelno == logging.INFO
+                        ),
+                    )
+                )
+
+                # Regression guard: group / '*' / 'Time' deletes are
+                # unaffected by the own_call normalization fix — dst is
+                # deliberately left un-normalized (see
+                # DeleteMessagesRequest._normalize_own_call's docstring: 'Time'
+                # and '*' are exact-case sentinels and dst is never
+                # operator-typed, unlike own_call).
+                group_response = await delete_endpoint(
+                    DeleteMessagesRequest(dst="232", own_call="", read_key="232")
+                )
+                results.append(
+                    (
+                        "group delete ('232') is unaffected by the own_call fix",
+                        group_response.get("deleted") == 1,
+                    )
+                )
+
+                star_response = await delete_endpoint(
+                    DeleteMessagesRequest(dst="*", own_call="", read_key="*")
+                )
+                results.append(
+                    (
+                        "'*' delete is unaffected by the own_call fix and skips the {CET} row",
+                        star_response.get("deleted") == 1,
+                    )
+                )
+
+                time_response = await delete_endpoint(
+                    DeleteMessagesRequest(dst="Time", own_call="", read_key="Time")
+                )
+                results.append(
+                    (
+                        (
+                            "'Time' delete still matches the legacy {CET} row verbatim"
+                            " (dst not uppercased)"
+                        ),
+                        time_response.get("deleted") == 1,
+                    )
+                )
+            finally:
+                prefs_logger.removeHandler(capture)
+                prefs_logger.setLevel(prev_prefs_log_level)
         finally:
             await storage.close()
 

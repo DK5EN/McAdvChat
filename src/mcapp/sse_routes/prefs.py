@@ -79,10 +79,21 @@ def build_prefs_router(manager: SSEManager) -> APIRouter:
         Clients may omit own_call; for a DM dst an empty own_call would
         degenerate the conversation key to 'X<>X' (matching no rows), so
         fall back to the proxy's configured callsign server-side.
+
+        body.own_call is already uppercased/stripped by
+        DeleteMessagesRequest._normalize_own_call — not repeated here, so
+        that fix stays the single, testable source of truth for
+        client-supplied own_call. Only the fallback value
+        (message_router.my_callsign) gets its own normalization: it's
+        normally already canonical (MessageRouter.apply_callsign uppercases
+        on assignment), but re-normalizing here is a no-op in the common
+        case and keeps the invariant true even if that ever changes.
         """
         storage = manager.require_storage()
         own_call = body.own_call or (
-            (manager.message_router.my_callsign or "") if manager.message_router else ""
+            (manager.message_router.my_callsign or "").strip().upper()
+            if manager.message_router
+            else ""
         )
         deleted = await storage.delete_messages_by_dst(body.dst, own_call, read_key=body.read_key)
         return {"status": "ok", "deleted": deleted}
