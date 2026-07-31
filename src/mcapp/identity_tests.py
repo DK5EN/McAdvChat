@@ -49,7 +49,7 @@ from typing import Any
 
 from . import config_loader
 from . import main as main_module
-from .ble_client import ConnectionState
+from .ble_client import BLEDevice, ConnectionState
 from .commands.constants import has_console
 from .commands.handler import create_command_handler
 from .config_loader import Config
@@ -980,6 +980,115 @@ async def _test_requery_reused_ble_connection(record: Callable[[str, bool], None
         main_module.BLE_REQUERY_TIMEOUT_S = original_timeout
 
 
+class _StubScanBLEClient:
+    """Minimal duck-type of the registered `ble_client` protocol whose `scan()`
+    returns canned `BLEDevice`s -- for `_handle_ble_scan_command`'s Paired-field
+    regression guard below.
+    """
+
+    def __init__(self, devices: list[BLEDevice]) -> None:
+        self._devices = devices
+
+    async def scan(self, timeout: float = 5.0, prefix: str = "") -> list[BLEDevice]:  # noqa: ASYNC109 - mirrors the real client's scan() signature
+        return self._devices
+
+
+async def _test_ble_scan_reports_real_paired_state(record: Callable[[str, bool], None]) -> None:
+    """REGRESSION: `_handle_ble_scan_command` used to hardcode `"Paired": True`
+    for every device in the "known" bucket, regardless of BlueZ's actual
+    `Paired` property. `BLEAdapter.scan()`'s "known" list is every CACHED
+    `org.bluez.Device1` object whose name matches the prefix -- paired or not,
+    it filters on name prefix only (`ble_service/src/ble_adapter.py`'s
+    `_scan_unlocked`) -- so a device BlueZ merely remembers from a previous
+    scan was reported to the webapp as paired. On the live Pi the working
+    node actually reads `Paired: no, Bonded: no, Trusted: yes`, so the field
+    was untruthful for the real production device, not just a hypothetical
+    one.
+
+    `BLEDevice.paired` already carries BlueZ's real value end to end
+    (ble_adapter.py's `_scan_unlocked` reads the real `Paired` D-Bus property
+    -> ble_service's `/api/ble/devices` `ScanResponse` -> `ble_client_remote.
+    py`'s `scan()` parses `d["paired"]`), so the fix is to stop discarding it
+    in `_handle_ble_scan_command` and forward `d.paired` instead of the
+    literal `True`.
+    """
+    router = MessageRouter(None)
+    devices = [
+        BLEDevice(
+            name="MC-KNOWN-PAIRED",
+            address="AA:BB:CC:DD:EE:01",
+            rssi=-40,
+            paired=True,
+            known=True,
+        ),
+        BLEDevice(
+            name="MC-KNOWN-UNPAIRED",
+            address="AA:BB:CC:DD:EE:02",
+            rssi=-55,
+            paired=False,
+            known=True,
+        ),
+        BLEDevice(
+            name="MC-UNKNOWN",
+            address="AA:BB:CC:DD:EE:03",
+            rssi=-70,
+            paired=False,
+            known=False,
+        ),
+    ]
+    router.register_protocol("ble_client", _StubScanBLEClient(devices))
+
+    captured: list[dict[str, Any]] = []
+
+    async def _capture(routed_message: dict[str, Any]) -> None:
+        captured.append(routed_message["data"])
+
+    router.subscribe("ble_status", _capture)
+
+    await router._handle_ble_scan_command()  # white-box startup test
+
+    known_frames = [f for f in captured if f.get("TYP") == "blueZknown"]
+    unknown_frames = [f for f in captured if f.get("TYP") == "blueZunKnown"]
+    record(
+        "BLE scan: exactly one blueZknown frame and one blueZunKnown frame published",
+        len(known_frames) == 1 and len(unknown_frames) == 1,
+    )
+
+    known = known_frames[0]
+    paired_path = "/org/bluez/hci0/dev_AA_BB_CC_DD_EE_01"
+    unpaired_path = "/org/bluez/hci0/dev_AA_BB_CC_DD_EE_02"
+    paired_entry = known.get(paired_path, {}).get("org.bluez.Device1", {})
+    unpaired_entry = known.get(unpaired_path, {}).get("org.bluez.Device1", {})
+
+    record(
+        "BLE scan: a genuinely paired known device reports Paired: true",
+        paired_entry.get("Paired") is True,
+    )
+    record(
+        "BLE scan: a known-but-not-paired device (BlueZ's stale cache, not a real "
+        "bond) reports Paired: false",
+        unpaired_entry.get("Paired") is False,
+    )
+    # Wire-shape guard: src/utils/btDeviceParsing.ts (webapp) parses the known
+    # bucket as {path: {'org.bluez.Device1': {...}}} -- only the truthfulness
+    # of Paired should have changed, not the nesting or the other keys.
+    record(
+        "BLE scan: known-bucket wire shape (nesting/keys) is unchanged",
+        paired_entry.get("Name") == "MC-KNOWN-PAIRED"
+        and paired_entry.get("Address") == "AA:BB:CC:DD:EE:01"
+        and paired_entry.get("Connected") is False
+        and paired_entry.get("Busy") is False,
+    )
+
+    unknown = unknown_frames[0]
+    unknown_path = "/org/bluez/hci0/dev_AA_BB_CC_DD_EE_03"
+    record(
+        "BLE scan: an unpaired/unknown device still lands in the unpaired bucket "
+        "as [name, address, rssi]",
+        unknown.get(unknown_path) == ["MC-UNKNOWN", "AA:BB:CC:DD:EE:03", -70],
+    )
+
+
 async def _test_identity_persist_is_serialised_and_off_thread(
     record: Callable[[str, bool], None],
 ) -> None:
@@ -1383,6 +1492,7 @@ async def run_identity_tests() -> bool:
     await _test_ble_identity_detection_end_to_end(_record)
     await _test_ble_gps_detection_persists_and_debounces(_record)
     await _test_requery_reused_ble_connection(_record)
+    await _test_ble_scan_reports_real_paired_state(_record)
     await _test_identity_persist_is_serialised_and_off_thread(_record)
     await _test_status_endpoint_reports_live_callsign(_record)
     await _test_status_endpoint_reports_udp_source_state(_record)

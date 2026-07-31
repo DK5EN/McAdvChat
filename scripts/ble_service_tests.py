@@ -74,7 +74,7 @@ import sys
 import tempfile
 import textwrap
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Coroutine
 from contextlib import suppress
 from typing import Any, cast
 
@@ -94,6 +94,8 @@ if str(_REPO_ROOT) not in sys.path:
 from ble_service.src import ble_adapter  # noqa: E402 - needs the sys.path bootstrap above
 from ble_service.src import main as ble_main  # noqa: E402 - same
 from ble_service.src.ble_adapter import (  # noqa: E402 - same
+    ADAPTER_INTERFACE,
+    ADAPTER_PATH,
     DEVICE_INTERFACE,
     GATT_CHARACTERISTIC_INTERFACE,
     NUS_RX_UUID,
@@ -1513,7 +1515,10 @@ def _build_connectable_adapter(
     fakes a test may assert against or mutate: "dev" (Device1), "props"
     (Device1 Properties), "read_char"/"read_props" (the NUS TX/notify
     characteristic + its Properties), "write_char" (the NUS RX/write
-    characteristic), "obj_mgr" (ObjectManager, GetManagedObjects).
+    characteristic), "obj_mgr" (ObjectManager, GetManagedObjects), "adapter"
+    (Adapter1 at ADAPTER_PATH -- RemoveDevice/StartDiscovery/StopDiscovery,
+    needed by stale-bond recovery's RemoveDevice call and by a real, unstubbed
+    `_scan_unlocked()`).
 
     A caller that drives this all the way through `ensure_connected()` starts
     the real keepalive/DST background tasks (`_finalize_successful_
@@ -1543,6 +1548,8 @@ def _build_connectable_adapter(
         write_char_path: {GATT_CHARACTERISTIC_INTERFACE: {"UUID": _FakeVariant(NUS_RX_UUID)}},
     }
 
+    adapter_iface = _FakeIface()
+
     bus = _FakeBus(
         {
             device_path: {DEVICE_INTERFACE: dev_iface, PROPERTIES_INTERFACE: props_iface},
@@ -1552,6 +1559,7 @@ def _build_connectable_adapter(
             },
             write_char_path: {GATT_CHARACTERISTIC_INTERFACE: write_char_iface},
             "/": {OBJECT_MANAGER_INTERFACE: obj_mgr_iface},
+            ADAPTER_PATH: {ADAPTER_INTERFACE: adapter_iface},
             **_agent_manager_object(),
         }
     )
@@ -1564,6 +1572,7 @@ def _build_connectable_adapter(
         "read_props": read_props_iface,
         "write_char": write_char_iface,
         "obj_mgr": obj_mgr_iface,
+        "adapter": adapter_iface,
     }
     return adapter, ifaces
 
@@ -1770,6 +1779,560 @@ def _test_dbus_error_classification_helpers(record: Any) -> None:
             DBusError("org.bluez.Error.AuthenticationFailed", "Authentication Failed")
         ),
     )
+
+
+def _test_fail_connect_wraps_and_chains(record: Any) -> None:
+    """`_fail_connect` is the single choke point every `_attempt_connection`
+    failure now funnels through (widening the connect-path failure taxonomy
+    beyond `DBusError` alone). It must always raise a `ConnectionError
+    (message)` chained to `cause` via `__cause__` -- that chain is how
+    `_is_recoverable_stale_bond_signature` later recovers the real D-Bus
+    error NAME from a wrapped `ConnectionError`, since `DBusError.__str__`
+    returns only `.text`, never `.type`.
+    """
+    cause = InterfaceNotFoundError("no such interface")
+    raised: BaseException | None = None
+    try:
+        ble_adapter._fail_connect("device not found: boom", cause)
+    except ConnectionError as e:
+        raised = e
+    record(
+        "_fail_connect: raises ConnectionError(message) chained to `cause` via __cause__",
+        isinstance(raised, ConnectionError)
+        and str(raised) == "device not found: boom"
+        and raised.__cause__ is cause,
+    )
+
+    raised2: BaseException | None = None
+    try:
+        ble_adapter._fail_connect("no cause here")
+    except ConnectionError as e:
+        raised2 = e
+    record(
+        "_fail_connect: with no cause given, still raises a plain ConnectionError(message) "
+        "with no __cause__",
+        isinstance(raised2, ConnectionError)
+        and str(raised2) == "no cause here"
+        and raised2.__cause__ is None,
+    )
+
+
+async def _test_attempt_connection_device_not_found_is_logged_and_wrapped(record: Any) -> None:
+    """Live-probe-confirmed common case (see module docstring background):
+    BlueZ has no D-Bus object for a MAC it has never seen, so
+    `Device1.get_interface()` raises `InterfaceNotFoundError` -- NOT a
+    `DBusError`. Before `_fail_connect` existed, this failure reached
+    `_connect_stage`/`_connect_with_scan_retry` without ever passing through
+    `_log_dbus_failure`'s dbus_error=/text= taxonomy line at all.
+    """
+    adapter = BLEAdapter()
+    # The device path is deliberately NOT registered on this fake bus, so
+    # get_interface(DEVICE_INTERFACE) raises InterfaceNotFoundError for real.
+    adapter.bus = cast("Any", _FakeBus(_agent_manager_object()))
+    err = await adapter._connect_stage(_ENSURE_CONNECTED_TEST_MAC)
+    record(
+        "_attempt_connection: a MAC BlueZ has never seen is wrapped via _fail_connect into "
+        "the device-not-found ConnectionError _is_device_not_found_error recognizes",
+        err is not None
+        and isinstance(err, ConnectionError)
+        and ble_adapter._is_device_not_found_error(err),
+    )
+    record(
+        "_attempt_connection: the wrapped error still chains the original "
+        "InterfaceNotFoundError as __cause__ (what the taxonomy reads the real Python "
+        "exception type from)",
+        err is not None and isinstance(err.__cause__, InterfaceNotFoundError),
+    )
+
+
+async def _test_read_paired_live_and_remove_device_unlocked(record: Any) -> None:
+    """The two D-Bus-touching primitives `_maybe_recover_stale_bond` is built
+    on: gate (a)'s live `Device1.Paired` read, and the actual
+    `Adapter1.RemoveDevice` call. Both bias toward the SAFE outcome (False)
+    on any failure -- a read/remove failure must never be treated as "go
+    ahead and recover".
+    """
+    adapter, dev_iface = _build_bare_adapter()
+    dev_iface.returns["get_paired"] = True
+    result = await adapter._read_paired_live(_ENSURE_CONNECTED_TEST_MAC)
+    record(
+        "_read_paired_live: reads True from a real (fake) live Device1.Paired property",
+        result is True,
+    )
+
+    adapter2, dev_iface2 = _build_bare_adapter()
+    dev_iface2.returns["get_paired"] = False
+    result2 = await adapter2._read_paired_live(_ENSURE_CONNECTED_TEST_MAC)
+    record(
+        "_read_paired_live: reads False when BlueZ reports Paired=false "
+        "(discriminating: not vacuously True)",
+        result2 is False,
+    )
+
+    # A device BlueZ has no D-Bus object for at all (never known, or already
+    # removed) -- InterfaceNotFoundError -- must read as False, never raise.
+    adapter3 = BLEAdapter()
+    adapter3.bus = cast("Any", _FakeBus(_agent_manager_object()))
+    result3 = await adapter3._read_paired_live(_ENSURE_CONNECTED_TEST_MAC)
+    record(
+        "_read_paired_live: a missing D-Bus object (InterfaceNotFoundError) reads as False, "
+        "never raises (bias toward NOT recovering on any read failure)",
+        result3 is False,
+    )
+
+    adapter4, dev_iface4 = _build_bare_adapter()
+    dev_iface4.raises["get_paired"] = RuntimeError("wedged")
+    result4 = await adapter4._read_paired_live(_ENSURE_CONNECTED_TEST_MAC)
+    record(
+        "_read_paired_live: a Paired property read that raises also reads as False",
+        result4 is False,
+    )
+
+    device_path = adapter._mac_to_dbus_path(_ENSURE_CONNECTED_TEST_MAC)
+    adapter_iface = _FakeIface()
+    remover = BLEAdapter()
+    remover.bus = cast(
+        "Any",
+        _FakeBus({ADAPTER_PATH: {ADAPTER_INTERFACE: adapter_iface}, **_agent_manager_object()}),
+    )
+    remove_result = await remover._remove_device_unlocked(_ENSURE_CONNECTED_TEST_MAC)
+    record(
+        "_remove_device_unlocked: calls Adapter1.RemoveDevice with the device's own D-Bus "
+        "path and returns True on success",
+        remove_result is True and ("call_remove_device", (device_path,)) in adapter_iface.calls,
+    )
+
+    adapter_iface2 = _FakeIface()
+    adapter_iface2.raises["call_remove_device"] = DBusError("org.bluez.Error.Failed", "nope")
+    remover2 = BLEAdapter()
+    remover2.bus = cast(
+        "Any",
+        _FakeBus({ADAPTER_PATH: {ADAPTER_INTERFACE: adapter_iface2}, **_agent_manager_object()}),
+    )
+    remove_result2 = await remover2._remove_device_unlocked(_ENSURE_CONNECTED_TEST_MAC)
+    record(
+        "_remove_device_unlocked: a DBusError from RemoveDevice returns False, never raises "
+        "(so _maybe_recover_stale_bond aborts instead of scanning/reconnecting for nothing)",
+        remove_result2 is False,
+    )
+
+
+def _test_stale_bond_signature_and_timeout_helpers(record: Any) -> None:
+    """The pure classification helpers `_maybe_recover_stale_bond`'s gates
+    (d) and (e) are built on.
+    """
+    auth_failed = DBusError("org.bluez.Error.AuthenticationFailed", "Authentication Failed")
+    record(
+        "_is_recoverable_stale_bond_signature: org.bluez.Error.AuthenticationFailed IS "
+        "recognised (the one conservative allowlist entry)",
+        ble_adapter._is_recoverable_stale_bond_signature(auth_failed),
+    )
+
+    wrapped_auth_failed = ConnectionError(f"Connect failed: {auth_failed}")
+    wrapped_auth_failed.__cause__ = auth_failed
+    record(
+        "_is_recoverable_stale_bond_signature: recognises the signature through "
+        "_fail_connect's ConnectionError(...) wrapping too, via __cause__ (DBusError.__str__ "
+        "carries no NAME, only .text, so this is the only place the real name survives)",
+        ble_adapter._is_recoverable_stale_bond_signature(wrapped_auth_failed),
+    )
+
+    generic_failed = DBusError("org.bluez.Error.Failed", "le-connection-abort-by-local")
+    record(
+        "_is_recoverable_stale_bond_signature: the generic org.bluez.Error.Failed + kernel "
+        "text is NOT recognised (discriminating: not every DBusError counts -- the unmeasured "
+        "taxonomy the design review flagged stays unrecognised by design)",
+        not ble_adapter._is_recoverable_stale_bond_signature(generic_failed),
+    )
+
+    not_found = ConnectionError(f"{ble_adapter._DEVICE_NOT_FOUND_MSG}: some detail")
+    record(
+        "_is_recoverable_stale_bond_signature: a device-not-found ConnectionError (no "
+        "DBusError anywhere in it) is not recognised either",
+        not ble_adapter._is_recoverable_stale_bond_signature(not_found),
+    )
+
+    record(
+        "_is_recoverable_stale_bond_signature: a bare TimeoutError is never recognised "
+        "(it is not, and never wraps, a DBusError)",
+        not ble_adapter._is_recoverable_stale_bond_signature(TimeoutError("timed out")),
+    )
+
+    record(
+        "_is_plain_timeout: a bare TimeoutError instance is a plain timeout",
+        ble_adapter._is_plain_timeout(TimeoutError("timed out")),
+    )
+
+    wrapped_timeout = ConnectionError("Connection timeout after 10 seconds")
+    wrapped_timeout.__cause__ = TimeoutError()
+    record(
+        "_is_plain_timeout: _fail_connect's ConnectionError(...) wrapping of Connect()'s own "
+        "wait_for timeout is recognised via __cause__ too",
+        ble_adapter._is_plain_timeout(wrapped_timeout),
+    )
+
+    record(
+        "_is_plain_timeout: a recognised stale-bond DBusError is NOT a timeout "
+        "(discriminating -- the two gates are independent, not aliases of each other)",
+        not ble_adapter._is_plain_timeout(auth_failed)
+        and not ble_adapter._is_plain_timeout(wrapped_auth_failed),
+    )
+
+
+def _stale_bond_error() -> ConnectionError:
+    """A `ConnectionError` shaped exactly like what `_fail_connect` produces
+    for a recognised `org.bluez.Error.AuthenticationFailed` Connect()
+    failure -- the one signature `_STALE_BOND_ERROR_NAMES` allows.
+    """
+    cause = DBusError("org.bluez.Error.AuthenticationFailed", "Authentication Failed")
+    err = ConnectionError(f"Connect failed: {cause}")
+    err.__cause__ = cause
+    return err
+
+
+async def _unreachable_recovery_step(*_args: Any, **_kwargs: Any) -> Any:
+    raise AssertionError("stale-bond recovery gate should have short-circuited before this")
+
+
+def _wire_recovery_stubs(
+    adapter: BLEAdapter,
+    *,
+    paired: Callable[[str], Coroutine[Any, Any, bool]] | None = None,
+    remove: Callable[[str], Coroutine[Any, Any, bool]] | None = None,
+    scan: Callable[..., Coroutine[Any, Any, list[Any]]] | None = None,
+    connect: Callable[[str], Coroutine[Any, Any, Exception | None]] | None = None,
+) -> None:
+    """Monkeypatch `_maybe_recover_stale_bond`'s four D-Bus-touching
+    siblings on `adapter`. Any argument left as `None` is wired to
+    `_unreachable_recovery_step`, so a gate that is SUPPOSED to short-circuit
+    before reaching that step fails loudly (AssertionError) instead of
+    silently proceeding.
+    """
+    # Resolved through an explicitly-annotated local first (matching each
+    # attribute's own precise type) rather than assigned straight from
+    # `paired or _unreachable_recovery_step`: mypy infers an OR expression's
+    # type as a Union of both arms and will not collapse that back down to
+    # the narrower Callable the attribute itself is typed as at the
+    # assignment site, even though each arm alone is assignable. Both ignore
+    # codes are needed on the final assignment: [method-assign] because it
+    # overwrites a bound method, [assignment] because mypy compares against
+    # the class's UNBOUND function type (including `self`) there, which a
+    # plain `Callable[[str], ...]` never structurally matches.
+    paired_fn: Callable[[str], Coroutine[Any, Any, bool]] = (
+        paired if paired is not None else _unreachable_recovery_step
+    )
+    remove_fn: Callable[[str], Coroutine[Any, Any, bool]] = (
+        remove if remove is not None else _unreachable_recovery_step
+    )
+    scan_fn: Callable[..., Coroutine[Any, Any, list[Any]]] = (
+        scan if scan is not None else _unreachable_recovery_step
+    )
+    connect_fn: Callable[[str], Coroutine[Any, Any, Exception | None]] = (
+        connect if connect is not None else _unreachable_recovery_step
+    )
+    adapter._read_paired_live = paired_fn  # type: ignore[method-assign, assignment]
+    adapter._remove_device_unlocked = remove_fn  # type: ignore[method-assign, assignment]
+    adapter._scan_unlocked = scan_fn  # type: ignore[method-assign]
+    adapter._connect_stage = connect_fn  # type: ignore[method-assign, assignment]
+
+
+async def _test_maybe_recover_stale_bond_blocking_gates(record: Any) -> None:
+    """Gates (b), (e), (d), (a) each independently block recovery -- and
+    block it BEFORE any D-Bus call past the one that gate itself needs (the
+    other three siblings are wired to `_unreachable_recovery_step`, so a
+    regression that skips straight to RemoveDevice fails loudly).
+    """
+    mac = _ENSURE_CONNECTED_TEST_MAC
+
+    adapter_b = BLEAdapter()
+    _wire_recovery_stubs(adapter_b)
+    err_b = _stale_bond_error()
+    result_b = await adapter_b._maybe_recover_stale_bond(mac, err_b, user_initiated=False)
+    record(
+        "gate (b): unattended (user_initiated=False) blocks recovery before any D-Bus call, "
+        "returning the original error unchanged",
+        result_b is err_b,
+    )
+
+    adapter_e = BLEAdapter()
+    _wire_recovery_stubs(adapter_e)
+    timeout_err = ConnectionError("Connection timeout after 10 seconds")
+    timeout_err.__cause__ = TimeoutError()
+    result_e = await adapter_e._maybe_recover_stale_bond(mac, timeout_err, user_initiated=True)
+    record(
+        "gate (e): a plain connect timeout never triggers recovery, even when user-initiated",
+        result_e is timeout_err,
+    )
+
+    adapter_d = BLEAdapter()
+    _wire_recovery_stubs(adapter_d)
+    cause_d = DBusError("org.bluez.Error.Failed", "le-connection-abort-by-local")
+    err_d = ConnectionError(f"Connect failed: {cause_d}")
+    err_d.__cause__ = cause_d
+    result_d = await adapter_d._maybe_recover_stale_bond(mac, err_d, user_initiated=True)
+    record(
+        "gate (d): an unrecognised error signature blocks recovery (unmeasured taxonomy "
+        "defaults to NOT recovering)",
+        result_d is err_d,
+    )
+
+    adapter_a = BLEAdapter()
+    paired_calls: list[str] = []
+
+    async def _paired_false(read_mac: str) -> bool:
+        paired_calls.append(read_mac)
+        return False
+
+    _wire_recovery_stubs(adapter_a, paired=_paired_false)
+    err_a = _stale_bond_error()
+    result_a = await adapter_a._maybe_recover_stale_bond(mac, err_a, user_initiated=True)
+    record(
+        "gate (a): Paired=false (live read) blocks recovery even for a recognised signature "
+        "on a user-initiated attempt -- a device that never bonded cannot have a stale bond",
+        result_a is err_a and paired_calls == [mac],
+    )
+
+
+async def _test_maybe_recover_stale_bond_remove_failure_aborts(record: Any) -> None:
+    """`RemoveDevice` itself failing aborts recovery -- no scan/reconnect for
+    something that was never actually destroyed -- and reports the ORIGINAL
+    connect error back, not a synthesized one.
+    """
+    mac = _ENSURE_CONNECTED_TEST_MAC
+    adapter = BLEAdapter()
+    order: list[str] = []
+
+    async def _paired_true(_read_mac: str) -> bool:
+        return True
+
+    async def _remove_fails(_remove_mac: str) -> bool:
+        order.append("remove")
+        return False
+
+    _wire_recovery_stubs(adapter, paired=_paired_true, remove=_remove_fails)
+    err = _stale_bond_error()
+    result = await adapter._maybe_recover_stale_bond(mac, err, user_initiated=True)
+    record(
+        "RemoveDevice itself failing aborts recovery (no scan/reconnect attempted) and "
+        "returns the ORIGINAL error, not a synthesized one",
+        result is err and order == ["remove"],
+    )
+
+
+async def _test_maybe_recover_stale_bond_succeeds_in_sequence(record: Any) -> None:
+    """Every gate passes: recovery succeeds, and the sequence really is
+    RemoveDevice -> discovery -> connect, in exactly that order (rule f) --
+    not a bare retry.
+    """
+    mac = _ENSURE_CONNECTED_TEST_MAC
+    adapter = BLEAdapter()
+    order: list[str] = []
+
+    async def _paired_true(_read_mac: str) -> bool:
+        order.append("paired")
+        return True
+
+    async def _remove_ok(_remove_mac: str) -> bool:
+        order.append("remove")
+        return True
+
+    async def _scan_ok(*_args: Any, **_kwargs: Any) -> list[Any]:
+        order.append("scan")
+        return []
+
+    async def _connect_ok(_connect_mac: str) -> Exception | None:
+        order.append("connect")
+        return None
+
+    _wire_recovery_stubs(
+        adapter, paired=_paired_true, remove=_remove_ok, scan=_scan_ok, connect=_connect_ok
+    )
+    err = _stale_bond_error()
+    result = await adapter._maybe_recover_stale_bond(mac, err, user_initiated=True)
+    record(
+        "recovery succeeds end to end when every gate passes: returns None so the caller "
+        "proceeds exactly as if the original connect had succeeded",
+        result is None,
+    )
+    record(
+        f"sequence proof: RemoveDevice -> discovery -> connect, in EXACTLY that order "
+        f"(observed: {order})",
+        order == ["paired", "remove", "scan", "connect"],
+    )
+
+
+async def _test_maybe_recover_stale_bond_post_recovery_failure(record: Any) -> None:
+    """Post-recovery connect ALSO fails: (h) the surfaced error must say
+    pairing was reset and re-pairing (possibly with a PIN) may be needed --
+    and (c) recovery still ran at MOST once (no loop back into a second
+    RemoveDevice for the retry's own failure, even though it is ITSELF a
+    recognised stale-bond signature).
+    """
+    mac = _ENSURE_CONNECTED_TEST_MAC
+    adapter = BLEAdapter()
+    order: list[str] = []
+
+    async def _paired_true(_read_mac: str) -> bool:
+        return True
+
+    async def _remove_ok(_remove_mac: str) -> bool:
+        order.append("remove")
+        return True
+
+    async def _scan_ok(*_args: Any, **_kwargs: Any) -> list[Any]:
+        order.append("scan")
+        return []
+
+    retry_cause = DBusError("org.bluez.Error.AuthenticationFailed", "Authentication Failed")
+    retry_err = ConnectionError(f"Connect failed: {retry_cause}")
+    retry_err.__cause__ = retry_cause
+
+    async def _connect_fails_again(_connect_mac: str) -> Exception | None:
+        order.append("connect")
+        return retry_err
+
+    _wire_recovery_stubs(
+        adapter,
+        paired=_paired_true,
+        remove=_remove_ok,
+        scan=_scan_ok,
+        connect=_connect_fails_again,
+    )
+    err = _stale_bond_error()
+    result = await adapter._maybe_recover_stale_bond(mac, err, user_initiated=True)
+    record(
+        "gate (h): a failed post-recovery connect returns a BondRecoveryReconnectError "
+        "saying pairing was reset and the device may need re-pairing, possibly with a PIN "
+        "-- not the generic connect-failure text",
+        isinstance(result, ble_adapter.BondRecoveryReconnectError)
+        and "pairing was reset" in str(result)
+        and "re-paired" in str(result)
+        and "PIN" in str(result),
+    )
+    record(
+        "gate (c): recovery runs AT MOST ONCE -- RemoveDevice is called exactly once even "
+        "though the post-recovery connect ALSO failed with a recognised stale-bond "
+        "signature (no second recovery attempt, no loop)",
+        order.count("remove") == 1,
+    )
+    record(
+        f"sequence proof (retry-fails case): still exactly remove -> scan -> connect, once "
+        f"each (observed: {order})",
+        order == ["remove", "scan", "connect"],
+    )
+
+
+def _pin_fake_bus(adapter: BLEAdapter) -> None:
+    """Make `_ensure_bus()` always return `adapter`'s CURRENT `.bus` (the
+    fake set up by `_build_connectable_adapter`), even after a failed
+    connect's `_cleanup_failed_connection()` -> `_reset_state()` sets
+    `adapter.bus = None`. Real `_ensure_bus()` would then open a brand new
+    (real) `MessageBus` for the retry -- exactly what stale-bond recovery's
+    post-RemoveDevice reconnect needs to do -- but there is no real D-Bus in
+    this sandboxed test environment, so a genuinely fresh connection attempt
+    would fail (or hang) for reasons that have nothing to do with the
+    behaviour under test. Needed by any test that drives a REAL Connect()
+    failure through `_build_connectable_adapter`'s fakes and then expects a
+    SECOND real attempt against those same fakes.
+    """
+    fixed_bus = adapter.bus
+
+    async def _ensure_bus_stub() -> Any:
+        adapter.bus = fixed_bus
+        return fixed_bus
+
+    adapter._ensure_bus = _ensure_bus_stub  # type: ignore[method-assign]
+
+
+async def _test_ensure_connected_recovers_stale_bond_end_to_end(record: Any) -> None:
+    """Full-stack proof through the PUBLIC `ensure_connected()` entry point
+    (real fake D-Bus, no BlueZ; `_scan_unlocked` stubbed only to skip its
+    real 5s discovery sleep): a recognised stale-bond signature on a
+    user-initiated connect actually destroys the old bond, rescans, and
+    reconnects -- proving the gates and the sequence work together end to
+    end, not just against monkeypatched siblings.
+    """
+    adapter, ifaces = _build_connectable_adapter()
+    _pin_fake_bus(adapter)
+    dev_iface = ifaces["dev"]
+    dev_iface.returns["get_paired"] = True
+    dev_iface.raises["call_connect"] = lambda n: (
+        DBusError("org.bluez.Error.AuthenticationFailed", "Authentication Failed")
+        if n == 1
+        else None
+    )
+
+    scan_calls: list[int] = []
+
+    async def _fast_scan(*_args: Any, **_kwargs: Any) -> list[Any]:
+        scan_calls.append(1)
+        return []
+
+    adapter._scan_unlocked = _fast_scan  # type: ignore[method-assign]
+
+    label = (
+        "ensure_connected(user_initiated=True): recovers from a recognised stale-bond "
+        "Connect() failure and ends up connected"
+    )
+    try:
+        result = await asyncio.wait_for(
+            adapter.ensure_connected(_ENSURE_CONNECTED_TEST_MAC, user_initiated=True),
+            timeout=5.0,
+        )
+        record(label, result.success is True and result.stage == "connected")
+        record(
+            "ensure_connected: stale-bond recovery actually called Adapter1.RemoveDevice "
+            "exactly once",
+            ifaces["adapter"].call_count("call_remove_device") == 1,
+        )
+        record(
+            "ensure_connected: rescanned exactly once between RemoveDevice and the retry connect",
+            len(scan_calls) == 1,
+        )
+        record(
+            "ensure_connected: Connect() was attempted twice (the original failure, then "
+            "the post-recovery retry)",
+            dev_iface.call_count("call_connect") == 2,
+        )
+    except TimeoutError:
+        record(label, False)
+    finally:
+        await adapter.disconnect()
+
+    # Discriminating: the SAME failure signature, but WITHOUT user_initiated
+    # (the default) -- must never recover, must fail the connect, and must
+    # never touch RemoveDevice or scan.
+    adapter2, ifaces2 = _build_connectable_adapter()
+    _pin_fake_bus(adapter2)
+    dev_iface2 = ifaces2["dev"]
+    dev_iface2.returns["get_paired"] = True
+    dev_iface2.raises["call_connect"] = DBusError(
+        "org.bluez.Error.AuthenticationFailed", "Authentication Failed"
+    )
+
+    async def _scan_must_not_run(*_args: Any, **_kwargs: Any) -> list[Any]:
+        raise AssertionError("must not scan -- recovery must not run unattended")
+
+    adapter2._scan_unlocked = _scan_must_not_run  # type: ignore[method-assign]
+
+    label2 = (
+        "ensure_connected() WITHOUT user_initiated=True (the default) never recovers, even "
+        "for the same recognised signature -- fails the connect instead"
+    )
+    try:
+        result2 = await asyncio.wait_for(
+            adapter2.ensure_connected(_ENSURE_CONNECTED_TEST_MAC), timeout=5.0
+        )
+        record(
+            label2,
+            result2.success is False
+            and result2.stage == "connect"
+            and ifaces2["adapter"].call_count("call_remove_device") == 0,
+        )
+    except TimeoutError:
+        record(label2, False)
+    finally:
+        await adapter2.disconnect()
 
 
 async def _test_connect_with_scan_retry(record: Any) -> None:
@@ -2507,25 +3070,47 @@ async def _test_register_agent_idempotent(record: Any) -> None:
 
 
 def _test_no_removedevice_outside_unpair(record: Any) -> None:
-    """Stale-bond recovery is explicitly out of scope this wave: no code
-    path other than the pre-existing `unpair()` may call BlueZ's
-    `RemoveDevice` -- doing so on a false positive destroys a real bond on a
-    headless Pi reachable only over SSH.
+    """BlueZ's bond-destroying `RemoveDevice` may be invoked from exactly TWO
+    places: the pre-existing standalone `unpair()` flow, and
+    `_remove_device_unlocked()` -- the only thing `_maybe_recover_stale_bond`
+    is allowed to call to destroy a bond. No other code path may call it --
+    doing so on a false positive destroys a real bond on a headless Pi
+    reachable only over SSH.
+
+    Checks the literal `call_remove_device(` invocation (the actual
+    dbus_next D-Bus call), not the broader "remove_device" substring this
+    check used before stale-bond recovery existed: that broader substring
+    also matches the HELPER NAME `_remove_device_unlocked` wherever it is
+    merely called or mentioned in a docstring (e.g. from
+    `_maybe_recover_stale_bond`), which is not itself a RemoveDevice
+    invocation and would make the naive check fail on entirely safe code.
     """
     module_source = inspect.getsource(ble_adapter)
     unpair_source = inspect.getsource(ble_adapter.BLEAdapter.unpair)
-    remainder = module_source.replace(unpair_source, "", 1)
+    remove_device_source = inspect.getsource(ble_adapter.BLEAdapter._remove_device_unlocked)
+    remainder = module_source.replace(unpair_source, "", 1).replace(remove_device_source, "", 1)
     record(
-        "ble_adapter.py: RemoveDevice/call_remove_device appears ONLY inside unpair() "
-        "(stale-bond recovery is explicitly out of scope this wave)",
-        "remove_device" not in remainder.lower(),
+        "ble_adapter.py: call_remove_device( appears ONLY inside unpair() and "
+        "_remove_device_unlocked() (the only thing stale-bond recovery may call to "
+        "destroy a bond)",
+        "call_remove_device(" not in remainder,
     )
     # Sanity: prove the substring check would actually catch it if unpair()'s
-    # own source weren't excluded first.
+    # and _remove_device_unlocked()'s own source weren't excluded first.
     record(
-        "ble_adapter.py: sanity -- RemoveDevice IS present in the full module "
+        "ble_adapter.py: sanity -- call_remove_device( IS present in the full module "
         "(the check above isn't vacuously true because nothing ever matches)",
-        "remove_device" in module_source.lower(),
+        "call_remove_device(" in module_source,
+    )
+    # Exactly two call sites, not one merged/refactored helper -- keeping
+    # RemoveDevice written out explicitly in BOTH unpair() and the recovery
+    # path (rather than funneled through one shared function) is what makes
+    # this audit meaningful: grepping call_remove_device( finds every caller
+    # directly, with no indirection point a future edit could route around.
+    record(
+        "ble_adapter.py: call_remove_device( is called from exactly two places "
+        "(unpair() and _remove_device_unlocked()), not funneled through a shared helper",
+        module_source.count("call_remove_device(") == 2,
     )
 
 
@@ -2682,11 +3267,20 @@ class _FakeEnsureConnectedAdapter:
         self.send_hello_calls = 0
         self.query_extended_registers_calls = 0
         self.post_connect_init_during_hello: int | None = None
+        self.user_initiated_calls: list[bool] = []
 
     async def ensure_connected(
-        self, mac: str, pin: int | None = None
+        self, mac: str, pin: int | None = None, *, user_initiated: bool = False
     ) -> ble_adapter.EnsureConnectedResult:
+        # Signature must mirror the real BLEAdapter.ensure_connected, including
+        # the keyword-only `user_initiated` gate -- otherwise the route can pass
+        # it and every route test explodes with TypeError instead of exercising
+        # the route. Recorded (not just accepted) so a test can assert the route
+        # actually ARMS stale-bond recovery: the default is False, and a route
+        # that forgot to pass it would leave recovery permanently inert in
+        # production while every other assertion still passed.
         self.ensure_connected_calls.append((mac, pin))
+        self.user_initiated_calls.append(user_initiated)
         if self._fault == "composite_hangs":
             await asyncio.sleep(3600)
         return self._result
@@ -3085,6 +3679,17 @@ async def _test_ensure_connected_route_cancels_background_tasks(record: Any) -> 
                 "/api/ble/ensure_connected: the composite actually ran AFTER cancellation "
                 "(not skipped)",
                 fake.ensure_connected_calls == [(_ENSURE_CONNECTED_TEST_MAC, None)],
+            )
+            # REGRESSION: user_initiated defaults to False in the adapter (so
+            # the unattended reconnect paths can never destroy a bond). This
+            # route is the ONLY caller allowed to arm it, and a request here
+            # always came from a human tapping a device. If it stops passing
+            # the flag, stale-bond recovery goes permanently inert in
+            # production while every other assertion in this suite still
+            # passes -- exactly the kind of silent dead feature this pins.
+            record(
+                "/api/ble/ensure_connected: arms stale-bond recovery (user_initiated=True)",
+                fake.user_initiated_calls == [True],
             )
         finally:
             ble_main._adapter = original_adapter
@@ -4155,6 +4760,8 @@ async def run_ble_service_tests() -> bool:
     _test_dbus_error_classification_helpers(_record)
     _test_no_removedevice_outside_unpair(_record)
     _test_ensure_connected_never_calls_locking_public_methods(_record)
+    _test_fail_connect_wraps_and_chains(_record)
+    _test_stale_bond_signature_and_timeout_helpers(_record)
     for case in (
         _test_connect_with_scan_retry,
         _test_ensure_connected_already_connected_is_noop,
@@ -4172,6 +4779,13 @@ async def run_ble_service_tests() -> bool:
         _test_pair_unlocked_disconnect_after_flag,
         _test_pair_public_delegates_to_pair_unlocked,
         _test_register_agent_idempotent,
+        _test_attempt_connection_device_not_found_is_logged_and_wrapped,
+        _test_read_paired_live_and_remove_device_unlocked,
+        _test_maybe_recover_stale_bond_blocking_gates,
+        _test_maybe_recover_stale_bond_remove_failure_aborts,
+        _test_maybe_recover_stale_bond_succeeds_in_sequence,
+        _test_maybe_recover_stale_bond_post_recovery_failure,
+        _test_ensure_connected_recovers_stale_bond_end_to_end,
     ):
         await case(_record)
 

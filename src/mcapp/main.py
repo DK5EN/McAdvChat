@@ -883,7 +883,7 @@ class MessageRouter:
                     "org.bluez.Device1": {
                         "Name": d.name,
                         "Address": d.address,
-                        "Paired": True,
+                        "Paired": d.paired,
                         "Connected": getattr(d, "connected", False),
                         "Busy": False,
                     }

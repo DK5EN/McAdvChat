@@ -44,7 +44,7 @@ from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from enum import Enum, IntEnum
-from typing import TYPE_CHECKING, Any, cast
+from typing import TYPE_CHECKING, Any, NoReturn, cast
 
 # Imported from their defining submodules (not the `dbus_next`/`dbus_next.aio`
 # packages) because those packages re-export these names without an `__all__`
@@ -137,15 +137,50 @@ def _log_dbus_failure(operation: str, error: BaseException) -> None:
     forgot its bond after a re-flash is indistinguishable from one that is simply
     out of range.
 
-    Planned automatic stale-bond recovery has to decide, from this signature
-    alone, whether to destroy a BlueZ bond. Getting that wrong on a headless Pi
-    leaves the node reachable only over SSH. BlueZ error texts also shifted
-    across 5.5x-5.6x and nothing in this repo pins the version (bootstrap
-    installs the distro package), so the mapping cannot be written from theory —
-    it has to be measured on the target. This line is what makes that possible.
+    Automatic stale-bond recovery (`_maybe_recover_stale_bond`) is gated on
+    this exact signature, but only ever trusts a small, explicitly-enumerated
+    allowlist of D-Bus error NAMEs -- never kernel-supplied text, which
+    reworded across BlueZ 5.5x-5.6x with nothing in this repo pinning the
+    version (bootstrap installs the distro package). Getting that gate wrong
+    on a headless Pi destroys a real bond and leaves the node reachable only
+    over SSH, so the taxonomy this line (and `_fail_connect`'s wider net
+    around it, covering InterfaceNotFoundError/TimeoutError/plain exceptions
+    too) produces has to stay complete enough to trust, not just theorized.
     """
     name, text = _dbus_error_parts(error)
     logger.warning("BLE %s failed: dbus_error=%s text=%r", operation, name, text)
+
+
+def _fail_connect(message: str, cause: BaseException | None = None) -> NoReturn:
+    """Log a connect-path failure via `_log_dbus_failure` (under one
+    "Device1.Connect" operation label, regardless of which step inside
+    `_attempt_connection` actually failed) and raise `ConnectionError(message)`
+    chained to `cause`.
+
+    Centralizing every `_attempt_connection` failure through here is what
+    makes the stale-bond taxonomy complete: before this, only the
+    `Device1.Connect` DBusError branch called `_log_dbus_failure` at all --
+    the InterfaceNotFoundError branch (BlueZ has no D-Bus object for this MAC
+    -- confirmed live on the target as the actual common "device not found"
+    failure mode) and the Connect() TimeoutError branch logged nothing, so
+    the taxonomy `_maybe_recover_stale_bond` depends on was silently missing
+    its most common failure. Logging `cause` (not the `ConnectionError` this
+    function wraps it in) is what actually gets the real D-Bus error NAME --
+    or the real Python exception type for a non-D-Bus cause -- into the log:
+    `DBusError.__str__` returns only `.text`, never `.type`, so a wrapping
+    exception's message never carries the name at all.
+
+    `cause=None` covers the two `_attempt_connection` failures that are a
+    plain condition check, not a caught exception (ServicesResolved timing
+    out, no GATT characteristics found) -- `_dbus_error_parts` then falls
+    back to logging the `ConnectionError` itself, exactly as it always did
+    for a bare `ConnectionError`.
+    """
+    err = ConnectionError(message)
+    _log_dbus_failure("Device1.Connect", cause if cause is not None else err)
+    if cause is not None:
+        raise err from cause
+    raise err
 
 
 # The exact marker _attempt_connection() raises into on InterfaceNotFoundError
@@ -210,6 +245,65 @@ def _is_gatt_security_error(error: BaseException) -> bool:
         return True
     lowered = text.lower()
     return any(marker in lowered for marker in _GATT_SECURITY_ERROR_TEXT_MARKERS)
+
+
+# Conservative, explicitly-enumerated D-Bus error NAMEs that justify
+# `_maybe_recover_stale_bond` destroying and re-establishing a BlueZ bond.
+# Deliberately tiny and NAME-only -- no text-marker fallback, unlike
+# `_is_gatt_security_error` above. The real taxonomy of Connect()-failure
+# names/text has not been measured on the target BlueZ build (see
+# `_log_dbus_failure`'s docstring); a false positive here means RemoveDevice
+# on a live, working bond, the worst outcome in this codebase, so an
+# unmeasured signature must never be added on a guess.
+#
+# `org.bluez.Error.AuthenticationFailed` is the one D-Bus error NAME that
+# unambiguously means "the stored link key BlueZ tried to use failed
+# authentication" -- exactly what a stale bond looks like -- and the NAME is
+# stable across the BlueZ 5.5x-5.6x text rewording that makes the generic
+# `org.bluez.Error.Failed` + kernel text (e.g. "le-connection-abort-by-local")
+# unsafe to pattern-match (see `_is_gatt_security_error`'s docstring and the
+# design review that rejected exactly that approach for this seam). It is
+# documented elsewhere as primarily a `Pair()`-flow error that may never
+# appear on a bare `Connect()` -- if BlueZ never emits it here, this entry is
+# simply inert, which is the correct failure mode for an unmeasured taxonomy.
+_STALE_BOND_ERROR_NAMES = frozenset({"org.bluez.Error.AuthenticationFailed"})
+
+
+def _is_recoverable_stale_bond_signature(error: BaseException) -> bool:
+    """True iff `error` IS a `DBusError`, or wraps one via `_fail_connect`'s
+    `raise ConnectionError(...) from cause` (see `_attempt_connection`),
+    whose `.type` is one of the conservative `_STALE_BOND_ERROR_NAMES`.
+
+    Everything else -- including a device-not-found `ConnectionError`, a
+    plain timeout, and the generic `org.bluez.Error.Failed` the design
+    review found most real Connect() failures actually surface as -- is
+    deliberately unrecognised. That is the whole point of this being an
+    allowlist instead of a denylist: bias hard toward NOT recovering. A false
+    negative just leaves today's behaviour (a failed connect); a false
+    positive destroys a bond.
+    """
+    dbus_cause = error if isinstance(error, DBusError) else error.__cause__
+    if not isinstance(dbus_cause, DBusError):
+        return False
+    name, _text = _dbus_error_parts(dbus_cause)
+    return name in _STALE_BOND_ERROR_NAMES
+
+
+def _is_plain_timeout(error: BaseException) -> bool:
+    """True for `_attempt_connection`'s 10s `wait_for` timing out on
+    `Connect()` itself (`asyncio.TimeoutError`, aliased to the builtin
+    `TimeoutError` since Python 3.11) -- an out-of-range or powered-off
+    device, not a bond problem.
+
+    Checked as its own explicit gate in `_maybe_recover_stale_bond`, ahead of
+    and independent from `_is_recoverable_stale_bond_signature`, so a bare
+    timeout can never trigger recovery even if a future edit to
+    `_STALE_BOND_ERROR_NAMES` were to overlap it -- the allowlist already
+    excludes `TimeoutError` structurally (it is never a `DBusError`), but
+    "never on a plain timeout" is its own hard rule, not an accident of the
+    signature check, and deserves its own named, independently testable gate.
+    """
+    return isinstance(error, TimeoutError) or isinstance(error.__cause__, TimeoutError)
 
 
 # D-Bus constants
@@ -344,6 +438,28 @@ class EnsureConnectedResult:
     stage: str
     error_name: str | None = None
     error_text: str | None = None
+
+
+class BondRecoveryReconnectError(ConnectionError):
+    """`_maybe_recover_stale_bond` destroyed the old BlueZ bond (RemoveDevice
+    succeeded) but the fresh connect attempt that followed the rescan still
+    failed. Returned (never actually raised out of `ensure_connected` --
+    it becomes an `EnsureConnectedResult`, same as every other connect-stage
+    failure) so the CALLER's world genuinely changed: the device is no
+    longer paired at all now, which is materially different from "the
+    existing bond didn't work this time" and needs its own message rather
+    than reusing the retry's generic connect-failure text (design review
+    requirement (h)).
+    """
+
+    def __init__(self, mac: str, retry_error: BaseException) -> None:
+        name, text = _dbus_error_parts(retry_error)
+        super().__init__(
+            f"BLE pairing was reset for {mac} after a stale-bond recovery attempt, but the "
+            f"reconnect still failed ({name}: {text}); the device may need to be re-paired, "
+            "possibly with a PIN"
+        )
+        self.retry_error = retry_error
 
 
 class MeshComPairingAgent(ServiceInterface):
@@ -797,7 +913,7 @@ class BLEAdapter:
         try:
             self.dev_iface = cast(DBusInterface, self.device_obj.get_interface(DEVICE_INTERFACE))
         except InterfaceNotFoundError as e:
-            raise ConnectionError(f"{_DEVICE_NOT_FOUND_MSG}: {e}") from e
+            _fail_connect(f"{_DEVICE_NOT_FOUND_MSG}: {e}", e)
 
         self.props_iface = cast(DBusInterface, self.device_obj.get_interface(PROPERTIES_INTERFACE))
 
@@ -818,10 +934,8 @@ class BLEAdapter:
         try:
             await asyncio.wait_for(self.dev_iface.call_connect(), timeout=CONNECT_TIMEOUT_S)
         except TimeoutError as e:
-            msg = f"Connection timeout after {CONNECT_TIMEOUT_S:.0f} seconds"
-            raise ConnectionError(msg) from e
+            _fail_connect(f"Connection timeout after {CONNECT_TIMEOUT_S:.0f} seconds", e)
         except DBusError as e:
-            _log_dbus_failure("Device1.Connect", e)
             if "In Progress" in str(e):
                 # BlueZ has a pending connection from a previous attempt
                 logger.warning("Stale 'In Progress' in BlueZ, clearing before retry")
@@ -829,8 +943,8 @@ class BLEAdapter:
                     await asyncio.wait_for(
                         self.dev_iface.call_disconnect(), timeout=DISCONNECT_TIMEOUT_S
                     )
-                raise ConnectionError("Cleared stale BlueZ state, will retry") from e
-            raise ConnectionError(f"Connect failed: {e}") from e
+                _fail_connect("Cleared stale BlueZ state, will retry", e)
+            _fail_connect(f"Connect failed: {e}", e)
 
         # Mark the device Trusted immediately after Connect() succeeds (not
         # gated on GATT discovery below) so BlueZ persists this Device1
@@ -848,19 +962,19 @@ class BLEAdapter:
 
         # Wait for services to resolve
         if not await self._wait_for_services_resolved(timeout=CONNECT_TIMEOUT_S):
-            raise ConnectionError("Services not resolved within timeout")
+            _fail_connect("Services not resolved within timeout")
 
         # Find GATT characteristics (with timeout to prevent hangs)
         try:
             await asyncio.wait_for(self._find_characteristics(path), timeout=CONNECT_TIMEOUT_S)
         except TimeoutError as e:
-            raise ConnectionError("GATT characteristic discovery timeout") from e
+            _fail_connect("GATT characteristic discovery timeout", e)
 
         # read_char_obj/read_char_iface (and write_char_iface) are always set as a
         # pair by _find_characteristics(); checking read_char_iface here also
         # narrows read_char_obj for mypy.
         if not self.read_char_iface or not self.read_char_obj or not self.write_char_iface:
-            raise ConnectionError("Required GATT characteristics not found")
+            _fail_connect("Required GATT characteristics not found")
 
         self.read_props_iface = cast(
             DBusInterface, self.read_char_obj.get_interface(PROPERTIES_INTERFACE)
@@ -1492,7 +1606,9 @@ class BLEAdapter:
         except asyncio.CancelledError:
             pass
 
-    async def ensure_connected(self, mac: str, pin: int | None = None) -> EnsureConnectedResult:
+    async def ensure_connected(
+        self, mac: str, pin: int | None = None, *, user_initiated: bool = False
+    ) -> EnsureConnectedResult:
         """Composite connect: connect if needed, mark Trusted, and pair on
         demand only if the GATT layer actually requires it this session.
 
@@ -1513,6 +1629,17 @@ class BLEAdapter:
             mac: Device MAC address.
             pin: Optional BLE PIN to apply for this and later sessions. `None`
                 leaves whatever is configured untouched.
+            user_initiated: Gate (b) for `_maybe_recover_stale_bond`: a human
+                asked for THIS connect attempt right now, so destroying a
+                stale bond and re-pairing is an acceptable outcome. Defaults
+                to False -- the safe side -- because an unattended caller
+                (`_auto_reconnect`/`_startup_auto_connect` in
+                `ble_service/src/main.py`) must never destroy a bond with
+                nobody watching. Threaded explicitly rather than inferred
+                from the call site: only `POST /api/ble/ensure_connected`
+                (a direct user action) should ever pass `True`; the
+                internal reconnect ladders call the legacy `connect()`, not
+                this method, and never see this flag at all.
         """
         async with self._operation_lock:
             self._cancel_connect = False
@@ -1537,7 +1664,13 @@ class BLEAdapter:
 
             connect_err = await self._connect_with_scan_retry(mac)
             if connect_err is not None:
-                await self._maybe_recover_stale_bond(mac, connect_err)
+                # A successful recovery resolves connect_err to None -- from
+                # here on this is indistinguishable from a first-try connect
+                # success, and falls through to the same GATT stage below.
+                connect_err = await self._maybe_recover_stale_bond(
+                    mac, connect_err, user_initiated=user_initiated
+                )
+            if connect_err is not None:
                 name, text = _dbus_error_parts(connect_err)
                 self._status.state = ConnectionState.ERROR
                 self._status.error = f"Connect failed: {text}"
@@ -1702,34 +1835,204 @@ class BLEAdapter:
         else:
             return None
 
-    async def _maybe_recover_stale_bond(self, mac: str, error: Exception) -> None:
-        """Extension point for stale-bond recovery. Deliberately a NO-OP in
-        this wave -- do not add a `RemoveDevice()` call here, or anywhere
-        else in this module outside `unpair()`, until the
-        `org.bluez.Error.*` taxonomy is measured on the real Pi target.
+    async def _read_paired_live(self, mac: str) -> bool:
+        """Read BlueZ's LIVE `Device1.Paired` property for `mac` -- never
+        cached, never inferred from what this process remembers. Gate (a)
+        for `_maybe_recover_stale_bond`, and the load-bearing one: a device
+        that never bonded cannot have a STALE bond, and the production node
+        (current MeshCom firmware calls `setSecurityAuth(false, false,
+        false)`, confirmed live: `Paired: no, Bonded: no`, no `[LinkKey]`) is
+        permanently on the safe side of this by construction. Only pre-2025
+        firmware bonds at all, so this is what keeps recovery dormant
+        everywhere it would be a false positive.
 
-        What this is waiting on: `org.bluez.Error.AuthenticationFailed` is a
-        `Pair()`-flow error that may never appear on a bare `Connect()`; real
-        `Connect()` failures instead surface as the generic
-        `org.bluez.Error.Failed` with kernel-supplied text (e.g.
-        "le-connection-abort-by-local") whose exact wording shifted across
-        BlueZ 5.5x-5.6x, and nothing in this repo pins the BlueZ version
-        (bootstrap installs the distro package). Guessing at that text and
-        calling `RemoveDevice` on a false positive destroys a real bond on a
-        headless Pi reachable only over SSH. `_log_dbus_failure` (added the
-        commit before this one) is already producing the dbus_error=/text=
-        log lines this decision needs; once real failures have been observed
-        on mcapp.local, this function is where the taxonomy-driven recovery
-        slots in.
+        Runs after a failed connect attempt, whose cleanup
+        (`_cleanup_failed_connection` -> `_reset_state`) has already dropped
+        `self.bus`/`self.dev_iface` -- so this opens its own fresh proxy via
+        `_ensure_bus()` rather than reusing anything left over from the
+        failed attempt, and reads the property fresh over that proxy rather
+        than trusting any `BLEDevice.paired` a caller might be holding.
+
+        Any failure to read (no D-Bus object for this MAC anymore, a wedged
+        bus, ...) returns False -- the same "bias toward NOT recovering" as
+        every other gate in this seam: a read failure must never be treated
+        as "paired".
         """
+        try:
+            bus = await self._ensure_bus()
+            path = self._mac_to_dbus_path(mac)
+            dev_obj = bus.get_proxy_object(
+                BLUEZ_SERVICE_NAME, path, await bus.introspect(BLUEZ_SERVICE_NAME, path)
+            )
+            dev_iface: DBusInterface = dev_obj.get_interface(DEVICE_INTERFACE)
+            return bool(await dev_iface.get_paired())
+        except Exception as e:
+            logger.debug("Stale-bond recovery: live Paired read failed for %s: %s", mac, e)
+            return False
+
+    async def _remove_device_unlocked(self, mac: str) -> bool:
+        """`Adapter1.RemoveDevice(mac)` without taking `_operation_lock` --
+        for `_maybe_recover_stale_bond`, which already holds it (called from
+        inside `ensure_connected`'s `async with self._operation_lock:`).
+
+        Deliberately NOT shared with `unpair()`'s own, near-identical
+        RemoveDevice call: keeping BlueZ's bond-destroying call written out
+        explicitly in exactly the two places allowed to use it -- rather than
+        funneled through one shared helper -- is what makes
+        `_test_no_removedevice_outside_unpair` a meaningful audit (`grep` for
+        `call_remove_device` finds every caller directly) instead of a check
+        on a single indirection point a future edit could route around.
+
+        Returns True iff BlueZ actually removed the device. False (never a
+        raise) on any failure -- `_maybe_recover_stale_bond` must not attempt
+        the scan/reconnect that follows in `ensure_connected`'s "sequence"
+        (RemoveDevice -> discovery -> connect) if nothing was actually
+        destroyed.
+        """
+        bus = await self._ensure_bus()
+        adapter_obj = bus.get_proxy_object(
+            BLUEZ_SERVICE_NAME, ADAPTER_PATH, await bus.introspect(BLUEZ_SERVICE_NAME, ADAPTER_PATH)
+        )
+        adapter_iface: DBusInterface = adapter_obj.get_interface(ADAPTER_INTERFACE)
+        device_path = self._mac_to_dbus_path(mac)
+        try:
+            await adapter_iface.call_remove_device(device_path)
+        except Exception as e:
+            _log_dbus_failure("Adapter1.RemoveDevice (stale-bond recovery)", e)
+            logger.warning(
+                "Stale-bond recovery: RemoveDevice failed for %s -- aborting recovery, "
+                "nothing was destroyed",
+                mac,
+            )
+            return False
+        else:
+            return True
+
+    async def _stale_bond_recovery_allowed(
+        self, mac: str, error: Exception, *, user_initiated: bool
+    ) -> bool:
+        """Gates (b), (e), (d), (a) for `_maybe_recover_stale_bond`, in that
+        order, each logged at DEBUG when it declines. Split out from
+        `_maybe_recover_stale_bond` itself purely to keep that method's
+        return-statement count low (ruff PLR0911) -- the gate order and
+        reasoning documented there apply here unchanged.
+        """
+        if not user_initiated:
+            logger.debug(
+                "Stale-bond recovery: skipped for %s -- not user-initiated (auto-reconnect/"
+                "startup must never destroy a bond unattended)",
+                mac,
+            )
+            return False
+
+        if _is_plain_timeout(error):
+            logger.debug(
+                "Stale-bond recovery: skipped for %s -- plain connect timeout, never a "
+                "stale-bond signature",
+                mac,
+            )
+            return False
+
+        if not _is_recoverable_stale_bond_signature(error):
+            name, text = _dbus_error_parts(error)
+            logger.debug(
+                "Stale-bond recovery: skipped for %s -- dbus_error=%s text=%r is not in the "
+                "conservative recognised signature set %s; biasing toward NOT recovering on "
+                "an unmeasured taxonomy",
+                mac,
+                name,
+                text,
+                sorted(_STALE_BOND_ERROR_NAMES),
+            )
+            return False
+
+        if not await self._read_paired_live(mac):
+            logger.debug(
+                "Stale-bond recovery: skipped for %s -- BlueZ reports Paired=false right now "
+                "(live read); a device that never bonded cannot have a stale bond",
+                mac,
+            )
+            return False
+
+        return True
+
+    async def _maybe_recover_stale_bond(
+        self, mac: str, error: Exception, *, user_initiated: bool
+    ) -> Exception | None:
+        """Stale-bond recovery: `RemoveDevice` -> rescan -> one reconnect
+        attempt, but ONLY when every one of these hard preconditions holds
+        (design review requirements (a)-(h); none of these is a heuristic --
+        any one failing means "do nothing"):
+
+        (b) `user_initiated` is True -- never from `_auto_reconnect` or
+            `_startup_auto_connect`, which run unattended and must not
+            destroy a bond with nobody watching. Checked first because it is
+            the cheapest gate and the one every other check is pointless
+            without.
+        (e) `error` is not a plain timeout (`_is_plain_timeout`) -- an
+            out-of-range or powered-off device dies as `TimeoutError` too,
+            and that must never look like a stale bond.
+        (d) `error` carries one of the conservative, explicitly-enumerated
+            `_STALE_BOND_ERROR_NAMES` (`_is_recoverable_stale_bond_signature`).
+            The taxonomy is not yet measured on the real target, so an
+            UNRECOGNISED signature is the common case and must default to
+            NOT recovering -- a false negative just leaves today's behaviour
+            (a failed connect); a false positive destroys a bond.
+        (a) `Paired` reads True LIVE from BlueZ right now (`_read_paired_
+            live`) -- checked last, immediately before the destructive step,
+            so the read is as fresh as possible and not stale by the time it
+            gates `RemoveDevice`. The load-bearing gate: a device that never
+            bonded cannot have a stale bond.
+
+        (c) At most once: this method is called from exactly ONE place in
+            `ensure_connected` (never in a loop, never re-entered), and does
+            not call itself -- the post-recovery reconnect's own failure is
+            handled inline below, not by recursing back into this method. A
+            second stale-bond failure from the SAME `ensure_connected()` call
+            is therefore structurally impossible, not just unlikely.
+        (f) The sequence, once every gate passes, is exactly `RemoveDevice`
+            (`_remove_device_unlocked`) -> discovery (`_scan_unlocked`) ->
+            one connect attempt (`_connect_stage`) -- never a bare retry:
+            `RemoveDevice` deletes the D-Bus object, so a retry without a
+            scan in between is guaranteed to fail with
+            `InterfaceNotFoundError`.
+        (g) A bond that is actually destroyed is logged at WARNING,
+            activity-log grade, recording the triggering error signature.
+        (h) If the post-recovery connect ALSO fails, the returned exception
+            (`BondRecoveryReconnectError`) says the pairing was reset and
+            the device may need to be re-paired, possibly with a PIN --
+            not the generic connect-failure text: the world genuinely
+            changed for the user, unlike an ordinary failed connect.
+
+        Returns None if recovery was not attempted or was not needed
+        (`error` should be reported to the caller as-is), or if recovery
+        SUCCEEDED (the caller should proceed exactly as if the original
+        connect had succeeded -- `_connect_stage` already ran
+        `_finalize_successful_connection` for it). Returns a (possibly
+        different) exception otherwise, for `ensure_connected` to report.
+        """
+        if not await self._stale_bond_recovery_allowed(mac, error, user_initiated=user_initiated):
+            return error
+
         name, text = _dbus_error_parts(error)
-        logger.debug(
-            "Stale-bond recovery not implemented (Wave A): connect to %s failed with "
-            "dbus_error=%s text=%r -- no action taken",
+        if not await self._remove_device_unlocked(mac):
+            return error
+
+        logger.warning(
+            "Stale-bond recovery: destroyed the BlueZ bond for %s after a recognised "
+            "stale-bond failure (dbus_error=%s text=%r) -- rescanning and reconnecting; the "
+            "device will need to be re-paired",
             mac,
             name,
             text,
         )
+
+        await self._scan_unlocked()
+        retry_err = await self._connect_stage(mac)
+        if retry_err is None:
+            return None
+
+        return BondRecoveryReconnectError(mac, retry_err)
 
     async def pair(self, mac: str) -> bool:
         """

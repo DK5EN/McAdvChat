@@ -1208,7 +1208,16 @@ async def ensure_connected_route(
 
     try:
         result = await asyncio.wait_for(
-            adapter.ensure_connected(mac, request.pin), timeout=ENSURE_CONNECTED_DEADLINE_S
+            # user_initiated=True is what ARMS stale-bond recovery, and this
+            # route is the only place it may be passed: a request to this
+            # endpoint always originates from someone tapping a device in the
+            # webapp. The unattended paths (_auto_reconnect,
+            # _startup_auto_connect) go through adapter.connect(), never here,
+            # and must never destroy a BlueZ bond with nobody watching — hence
+            # the parameter defaults to False and is threaded explicitly rather
+            # than inferred from "this is the only caller today".
+            adapter.ensure_connected(mac, request.pin, user_initiated=True),
+            timeout=ENSURE_CONNECTED_DEADLINE_S,
         )
     except TimeoutError:
         _log_activity("ensure_connect_failed", f"Timed out connecting to {mac}", "error")
