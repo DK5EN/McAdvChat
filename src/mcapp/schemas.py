@@ -114,6 +114,25 @@ class BlePinRequest(BaseModel):
         return v
 
 
+class BleEnsureConnectRequest(BaseModel):
+    """POST /api/ble/ensure_connected — implicit-pairing composite connect.
+
+    Forwarded to ble_service's own POST /api/ble/ensure_connected (Wave B).
+    `pin` is folded into this single call instead of requiring a prior
+    PATCH /api/ble/pin into global mutable state.
+    """
+
+    device_address: str = Field(min_length=1)
+    pin: int | None = None
+
+    @field_validator("pin")
+    @classmethod
+    def _check_pin_range(cls, v: int | None) -> int | None:
+        if v is not None and v != 0 and not (_BLE_PIN_MIN <= v <= _BLE_PIN_MAX):
+            raise ValueError("pin must be 0 or 100000–999999")
+        return v
+
+
 class UpdateStartRequest(BaseModel):
     """POST /api/update/start — launch the update runner."""
 

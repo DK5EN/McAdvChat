@@ -21,10 +21,17 @@ from typing import Annotated, Any
 
 from fastapi import Depends, FastAPI, Header, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
+from pydantic import BaseModel, Field, field_validator
 from sse_starlette.sse import EventSourceResponse
 
-from .ble_adapter import MESHCOM_NAME_PREFIX, BLEAdapter, ConnectionState, build_hello_bytes
+from . import ble_adapter
+from .ble_adapter import (
+    MESHCOM_NAME_PREFIX,
+    BLEAdapter,
+    ConnectionState,
+    EnsureConnectedResult,
+    build_hello_bytes,
+)
 
 _MIN_FRAME_WITH_FCS = 4  # 2 payload bytes + 2 FCS bytes
 _BLE_PIN_MIN = 100_000
@@ -37,6 +44,48 @@ RECONNECT_DELAYS_S = (5, 10, 20, 60)
 SSE_PING_INTERVAL_S = 30.0  # ⚠ client (ble_client_remote.py SSE_READ_TIMEOUT_S) must exceed this
 POST_CONNECT_SETTLE_S = 1.0
 INTER_MESSAGE_DELAY_S = 0.2
+# Hard deadline for the ensure_connected() composite (Wave B). Wave A replaced
+# the old 3x-attempt connect ladder with a single attempt (plus at most one
+# scan-retry for a not-yet-known MAC), each step already bounded by its own
+# ble_adapter.py wait_for() (CONNECT_TIMEOUT_S, PROPERTY_SET_TIMEOUT_S, ...).
+# This asyncio.wait_for() is main.py's outer safety net against a step that
+# somehow doesn't honour its own timeout, not the expected typical duration --
+# see CONNECT_REQUEST_TIMEOUT_S in ble_client_remote.py for how the mcapp
+# client's timeout is derived from this number.
+ENSURE_CONNECTED_DEADLINE_S = 28.0
+# Hard deadline for /api/ble/ensure_connected's post-connect init (send_hello,
+# POST_CONNECT_SETTLE_S, query_extended_registers), which runs AFTER
+# ENSURE_CONNECTED_DEADLINE_S has already returned and is therefore NOT covered
+# by it. Unbounded, the route's worst case was the 28s composite plus a hello
+# write (WRITE_TIMEOUT_S), the settle second, and two register queries (each a
+# write plus REGISTER_QUERY_DELAY_S, both constants from ble_adapter.py) —
+# 28 + 5 + 1 + 11.6, i.e. 45.6s. That OVERRUNS the mcapp client's
+# CONNECT_REQUEST_TIMEOUT_S of 40s (src/mcapp/ble_client_remote.py): the outer
+# timeout fired while this route was still working, mcapp reported a bare
+# "Connection error" with NO error_code, and the two processes disagreed about
+# whether the node was connected.
+# ⚠ INVARIANT, pinned by scripts/ble_service_tests.py — this deadline plus
+# ENSURE_CONNECTED_DEADLINE_S must stay strictly under the client's
+# CONNECT_REQUEST_TIMEOUT_S, i.e. 28 + 8 = 36 < 40, leaving ~4s for
+# HTTP/network overhead. A timeout here
+# is NOT a failure: the register queries are best effort (they already swallow
+# their own per-command errors) and adapter.is_connected still decides the
+# response, so a slow-but-live link is reported as the success it is.
+POST_CONNECT_INIT_DEADLINE_S = 8.0
+# How long after send_hello() a disconnect is attributed to a rejected
+# app-layer hello hash (wrong BLE PIN) rather than a generic connection loss.
+# The firmware (phone_commands.cpp) sets ble_disconnect_requested synchronously
+# while handling the 0x10 hello frame, so BlueZ observes Connected -> False
+# within about a second of the write completing on a healthy link.
+# /api/ble/ensure_connected's own post-connect init (POST_CONNECT_SETTLE_S=1s
+# settle + two extended-register queries, each up to
+# WRITE_TIMEOUT_S+REGISTER_QUERY_DELAY_S ~= 5.8s) can itself run up to ~2.6s
+# in the common case, so 5s gives that generous headroom against Pi-Zero-2W
+# scheduler/D-Bus jitter while staying far short of the 300s keepalive
+# interval or a typical multi-second interference blip -- it should not get
+# confused with an unrelated later drop. See _on_adapter_disconnect() and the
+# /api/ble/ensure_connected route.
+PIN_REQUIRED_WINDOW_S = 5.0
 
 # SSE `status` event `state` values and 409-response `reason` values (BLE-10).
 # This is a small transitional/error vocabulary layered on top of BlueZ's own
@@ -51,6 +100,21 @@ STATUS_DISCONNECTED = "disconnected"
 STATUS_RECONNECTING = "reconnecting"
 STATUS_RECONNECT_EXHAUSTED = "reconnect_exhausted"
 REASON_BUSY = "busy"
+
+# `error_code` values on /api/ble/ensure_connected's EnsureConnectedResponse
+# (Wave B) -- same mirroring rule as STATUS_*/REASON_* above: mcapp's
+# src/mcapp/ble_client_remote.py forwards these strings verbatim to the
+# browser (as an added field on the existing `result: "error"` ble_status
+# wire frame; NOT a new `result` value -- see that module's docstring) and
+# additionally hardcodes "busy" itself for a bare 409 (which has no JSON body
+# to carry error_code). ⚠ changing any of these values is a wire-format break.
+_ERROR_CODE_DEVICE_NOT_FOUND = "device_not_found"
+_ERROR_CODE_CONNECT_FAILED = "connect_failed"
+_ERROR_CODE_PAIR_FAILED = "pair_failed"
+_ERROR_CODE_GATT_FAILED = "gatt_failed"
+_ERROR_CODE_PIN_REQUIRED = "pin_required"
+_ERROR_CODE_TIMEOUT = "timeout"
+_ERROR_CODE_BUSY = "busy"  # == REASON_BUSY; kept as its own name for the error_code vocabulary
 
 
 def _now_ms() -> int:
@@ -103,6 +167,37 @@ class ServiceState:
     reconnecting: bool = False
     reconnect_attempt: int = 0
     reconnect_max_attempts: int = 0
+
+    # pin_required probe (Wave B): a `time.monotonic()` deadline set by
+    # /api/ble/ensure_connected right before send_hello(). Consulted (and
+    # one-shot-consumed) by _on_adapter_disconnect() to suppress scheduling
+    # the auto-reconnect ladder for a disconnect that is really a rejected
+    # BLE PIN, not a connection loss worth retrying blindly.
+    #
+    # ⚠ Must be None outside an in-flight ensure_connected's post-connect init
+    # window, and the route clears it in a `finally` to guarantee that. The
+    # PIN_REQUIRED_WINDOW_S deadline alone is not enough: on the success path
+    # the route finishes its init in ~2.6s, so leaving the deadline armed left
+    # ~2.4s in which a GENUINE RF drop was silently swallowed -- no ladder
+    # scheduled, mcapp already told "connected", node down until a human
+    # pressed Connect. Suppressing a real disconnect is strictly worse than the
+    # futile-retry bug this mechanism exists to fix, so the armed window is
+    # kept exactly co-extensive with the route's ability to REPORT
+    # pin_required. See the route and _on_adapter_disconnect().
+    pin_probe_deadline: float | None = None
+
+    # Number of /api/ble/ensure_connected calls currently inside their
+    # post-connect init (Wave B). adapter.ensure_connected() releases
+    # `_operation_lock` before returning, so `adapter.is_busy` is False for the
+    # whole of that init -- and _connect_and_initialize()'s reset_bus() gate
+    # (which keys off is_busy) would happily drop the D-Bus bus underneath the
+    # in-flight send_hello()/query_extended_registers(). The write then fails
+    # with "Not connected", the adapter flips to DISCONNECTED, and the route
+    # reports error_code=pin_required -- telling the user their BLE PIN is
+    # wrong when nothing was wrong with it. A counter, not a bool: two
+    # overlapping requests must not have the first one's exit re-open the gate
+    # while the second is still initialising.
+    post_connect_init: int = 0
 
     # Activity log ring buffer
     activity_log: deque[dict[str, Any]] = field(
@@ -335,8 +430,28 @@ def _save_ble_pin(pin: int) -> None:
 async def _connect_and_initialize(mac: str) -> bool:
     """Connect to device and run post-connect initialization. Returns True on success."""
     adapter = _adapter()
-    # Clean up stale bus before reconnect
-    adapter.reset_bus()
+
+    # Clean up a stale bus before reconnect -- but only when nothing else is
+    # mid-operation. reset_bus() drops adapter.bus WITHOUT taking
+    # _operation_lock (it has no lock of its own -- see its docstring), so
+    # calling it unconditionally here could rip the bus out from under a
+    # DIFFERENT in-flight locked operation (e.g. /api/ble/ensure_connected)
+    # that is using that same bus for its own D-Bus calls: this function is
+    # also the entry point _auto_reconnect() uses on a disconnect-triggered
+    # reconnect, which can race an unrelated caller that already holds the
+    # lock. Skipping the reset while busy is safe: adapter.connect() (right
+    # below) queues on _operation_lock until the busy operation releases it,
+    # and _ensure_bus() lazily reconnects if adapter.bus ends up None anyway
+    # -- so a live bus left behind by the operation that just finished is
+    # reused instead of being torn down for no reason.
+    #
+    # `state.post_connect_init` extends that same skip over the one window
+    # is_busy cannot see: adapter.ensure_connected() releases `_operation_lock`
+    # before /api/ble/ensure_connected runs its own send_hello()/
+    # query_extended_registers(), so is_busy reads False there while the bus is
+    # very much in use. See ServiceState.post_connect_init.
+    if not adapter.is_busy and state.post_connect_init == 0:
+        adapter.reset_bus()
 
     success = await adapter.connect(mac)
     if success:
@@ -345,6 +460,103 @@ async def _connect_and_initialize(mac: str) -> bool:
         await asyncio.sleep(POST_CONNECT_SETTLE_S)
         await adapter.query_extended_registers()
     return success
+
+
+async def _cancel_background_connect_tasks() -> None:
+    """Cancel and AWAIT `state.reconnect_task`/`state.auto_connect_task`
+    before an explicit /api/ble/ensure_connected starts (Wave B).
+
+    Without the await, a background reconnect can race the caller: the user
+    taps node B, the reconnect loop (still chasing node A) wakes and wins
+    `_operation_lock` first, and the system ends up connected to node A while
+    the user is looking at an error for node B. `task.cancel()` alone (as
+    /api/ble/disconnect and /api/ble/cancel_reconnect already do) only
+    *requests* cancellation -- it does not guarantee the task has actually
+    stopped touching the adapter by the time this function returns; only
+    awaiting it does.
+
+    `asyncio.gather(..., return_exceptions=True)` rather than a
+    `suppress(CancelledError)` around each individual await, for two reasons:
+      - `suppress` also swallows a CancelledError raised into THIS task.
+        Uvicorn cancels in-flight request handlers on shutdown, so the
+        suppressing form silently resumed the route and started a fresh BLE
+        connect on a service that was going away. gather re-raises that one
+        while still absorbing the awaited tasks' own cancellations.
+      - it cancels BOTH tasks before awaiting either, instead of letting the
+        second keep running (and keep grabbing `_operation_lock`) for as long
+        as the first takes to unwind.
+    """
+    tasks = [
+        task
+        for task in (state.reconnect_task, state.auto_connect_task)
+        if task is not None and not task.done()
+    ]
+    for task in tasks:
+        task.cancel()
+    if tasks:
+        await asyncio.gather(*tasks, return_exceptions=True)
+    state.reconnect_task = None
+    state.auto_connect_task = None
+    state.reconnecting = False
+    state.reconnect_attempt = 0
+
+
+async def _ensure_connected_post_init(adapter: BLEAdapter) -> None:
+    """The post-connect initialisation /api/ble/ensure_connected runs after
+    `adapter.ensure_connected()` returns -- the same steps
+    `_connect_and_initialize()` performs, minus `start_notify()` (which
+    `ensure_connected()` already did itself).
+
+    Split out of the route body only so it can be wrapped in a single
+    `asyncio.wait_for(POST_CONNECT_INIT_DEADLINE_S)`: none of these steps is
+    covered by ENSURE_CONNECTED_DEADLINE_S, and together they can outlast the
+    mcapp client's whole request budget. See POST_CONNECT_INIT_DEADLINE_S.
+    """
+    await adapter.send_hello()
+    await asyncio.sleep(POST_CONNECT_SETTLE_S)
+    if adapter.is_connected:
+        await adapter.query_extended_registers()
+
+
+def _error_code_for_result(result: EnsureConnectedResult) -> str:
+    """Map a failed `EnsureConnectedResult` to a machine-readable
+    `error_code` for `EnsureConnectedResponse` (Wave B).
+
+    | stage                        | error_code          |
+    |-------------------------------|---------------------|
+    | connect (device not found)    | device_not_found    |
+    | connect (any other failure)   | connect_failed      |
+    | pair                          | pair_failed         |
+    | gatt / gatt_post_pair         | gatt_failed         |
+    | (unrecognised future stage)   | connect_failed      |
+
+    `pin_required`, `timeout` and `busy` are NOT produced here -- they are
+    detected/handled by the route itself: `pin_required` is a disconnect
+    shortly after send_hello(), which only makes sense AFTER
+    `ensure_connected()` has already reported success; `timeout` is this
+    route's own `asyncio.wait_for` deadline; `busy` is the synchronous
+    is_busy guard at the top of the route, surfaced as a 409 rather than this
+    response body. Mirrored (not imported -- ble_service and mcapp are
+    separate processes) into `src/mcapp/ble_client_remote.py`'s
+    `ensure_connected()`, which forwards this string unchanged to the
+    browser -- see the error_code wire-vocabulary note above STATUS_CONNECTED.
+    """
+    if result.stage == "connect":
+        # `_DEVICE_NOT_FOUND_MSG` is private to ble_adapter.py, imported
+        # (rather than a duplicated literal here) for the same reason
+        # `_is_device_not_found_error` shares it with `_attempt_connection`:
+        # a second copy of this string could silently drift from the one
+        # that actually gets raised.
+        if (
+            result.error_text and ble_adapter._DEVICE_NOT_FOUND_MSG in result.error_text  # noqa: SLF001 - shared failure-signature marker, see docstring
+        ):
+            return _ERROR_CODE_DEVICE_NOT_FOUND
+        return _ERROR_CODE_CONNECT_FAILED
+    if result.stage == "pair":
+        return _ERROR_CODE_PAIR_FAILED
+    if result.stage in ("gatt", "gatt_post_pair"):
+        return _ERROR_CODE_GATT_FAILED
+    return _ERROR_CODE_CONNECT_FAILED
 
 
 # --- Auto-reconnect / auto-connect ---
@@ -381,6 +593,27 @@ def _on_adapter_disconnect() -> None:
     _log_activity("disconnect", "Unexpected connection loss", "warn")
     if state.user_disconnected:
         return
+
+    # pin_required suppression (Wave B): a disconnect this soon after
+    # /api/ble/ensure_connected sent hello is almost certainly the firmware
+    # rejecting a wrong BLE PIN (phone_commands.cpp's ble_disconnect_requested),
+    # not a connection worth chasing with the reconnect ladder. Scheduling
+    # _auto_reconnect() here would re-send the SAME wrong hello on every one
+    # of RECONNECT_DELAYS_S's 4 attempts (~95s) and bury the PIN prompt behind
+    # a "Reconnecting (1/4)" spinner. One-shot: consumed (cleared) here
+    # whether or not it was actually still within the window, so a stale
+    # deadline can never suppress a LATER, unrelated disconnect.
+    if state.pin_probe_deadline is not None:
+        deadline = state.pin_probe_deadline
+        state.pin_probe_deadline = None
+        if time.monotonic() <= deadline:
+            logger.warning(
+                "Disconnect within %.1fs of hello -- treating as a rejected BLE PIN, "
+                "suppressing auto-reconnect",
+                PIN_REQUIRED_WINDOW_S,
+            )
+            return
+
     logger.warning("Unexpected disconnect detected, scheduling auto-reconnect")
     # Schedule reconnect (can't await from sync callback)
     if state.reconnect_task is None or state.reconnect_task.done():
@@ -718,6 +951,41 @@ class ConnectRequest(BaseModel):
     device_name: str | None = None
 
 
+class EnsureConnectRequest(BaseModel):
+    """POST /api/ble/ensure_connected request (Wave B, implicit pairing).
+
+    `pin` is folded into this single call instead of requiring a prior
+    PATCH /api/ble/pin into global mutable state -- see the route's
+    docstring.
+    """
+
+    device_address: str = Field(min_length=1)
+    pin: int | None = None
+
+    @field_validator("pin")
+    @classmethod
+    def _check_pin_range(cls, v: int | None) -> int | None:
+        if v is not None and v != 0 and not (_BLE_PIN_MIN <= v <= _BLE_PIN_MAX):
+            raise ValueError("pin must be 0 or 100000–999999")
+        return v
+
+
+class EnsureConnectedResponse(BaseModel):
+    """POST /api/ble/ensure_connected response.
+
+    Deliberately its own model, NOT `ResultResponse` (used by /api/ble/connect
+    and most other routes here): /api/ble/connect must stay byte-identical,
+    so it keeps returning `ResultResponse` with no `error_code` field.
+    `error_code` is populated whenever `success` is False (see
+    `_error_code_for_result` and the route's pin_required/timeout/busy cases)
+    and is always None on success.
+    """
+
+    success: bool
+    message: str
+    error_code: str | None = None
+
+
 class SendRequest(BaseModel):
     """Send data request"""
 
@@ -890,6 +1158,147 @@ async def connect(request: ConnectRequest, _: bool = Depends(verify_api_key)) ->
         logger.exception("Connect error")
         _log_activity("connect_error", str(e), "error")
         raise HTTPException(status_code=500, detail=str(e)) from e
+
+
+@app.post("/api/ble/ensure_connected", response_model=EnsureConnectedResponse)
+async def ensure_connected_route(
+    request: EnsureConnectRequest, _: bool = Depends(verify_api_key)
+) -> EnsureConnectedResponse:
+    """Implicit-pairing composite connect (Wave B).
+
+    A NEW route, not an overload of /api/ble/connect: a slot rollback on the
+    Pi can put an old mcapp against a new ble_service, and overloading
+    /api/ble/connect would silently change ITS semantics (ladder retry, no
+    implicit pairing, PIN applied only via a separate PATCH /api/ble/pin)
+    under a client tuned for the old behaviour. `pin` is folded into this
+    single call instead -- see `EnsureConnectRequest`.
+
+    The internal startup/reconnect paths (`_startup_auto_connect`,
+    `_auto_reconnect`, both via `_retry_connect`) keep calling
+    `_connect_and_initialize` directly; only THIS explicit, user-initiated
+    route uses `BLEAdapter.ensure_connected()`.
+    """
+    mac = request.device_address
+    adapter = _adapter()
+
+    # Preempt our OWN background reconnect/auto-connect before doing anything
+    # else -- otherwise a background reconnect can race the caller: the user
+    # taps node B, the reconnect loop (still chasing node A) wins
+    # _operation_lock first, and the system ends up connected to node A while
+    # the user is looking at an error for node B.
+    await _cancel_background_connect_tasks()
+
+    # Only a genuinely concurrent OTHER operation (scan/pair/unpair/another
+    # connect request racing this one) can still be busy at this point.
+    # /api/ble/connect has no busy guard at all, so retries silently pile up
+    # on the lock; this route answers synchronously instead of queueing.
+    if adapter.is_busy:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "message": "Cannot connect: another BLE operation is in progress",
+                "reason": REASON_BUSY,
+                "error_code": _ERROR_CODE_BUSY,
+                "device_name": state.last_connected_name,
+            },
+        )
+
+    state.user_disconnected = False
+    _log_activity("ensure_connect_start", f"Connecting to {mac}", "info")
+
+    try:
+        result = await asyncio.wait_for(
+            adapter.ensure_connected(mac, request.pin), timeout=ENSURE_CONNECTED_DEADLINE_S
+        )
+    except TimeoutError:
+        _log_activity("ensure_connect_failed", f"Timed out connecting to {mac}", "error")
+        return EnsureConnectedResponse(
+            success=False,
+            message=f"Connect timed out after {ENSURE_CONNECTED_DEADLINE_S:.0f}s",
+            error_code=_ERROR_CODE_TIMEOUT,
+        )
+
+    if not result.success:
+        _log_activity(
+            "ensure_connect_failed",
+            f"Failed to connect to {mac} (stage={result.stage}): {result.error_text}",
+            "error",
+        )
+        return EnsureConnectedResponse(
+            success=False,
+            message=result.error_text or "Connection failed",
+            error_code=_error_code_for_result(result),
+        )
+
+    # Same post-connect initialisation /api/ble/connect performs
+    # (start_notify already ran inside ensure_connected() itself), plus the
+    # pin_required probe: the firmware drops the link when the app-layer
+    # hello hash is wrong, so a disconnect shortly after send_hello() means
+    # "wrong PIN", not a generic connection loss. See PIN_REQUIRED_WINDOW_S
+    # and _on_adapter_disconnect() for the matching background-reconnect
+    # suppression, which is armed by the deadline set right here.
+    #
+    # Both markers are cleared in the `finally` -- unconditionally, on the
+    # success path and on any exception alike. Leaving pin_probe_deadline armed
+    # past this block hands the NEXT disconnect (a real RF drop, not a rejected
+    # PIN) a free suppression of the auto-reconnect ladder; see
+    # ServiceState.pin_probe_deadline. The deadline is cleared by identity, not
+    # blindly, so a concurrent second request's arming survives this one's exit
+    # and so a deadline already consumed by _on_adapter_disconnect() is not
+    # resurrected.
+    probe_deadline = time.monotonic() + PIN_REQUIRED_WINDOW_S
+    state.pin_probe_deadline = probe_deadline
+    state.post_connect_init += 1
+    try:
+        await asyncio.wait_for(
+            _ensure_connected_post_init(adapter), timeout=POST_CONNECT_INIT_DEADLINE_S
+        )
+    except TimeoutError:
+        # Not a failure: the register queries are best effort and the link is
+        # very likely still up. adapter.is_connected below decides.
+        logger.warning(
+            "Post-connect init for %s exceeded %.0fs; continuing on connection state",
+            mac,
+            POST_CONNECT_INIT_DEADLINE_S,
+        )
+    finally:
+        state.post_connect_init -= 1
+        if state.pin_probe_deadline == probe_deadline:
+            state.pin_probe_deadline = None
+
+    if not adapter.is_connected:
+        _log_activity(
+            "ensure_connect_failed", f"Disconnected shortly after hello to {mac} (PIN?)", "error"
+        )
+        return EnsureConnectedResponse(
+            success=False,
+            message=(
+                "Device disconnected immediately after connecting -- "
+                "the configured BLE PIN is likely wrong"
+            ),
+            error_code=_ERROR_CODE_PIN_REQUIRED,
+        )
+
+    # Persist the PIN that just worked, exactly as PATCH /api/ble/pin does.
+    # adapter.ensure_connected() only applied it to the LIVE adapter object
+    # (pairing_passkey + hello_bytes), which dies with the process: without
+    # this, the next service restart reloaded the OLD pin from ble_state.json,
+    # _startup_auto_connect sent the stale hello, the firmware dropped the
+    # link, and the reconnect ladder retried the same wrong PIN to exhaustion
+    # -- a headless Pi that never comes back from a reboot until someone
+    # re-enters the PIN by hand. Only on success: a PIN that was just rejected
+    # (pin_required, above) must NOT overwrite a good stored one. Written
+    # BEFORE _save_ble_state, which re-reads ble_pin off disk to preserve it.
+    if request.pin is not None and request.pin != state.ble_pin:
+        state.ble_pin = request.pin
+        _save_ble_pin(request.pin)
+
+    state.last_connected_mac = mac
+    resolved_name = _resolved_device_name()
+    state.last_connected_name = resolved_name
+    _save_ble_state(mac, resolved_name)
+    _log_activity("ensure_connect_success", f"Connected to {mac}", "info")
+    return EnsureConnectedResponse(success=True, message=f"Connected to {mac}")
 
 
 @app.post("/api/ble/disconnect", response_model=ResultResponse)

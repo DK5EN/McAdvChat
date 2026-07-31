@@ -39,7 +39,23 @@ SSE_BACKOFF_MAX_S = 60
 REQUEST_RETRIES = 2
 REQUEST_RETRY_DELAY_S = 1.5
 STARTUP_STATUS_RETRIES = 4
-CONNECT_REQUEST_TIMEOUT_S = 45.0  # = 3x10s BLE adapter connect attempts + cleanup slack
+# Outer HTTP budget for /api/ble/connect and /api/ble/ensure_connected. It has
+# to be strictly LARGER than everything ble_service bounds on its own side, or
+# an inner timeout never gets to report itself: httpx raises here first,
+# `_request` turns that into a bare RuntimeError("Connection error: ...")
+# (NOT a BLEServiceError), `ensure_connected()` below falls into its generic
+# `except Exception` and returns error_code=None, and mcapp latches
+# ConnectionState.ERROR while ble_service may go on to finish the connect
+# successfully -- two processes disagreeing about whether the node is up.
+#
+# ⚠ INVARIANT, pinned by scripts/ble_service_tests.py against the real
+# ble_service constants (Wave A replaced the old 3x10s connect ladder with a
+# single attempt, so the previous "= 3x10s + slack" derivation is obsolete):
+# ble_service's ENSURE_CONNECTED_DEADLINE_S of 28s plus its
+# POST_CONNECT_INIT_DEADLINE_S of 8s must stay strictly under this constant,
+# i.e. 36 < 40, leaving ~4s for HTTP/network overhead. Raise this, or lower one
+# of those two, if either side's budget grows.
+CONNECT_REQUEST_TIMEOUT_S = 40.0
 # ⚠ must exceed ble_service's SSE_PING_INTERVAL_S (30.0) or the client times out first.
 SSE_READ_TIMEOUT_S = 90.0
 
@@ -51,6 +67,16 @@ SSE_READ_TIMEOUT_S = 90.0
 # the other is a wire-format break.
 STATUS_RECONNECTING = "reconnecting"
 STATUS_RECONNECT_EXHAUSTED = "reconnect_exhausted"
+
+# `error_code` values ble_service's /api/ble/ensure_connected can return on
+# EnsureConnectedResponse (Wave B). Mirrored (not imported) from
+# ble_service/src/main.py's _ERROR_CODE_* constants -- ensure_connected()
+# below forwards every other error_code the response body carries verbatim
+# (it never needs to know the full vocabulary), but "busy" is the one value
+# this module has to construct itself: a 409 has no JSON body with an
+# error_code field, only the existing `reason` (REASON_BUSY, not mirrored
+# here since only its value "busy" is needed and it already equals this).
+ERROR_CODE_BUSY = "busy"
 
 
 class BLEServiceError(RuntimeError):
@@ -213,21 +239,30 @@ class BLEClientRemote(BLEClientBase):
                 return response_data
         raise RuntimeError("BLE service busy after retries")
 
-    async def _publish_status(self, command: str, result: str, msg: str) -> None:
-        """Publish BLE status through message router"""
+    async def _publish_status(
+        self, command: str, result: str, msg: str, *, error_code: str | None = None
+    ) -> None:
+        """Publish BLE status through message router.
+
+        `error_code` (Wave B) is an ADDED field on the existing `result:
+        "error"` frame, not a new `result` value: an old frontend keeps its
+        hard-error handling unchanged and just ignores the extra field. Only
+        set for the `/api/ble/ensure_connected` failure path today, so it is
+        omitted (not sent as null) rather than always present, keeping every
+        other caller's frame byte-identical to before.
+        """
         if self.message_router:
-            await self.message_router.publish(
-                "ble",
-                "ble_status",
-                {
-                    "src_type": "BLE",
-                    "TYP": "blueZ",
-                    "command": command,
-                    "result": result,
-                    "msg": msg,
-                    "timestamp": now_ms(),
-                },
-            )
+            payload: dict[str, Any] = {
+                "src_type": "BLE",
+                "TYP": "blueZ",
+                "command": command,
+                "result": result,
+                "msg": msg,
+                "timestamp": now_ms(),
+            }
+            if error_code is not None:
+                payload["error_code"] = error_code
+            await self.message_router.publish("ble", "ble_status", payload)
 
     async def scan(
         self,
@@ -323,6 +358,87 @@ class BLEClientRemote(BLEClientBase):
 
         else:
             return success
+
+    async def ensure_connected(self, mac: str, pin: int | None = None) -> dict[str, Any]:
+        """Connect via ble_service's implicit-pairing composite (Wave B).
+
+        Not part of `BLEClientBase` -- `ble_client.py`/`ble_client_disabled.py`
+        are out of scope this wave, so this is a `BLEClientRemote`-only
+        addition. `sse_routes/deploy.py`'s forwarding route already guards
+        with `hasattr(ble, "ensure_connected")` (same pattern as
+        `set_ble_pin`), so BLE-disabled mode degrades to a clean 503 instead
+        of an AttributeError.
+
+        Unlike `connect()`, this folds an optional PIN into the SAME request
+        instead of needing a separate `set_ble_pin()` call first, and
+        forwards ble_service's machine-readable `error_code`
+        (device_not_found/connect_failed/pair_failed/gatt_failed/
+        pin_required/timeout, or the locally-synthesized `ERROR_CODE_BUSY`
+        for a 409) unchanged to the caller -- ultimately the
+        `/api/ble/ensure_connected` route in `sse_routes/deploy.py`, and from
+        there Wave C's frontend.
+
+        Deliberately has no CONNECTING-state/cooldown guard like `connect()`:
+        ble_service's own `is_busy` check already answers synchronously
+        (surfaced here as a 409 -> "busy"), and a cooldown would block the
+        exact case `pin_required` exists to serve -- the user immediately
+        retrying with the correct PIN.
+
+        Returns a dict (not a bare bool like `connect()`) so the caller can
+        see `error_code`, not just success/failure.
+        """
+        payload: dict[str, Any] = {"device_address": mac}
+        if pin is not None:
+            payload["pin"] = pin
+
+        self._status.state = ConnectionState.CONNECTING
+        await self._publish_status("connect BLE", "info", f"Connecting to {mac}...")
+
+        try:
+            response = await self._request(
+                "POST",
+                "/api/ble/ensure_connected",
+                payload,
+                retries=0,  # ble_service answers "busy" synchronously; don't retry 409 here
+                request_timeout=CONNECT_REQUEST_TIMEOUT_S,
+            )
+        except BLEServiceError as e:
+            busy = e.status_code == HTTPStatus.CONFLICT
+            message = (
+                "Cannot connect: another BLE operation is already in progress" if busy else str(e)
+            )
+            error_code = ERROR_CODE_BUSY if busy else None
+            logger.warning("ensure_connected error: %s", message)
+            self._status.state = ConnectionState.ERROR
+            self._status.error = message
+            await self._publish_status(
+                "connect BLE result", "error", message, error_code=error_code
+            )
+            return {"success": False, "message": message, "error_code": error_code}
+        except Exception as e:
+            logger.exception("ensure_connected error")
+            self._status.state = ConnectionState.ERROR
+            self._status.error = str(e)
+            await self._publish_status("connect BLE result", "error", str(e))
+            return {"success": False, "message": str(e), "error_code": None}
+
+        success = cast(bool, response.get("success", False))
+        message = cast(str, response.get("message", ""))
+        error_code = cast("str | None", response.get("error_code"))
+
+        if success:
+            self._status.state = ConnectionState.CONNECTED
+            self._status.device_address = mac
+            self._last_connect_attempt = 0
+            await self._publish_status("connect BLE result", "ok", f"Connected to {mac}")
+        else:
+            self._status.state = ConnectionState.ERROR
+            self._status.error = message or "Connection failed"
+            await self._publish_status(
+                "connect BLE result", "error", self._status.error, error_code=error_code
+            )
+
+        return {"success": success, "message": message, "error_code": error_code}
 
     async def disconnect(self) -> bool:
         """Disconnect via remote service"""

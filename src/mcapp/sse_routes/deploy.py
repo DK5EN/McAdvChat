@@ -3,12 +3,12 @@
 from __future__ import annotations
 
 import asyncio
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, cast
 
 from fastapi import APIRouter, HTTPException, Request
 
 from ..logging_setup import get_logger
-from ..schemas import BlePinRequest, UpdateStartRequest
+from ..schemas import BleEnsureConnectRequest, BlePinRequest, UpdateStartRequest
 
 if TYPE_CHECKING:
     from ..sse_handler import SSEManager
@@ -35,6 +35,27 @@ def build_deploy_router(manager: SSEManager) -> APIRouter:
             logger.exception("set_ble_pin forward failed")
             raise HTTPException(status_code=502, detail=str(e)) from e
         return {"ok": ok}
+
+    @router.post("/api/ble/ensure_connected")
+    async def ensure_connected(body: BleEnsureConnectRequest) -> dict[str, Any]:
+        """Forward the implicit-pairing composite connect to the BLE service.
+
+        The browser only ever reaches mcapp (Caddy/lighttpd proxy ^/api/ ->
+        :8082) -- ble_service's own POST /api/ble/ensure_connected lives on
+        :8081, which is not browser-reachable (and would be mixed-content
+        blocked over TLS regardless). Same 503/502 pattern as set_ble_pin
+        above: 503 when the active BLE client doesn't support this call
+        (BLE-disabled mode), 502 when the forward itself fails.
+        """
+        ble = manager.message_router.get_protocol("ble_client") if manager.message_router else None
+        if not ble or not hasattr(ble, "ensure_connected"):
+            raise HTTPException(status_code=503, detail="BLE client not available")
+        try:
+            result = await ble.ensure_connected(body.device_address, body.pin)
+        except Exception as e:
+            logger.exception("ensure_connected forward failed")
+            raise HTTPException(status_code=502, detail=str(e)) from e
+        return cast(dict[str, Any], result)
 
     # ── Update / Deployment Endpoints ──────────────────────────
 
