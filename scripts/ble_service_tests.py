@@ -63,6 +63,7 @@ Offline, TTY-free and deterministic:
 from __future__ import annotations
 
 import ast
+import asyncio
 import binascii
 import inspect
 import json
@@ -70,9 +71,11 @@ import pathlib
 import random
 import sys
 import tempfile
+import textwrap
 from collections.abc import Callable
 from typing import Any, cast
 
+from dbus_next.errors import DBusError, InterfaceNotFoundError
 from fastapi.testclient import TestClient
 
 # `ble_service` is an editable workspace member whose .pth does not put it on
@@ -84,8 +87,18 @@ _REPO_ROOT = pathlib.Path(__file__).resolve().parent.parent
 if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
-from ble_service.src import main as ble_main  # noqa: E402 - needs the sys.path bootstrap above
-from ble_service.src.ble_adapter import BLEAdapter, ConnectionState  # noqa: E402 - same
+from ble_service.src import ble_adapter  # noqa: E402 - needs the sys.path bootstrap above
+from ble_service.src import main as ble_main  # noqa: E402 - same
+from ble_service.src.ble_adapter import (  # noqa: E402 - same
+    DEVICE_INTERFACE,
+    GATT_CHARACTERISTIC_INTERFACE,
+    NUS_RX_UUID,
+    NUS_TX_UUID,
+    OBJECT_MANAGER_INTERFACE,
+    PROPERTIES_INTERFACE,
+    BLEAdapter,
+    ConnectionState,
+)
 
 # Imported directly (not as `ble_main.ConnectionState`/`ble_main.BLEAdapter`)
 # because ble_adapter.py re-exports both into main.py's namespace without an
@@ -1293,6 +1306,1305 @@ async def _test_retry_connect_exhausts_after_delays(record: Any) -> None:
             restore_side_effects()
 
 
+_ENSURE_CONNECTED_TEST_MAC = "AA:BB:CC:DD:EE:FF"
+
+
+class _FakeVariant:
+    """Duck-types `dbus_next.signature.Variant` -- `ble_adapter.py` only ever
+    reads `.value` off a property-Get / GetManagedObjects result."""
+
+    def __init__(self, value: Any) -> None:
+        self.value = value
+
+
+class _FakeIface:
+    """A configurable stand-in for a `dbus_next` `ProxyInterface`, covering
+    `ensure_connected()`'s D-Bus call sites (Device1, Properties,
+    GattCharacteristic1, ObjectManager, AgentManager1) with no real D-Bus and
+    no BlueZ.
+
+    Records every call in order (`self.calls`). `call_*`/`get_*`/`set_*`
+    method calls are async (matching `dbus_next.aio`); `on_*`/`off_*` signal
+    (un)subscriptions are sync no-ops (matching `dbus_next`'s signal API --
+    these tests never need a notification to actually fire).
+
+    `returns[name]` supplies a canned return value for a method, keyed by the
+    dbus_next-generated name (e.g. "get_paired", "call_pair").
+    `raises[name]` is either a `BaseException` (raised on every call) or a
+    `Callable[[int], BaseException | None]` given the 1-based call count for
+    that name so far -- letting a test make the Nth call to the same method
+    fail differently from the (N+1)th (e.g. "the first StartNotify raises a
+    security error, the second succeeds"), or mutate other fake state as a
+    side effect without raising at all (see `_pair_side_effect` below).
+
+    `call_get(iface, prop)` (Properties.Get) is special-cased to read
+    `self.properties` by property name and wrap the result in a
+    `_FakeVariant`, since ble_adapter.py calls it with different property
+    names against the same interface (Connected/ServicesResolved/Name,
+    Notifying).
+
+    `hangs` holds method names that never return -- modelling a wedged
+    bluetoothd. dbus_next has no reply timeout of its own, so an un-timed call
+    really would block forever; a test can only tell "this call has a timeout"
+    apart from "this call wedges the operation lock until the service is
+    restarted" if the fake can actually hang.
+    """
+
+    def __init__(self) -> None:
+        self.calls: list[tuple[str, tuple[Any, ...]]] = []
+        self.returns: dict[str, Any] = {}
+        self.raises: dict[str, BaseException | Callable[[int], BaseException | None]] = {}
+        self.properties: dict[str, Any] = {}
+        self.hangs: set[str] = set()
+
+    def call_count(self, name: str) -> int:
+        return sum(1 for called, _args in self.calls if called == name)
+
+    def __getattr__(self, name: str) -> Callable[..., Any]:
+        if name.startswith(("on_", "off_")):
+
+            def _sync(*args: Any) -> None:
+                self.calls.append((name, args))
+
+            return _sync
+
+        async def _async(*args: Any) -> Any:
+            self.calls.append((name, args))
+            if name in self.hangs:
+                await asyncio.sleep(3600)
+            trigger = self.raises.get(name)
+            if trigger is not None:
+                exc = trigger(self.call_count(name)) if callable(trigger) else trigger
+                if exc is not None:
+                    raise exc
+            if name == "call_get" and len(args) >= 2:
+                return _FakeVariant(self.properties.get(args[1]))
+            return self.returns.get(name)
+
+        return _async
+
+
+class _FakeProxyObject:
+    def __init__(self, ifaces: dict[str, _FakeIface]) -> None:
+        self._ifaces = ifaces
+
+    def get_interface(self, name: str) -> _FakeIface:
+        if name not in self._ifaces:
+            raise InterfaceNotFoundError(f"{name} not found")
+        return self._ifaces[name]
+
+
+class _FakeBus:
+    """Stand-in for `dbus_next.aio.MessageBus` -- enough of `introspect()` /
+    `get_proxy_object()` / `export()` for `ble_adapter.py`'s D-Bus call sites
+    to run against. `objects[path]` holds the interfaces registered at that
+    D-Bus path; a path/interface combination not registered raises
+    `InterfaceNotFoundError`, exactly like a MAC BlueZ has never seen (the
+    device-not-found test relies on exactly this).
+
+    `export()` mirrors `dbus_next.message_bus.BaseMessageBus.export`, which
+    raises a plain `ValueError` when an interface of the same name is exported
+    twice at the same path. `_register_agent` may legitimately run twice on
+    one bus (a first attempt that failed after the export), so that ValueError
+    is on the real retry path -- a no-op fake would make the retry test pass
+    against code that cannot actually retry.
+    """
+
+    def __init__(self, objects: dict[str, dict[str, _FakeIface]]) -> None:
+        self.objects = objects
+        self.exports: dict[str, list[Any]] = {}
+
+    async def introspect(self, _service: str, _path: str) -> None:
+        return None
+
+    def get_proxy_object(self, _service: str, path: str, _introspection: Any) -> _FakeProxyObject:
+        return _FakeProxyObject(self.objects.get(path, {}))
+
+    def export(self, path: str, interface: Any) -> None:
+        exported = self.exports.setdefault(path, [])
+        name = getattr(interface, "name", None)
+        if any(getattr(other, "name", None) == name for other in exported):
+            raise ValueError(
+                f'An interface with this name is already exported on this bus at path "{path}": '
+                f'"{name}"'
+            )
+        exported.append(interface)
+
+    def disconnect(self) -> None:
+        return None
+
+
+_AGENT_MANAGER_INTERFACE = "org.bluez.AgentManager1"
+
+
+def _agent_manager_object() -> dict[str, dict[str, _FakeIface]]:
+    """BlueZ's `/org/bluez` object with an AgentManager1 on it.
+
+    Every fake bus needs this: `_ensure_bus()` registers the pairing agent on
+    any bus whose agent is not registered yet, so a bus without an
+    AgentManager1 pushes the code under test down its "registration failed,
+    continuing without an agent" branch in EVERY test -- which both floods the
+    output with tracebacks and quietly means the tests never exercise the
+    registered-agent path they are supposed to model.
+    """
+    return {"/org/bluez": {_AGENT_MANAGER_INTERFACE: _FakeIface()}}
+
+
+def _agent_manager_of(adapter: BLEAdapter) -> _FakeIface:
+    """The AgentManager1 fake behind `adapter`'s fake bus."""
+    return cast("Any", adapter.bus).objects["/org/bluez"][_AGENT_MANAGER_INTERFACE]
+
+
+def _build_bare_adapter(mac: str = _ENSURE_CONNECTED_TEST_MAC) -> tuple[BLEAdapter, _FakeIface]:
+    """A BLEAdapter wired only with a Device1 fake at `mac`'s D-Bus path (plus
+    the AgentManager1 every fake bus needs) -- enough for `_pair_unlocked`
+    (which never touches GATT characteristics or the ObjectManager), without
+    the full `connect()` plumbing `_build_connectable_adapter` sets up.
+    `adapter.bus` is set directly, so `_ensure_bus()` never creates a real
+    `MessageBus` (no real D-Bus, no BlueZ).
+    """
+    adapter = BLEAdapter()
+    device_path = adapter._mac_to_dbus_path(mac)
+    dev_iface = _FakeIface()
+    adapter.bus = cast(
+        "Any",
+        _FakeBus({device_path: {DEVICE_INTERFACE: dev_iface}, **_agent_manager_object()}),
+    )
+    return adapter, dev_iface
+
+
+def _pair_side_effect(dev_iface: _FakeIface) -> Callable[[int], BaseException | None]:
+    """A `_FakeIface.raises["call_pair"]` hook: never raises, but flips
+    `get_paired` to True as a side effect -- so the post-Pair() `is_paired`
+    read in `_pair_unlocked`, and any later Paired pre-check, see a device
+    that really is paired now, the way real BlueZ would after a successful
+    `Pair()` call.
+    """
+
+    def _hook(_call_number: int) -> BaseException | None:
+        dev_iface.returns["get_paired"] = True
+        return None
+
+    return _hook
+
+
+def _build_connectable_adapter(
+    mac: str = _ENSURE_CONNECTED_TEST_MAC,
+) -> tuple[BLEAdapter, dict[str, _FakeIface]]:
+    """A BLEAdapter wired to a fully fake D-Bus/BlueZ that lets a plain
+    `connect()` -- and therefore `ensure_connected()` -- succeed end-to-end
+    with no real bus and no BlueZ, matching current firmware's zero-security
+    GATT layer (see the module's "Established facts": current firmware needs
+    no pairing at all). Returns the adapter and a dict of the underlying
+    fakes a test may assert against or mutate: "dev" (Device1), "props"
+    (Device1 Properties), "read_char"/"read_props" (the NUS TX/notify
+    characteristic + its Properties), "write_char" (the NUS RX/write
+    characteristic), "obj_mgr" (ObjectManager, GetManagedObjects).
+
+    A caller that drives this all the way through `ensure_connected()` starts
+    the real keepalive/DST background tasks (`_finalize_successful_
+    connection`) -- always clean up with `await adapter.disconnect()` in a
+    `finally`, or they leak as pending asyncio tasks into whatever runs next
+    in the same process (this suite runs itself twice as a leak check).
+    """
+    adapter = BLEAdapter()
+    device_path = adapter._mac_to_dbus_path(mac)
+    read_char_path = f"{device_path}/service0/char_tx"
+    write_char_path = f"{device_path}/service0/char_rx"
+
+    dev_iface = _FakeIface()
+    dev_iface.raises["call_pair"] = _pair_side_effect(dev_iface)
+
+    props_iface = _FakeIface()
+    props_iface.properties = {"Connected": False, "ServicesResolved": True, "Name": "MC-TEST"}
+
+    read_char_iface = _FakeIface()
+    read_props_iface = _FakeIface()
+    read_props_iface.properties = {"Notifying": False}
+    write_char_iface = _FakeIface()
+
+    obj_mgr_iface = _FakeIface()
+    obj_mgr_iface.returns["call_get_managed_objects"] = {
+        read_char_path: {GATT_CHARACTERISTIC_INTERFACE: {"UUID": _FakeVariant(NUS_TX_UUID)}},
+        write_char_path: {GATT_CHARACTERISTIC_INTERFACE: {"UUID": _FakeVariant(NUS_RX_UUID)}},
+    }
+
+    bus = _FakeBus(
+        {
+            device_path: {DEVICE_INTERFACE: dev_iface, PROPERTIES_INTERFACE: props_iface},
+            read_char_path: {
+                GATT_CHARACTERISTIC_INTERFACE: read_char_iface,
+                PROPERTIES_INTERFACE: read_props_iface,
+            },
+            write_char_path: {GATT_CHARACTERISTIC_INTERFACE: write_char_iface},
+            "/": {OBJECT_MANAGER_INTERFACE: obj_mgr_iface},
+            **_agent_manager_object(),
+        }
+    )
+    adapter.bus = cast("Any", bus)
+
+    ifaces = {
+        "dev": dev_iface,
+        "props": props_iface,
+        "read_char": read_char_iface,
+        "read_props": read_props_iface,
+        "write_char": write_char_iface,
+        "obj_mgr": obj_mgr_iface,
+    }
+    return adapter, ifaces
+
+
+def _self_call_names(source: str) -> set[str]:
+    """Every `self.<name>(...)` call inside a source snippet -- the edge
+    function for `_reachable_self_methods`, which proves nothing reachable
+    from `ensure_connected()` takes `_operation_lock` a second time
+    (`asyncio.Lock` is not reentrant, so that self-deadlocks the whole
+    adapter -- unrecoverable on a headless Pi short of restarting the
+    service).
+
+    Uses `textwrap.dedent`, NOT `inspect.cleandoc` (the convention the rest
+    of this suite's structural checks use for MODULE-LEVEL functions, e.g.
+    `_test_auto_reconnect_persists_the_name`): `cleandoc` special-cases the
+    first line's indentation to zero independently of the rest, which is
+    harmless for a module-level function (already at column 0) but corrupts
+    an indented METHOD's source -- the `async def` line collapses to column
+    0 while the body keeps a leftover indent computed from a *different*
+    margin, producing an `IndentationError` on `ast.parse`. `dedent` strips
+    the same common leading whitespace from every line uniformly, which is
+    what a method's source (all of it indented by the class body) needs.
+    """
+    tree = ast.parse(textwrap.dedent(source))
+    return {
+        node.func.attr
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and isinstance(node.func.value, ast.Name)
+        and node.func.value.id == "self"
+    }
+
+
+def _adapter_method_source(name: str) -> str | None:
+    """Source of `BLEAdapter.<name>` if it is a plain (or async) method,
+    else None -- `self.<name>(...)` also matches instance attributes that
+    happen to be callable (`self._disconnect_callback()`,
+    `self.notification_callback()`), which have no class-level source to
+    walk and no lock to take.
+    """
+    attr = inspect.getattr_static(BLEAdapter, name, None)
+    if isinstance(attr, property):
+        attr = attr.fget
+    if not inspect.isfunction(attr):
+        return None
+    return inspect.getsource(attr)
+
+
+def _reachable_self_methods(root: str) -> set[str]:
+    """Transitive closure of `BLEAdapter` methods reachable from
+    `BLEAdapter.<root>` through `self.<method>(...)` calls, `root` included.
+
+    Transitivity is the whole point. A one-level check over a hand-listed set
+    of helpers passes even when the deadlock is two calls further down (say a
+    `self.connect()` added inside `_attempt_connection`, which
+    `ensure_connected` reaches via `_connect_with_scan_retry` ->
+    `_connect_stage`), and it silently stops covering any helper someone adds
+    later without editing the list. Coroutines created for background tasks
+    (`asyncio.create_task(self._keepalive_loop())`) are ordinary `self.` calls
+    in the AST and are followed too -- they run while the lock is held.
+    """
+    reachable: set[str] = set()
+    pending = [root]
+    visited: set[str] = set()
+    while pending:
+        name = pending.pop()
+        if name in visited:
+            continue
+        visited.add(name)
+        source = _adapter_method_source(name)
+        if source is None:
+            continue
+        reachable.add(name)
+        pending.extend(_self_call_names(source))
+    return reachable
+
+
+def _takes_operation_lock(source: str) -> bool:
+    """True iff `source` actually ACQUIRES `self._operation_lock` -- an
+    `async with self._operation_lock:` block or an explicit
+    `self._operation_lock.acquire()`.
+
+    Matched on the AST rather than by substring: half the unlocked internals
+    name `_operation_lock` in their docstrings precisely to say they do NOT
+    take it, and a substring check would flag every one of them.
+    """
+    tree = ast.parse(textwrap.dedent(source))
+
+    def _is_lock(node: ast.expr) -> bool:
+        return (
+            isinstance(node, ast.Attribute)
+            and node.attr == "_operation_lock"
+            and isinstance(node.value, ast.Name)
+            and node.value.id == "self"
+        )
+
+    for node in ast.walk(tree):
+        if isinstance(node, ast.With | ast.AsyncWith) and any(
+            _is_lock(item.context_expr) for item in node.items
+        ):
+            return True
+        if (
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and node.func.attr == "acquire"
+            and _is_lock(node.func.value)
+        ):
+            return True
+    return False
+
+
+def _test_ensure_connected_result_shape(record: Any) -> None:
+    """`EnsureConnectedResult` is the Wave A/Wave B contract -- pin its
+    field names and defaults so a rename doesn't silently break Wave B's
+    consumption of `stage`/`error_name`/`error_text`.
+    """
+    success = ble_adapter.EnsureConnectedResult(success=True, stage="connected")
+    record("EnsureConnectedResult: success field round-trips", success.success is True)
+    record("EnsureConnectedResult: stage field round-trips", success.stage == "connected")
+    record(
+        "EnsureConnectedResult: error_name/error_text default to None on success",
+        success.error_name is None and success.error_text is None,
+    )
+
+    failure = ble_adapter.EnsureConnectedResult(
+        success=False,
+        stage="connect",
+        error_name="org.bluez.Error.Failed",
+        error_text="le-connection-abort-by-local",
+    )
+    record(
+        "EnsureConnectedResult: carries the D-Bus error name/text on failure "
+        "(Wave B's machine-readable error_code depends on this)",
+        failure.error_name == "org.bluez.Error.Failed"
+        and failure.error_text == "le-connection-abort-by-local",
+    )
+
+
+def _test_dbus_error_classification_helpers(record: Any) -> None:
+    """The pure classification helpers `ensure_connected` is built on."""
+    dbus_err = DBusError("org.bluez.Error.NotPermitted", "Not Permitted")
+    name, text = ble_adapter._dbus_error_parts(dbus_err)
+    record(
+        "_dbus_error_parts: reads .type/.text off a real DBusError",
+        name == "org.bluez.Error.NotPermitted" and text == "Not Permitted",
+    )
+    plain_err = ConnectionError("boom")
+    name2, text2 = ble_adapter._dbus_error_parts(plain_err)
+    record(
+        "_dbus_error_parts: falls back to the exception type name for a non-DBusError",
+        name2 == "ConnectionError" and text2 == "boom",
+    )
+
+    not_found = ConnectionError(f"{ble_adapter._DEVICE_NOT_FOUND_MSG}: some detail")
+    record(
+        "_is_device_not_found_error: recognizes _attempt_connection's wrapped "
+        "InterfaceNotFoundError",
+        ble_adapter._is_device_not_found_error(not_found),
+    )
+    record(
+        "_is_device_not_found_error: a generic ConnectionError is NOT device-not-found "
+        "(discriminating -- not vacuously true for any ConnectionError)",
+        not ble_adapter._is_device_not_found_error(ConnectionError("Connect failed: timeout")),
+    )
+    record(
+        "_is_device_not_found_error: a non-ConnectionError exception is never device-not-found",
+        not ble_adapter._is_device_not_found_error(RuntimeError(ble_adapter._DEVICE_NOT_FOUND_MSG)),
+    )
+
+    for name3 in ("org.bluez.Error.NotPermitted", "org.bluez.Error.NotAuthorized"):
+        record(
+            f"_is_gatt_security_error: {name3} is a security error",
+            ble_adapter._is_gatt_security_error(DBusError(name3, "denied")),
+        )
+    record(
+        "_is_gatt_security_error: org.bluez.Error.NotPaired is a security error by NAME alone "
+        "(BlueZ's gatt-client maps ATT insufficient-authentication onto it; text deliberately "
+        "matches no marker here, so this pins the name entry, not the text fallback)",
+        ble_adapter._is_gatt_security_error(
+            DBusError("org.bluez.Error.NotPaired", "GATT operation refused")
+        ),
+    )
+    record(
+        "_is_gatt_security_error: org.bluez.Error.Failed carrying UNRELATED kernel text is NOT "
+        "a security error (that ambiguous case is the stale-bond seam's job, out of scope "
+        "this wave)",
+        not ble_adapter._is_gatt_security_error(
+            DBusError("org.bluez.Error.Failed", "le-connection-abort-by-local")
+        ),
+    )
+    record(
+        "_is_gatt_security_error: org.bluez.Error.Failed carrying SECURITY text still counts "
+        "(BlueZ 5.5x-5.6x reworded these and nothing here pins the version; a missed one "
+        "strands the old firmware this path exists for)",
+        ble_adapter._is_gatt_security_error(
+            DBusError("org.bluez.Error.Failed", "Insufficient Authentication")
+        ),
+    )
+    record(
+        "_is_gatt_security_error: org.bluez.Error.AuthenticationFailed (a Pair()-flow error) "
+        "is NOT treated as a GATT security error either",
+        not ble_adapter._is_gatt_security_error(
+            DBusError("org.bluez.Error.AuthenticationFailed", "Authentication Failed")
+        ),
+    )
+
+
+async def _test_connect_with_scan_retry(record: Any) -> None:
+    """`_connect_with_scan_retry`: device-not-found triggers exactly one
+    scan-then-retry; any other failure does not scan at all.
+    """
+    adapter = BLEAdapter()
+    stage_calls: list[str] = []
+
+    async def _stage_not_found(mac: str) -> Exception | None:
+        stage_calls.append(mac)
+        if len(stage_calls) == 1:
+            return ConnectionError(f"{ble_adapter._DEVICE_NOT_FOUND_MSG}: nope")
+        return None
+
+    scan_calls: list[float] = []
+
+    async def _scan_stub(*_args: Any, **_kwargs: Any) -> list[Any]:
+        scan_calls.append(1)
+        return []
+
+    adapter._connect_stage = _stage_not_found  # type: ignore[method-assign]
+    adapter._scan_unlocked = _scan_stub  # type: ignore[method-assign]
+
+    err = await adapter._connect_with_scan_retry(_ENSURE_CONNECTED_TEST_MAC)
+    record(
+        "_connect_with_scan_retry: device-not-found scans exactly once then retries once "
+        f"(stage calls={len(stage_calls)}, scans={len(scan_calls)})",
+        err is None and len(stage_calls) == 2 and len(scan_calls) == 1,
+    )
+
+    # Discriminating: a non-device-not-found failure must NOT trigger a scan.
+    adapter2 = BLEAdapter()
+    stage_calls2: list[str] = []
+
+    async def _stage_other_error(mac: str) -> Exception | None:
+        stage_calls2.append(mac)
+        return ConnectionError("Connect failed: le-connection-abort-by-local")
+
+    scan_calls2: list[float] = []
+
+    async def _scan_stub2(*_args: Any, **_kwargs: Any) -> list[Any]:
+        scan_calls2.append(1)
+        return []
+
+    adapter2._connect_stage = _stage_other_error  # type: ignore[method-assign]
+    adapter2._scan_unlocked = _scan_stub2  # type: ignore[method-assign]
+
+    err2 = await adapter2._connect_with_scan_retry(_ENSURE_CONNECTED_TEST_MAC)
+    record(
+        "_connect_with_scan_retry: a non-device-not-found failure never scans "
+        f"(stage calls={len(stage_calls2)}, scans={len(scan_calls2)})",
+        err2 is not None and len(stage_calls2) == 1 and len(scan_calls2) == 0,
+    )
+
+
+async def _test_ensure_connected_already_connected_is_noop(record: Any) -> None:
+    """Already connected to the requested MAC: `ensure_connected` returns
+    success immediately without touching connect/scan/GATT/pair at all.
+    """
+    adapter = BLEAdapter()
+    adapter._status.state = ConnectionState.CONNECTED
+    adapter._connected_mac = _ENSURE_CONNECTED_TEST_MAC
+
+    async def _fail(*_args: Any, **_kwargs: Any) -> Any:
+        raise AssertionError("must not be called for the already-connected no-op")
+
+    adapter._connect_stage = _fail  # type: ignore[method-assign]
+    adapter._scan_unlocked = _fail  # type: ignore[method-assign]
+    adapter.start_notify = _fail  # type: ignore[method-assign]
+    adapter._pair_unlocked = _fail  # type: ignore[method-assign]
+
+    result = await adapter.ensure_connected(_ENSURE_CONNECTED_TEST_MAC)
+    record(
+        "ensure_connected: already connected to the requested MAC is a pure no-op success",
+        result.success is True and result.stage == "already_connected",
+    )
+
+    # Discriminating: connected to a DIFFERENT mac must NOT take the no-op
+    # path -- it must disconnect and attempt a real (stubbed) connect.
+    adapter2 = BLEAdapter()
+    adapter2._status.state = ConnectionState.CONNECTED
+    adapter2._connected_mac = "11:22:33:44:55:66"
+    disconnect_calls: list[int] = []
+
+    async def _disconnect_stub() -> bool:
+        disconnect_calls.append(1)
+        adapter2._status.state = ConnectionState.DISCONNECTED
+        return True
+
+    stage_calls: list[str] = []
+
+    async def _stage_stub(mac: str) -> Exception | None:
+        stage_calls.append(mac)
+        return None
+
+    async def _gatt_stub(_mac: str) -> None:
+        return None
+
+    adapter2._disconnect_internal = _disconnect_stub  # type: ignore[method-assign]
+    adapter2._connect_with_scan_retry = _stage_stub  # type: ignore[method-assign]
+    adapter2._ensure_gatt_ready = _gatt_stub  # type: ignore[method-assign]
+
+    result2 = await adapter2.ensure_connected(_ENSURE_CONNECTED_TEST_MAC)
+    record(
+        "ensure_connected: connected to a DIFFERENT mac disconnects first and reconnects "
+        "(the no-op path is genuinely mac-specific, not vacuously 'connected == success')",
+        result2.success is True
+        and result2.stage == "connected"
+        and len(disconnect_calls) == 1
+        and stage_calls == [_ENSURE_CONNECTED_TEST_MAC],
+    )
+
+
+async def _test_ensure_connected_happy_path_sets_trusted(record: Any) -> None:
+    """End-to-end (fake D-Bus, no BlueZ): a plain connect through
+    `ensure_connected` sets Trusted and never calls Pair() when the GATT
+    layer needs no security -- current firmware's behaviour.
+    """
+    adapter, ifaces = _build_connectable_adapter()
+    try:
+        result = await asyncio.wait_for(
+            adapter.ensure_connected(_ENSURE_CONNECTED_TEST_MAC), timeout=5.0
+        )
+        record(
+            "ensure_connected: happy-path connect succeeds without deadlocking",
+            result.success is True and result.stage == "connected",
+        )
+        record(
+            "ensure_connected: sets Trusted on every successful connect "
+            "(fixes the temporary-Device1-eviction regression)",
+            ("set_trusted", (True,)) in ifaces["dev"].calls,
+        )
+        record(
+            "ensure_connected: never calls Pair() when the GATT layer needs no security",
+            ifaces["dev"].call_count("call_pair") == 0,
+        )
+        record(
+            "ensure_connected: subscribes to notifications (GATT layer actually usable)",
+            ifaces["read_char"].call_count("call_start_notify") == 1,
+        )
+    except TimeoutError:
+        record("ensure_connected: happy-path connect succeeds without deadlocking", False)
+    finally:
+        await adapter.disconnect()
+
+    # Trusted lives in _attempt_connection, which the plain retry ladder uses
+    # too -- so the legacy connect() path must set it as well. Without Trusted
+    # the Device1 object stays temporary and BlueZ evicts it ~30s after
+    # disconnect, and _startup_auto_connect does no scan, so every future
+    # auto-connect to that MAC fails outright.
+    adapter2, ifaces2 = _build_connectable_adapter()
+    try:
+        ok = await asyncio.wait_for(adapter2.connect(_ENSURE_CONNECTED_TEST_MAC), timeout=5.0)
+        record(
+            "connect(): the legacy path sets Trusted too (same _attempt_connection core, "
+            "so a temporary Device1 cannot be evicted between reboots)",
+            ok is True and ("set_trusted", (True,)) in ifaces2["dev"].calls,
+        )
+    except TimeoutError:
+        record("connect(): the legacy path sets Trusted too", False)
+    finally:
+        await adapter2.disconnect()
+
+
+async def _test_ensure_connected_gatt_security_pairs_then_resumes(record: Any) -> None:
+    """A GATT-layer security error (StartNotify) triggers exactly one
+    on-demand `Pair()`, does NOT disconnect afterward, and resumes the SAME
+    session by retrying `start_notify()` -- older-firmware behaviour.
+    """
+    adapter, ifaces = _build_connectable_adapter()
+    ifaces["read_char"].raises["call_start_notify"] = lambda n: (
+        DBusError("org.bluez.Error.NotPermitted", "Not Permitted") if n == 1 else None
+    )
+    try:
+        result = await asyncio.wait_for(
+            adapter.ensure_connected(_ENSURE_CONNECTED_TEST_MAC), timeout=5.0
+        )
+        record(
+            "ensure_connected: pairs on demand and resumes after a GATT security error "
+            "without deadlocking",
+            result.success is True and result.stage == "connected",
+        )
+        record(
+            "ensure_connected: calls Pair() exactly once (on demand)",
+            ifaces["dev"].call_count("call_pair") == 1,
+        )
+        record(
+            "ensure_connected: does NOT disconnect after the on-demand pair "
+            "(resumes the same session -- unlike the standalone pair() flow)",
+            ifaces["dev"].call_count("call_disconnect") == 0,
+        )
+        record(
+            "ensure_connected: retries start_notify after pairing "
+            "(subscribed on the second attempt)",
+            ifaces["read_char"].call_count("call_start_notify") == 2,
+        )
+    except TimeoutError:
+        record(
+            "ensure_connected: pairs on demand and resumes after a GATT security error "
+            "without deadlocking",
+            False,
+        )
+    finally:
+        await adapter.disconnect()
+
+
+async def _test_ensure_connected_gatt_non_security_error_does_not_pair(record: Any) -> None:
+    """Discriminating counterpart to the security-error test: a GATT error
+    that is NOT security-flavoured (BlueZ's generic org.bluez.Error.Failed)
+    must fail the connect, not trigger a pair attempt.
+    """
+    adapter, ifaces = _build_connectable_adapter()
+    ifaces["read_char"].raises["call_start_notify"] = DBusError(
+        "org.bluez.Error.Failed", "le-connection-abort-by-local"
+    )
+    try:
+        result = await asyncio.wait_for(
+            adapter.ensure_connected(_ENSURE_CONNECTED_TEST_MAC), timeout=5.0
+        )
+        record(
+            "ensure_connected: a non-security GATT error fails as stage='gatt', not paired",
+            result.success is False
+            and result.stage == "gatt"
+            and result.error_name == "org.bluez.Error.Failed",
+        )
+        record(
+            "ensure_connected: a non-security GATT error never triggers an on-demand pair",
+            ifaces["dev"].call_count("call_pair") == 0,
+        )
+        # A failure after Connect() succeeded must leave NOTHING behind, the
+        # same contract connect() honours via _cleanup_failed_connection.
+        # Without the teardown the BLE link stays up at the BlueZ level for a
+        # session nobody can use -- the node holds a client slot open, the
+        # keepalive/DST tasks keep running, and the still-subscribed
+        # PropertiesChanged handler can null the GATT interfaces out from
+        # under the NEXT connect attempt.
+        record(
+            "ensure_connected: a GATT-stage failure actually disconnects the half-open link",
+            ifaces["dev"].call_count("call_disconnect") >= 1,
+        )
+        record(
+            "ensure_connected: a GATT-stage failure clears the session state "
+            "(_connected_mac/device/GATT interfaces)",
+            adapter._connected_mac is None
+            and adapter.status.device is None
+            and adapter.dev_iface is None
+            and adapter.read_char_iface is None,
+        )
+        record(
+            "ensure_connected: a GATT-stage failure stops the keepalive/DST tasks",
+            adapter._keepalive_task is None and adapter._dst_check_task is None,
+        )
+        record(
+            "ensure_connected: a GATT-stage failure still REPORTS as an error afterwards "
+            "(teardown must not overwrite the status with a clean 'disconnected')",
+            adapter.status.state == ConnectionState.ERROR and bool(adapter.status.error),
+        )
+    except TimeoutError:
+        record(
+            "ensure_connected: a non-security GATT error fails as stage='gatt', not paired",
+            False,
+        )
+    finally:
+        await adapter.disconnect()
+
+
+async def _test_ensure_connected_non_dbus_gatt_error_is_returned_not_raised(record: Any) -> None:
+    """`start_notify()` can fail with something other than a `DBusError`: if
+    the device drops between the connect finalization and the subscribe, the
+    PropertiesChanged handler has already run `_on_disconnect_detected` and
+    nulled the GATT interfaces, so `start_notify()` raises a plain
+    `RuntimeError("Not connected")`. `ensure_connected` promises to RETURN an
+    `EnsureConnectedResult` -- Wave B has no `stage` to act on if it raises
+    instead, and the half-open session would never be torn down.
+    """
+    adapter, ifaces = _build_connectable_adapter()
+
+    async def _dropped() -> None:
+        raise RuntimeError("Not connected")
+
+    adapter.start_notify = _dropped  # type: ignore[method-assign]
+    label = (
+        "ensure_connected: a non-DBusError from start_notify (device dropped mid-connect) "
+        "is returned as stage='gatt', never raised out of the result contract"
+    )
+    try:
+        result = await asyncio.wait_for(
+            adapter.ensure_connected(_ENSURE_CONNECTED_TEST_MAC), timeout=5.0
+        )
+        record(
+            label,
+            result.success is False
+            and result.stage == "gatt"
+            and result.error_name == "RuntimeError",
+        )
+        record(
+            "ensure_connected: a non-DBusError from start_notify never counts as "
+            "'needs pairing' (only a DBusError can)",
+            ifaces["dev"].call_count("call_pair") == 0,
+        )
+    except (RuntimeError, TimeoutError):
+        record(label, False)
+        record(
+            "ensure_connected: a non-DBusError from start_notify never counts as "
+            "'needs pairing' (only a DBusError can)",
+            False,
+        )
+    finally:
+        await adapter.disconnect()
+
+
+async def _test_start_notify_failure_leaves_no_duplicate_subscription(record: Any) -> None:
+    """dbus_next APPENDS signal handlers without de-duplication
+    (`BaseProxyInterface._add_signal` -> `handlers.append(fn)`) and dispatches
+    the whole list. `start_notify()` attaches its PropertiesChanged handler
+    BEFORE calling StartNotify, and `ensure_connected` calls `start_notify()`
+    a second time after an on-demand pair -- so a failed first attempt that
+    leaves its handler attached makes every subsequent BLE notification
+    arrive TWICE (duplicate messages into the proxy).
+    """
+    adapter, ifaces = _build_connectable_adapter()
+    ifaces["read_char"].raises["call_start_notify"] = lambda n: (
+        DBusError("org.bluez.Error.NotPermitted", "Not Permitted") if n == 1 else None
+    )
+    try:
+        result = await asyncio.wait_for(
+            adapter.ensure_connected(_ENSURE_CONNECTED_TEST_MAC), timeout=5.0
+        )
+        read_props = ifaces["read_props"]
+        attached = read_props.call_count("on_properties_changed")
+        detached = read_props.call_count("off_properties_changed")
+        record(
+            "start_notify: after the pair-and-resume retry exactly ONE notification handler "
+            f"is attached (attached={attached}, detached={detached}) -- two would deliver "
+            "every BLE message twice",
+            result.success is True and attached - detached == 1,
+        )
+    except TimeoutError:
+        record(
+            "start_notify: after the pair-and-resume retry exactly ONE notification handler "
+            "is attached -- two would deliver every BLE message twice",
+            False,
+        )
+    finally:
+        await adapter.disconnect()
+
+    # Unit-level counterpart: a failing StartNotify re-raises AND detaches, so
+    # the net subscription count is zero however the caller retries.
+    adapter2, ifaces2 = _build_connectable_adapter()
+    ifaces2["read_char"].raises["call_start_notify"] = DBusError("org.bluez.Error.Failed", "nope")
+    adapter2._status.state = ConnectionState.CONNECTED
+    adapter2.read_char_iface = cast("Any", ifaces2["read_char"])
+    adapter2.read_props_iface = cast("Any", ifaces2["read_props"])
+    raised = False
+    try:
+        await adapter2.start_notify()
+    except DBusError:
+        raised = True
+    record(
+        "start_notify: a failed StartNotify re-raises and detaches its own handler "
+        "(net zero subscriptions left behind)",
+        raised
+        and ifaces2["read_props"].call_count("on_properties_changed") == 1
+        and ifaces2["read_props"].call_count("off_properties_changed") == 1,
+    )
+
+    # The other half of "attach exactly once": BlueZ reporting an existing
+    # notify session must not short-circuit past the attach, or the session
+    # looks healthy and silently delivers nothing.
+    adapter3, ifaces3 = _build_connectable_adapter()
+    ifaces3["read_props"].properties = {"Notifying": True}
+    adapter3._status.state = ConnectionState.CONNECTED
+    adapter3.read_char_iface = cast("Any", ifaces3["read_char"])
+    adapter3.read_props_iface = cast("Any", ifaces3["read_props"])
+    await adapter3.start_notify()
+    record(
+        "start_notify: an already-notifying characteristic still gets the handler attached "
+        "(a session that delivers nothing is worse than a duplicate StartNotify)",
+        ifaces3["read_props"].call_count("on_properties_changed") == 1
+        and ifaces3["read_char"].call_count("call_start_notify") == 0,
+    )
+    await adapter3.start_notify()
+    record(
+        "start_notify: calling it again never double-attaches the handler",
+        ifaces3["read_props"].call_count("on_properties_changed") == 1,
+    )
+
+
+async def _test_ensure_connected_applies_pin_to_both_uses(record: Any) -> None:
+    """`ensure_connected(mac, pin=...)` has to apply the PIN to BOTH of its
+    uses. The firmware derives the SMP passkey and the app-layer hello hash
+    from the same bt_code value, so setting only `pairing_passkey` yields a
+    link that pairs and is then rejected at the app layer by `send_hello()`.
+    """
+    adapter, _ifaces = _build_connectable_adapter()
+    try:
+        result = await asyncio.wait_for(
+            adapter.ensure_connected(_ENSURE_CONNECTED_TEST_MAC, pin=123456), timeout=5.0
+        )
+        record(
+            "ensure_connected(pin=...): applies the PIN as the SMP passkey",
+            result.success is True and adapter.pairing_passkey == 123456,
+        )
+        record(
+            "ensure_connected(pin=...): ALSO rebuilds hello_bytes from it "
+            "(same bt_code serves the passkey and the app-layer hello hash)",
+            adapter.hello_bytes == ble_adapter.build_hello_bytes(123456),
+        )
+    except TimeoutError:
+        record("ensure_connected(pin=...): applies the PIN as the SMP passkey", False)
+        record("ensure_connected(pin=...): ALSO rebuilds hello_bytes from it", False)
+    finally:
+        await adapter.disconnect()
+
+    # Discriminating: pin=None must not touch either value.
+    adapter2, _ifaces2 = _build_connectable_adapter()
+    adapter2.pairing_passkey = 654321
+    adapter2.hello_bytes = ble_adapter.build_hello_bytes(654321)
+    try:
+        await asyncio.wait_for(adapter2.ensure_connected(_ENSURE_CONNECTED_TEST_MAC), timeout=5.0)
+        record(
+            "ensure_connected(pin=None): leaves the configured PIN and hello_bytes untouched",
+            adapter2.pairing_passkey == 654321
+            and adapter2.hello_bytes == ble_adapter.build_hello_bytes(654321),
+        )
+    except TimeoutError:
+        record(
+            "ensure_connected(pin=None): leaves the configured PIN and hello_bytes untouched",
+            False,
+        )
+    finally:
+        await adapter2.disconnect()
+
+
+async def _test_pair_then_resume_reports_a_cause_for_a_silent_pair_failure(record: Any) -> None:
+    """`_pair_unlocked` can fail WITHOUT raising: BlueZ accepts `Pair()` but
+    still reports `Paired == False`, giving `(False, None)`.
+    `EnsureConnectedResult` promises a populated error_name/error_text on
+    every failure (Wave B builds its machine-readable error_code from them),
+    so that case must not hand back a failure with no cause at all.
+    """
+    adapter, _dev = _build_bare_adapter()
+
+    async def _pair_silently_fails(_mac: str, *, disconnect_after: bool) -> tuple[bool, None]:
+        return False, None
+
+    adapter._pair_unlocked = _pair_silently_fails  # type: ignore[method-assign]
+    result = await adapter._pair_then_resume(_ENSURE_CONNECTED_TEST_MAC)
+    record(
+        "_pair_then_resume: a pair failure with no exception still carries an error_name/"
+        "error_text (never a failure result with a None cause)",
+        result is not None
+        and result.success is False
+        and result.stage == "pair"
+        and result.error_name == "PairingNotEstablished"
+        and bool(result.error_text),
+    )
+
+
+async def _test_pairing_agent_lifecycle(record: Any) -> None:
+    """The invariant the implicit-pairing design rests on: a live bus always
+    has a registered pairing agent. Without one, BlueZ has nothing to answer
+    `RequestPasskey` during kernel-initiated SMP and older firmware can never
+    be paired -- the exact bug this wave exists to fix.
+    """
+    # main.py's _connect_and_initialize calls reset_bus() before EVERY
+    # connect. If that leaves _agent_registered set, _register_agent()
+    # short-circuits on the next, freshly created bus and every bus after the
+    # first one runs with no agent at all.
+    adapter, _dev = _build_bare_adapter()
+    adapter._agent_registered = True
+    adapter.reset_bus()
+    record(
+        "reset_bus(): clears _agent_registered -- the agent lived on the bus being dropped, "
+        "and main.py calls this before every connect",
+        adapter._agent_registered is False and adapter.bus is None,
+    )
+
+    adapter2, _dev2 = _build_bare_adapter()
+    await adapter2._ensure_bus()
+    manager2 = _agent_manager_of(adapter2)
+    record(
+        "_ensure_bus(): registers the agent on a bus whose registration is missing, not only "
+        "on one it created itself (the reset_bus() -> connect() path)",
+        adapter2._agent_registered is True
+        and manager2.call_count("call_register_agent") == 1
+        and manager2.call_count("call_request_default_agent") == 1,
+    )
+    await adapter2._ensure_bus()
+    record(
+        "_ensure_bus(): does not re-register on every call "
+        "(discriminating: a broken guard would show call_count == 2)",
+        manager2.call_count("call_register_agent") == 1,
+    )
+
+    # A registration that fails must not raise (scan/connect must still work
+    # without an agent) and must not stay broken for the bus's whole lifetime.
+    adapter3, _dev3 = _build_bare_adapter()
+    manager3 = _agent_manager_of(adapter3)
+    manager3.raises["call_register_agent"] = lambda n: (
+        DBusError("org.bluez.Error.Failed", "busy") if n == 1 else None
+    )
+    await adapter3._ensure_bus()
+    failed_first = adapter3._agent_registered
+    await adapter3._ensure_bus()
+    record(
+        "_ensure_bus(): a failed agent registration is swallowed, not raised "
+        "(scanning/connecting must still work without an agent)",
+        failed_first is False,
+    )
+    record(
+        "_ensure_bus(): retries a failed registration on the next operation, tolerating the "
+        "duplicate export dbus_next rejects with ValueError",
+        adapter3._agent_registered is True and manager3.call_count("call_register_agent") == 2,
+    )
+
+    # BlueZ answering a repeat RegisterAgent with AlreadyExists means the
+    # agent IS registered -- the retry must treat it as success.
+    adapter4, _dev4 = _build_bare_adapter()
+    manager4 = _agent_manager_of(adapter4)
+    manager4.raises["call_register_agent"] = DBusError(
+        "org.bluez.Error.AlreadyExists", "Already Exists"
+    )
+    await adapter4._ensure_bus()
+    record(
+        "_ensure_bus(): AlreadyExists from RegisterAgent counts as registered "
+        "(still requests the default agent)",
+        adapter4._agent_registered is True
+        and manager4.call_count("call_request_default_agent") == 1,
+    )
+
+    # bluetoothd restarting drops the agent while our SYSTEM-bus connection
+    # survives, so nothing else would ever notice. BlueZ calls Agent1.Release()
+    # in that case.
+    adapter5, _dev5 = _build_bare_adapter()
+    await adapter5._ensure_bus()
+    # `.get`, not `[...]`: if a regression stops the agent being exported at
+    # all, this must record a failure like every other case rather than raise
+    # a KeyError that aborts the rest of the suite.
+    exported = cast("Any", adapter5.bus).exports.get(ble_adapter.AGENT_PATH, [])
+    for agent in exported[:1]:
+        agent.Release()
+    record(
+        "Agent1.Release(): clears _agent_registered so a bluetoothd restart cannot leave the "
+        "adapter believing a stale registration",
+        adapter5._agent_registered is False,
+    )
+    await adapter5._ensure_bus()
+    record(
+        "Agent1.Release(): the next operation re-registers on the same live bus",
+        _agent_manager_of(adapter5).call_count("call_register_agent") == 2,
+    )
+
+
+async def _test_connect_survives_a_wedged_trusted_write(record: Any) -> None:
+    """`Device1.Trusted` is written while `_operation_lock` is held, and
+    dbus_next has NO reply timeout of its own -- an un-timed property write to
+    a wedged bluetoothd never returns and hangs every BLE operation until the
+    service is restarted. The write is best-effort, so it must time out and
+    let the connect finish.
+    """
+    original = ble_adapter.PROPERTY_SET_TIMEOUT_S
+    ble_adapter.PROPERTY_SET_TIMEOUT_S = 0.05
+    adapter, ifaces = _build_connectable_adapter()
+    ifaces["dev"].hangs.add("set_trusted")
+    label = (
+        "connect: a wedged Device1.Trusted write times out instead of hanging the operation "
+        "lock forever (dbus_next has no reply timeout of its own)"
+    )
+    try:
+        result = await asyncio.wait_for(
+            adapter.ensure_connected(_ENSURE_CONNECTED_TEST_MAC), timeout=5.0
+        )
+        record(label, result.success is True and ifaces["dev"].call_count("set_trusted") == 1)
+        record("connect: the operation lock is released afterwards", adapter.is_busy is False)
+    except TimeoutError:
+        record(label, False)
+        record("connect: the operation lock is released afterwards", False)
+    finally:
+        ble_adapter.PROPERTY_SET_TIMEOUT_S = original
+        await adapter.disconnect()
+
+
+async def _test_pair_unlocked_paired_precheck(record: Any) -> None:
+    """`_pair_unlocked`'s Paired pre-check skips a redundant `Pair()` call
+    when BlueZ already reports the device Paired.
+    """
+    adapter, dev_iface = _build_bare_adapter()
+    dev_iface.returns["get_paired"] = True
+
+    ok, err = await adapter._pair_unlocked(_ENSURE_CONNECTED_TEST_MAC, disconnect_after=False)
+    record(
+        "_pair_unlocked: an already-Paired device succeeds without calling Pair()",
+        ok is True and err is None,
+    )
+    record(
+        "_pair_unlocked: Paired pre-check -- Pair() never called (redundant call skipped)",
+        dev_iface.call_count("call_pair") == 0,
+    )
+
+    # Discriminating: NOT yet paired must actually call Pair() once.
+    adapter2, dev_iface2 = _build_bare_adapter()
+    dev_iface2.returns["get_paired"] = False
+    dev_iface2.raises["call_pair"] = _pair_side_effect(dev_iface2)
+
+    ok2, _err2 = await adapter2._pair_unlocked(_ENSURE_CONNECTED_TEST_MAC, disconnect_after=False)
+    record(
+        "_pair_unlocked: a not-yet-paired device calls Pair() exactly once "
+        "(the pre-check is not vacuously skipping every call)",
+        ok2 is True and dev_iface2.call_count("call_pair") == 1,
+    )
+
+
+async def _test_pair_unlocked_already_exists_is_success(record: Any) -> None:
+    """`org.bluez.Error.AlreadyExists` from `Pair()` counts as success, not
+    failure -- re-pairing an already-working device must not look like a
+    real pairing failure.
+    """
+    adapter, dev_iface = _build_bare_adapter()
+    dev_iface.returns["get_paired"] = False
+
+    def _already_exists(_n: int) -> BaseException:
+        # AlreadyExists means BlueZ already has a bond for this device -- so
+        # a real GetPaired right after this really would read True. Modeled
+        # as a side effect (see _pair_side_effect) rather than pre-seeding
+        # get_paired=True, which would make the Paired PRE-check skip
+        # call_pair() entirely and never exercise this branch at all.
+        dev_iface.returns["get_paired"] = True
+        return DBusError("org.bluez.Error.AlreadyExists", "Already Exists")
+
+    dev_iface.raises["call_pair"] = _already_exists
+
+    ok, err = await adapter._pair_unlocked(_ENSURE_CONNECTED_TEST_MAC, disconnect_after=False)
+    record(
+        "_pair_unlocked: AlreadyExists from Pair() counts as success, not failure",
+        ok is True and err is None,
+    )
+
+    # Discriminating: a genuinely different Pair() failure must NOT be masked.
+    adapter2, dev_iface2 = _build_bare_adapter()
+    dev_iface2.returns["get_paired"] = False
+    dev_iface2.raises["call_pair"] = DBusError(
+        "org.bluez.Error.AuthenticationFailed", "Authentication Failed"
+    )
+
+    ok2, err2 = await adapter2._pair_unlocked(_ENSURE_CONNECTED_TEST_MAC, disconnect_after=False)
+    record(
+        "_pair_unlocked: a genuine Pair() failure (not AlreadyExists) is NOT masked as success",
+        ok2 is False and err2 is not None,
+    )
+
+
+async def _test_pair_unlocked_disconnect_after_flag(record: Any) -> None:
+    """`disconnect_after` controls exactly one thing: whether `_pair_unlocked`
+    disconnects after a settle delay. `pair()` (the standalone/public flow)
+    passes True; `ensure_connected`'s on-demand pairing passes False so it
+    can resume the same session. `POST_PAIR_SETTLE_S` is patched to 0 so this
+    does not sleep for real.
+    """
+    original_settle = ble_adapter.POST_PAIR_SETTLE_S
+    ble_adapter.POST_PAIR_SETTLE_S = 0
+    try:
+        adapter, dev_iface = _build_bare_adapter()
+        dev_iface.returns["get_paired"] = False
+        dev_iface.raises["call_pair"] = _pair_side_effect(dev_iface)
+
+        ok, _err = await adapter._pair_unlocked(_ENSURE_CONNECTED_TEST_MAC, disconnect_after=True)
+        record(
+            "_pair_unlocked(disconnect_after=True): disconnects after the settle delay "
+            "(the standalone pair() flow)",
+            ok is True and dev_iface.call_count("call_disconnect") == 1,
+        )
+
+        adapter2, dev_iface2 = _build_bare_adapter()
+        dev_iface2.returns["get_paired"] = False
+        dev_iface2.raises["call_pair"] = _pair_side_effect(dev_iface2)
+
+        ok2, _err2 = await adapter2._pair_unlocked(
+            _ENSURE_CONNECTED_TEST_MAC, disconnect_after=False
+        )
+        record(
+            "_pair_unlocked(disconnect_after=False): does NOT disconnect "
+            "(ensure_connected's on-demand pairing)",
+            ok2 is True and dev_iface2.call_count("call_disconnect") == 0,
+        )
+    finally:
+        ble_adapter.POST_PAIR_SETTLE_S = original_settle
+
+
+async def _test_pair_public_delegates_to_pair_unlocked(record: Any) -> None:
+    """The public `pair()` still works end-to-end after the refactor: it
+    delegates to `_pair_unlocked(disconnect_after=True)` under the lock.
+    """
+    original_settle = ble_adapter.POST_PAIR_SETTLE_S
+    ble_adapter.POST_PAIR_SETTLE_S = 0
+    try:
+        adapter, dev_iface = _build_bare_adapter()
+        dev_iface.returns["get_paired"] = False
+        dev_iface.raises["call_pair"] = _pair_side_effect(dev_iface)
+
+        result = await adapter.pair(_ENSURE_CONNECTED_TEST_MAC)
+        record(
+            "pair(): public API still succeeds and disconnects after settling "
+            "(delegates to _pair_unlocked(disconnect_after=True))",
+            result is True and dev_iface.call_count("call_disconnect") == 1,
+        )
+    finally:
+        ble_adapter.POST_PAIR_SETTLE_S = original_settle
+
+
+async def _test_register_agent_idempotent(record: Any) -> None:
+    """`_register_agent` registers exactly once per bus lifetime, and
+    `_ensure_bus()` is the sole caller -- covering "register the agent
+    unconditionally at adapter startup" without touching a real D-Bus.
+    """
+    adapter = BLEAdapter()
+    agent_manager_iface = _FakeIface()
+    bus = _FakeBus({"/org/bluez": {"org.bluez.AgentManager1": agent_manager_iface}})
+
+    await adapter._register_agent(cast("Any", bus))
+    record(
+        "_register_agent: registers and requests the default agent",
+        agent_manager_iface.call_count("call_register_agent") == 1
+        and agent_manager_iface.call_count("call_request_default_agent") == 1,
+    )
+    record("_register_agent: sets _agent_registered", adapter._agent_registered is True)
+
+    await adapter._register_agent(cast("Any", bus))
+    record(
+        "_register_agent: idempotent -- a second call does not re-register "
+        "(discriminating: a broken guard would show call_count == 2)",
+        agent_manager_iface.call_count("call_register_agent") == 1,
+    )
+
+
+def _test_no_removedevice_outside_unpair(record: Any) -> None:
+    """Stale-bond recovery is explicitly out of scope this wave: no code
+    path other than the pre-existing `unpair()` may call BlueZ's
+    `RemoveDevice` -- doing so on a false positive destroys a real bond on a
+    headless Pi reachable only over SSH.
+    """
+    module_source = inspect.getsource(ble_adapter)
+    unpair_source = inspect.getsource(ble_adapter.BLEAdapter.unpair)
+    remainder = module_source.replace(unpair_source, "", 1)
+    record(
+        "ble_adapter.py: RemoveDevice/call_remove_device appears ONLY inside unpair() "
+        "(stale-bond recovery is explicitly out of scope this wave)",
+        "remove_device" not in remainder.lower(),
+    )
+    # Sanity: prove the substring check would actually catch it if unpair()'s
+    # own source weren't excluded first.
+    record(
+        "ble_adapter.py: sanity -- RemoveDevice IS present in the full module "
+        "(the check above isn't vacuously true because nothing ever matches)",
+        "remove_device" in module_source.lower(),
+    )
+
+
+def _test_ensure_connected_never_calls_locking_public_methods(record: Any) -> None:
+    """One `_operation_lock` acquisition for the whole `ensure_connected`
+    composite: NOTHING transitively reachable from it may acquire the lock
+    again. `asyncio.Lock` is not reentrant, so a second acquisition from
+    inside `ensure_connected`'s own `async with self._operation_lock:` hangs
+    BLE until the service is restarted.
+    """
+    reachable = _reachable_self_methods("ensure_connected")
+
+    offenders = sorted(
+        name
+        for name in reachable
+        if name != "ensure_connected" and _takes_operation_lock(_adapter_method_source(name) or "")
+    )
+    record(
+        f"ensure_connected: nothing in its transitive self-call closure re-acquires "
+        f"_operation_lock ({len(reachable)} methods reachable)"
+        + (f" -- OFFENDING: {offenders}" if offenders else ""),
+        not offenders,
+    )
+    record(
+        "ensure_connected: it does take the lock itself (exactly one acquisition, at the top)",
+        _takes_operation_lock(inspect.getsource(BLEAdapter.ensure_connected)),
+    )
+
+    # The closure has to be genuinely transitive: these are reached only two
+    # to four `self.` hops down (ensure_connected -> _connect_with_scan_retry
+    # -> _connect_stage -> _attempt_connection -> _ensure_bus ->
+    # _register_agent, and ... -> _finalize_successful_connection ->
+    # _start_keepalive -> _keepalive_loop -> send_command -> write). A
+    # one-level checker sees none of them.
+    deep = {
+        "_attempt_connection",
+        "_ensure_bus",
+        "_register_agent",
+        "_find_gatt_characteristic",
+        "_finalize_successful_connection",
+        "_cleanup_failed_connection",
+        "_keepalive_loop",
+        "write",
+        "start_notify",
+        "_pair_unlocked",
+        "_scan_unlocked",
+        "_disconnect_internal",
+    }
+    missing = sorted(deep - reachable)
+    record(
+        "the closure is transitive, not one-level (reaches _attempt_connection/_ensure_bus/"
+        "_register_agent/_keepalive_loop/write/...)"
+        + (f" -- MISSING: {missing}" if missing else ""),
+        not missing,
+    )
+
+    # Discriminating in both directions: the lock-taking public entry points
+    # really are detected by _takes_operation_lock (so "no offenders" means
+    # something), and none of them is reachable (so the closure is not just
+    # failing to find them).
+    lockers = {"connect", "pair", "unpair", "scan", "disconnect"}
+    undetected = sorted(
+        name for name in lockers if not _takes_operation_lock(_adapter_method_source(name) or "")
+    )
+    record(
+        "the lock detector is discriminating -- every public lock-taking entry point "
+        f"({', '.join(sorted(lockers))}) is flagged by it"
+        + (f" -- UNDETECTED: {undetected}" if undetected else ""),
+        not undetected,
+    )
+    record(
+        "none of those public lock-taking entry points is reachable from ensure_connected",
+        not (lockers & reachable),
+    )
+
+    # And the detector must not fire on a helper that merely mentions the lock
+    # in prose -- several unlocked internals document that they do NOT take it.
+    record(
+        "the lock detector ignores docstring mentions (_scan_unlocked/_pair_unlocked name "
+        "_operation_lock in prose but never acquire it)",
+        "_operation_lock" in (_adapter_method_source("_scan_unlocked") or "")
+        and not _takes_operation_lock(_adapter_method_source("_scan_unlocked") or ""),
+    )
+
+    bad_source = (
+        "async def bad(self):\n    async with self._operation_lock:\n        await self.x()\n"
+    )
+    record(
+        "the lock detector catches a synthetic second acquisition",
+        _takes_operation_lock(bad_source),
+    )
+
+
 async def run_ble_service_tests() -> bool:
     """Run the ble_service suite. True iff every case passed.
 
@@ -1328,6 +2640,33 @@ async def run_ble_service_tests() -> bool:
     await _test_retry_connect_startup_already_connected(_record)
     await _test_retry_connect_exhausts_after_delays(_record)
 
+    # ensure_connected() composite (implicit-pairing Wave A) -- ble_adapter.py.
+    # Registered as a tuple rather than one `await` per line purely to keep
+    # this function under ruff's PLR0915 statement cap; add new cases here.
+    _test_ensure_connected_result_shape(_record)
+    _test_dbus_error_classification_helpers(_record)
+    _test_no_removedevice_outside_unpair(_record)
+    _test_ensure_connected_never_calls_locking_public_methods(_record)
+    for case in (
+        _test_connect_with_scan_retry,
+        _test_ensure_connected_already_connected_is_noop,
+        _test_ensure_connected_happy_path_sets_trusted,
+        _test_ensure_connected_gatt_security_pairs_then_resumes,
+        _test_ensure_connected_gatt_non_security_error_does_not_pair,
+        _test_ensure_connected_non_dbus_gatt_error_is_returned_not_raised,
+        _test_start_notify_failure_leaves_no_duplicate_subscription,
+        _test_ensure_connected_applies_pin_to_both_uses,
+        _test_pair_then_resume_reports_a_cause_for_a_silent_pair_failure,
+        _test_pairing_agent_lifecycle,
+        _test_connect_survives_a_wedged_trusted_write,
+        _test_pair_unlocked_paired_precheck,
+        _test_pair_unlocked_already_exists_is_success,
+        _test_pair_unlocked_disconnect_after_flag,
+        _test_pair_public_delegates_to_pair_unlocked,
+        _test_register_agent_idempotent,
+    ):
+        await case(_record)
+
     passed = sum(1 for _, ok in results if ok)
     total = len(results)
     if has_console:
@@ -1337,6 +2676,4 @@ async def run_ble_service_tests() -> bool:
 
 
 if __name__ == "__main__":
-    import asyncio
-
     sys.exit(0 if asyncio.run(run_ble_service_tests()) else 1)

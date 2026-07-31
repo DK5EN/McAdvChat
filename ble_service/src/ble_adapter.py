@@ -94,6 +94,11 @@ WRITE_TIMEOUT_S = 5.0
 DISCONNECT_TIMEOUT_S = 3.0
 # Pre-connect stale-state cleanup; distinct value from DISCONNECT_TIMEOUT_S.
 STALE_DISCONNECT_TIMEOUT_S = 5.0
+# D-Bus property write (Device1.Trusted). dbus_next has NO reply timeout of
+# its own: an un-timed call to a wedged bluetoothd never returns, and this one
+# runs while `_operation_lock` is held, which would hang every BLE operation
+# until the service is restarted.
+PROPERTY_SET_TIMEOUT_S = 5.0
 KEEPALIVE_INTERVAL_S = 300
 DST_CHECK_INTERVAL_S = 3600
 POST_PAIR_SETTLE_S = 2
@@ -101,6 +106,22 @@ REGISTER_QUERY_DELAY_S = 0.8
 MESHCOM_NAME_PREFIX = "MC-"  # not shared with src/mcapp — ble_service is a separate process
 
 logger = logging.getLogger(__name__)
+
+
+def _dbus_error_parts(error: BaseException) -> tuple[str, str]:
+    """Extract (name, text) from a D-Bus failure.
+
+    `name` is the D-Bus error NAME (e.g. "org.bluez.Error.Failed") for a real
+    `dbus_next.errors.DBusError`; for anything else (a plain `ConnectionError`
+    from a timeout, say) it falls back to the Python exception type name so
+    callers always get a stable, non-None identifier. Shared by
+    `_log_dbus_failure` (logging) and `EnsureConnectedResult.error_name` /
+    `error_text` (Wave B's machine-readable `error_code`) so both describe the
+    same failure the same way.
+    """
+    name = getattr(error, "type", None) or type(error).__name__
+    text = getattr(error, "text", None) or str(error)
+    return name, text
 
 
 def _log_dbus_failure(operation: str, error: BaseException) -> None:
@@ -123,9 +144,72 @@ def _log_dbus_failure(operation: str, error: BaseException) -> None:
     installs the distro package), so the mapping cannot be written from theory —
     it has to be measured on the target. This line is what makes that possible.
     """
-    name = getattr(error, "type", None) or type(error).__name__
-    text = getattr(error, "text", None) or str(error)
+    name, text = _dbus_error_parts(error)
     logger.warning("BLE %s failed: dbus_error=%s text=%r", operation, name, text)
+
+
+# The exact marker _attempt_connection() raises into on InterfaceNotFoundError
+# (a MAC BlueZ has no D-Bus object for yet). Shared with _is_device_not_found_error
+# below so the two can't drift apart.
+_DEVICE_NOT_FOUND_MSG = "Device not found or not paired"
+
+
+def _is_device_not_found_error(error: BaseException) -> bool:
+    """True iff `error` is `_attempt_connection`'s wrapped `InterfaceNotFoundError`
+    -- i.e. BlueZ has never seen this MAC and has no D-Bus Device1 object for it
+    yet, as opposed to a real (possibly transient) connect failure. Used by
+    `ensure_connected`'s scan-and-retry-once policy: a scan is only useful for
+    the former.
+    """
+    return isinstance(error, ConnectionError) and _DEVICE_NOT_FOUND_MSG in str(error)
+
+
+# GATT-layer error signatures that mean "this characteristic needs a
+# paired/encrypted link" -- worth pairing on demand and resuming. The generic
+# org.bluez.Error.Failed is deliberately absent from the NAME set; see
+# _is_gatt_security_error for how (and why) its text is still inspected.
+_GATT_SECURITY_ERROR_NAMES = frozenset(
+    {
+        "org.bluez.Error.NotPermitted",
+        "org.bluez.Error.NotAuthorized",
+        # BlueZ's gatt-client maps the ATT "insufficient authentication" /
+        # "insufficient encryption" error codes onto this name. It says
+        # literally "pair first" -- if this BlueZ build never emits it the
+        # entry is simply inert, whereas leaving it out on a build that does
+        # strands exactly the old firmware this whole path exists for.
+        "org.bluez.Error.NotPaired",
+    }
+)
+_GATT_SECURITY_ERROR_TEXT_MARKERS = (
+    "not permitted",
+    "not authorized",
+    "not paired",
+    "insufficient authentication",
+    "insufficient encryption",
+)
+
+
+def _is_gatt_security_error(error: BaseException) -> bool:
+    """True for a GATT-layer (StartNotify/WriteValue) error that means "pair
+    first". Matches the D-Bus error NAME first (stable across BlueZ
+    versions), then falls back to the text markers.
+
+    The text fallback deliberately applies to ANY error name, including the
+    generic `org.bluez.Error.Failed`: BlueZ 5.5x-5.6x reworded these and
+    nothing here pins the version, so `Failed` + "Insufficient Authentication"
+    has to count. Only called for a StartNotify/WriteValue failure, where the
+    asymmetry is clear-cut -- a needless `Pair()` costs one D-Bus round trip
+    (`_pair_unlocked` never removes a bond), while a missed one leaves older
+    firmware permanently unusable, which is the bug this path exists to fix.
+    `Failed` with unrelated kernel text (e.g. "le-connection-abort-by-local")
+    still matches nothing here; that ambiguous case is left alone rather than
+    guessed at -- see `_maybe_recover_stale_bond`.
+    """
+    name, text = _dbus_error_parts(error)
+    if name in _GATT_SECURITY_ERROR_NAMES:
+        return True
+    lowered = text.lower()
+    return any(marker in lowered for marker in _GATT_SECURITY_ERROR_TEXT_MARKERS)
 
 
 # D-Bus constants
@@ -222,6 +306,46 @@ class BLEStatus:
     last_activity: float = field(default_factory=time.time)
 
 
+@dataclass
+class EnsureConnectedResult:
+    """Structured outcome of `BLEAdapter.ensure_connected()`.
+
+    Wave B (`ble_service/src/main.py`) consumes `stage`/`error_name` to build
+    a machine-readable `error_code` for the HTTP layer instead of pattern-
+    matching a free-text message, so this shape is the contract between the
+    two waves -- treat field names/meanings as load-bearing.
+
+    success: True iff the device ends up connected, Trusted, and subscribed
+        to notifications -- either just now, or already (`stage ==
+        "already_connected"`).
+    stage: where the operation landed.
+        - "already_connected" / "connected": success.
+        - "connect": the Connect() stage failed (after the internal
+          scan-and-retry-once for a not-yet-known MAC).
+        - "pair": on-demand GATT-layer pairing failed.
+        - "gatt" / "gatt_post_pair": subscribing to notifications failed for
+          a reason other than "needs pairing", or failed again even after a
+          successful on-demand pair.
+    error_name: the D-Bus error NAME (e.g. "org.bluez.Error.Failed") on
+        failure, the Python exception type name for a non-D-Bus failure (e.g.
+        "TimeoutError"), or the synthetic "PairingNotEstablished" for the one
+        failure BlueZ reports without raising at all. Never None on failure --
+        Wave B may rely on that; always None on success.
+    error_text: the D-Bus error text / exception message, for logging. None
+        on success.
+
+    A failure result also implies the session has been torn down: the connect
+    stage cleans up via `_cleanup_failed_connection`, the pair/GATT stages via
+    `_teardown_after_post_connect_failure`. There is no "returned False but
+    the link is still up" state for a caller to reason about.
+    """
+
+    success: bool
+    stage: str
+    error_name: str | None = None
+    error_text: str | None = None
+
+
 class MeshComPairingAgent(ServiceInterface):
     """BlueZ pairing agent that supplies the configured BLE PIN as the NimBLE passkey.
 
@@ -232,13 +356,22 @@ class MeshComPairingAgent(ServiceInterface):
     needing to re-register the agent on the D-Bus.
     """
 
-    def __init__(self, pin_getter: Callable[[], int]):
+    def __init__(self, pin_getter: Callable[[], int], on_release: Callable[[], None] | None = None):
         super().__init__("org.bluez.Agent1")
         self._pin_getter = pin_getter
+        self._on_release = on_release
 
     @method()  # type: ignore[untyped-decorator]  # dbus_next.service.method() is an untyped decorator upstream
     def Release(self) -> None:  # noqa: N802 - D-Bus Agent1 interface method
         logger.info("Agent released")
+        # BlueZ unregistered us (bluetoothd restart is the realistic case).
+        # Tell the adapter so it re-registers rather than believing a stale
+        # "already registered" flag for the rest of the bus's lifetime.
+        if self._on_release is not None:
+            try:
+                self._on_release()
+            except Exception:
+                logger.exception("Agent release callback failed")
 
     @method()  # type: ignore[untyped-decorator]  # dbus_next.service.method() is an untyped decorator upstream
     def RequestPasskey(self, device: "o") -> "u":  # noqa: N802 - D-Bus Agent1 interface
@@ -329,6 +462,10 @@ class BLEAdapter:
         self._last_utc_offset: float | None = None
         self._connected_mac: str | None = None
         self._agent_registered: bool = False
+        # Whether _on_props_changed is currently attached to read_props_iface;
+        # see start_notify() for why neither attaching nor skipping is safe to
+        # do unconditionally.
+        self._notify_handler_attached: bool = False
         self._cancel_connect: bool = False
         self._disconnect_callback: Callable[[], None] | None = None
         self._device_props_handler: Callable[[str, dict[str, Variant], list[str]], Any] | None = (
@@ -355,22 +492,117 @@ class BLEAdapter:
 
         Used before a reconnect attempt to clear a stale bus from a previous
         session rather than reusing a possibly-dead connection.
+
+        Clearing `_agent_registered` here is load-bearing, not bookkeeping:
+        the pairing agent lives on the bus being dropped, and
+        `ble_service/src/main.py` calls this before EVERY connect
+        (`_connect_and_initialize`). Leaving the flag set made
+        `_register_agent()` short-circuit on the next, freshly created bus, so
+        every bus after the first one ran with NO agent registered -- and
+        kernel-initiated SMP during StartNotify then has nothing to answer
+        BlueZ's `RequestPasskey`, which is exactly the failure implicit
+        pairing exists to fix. Same reasoning as `_reset_state()`.
         """
         if self.bus:
             with contextlib.suppress(Exception):
                 # MessageBus.disconnect() has no return annotation upstream.
                 cast(Any, self.bus).disconnect()
             self.bus = None
+        self._agent_registered = False
 
     def _mac_to_dbus_path(self, mac: str) -> str:
         """Convert MAC address to D-Bus device path"""
         return f"{ADAPTER_PATH}/dev_{mac.replace(':', '_')}"
 
     async def _ensure_bus(self) -> MessageBus:
-        """Ensure D-Bus connection is established, and return it (never None)."""
+        """Ensure D-Bus connection is established, and return it (never None).
+
+        Also (re)registers the BlueZ pairing agent on every freshly created
+        bus -- this is "adapter startup" for agent-registration purposes:
+        every scan/connect/pair/unpair passes through here before touching
+        BlueZ, and there is no other single choke point that does. The agent
+        used to be registered only inside `pair()`, so a bare `connect()` to
+        a device that still demands GATT-layer security (older MeshCom
+        firmware) had no agent to answer BlueZ's `RequestPasskey` during
+        kernel-initiated SMP. Registration failure is logged, not raised —
+        scanning/connecting must still work even if the agent can't be
+        registered (unchanged from the old behaviour of a device with no PIN
+        configured).
+
+        Registration is attempted whenever `_agent_registered` is False, not
+        only on the call that creates the bus: a registration that failed (or
+        one BlueZ later dropped -- see `_on_agent_released`) would otherwise
+        stay broken for the entire lifetime of an otherwise healthy bus,
+        because nothing else ever retries it.
+        """
         if self.bus is None:
             self.bus = await MessageBus(bus_type=BusType.SYSTEM).connect()
+        if not self._agent_registered:
+            try:
+                await self._register_agent(self.bus)
+            except Exception:
+                logger.exception("Failed to register BLE pairing agent (continuing without one)")
         return self.bus
+
+    def _on_agent_released(self) -> None:
+        """BlueZ called `Agent1.Release()` on our agent -- it has dropped it.
+        The realistic case is bluetoothd restarting: our connection to the
+        SYSTEM bus survives that, so `self.bus` stays valid and nothing else
+        would ever notice the agent is gone. Clear the flag so the next
+        `_ensure_bus()` re-registers instead of short-circuiting on a stale
+        True.
+        """
+        logger.info("BLE pairing agent released by BlueZ; re-registering on next operation")
+        self._agent_registered = False
+
+    async def _register_agent(self, bus: MessageBus) -> None:
+        """Register the MeshCom pairing agent on `bus`, once per bus lifetime.
+
+        Idempotent via `_agent_registered`. Only ever called from
+        `_ensure_bus()`, which owns `self.bus`, so the flag and "is an agent
+        actually registered on `self.bus`" never drift apart — see
+        `_reset_state()`/`reset_bus()` on why clearing this flag whenever the
+        bus is dropped is correct rather than reintroducing the gap this
+        method exists to close.
+
+        Both BlueZ-side steps tolerate "already done", because this can now
+        run a second time on the SAME bus after a partial failure (e.g.
+        RegisterAgent succeeded and RequestDefaultAgent did not): dbus_next
+        raises a plain `ValueError` when an interface of the same name is
+        re-exported at the same path, and BlueZ answers a repeat
+        RegisterAgent with `org.bluez.Error.AlreadyExists`. Neither means the
+        retry failed.
+
+        The agent reads `self.pairing_passkey` at call time (not at
+        registration time), so `PATCH /api/ble/pin` takes effect on the next
+        pairing prompt without needing to re-register.
+        """
+        if self._agent_registered:
+            return
+
+        agent = MeshComPairingAgent(
+            lambda: self.pairing_passkey, on_release=self._on_agent_released
+        )
+        try:
+            bus.export(AGENT_PATH, agent)
+        except ValueError:
+            logger.debug("Pairing agent already exported at %s, reusing it", AGENT_PATH)
+
+        manager_obj = bus.get_proxy_object(
+            BLUEZ_SERVICE_NAME,
+            "/org/bluez",
+            await bus.introspect(BLUEZ_SERVICE_NAME, "/org/bluez"),
+        )
+        agent_manager: DBusInterface = manager_obj.get_interface("org.bluez.AgentManager1")
+        try:
+            await agent_manager.call_register_agent(AGENT_PATH, "KeyboardDisplay")
+        except DBusError as e:
+            if (getattr(e, "type", None) or "") != "org.bluez.Error.AlreadyExists":
+                raise
+            logger.debug("Pairing agent already registered with BlueZ, requesting default only")
+        await agent_manager.call_request_default_agent(AGENT_PATH)
+        self._agent_registered = True
+        logger.info("BLE pairing agent registered")
 
     async def scan(
         self,
@@ -388,85 +620,92 @@ class BLEAdapter:
             List of discovered BLEDevice objects
         """
         async with self._operation_lock:
-            bus = await self._ensure_bus()
+            return await self._scan_unlocked(timeout, prefix)
 
-            found_devices: dict[str, BLEDevice] = {}
-            known_devices: list[BLEDevice] = []
+    async def _scan_unlocked(
+        self,
+        timeout: float = 5.0,  # noqa: ASYNC109 - internal impl of scan()'s public timeout param
+        prefix: str = MESHCOM_NAME_PREFIX,
+    ) -> list[BLEDevice]:
+        """`scan()` without taking `_operation_lock` -- for callers (currently
+        only `ensure_connected`'s device-not-found retry) that already hold
+        it and must not call the public, lock-taking `scan()` from inside
+        their own `async with self._operation_lock:` block (self-deadlock)."""
+        bus = await self._ensure_bus()
 
-            # Get adapter
-            path = ADAPTER_PATH
-            introspection = await bus.introspect(BLUEZ_SERVICE_NAME, path)
-            adapter_obj = bus.get_proxy_object(BLUEZ_SERVICE_NAME, path, introspection)
-            adapter: DBusInterface = adapter_obj.get_interface(ADAPTER_INTERFACE)
+        found_devices: dict[str, BLEDevice] = {}
+        known_devices: list[BLEDevice] = []
 
-            # Get object manager for existing devices
-            obj_mgr = bus.get_proxy_object(
-                BLUEZ_SERVICE_NAME, "/", await bus.introspect(BLUEZ_SERVICE_NAME, "/")
-            )
-            obj_mgr_iface: DBusInterface = obj_mgr.get_interface(OBJECT_MANAGER_INTERFACE)
+        # Get adapter
+        path = ADAPTER_PATH
+        introspection = await bus.introspect(BLUEZ_SERVICE_NAME, path)
+        adapter_obj = bus.get_proxy_object(BLUEZ_SERVICE_NAME, path, introspection)
+        adapter: DBusInterface = adapter_obj.get_interface(ADAPTER_INTERFACE)
 
-            # Check known/paired devices first
-            objects = await obj_mgr_iface.call_get_managed_objects()
-            for obj_path, interfaces in objects.items():
-                if DEVICE_INTERFACE in interfaces:
-                    props = interfaces[DEVICE_INTERFACE]
-                    name = props.get("Name", Variant("s", "")).value
+        # Get object manager for existing devices
+        obj_mgr = bus.get_proxy_object(
+            BLUEZ_SERVICE_NAME, "/", await bus.introspect(BLUEZ_SERVICE_NAME, "/")
+        )
+        obj_mgr_iface: DBusInterface = obj_mgr.get_interface(OBJECT_MANAGER_INTERFACE)
+
+        # Check known/paired devices first
+        objects = await obj_mgr_iface.call_get_managed_objects()
+        for obj_path, interfaces in objects.items():
+            if DEVICE_INTERFACE in interfaces:
+                props = interfaces[DEVICE_INTERFACE]
+                name = props.get("Name", Variant("s", "")).value
+                addr = props.get("Address", Variant("s", "")).value
+                paired = props.get("Paired", Variant("b", False)).value
+                rssi = props.get("RSSI", Variant("n", 0)).value
+
+                if name.startswith(prefix):
+                    device = BLEDevice(
+                        name=name,
+                        address=addr,
+                        rssi=rssi,
+                        paired=paired,
+                        known=True,
+                        path=obj_path,
+                    )
+                    known_devices.append(device)
+
+        # Setup handler for new devices during scan
+        async def on_interfaces_added(path: str, interfaces: dict[str, dict[str, Variant]]) -> None:
+            if DEVICE_INTERFACE in interfaces:
+                props = interfaces[DEVICE_INTERFACE]
+                name = props.get("Name", Variant("s", "")).value
+                if name.startswith(prefix):
                     addr = props.get("Address", Variant("s", "")).value
-                    paired = props.get("Paired", Variant("b", False)).value
                     rssi = props.get("RSSI", Variant("n", 0)).value
+                    found_devices[path] = BLEDevice(
+                        name=name, address=addr, rssi=rssi, paired=False, path=path
+                    )
 
-                    if name.startswith(prefix):
-                        device = BLEDevice(
-                            name=name,
-                            address=addr,
-                            rssi=rssi,
-                            paired=paired,
-                            known=True,
-                            path=obj_path,
-                        )
-                        known_devices.append(device)
+        pending_tasks: set[asyncio.Task[None]] = set()
 
-            # Setup handler for new devices during scan
-            async def on_interfaces_added(
-                path: str, interfaces: dict[str, dict[str, Variant]]
-            ) -> None:
-                if DEVICE_INTERFACE in interfaces:
-                    props = interfaces[DEVICE_INTERFACE]
-                    name = props.get("Name", Variant("s", "")).value
-                    if name.startswith(prefix):
-                        addr = props.get("Address", Variant("s", "")).value
-                        rssi = props.get("RSSI", Variant("n", 0)).value
-                        found_devices[path] = BLEDevice(
-                            name=name, address=addr, rssi=rssi, paired=False, path=path
-                        )
+        def on_interfaces_added_sync(path: str, interfaces: dict[str, dict[str, Variant]]) -> None:
+            task = asyncio.create_task(on_interfaces_added(path, interfaces))
+            pending_tasks.add(task)
+            task.add_done_callback(pending_tasks.discard)
 
-            pending_tasks: set[asyncio.Task[None]] = set()
+        obj_mgr_iface.on_interfaces_added(on_interfaces_added_sync)
 
-            def on_interfaces_added_sync(
-                path: str, interfaces: dict[str, dict[str, Variant]]
-            ) -> None:
-                task = asyncio.create_task(on_interfaces_added(path, interfaces))
-                pending_tasks.add(task)
-                task.add_done_callback(pending_tasks.discard)
+        # Start discovery
+        logger.info("Starting BLE scan (timeout=%.1fs, prefix='%s')", timeout, prefix)
+        await adapter.call_start_discovery()
 
-            obj_mgr_iface.on_interfaces_added(on_interfaces_added_sync)
+        try:
+            await asyncio.sleep(timeout)
+        finally:
+            await adapter.call_stop_discovery()
 
-            # Start discovery
-            logger.info("Starting BLE scan (timeout=%.1fs, prefix='%s')", timeout, prefix)
-            await adapter.call_start_discovery()
+        # Combine results
+        all_devices = known_devices + list(found_devices.values())
+        logger.info(
+            "Scan complete: %d known, %d discovered", len(known_devices), len(found_devices)
+        )
 
-            try:
-                await asyncio.sleep(timeout)
-            finally:
-                await adapter.call_stop_discovery()
-
-            # Combine results
-            all_devices = known_devices + list(found_devices.values())
-            logger.info(
-                "Scan complete: %d known, %d discovered", len(known_devices), len(found_devices)
-            )
-
-            return all_devices
+        return all_devices
 
     async def connect(self, mac: str, max_retries: int = 3) -> bool:
         """
@@ -500,27 +739,6 @@ class BLEAdapter:
 
                 try:
                     await self._attempt_connection(mac, path)
-                    self._connected_mac = mac
-                    self._status.state = ConnectionState.CONNECTED
-                    # Read device name from BlueZ D-Bus
-                    name = ""
-                    if self.props_iface is not None:
-                        try:
-                            name = (await self.props_iface.call_get(DEVICE_INTERFACE, "Name")).value
-                        except Exception:
-                            name = ""
-                    self._status.device = BLEDevice(name=name, address=mac)
-                    self._status.last_activity = time.time()
-
-                    # Subscribe to D-Bus PropertiesChanged for instant disconnect detection
-                    self._subscribe_device_properties()
-
-                    # Start keepalive and DST check
-                    self._start_keepalive()
-                    self._start_dst_check()
-
-                    logger.info("Connected to %s", mac)
-
                 except Exception as e:
                     logger.warning(
                         "Connection attempt %d/%d failed: %s", attempt + 1, max_retries, e
@@ -530,6 +748,7 @@ class BLEAdapter:
                         await asyncio.sleep(1)
 
                 else:
+                    await self._finalize_successful_connection(mac)
                     return True
             await self._cleanup_failed_connection()
 
@@ -541,6 +760,33 @@ class BLEAdapter:
                 self._status.error = f"Connection failed after {max_retries} attempts"
             return False
 
+    async def _finalize_successful_connection(self, mac: str) -> None:
+        """Shared post-connect bookkeeping for every path that just ran
+        `_attempt_connection()` successfully -- `connect()`'s retry loop and
+        `ensure_connected()`'s single-attempt composite. Extracted so both
+        stay identical rather than drifting.
+        """
+        self._connected_mac = mac
+        self._status.state = ConnectionState.CONNECTED
+        # Read device name from BlueZ D-Bus
+        name = ""
+        if self.props_iface is not None:
+            try:
+                name = (await self.props_iface.call_get(DEVICE_INTERFACE, "Name")).value
+            except Exception:
+                name = ""
+        self._status.device = BLEDevice(name=name, address=mac)
+        self._status.last_activity = time.time()
+
+        # Subscribe to D-Bus PropertiesChanged for instant disconnect detection
+        self._subscribe_device_properties()
+
+        # Start keepalive and DST check
+        self._start_keepalive()
+        self._start_dst_check()
+
+        logger.info("Connected to %s", mac)
+
     async def _attempt_connection(self, _mac: str, path: str) -> None:
         """Single connection attempt with stale BlueZ state handling"""
         bus = await self._ensure_bus()
@@ -551,7 +797,7 @@ class BLEAdapter:
         try:
             self.dev_iface = cast(DBusInterface, self.device_obj.get_interface(DEVICE_INTERFACE))
         except InterfaceNotFoundError as e:
-            raise ConnectionError(f"Device not found or not paired: {e}") from e
+            raise ConnectionError(f"{_DEVICE_NOT_FOUND_MSG}: {e}") from e
 
         self.props_iface = cast(DBusInterface, self.device_obj.get_interface(PROPERTIES_INTERFACE))
 
@@ -585,6 +831,20 @@ class BLEAdapter:
                     )
                 raise ConnectionError("Cleared stale BlueZ state, will retry") from e
             raise ConnectionError(f"Connect failed: {e}") from e
+
+        # Mark the device Trusted immediately after Connect() succeeds (not
+        # gated on GATT discovery below) so BlueZ persists this Device1
+        # object across disconnects/reboots. An untrusted, never-paired
+        # device is "temporary" to BlueZ and gets evicted ~30s after
+        # disconnect -- and _startup_auto_connect does no scan, so a
+        # temporary device would fail every future auto-connect attempt
+        # outright. Idempotent (also clears the temporary flag); best-effort
+        # -- a failure here must not fail the connection itself, and it must
+        # not be able to HANG it either (see PROPERTY_SET_TIMEOUT_S).
+        try:
+            await asyncio.wait_for(self.dev_iface.set_trusted(True), timeout=PROPERTY_SET_TIMEOUT_S)
+        except Exception as e:
+            _log_dbus_failure("Device1.Trusted", e)
 
         # Wait for services to resolve
         if not await self._wait_for_services_resolved(timeout=CONNECT_TIMEOUT_S):
@@ -730,6 +990,16 @@ class BLEAdapter:
         self.read_props_iface = None
         self.write_char_iface = None
         self._connected_mac = None
+        # The proxy the notification handler was attached to is gone with the
+        # interfaces above, so the handler is gone with it.
+        self._notify_handler_attached = False
+        # Correct, not a gap: this only ever runs alongside dropping
+        # `self.bus` above (both callers disconnect the bus first — see
+        # `_cleanup_failed_connection`/`_disconnect_internal`). A dropped
+        # D-Bus connection means BlueZ has already forgotten any agent that
+        # connection registered, so the flag and D-Bus reality stay in
+        # lockstep: `_ensure_bus()` re-registers on the next fresh bus. See
+        # `_register_agent`'s docstring.
         self._agent_registered = False
 
     async def disconnect(self) -> bool:
@@ -794,26 +1064,47 @@ class BLEAdapter:
             await self.read_props_iface.call_get(GATT_CHARACTERISTIC_INTERFACE, "Notifying")
         ).value
 
+        # Attach the PropertiesChanged handler exactly once per characteristic
+        # proxy, tracked explicitly because neither end is idempotent on its
+        # own and both failure modes are silent:
+        #   - dbus_next APPENDS signal handlers with no de-duplication
+        #     (BaseProxyInterface._add_signal -> handlers.append(fn)) and
+        #     dispatches the whole list, so attaching twice delivers every BLE
+        #     notification TWICE;
+        #   - returning early on "already notifying" WITHOUT attaching leaves a
+        #     session that looks perfectly healthy and delivers nothing.
+        # `ensure_connected` retries this method after an on-demand pair, which
+        # is exactly the second call that hits both.
+        if not self._notify_handler_attached:
+            self.read_props_iface.on_properties_changed(self._on_props_changed)
+            self._notify_handler_attached = True
+
         if is_notifying:
             logger.info("Already notifying")
             return
 
-        # Setup notification handler
-        self.read_props_iface.on_properties_changed(self._on_props_changed)
-        await self.read_char_iface.call_start_notify()
+        try:
+            await self.read_char_iface.call_start_notify()
+        except Exception:
+            self._detach_notify_handler()
+            raise
 
         logger.info("Notifications started")
+
+    def _detach_notify_handler(self) -> None:
+        """Drop the PropertiesChanged handler if it is attached, best effort."""
+        if self._notify_handler_attached and self.read_props_iface is not None:
+            with contextlib.suppress(Exception):
+                self.read_props_iface.off_properties_changed(self._on_props_changed)
+        self._notify_handler_attached = False
 
     async def _stop_notify(self) -> None:
         """Stop notifications"""
         if not self.read_char_iface:
+            self._notify_handler_attached = False
             return
 
-        try:
-            if self.read_props_iface:
-                self.read_props_iface.off_properties_changed(self._on_props_changed)
-        except Exception as e:
-            logger.debug("Detaching properties handler failed: %s", e)
+        self._detach_notify_handler()
 
         try:
             await self.read_char_iface.call_stop_notify()
@@ -899,6 +1190,8 @@ class BLEAdapter:
         self.read_char_iface = None
         self.read_props_iface = None
         self.write_char_iface = None
+        # Dropped with the proxy it was attached to, same as in _reset_state.
+        self._notify_handler_attached = False
 
         if self._disconnect_callback:
             try:
@@ -1199,9 +1492,252 @@ class BLEAdapter:
         except asyncio.CancelledError:
             pass
 
+    async def ensure_connected(self, mac: str, pin: int | None = None) -> EnsureConnectedResult:
+        """Composite connect: connect if needed, mark Trusted, and pair on
+        demand only if the GATT layer actually requires it this session.
+
+        Current firmware (both ESP32 post-2025-04-15 and nRF52
+        post-2025-04-28) needs no pairing at all, so the common case is:
+        connect, Trust, subscribe, done -- `pair()`/`Pair()` never runs.
+        Older firmware demands security at the GATT layer (StartNotify), not
+        at Connect(), so that is exactly where this looks for it.
+
+        One `_operation_lock` acquisition for the whole operation. Calls only
+        unlocked internals (`_connect_with_scan_retry`, `_disconnect_internal`,
+        `_ensure_gatt_ready`, `_pair_then_resume` -> `_pair_unlocked`) --
+        never the public `connect()`/`pair()`, which each take the lock
+        themselves and would deadlock (`asyncio.Lock` is not reentrant) if
+        called from here while it is already held.
+
+        Args:
+            mac: Device MAC address.
+            pin: Optional BLE PIN to apply for this and later sessions. `None`
+                leaves whatever is configured untouched.
+        """
+        async with self._operation_lock:
+            self._cancel_connect = False
+
+            if pin is not None:
+                # The firmware uses ONE bt_code value as both the SMP passkey
+                # and the key for the app-layer hello hash, so applying half
+                # of it yields a session that pairs at the link layer and is
+                # then rejected at the app layer (`send_hello`). Mirrors what
+                # PATCH /api/ble/pin does in ble_service/src/main.py.
+                self.pairing_passkey = pin
+                self.hello_bytes = build_hello_bytes(pin)
+
+            if self.is_connected:
+                if self._connected_mac == mac:
+                    logger.info("ensure_connected: already connected to %s", mac)
+                    return EnsureConnectedResult(success=True, stage="already_connected")
+                logger.warning(
+                    "ensure_connected: connected to a different device, disconnecting first"
+                )
+                await self._disconnect_internal()
+
+            connect_err = await self._connect_with_scan_retry(mac)
+            if connect_err is not None:
+                await self._maybe_recover_stale_bond(mac, connect_err)
+                name, text = _dbus_error_parts(connect_err)
+                self._status.state = ConnectionState.ERROR
+                self._status.error = f"Connect failed: {text}"
+                return EnsureConnectedResult(
+                    success=False, stage="connect", error_name=name, error_text=text
+                )
+
+            gatt_failure = await self._ensure_gatt_ready(mac)
+            if gatt_failure is not None:
+                await self._teardown_after_post_connect_failure()
+                return gatt_failure
+
+            return EnsureConnectedResult(success=True, stage="connected")
+
+    async def _teardown_after_post_connect_failure(self) -> None:
+        """Tear down the half-open session left behind when `Connect()`
+        succeeded but the pair/GATT stage did not, then restore the ERROR
+        status the failing stage recorded.
+
+        `connect()`'s contract is "a failed connect leaves nothing behind"
+        (`_cleanup_failed_connection` on every failing attempt), and
+        `ensure_connected` must not be the one entry point that breaks it.
+        Without this the BLE link stays UP at the BlueZ level -- holding a
+        client slot open on the node for a session nobody can use -- with the
+        keepalive/DST tasks running, `_connected_mac` set, and a live
+        PropertiesChanged subscription whose handler can null the GATT
+        interfaces out from under the NEXT connect attempt.
+
+        `_disconnect_internal()` finishes with state DISCONNECTED and
+        `device = None`, so the ERROR state/message is captured first and
+        re-applied afterwards: Wave B reads `status.state`/`status.error`, and
+        "disconnected, no error" would misreport a hard failure as a clean
+        idle adapter. Wrapped in `suppress` because teardown is best effort --
+        the failure being reported is the one that matters.
+        """
+        failed_state, failed_error = self._status.state, self._status.error
+        with contextlib.suppress(Exception):
+            await self._disconnect_internal()
+        self._status.state = failed_state
+        self._status.error = failed_error
+
+    async def _connect_with_scan_retry(self, mac: str) -> Exception | None:
+        """`ensure_connected`'s connect policy: a single attempt
+        (`max_retries=1` in spirit -- Wave B owns an overall ~25-30s deadline,
+        and `connect()`'s 3x-with-1s-sleep ladder would blow that), and if
+        the failure is specifically "BlueZ has never seen this MAC"
+        (`_is_device_not_found_error`), one scan to repopulate BlueZ's D-Bus
+        object followed by exactly one retry. Any other failure is returned
+        as-is, no retry.
+        """
+        err = await self._connect_stage(mac)
+        if err is None or not _is_device_not_found_error(err):
+            return err
+
+        logger.info("ensure_connected: %s not known to BlueZ yet, scanning then retrying once", mac)
+        await self._scan_unlocked()
+        return await self._connect_stage(mac)
+
+    async def _connect_stage(self, mac: str) -> Exception | None:
+        """A single connect attempt, reusing the same `_attempt_connection()`
+        core `connect()` uses -- connect mechanics (stale-state cleanup, GATT
+        characteristic discovery, Trusted) are identical, only the
+        retry/backoff wrapper differs. Returns None on success (state
+        finalized via `_finalize_successful_connection`, mirroring
+        `connect()`'s success path) or the raised exception on failure (state
+        cleaned up via `_cleanup_failed_connection`, mirroring `connect()`'s
+        failure path) -- a bare bool cannot tell the caller *which*
+        exception it was, and `ensure_connected` needs that to recognize
+        "device not found".
+        """
+        self._status.state = ConnectionState.CONNECTING
+        self._status.error = None
+        path = self._mac_to_dbus_path(mac)
+        try:
+            await self._attempt_connection(mac, path)
+        except Exception as e:
+            logger.warning("ensure_connected: connect attempt failed: %s", e)
+            await self._cleanup_failed_connection()
+            return e
+        else:
+            await self._finalize_successful_connection(mac)
+            return None
+
+    async def _ensure_gatt_ready(self, mac: str) -> EnsureConnectedResult | None:
+        """Subscribe to notifications; pair on demand (once) if the GATT
+        layer itself reports a security error, then resume. Returns None on
+        success, a failure `EnsureConnectedResult` otherwise.
+
+        Catches `Exception`, not just `DBusError`: `start_notify()` also
+        raises a plain `RuntimeError("Not connected")` when the GATT
+        interfaces have been cleared, which happens for real if the device
+        drops between `_finalize_successful_connection` and here (the
+        PropertiesChanged handler calls `_on_disconnect_detected`, which nulls
+        them). Letting that escape would break `ensure_connected`'s documented
+        contract of always RETURNING an `EnsureConnectedResult` -- Wave B
+        would see a bare exception with no `stage`, and the half-open session
+        would never be torn down. Only a `DBusError` can mean "pair first";
+        anything else is reported as a plain GATT failure.
+        """
+        try:
+            await self.start_notify()
+        except Exception as e:
+            if not (isinstance(e, DBusError) and _is_gatt_security_error(e)):
+                _log_dbus_failure("GattCharacteristic1.StartNotify", e)
+                name, text = _dbus_error_parts(e)
+                self._status.state = ConnectionState.ERROR
+                self._status.error = f"GATT subscribe failed: {text}"
+                return EnsureConnectedResult(
+                    success=False, stage="gatt", error_name=name, error_text=text
+                )
+            return await self._pair_then_resume(mac)
+        else:
+            return None
+
+    async def _pair_then_resume(self, mac: str) -> EnsureConnectedResult | None:
+        """Pair on demand and resume the SAME session -- unlike the
+        standalone `pair()` flow, do NOT disconnect afterward: this runs
+        mid-connection, in service of the connect the caller actually asked
+        for, not a separate "just pair" request.
+
+        The GATT characteristic proxies obtained BEFORE pairing are reused
+        afterwards. They are D-Bus proxies addressed by object path, not
+        cached ATT handles: if BlueZ had torn the characteristic objects down
+        and rebuilt them across SMP elevation, the retried call would fail
+        loudly with UnknownObject/UnknownMethod and land in `gatt_post_pair`
+        (which tears the session down, so the caller's next attempt
+        re-discovers them). There is no path here that silently talks to a
+        stale handle.
+        """
+        logger.info("ensure_connected: GATT layer demands pairing for %s, pairing on demand", mac)
+        pair_ok, pair_err = await self._pair_unlocked(mac, disconnect_after=False)
+        if not pair_ok:
+            # `_pair_unlocked` can fail WITHOUT an exception: BlueZ accepting
+            # Pair() but still reporting Paired == False. `EnsureConnectedResult`
+            # promises a populated error_name/error_text on every failure
+            # (Wave B builds its error_code from them), so fill that hole here
+            # rather than handing back a failure with no cause at all.
+            name, text = (
+                _dbus_error_parts(pair_err)
+                if pair_err is not None
+                else (
+                    "PairingNotEstablished",
+                    "Pair() reported success but BlueZ still reports the device as not paired",
+                )
+            )
+            self._status.state = ConnectionState.ERROR
+            self._status.error = "Pairing required but failed"
+            return EnsureConnectedResult(
+                success=False, stage="pair", error_name=name, error_text=text
+            )
+
+        try:
+            await self.start_notify()
+        except Exception as e:
+            _log_dbus_failure("GattCharacteristic1.StartNotify (post-pair retry)", e)
+            name, text = _dbus_error_parts(e)
+            self._status.state = ConnectionState.ERROR
+            self._status.error = f"GATT subscribe failed after pairing: {text}"
+            return EnsureConnectedResult(
+                success=False, stage="gatt_post_pair", error_name=name, error_text=text
+            )
+        else:
+            return None
+
+    async def _maybe_recover_stale_bond(self, mac: str, error: Exception) -> None:
+        """Extension point for stale-bond recovery. Deliberately a NO-OP in
+        this wave -- do not add a `RemoveDevice()` call here, or anywhere
+        else in this module outside `unpair()`, until the
+        `org.bluez.Error.*` taxonomy is measured on the real Pi target.
+
+        What this is waiting on: `org.bluez.Error.AuthenticationFailed` is a
+        `Pair()`-flow error that may never appear on a bare `Connect()`; real
+        `Connect()` failures instead surface as the generic
+        `org.bluez.Error.Failed` with kernel-supplied text (e.g.
+        "le-connection-abort-by-local") whose exact wording shifted across
+        BlueZ 5.5x-5.6x, and nothing in this repo pins the BlueZ version
+        (bootstrap installs the distro package). Guessing at that text and
+        calling `RemoveDevice` on a false positive destroys a real bond on a
+        headless Pi reachable only over SSH. `_log_dbus_failure` (added the
+        commit before this one) is already producing the dbus_error=/text=
+        log lines this decision needs; once real failures have been observed
+        on mcapp.local, this function is where the taxonomy-driven recovery
+        slots in.
+        """
+        name, text = _dbus_error_parts(error)
+        logger.debug(
+            "Stale-bond recovery not implemented (Wave A): connect to %s failed with "
+            "dbus_error=%s text=%r -- no action taken",
+            mac,
+            name,
+            text,
+        )
+
     async def pair(self, mac: str) -> bool:
         """
         Pair with a BLE device.
+
+        Standalone pairing flow (e.g. a user-initiated "Pair" action):
+        disconnects after a settle delay, unlike the on-demand pairing
+        `ensure_connected` does mid-connection.
 
         Args:
             mac: Device MAC address
@@ -1210,58 +1746,76 @@ class BLEAdapter:
             True if pairing successful
         """
         async with self._operation_lock:
-            bus = await self._ensure_bus()
+            success, _err = await self._pair_unlocked(mac, disconnect_after=True)
+            return success
 
-            path = self._mac_to_dbus_path(mac)
+    async def _pair_unlocked(
+        self, mac: str, *, disconnect_after: bool
+    ) -> tuple[bool, Exception | None]:
+        """Pair with `mac` without taking `_operation_lock` -- for callers
+        that already hold it (`pair()`, `ensure_connected`'s on-demand
+        pairing via `_pair_then_resume`).
 
-            # Register agent (once per bus lifetime). The agent reads
-            # self.pairing_passkey at call time, so changes via
-            # PATCH /api/ble/pin take effect on the next pair attempt
-            # without re-registering.
-            if not self._agent_registered:
-                agent = MeshComPairingAgent(lambda: self.pairing_passkey)
-                bus.export(AGENT_PATH, agent)
+        Two established-bug fixes over the historical `pair()` body, both now
+        shared by every caller:
+          - A `Paired` pre-check skips a redundant `Pair()` call entirely.
+          - `org.bluez.Error.AlreadyExists` from `Pair()` counts as success,
+            not failure -- re-pairing an already-working device used to look
+            identical to a real pairing failure (one blanket `except`).
 
-                manager_obj = bus.get_proxy_object(
-                    BLUEZ_SERVICE_NAME,
-                    "/org/bluez",
-                    await bus.introspect(BLUEZ_SERVICE_NAME, "/org/bluez"),
-                )
-                agent_manager: DBusInterface = manager_obj.get_interface("org.bluez.AgentManager1")
-                await agent_manager.call_register_agent(AGENT_PATH, "KeyboardDisplay")
-                await agent_manager.call_request_default_agent(AGENT_PATH)
-                self._agent_registered = True
+        Returns `(True, None)` on success (including both cases above),
+        `(False, exception)` on a genuine failure.
+        """
+        bus = await self._ensure_bus()
+        path = self._mac_to_dbus_path(mac)
 
-            # Pair
-            dev_obj = bus.get_proxy_object(
-                BLUEZ_SERVICE_NAME, path, await bus.introspect(BLUEZ_SERVICE_NAME, path)
-            )
+        dev_obj = bus.get_proxy_object(
+            BLUEZ_SERVICE_NAME, path, await bus.introspect(BLUEZ_SERVICE_NAME, path)
+        )
+        try:
+            dev_iface: DBusInterface = dev_obj.get_interface(DEVICE_INTERFACE)
+        except InterfaceNotFoundError as e:
+            logger.warning("Pair: device not found: %s", mac)
+            return False, e
 
-            try:
-                dev_iface: DBusInterface = dev_obj.get_interface(DEVICE_INTERFACE)
-            except InterfaceNotFoundError:
-                logger.exception("Device not found: %s", mac)
-                return False
+        try:
+            already_paired = bool(await dev_iface.get_paired())
+        except Exception:
+            already_paired = False  # property read failed; fall through to Pair() itself
 
+        if already_paired:
+            logger.info("Already paired with %s, skipping redundant Pair()", mac)
+        else:
             try:
                 await dev_iface.call_pair()
-                await dev_iface.set_trusted(True)
-
-                is_paired = bool(await dev_iface.get_paired())
-                logger.info("Paired with %s: %s", mac, is_paired)
-
-                # Disconnect after pairing
-                await asyncio.sleep(POST_PAIR_SETTLE_S)
-                with contextlib.suppress(Exception):
-                    await dev_iface.call_disconnect()
-
+            except DBusError as e:
+                if (getattr(e, "type", None) or "") == "org.bluez.Error.AlreadyExists":
+                    logger.info("Pair() returned AlreadyExists for %s -- treating as success", mac)
+                else:
+                    _log_dbus_failure("Device1.Pair", e)
+                    return False, e
             except Exception as e:
                 _log_dbus_failure("Device1.Pair", e)
-                logger.exception("Pairing failed")
-                return False
+                return False, e
 
-            else:
-                return is_paired
+        with contextlib.suppress(Exception):
+            await dev_iface.set_trusted(True)
+
+        try:
+            is_paired = bool(await dev_iface.get_paired())
+        except Exception:
+            # Pair()/AlreadyExists/the pre-check above all imply paired even
+            # if this read fails.
+            is_paired = True
+
+        logger.info("Paired with %s: %s", mac, is_paired)
+
+        if disconnect_after:
+            await asyncio.sleep(POST_PAIR_SETTLE_S)
+            with contextlib.suppress(Exception):
+                await dev_iface.call_disconnect()
+
+        return is_paired, None
 
     async def unpair(self, mac: str) -> bool:
         """
