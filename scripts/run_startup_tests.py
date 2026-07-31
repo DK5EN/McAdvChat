@@ -23,6 +23,7 @@ user info text must contain "Node" — the built-in test cases assume both.
 import asyncio
 import sys
 
+from ble_service_tests import run_ble_service_tests
 from config_migration_tests import run_config_migration_tests
 from update_runner_tests import run_update_runner_tests
 
@@ -48,7 +49,7 @@ from mcapp.udp_handler import run_startup_tests as run_udp_handler_tests
 from mcapp.udp_parsing_tests import run_udp_parsing_tests
 
 
-async def main() -> int:
+async def main() -> int:  # noqa: PLR0915 - flat suite registry; one visible line per suite is the point
     router = MessageRouter(None)
     router.set_callsign("DK5EN")
     suppression_ok = router.test_suppression_logic()
@@ -62,6 +63,9 @@ async def main() -> int:
 
     dedup_contract_ok = run_dedup_contract_tests()
     print(f"dedup_contract: {'PASS' if dedup_contract_ok else 'FAIL'}")
+
+    ble_service_ok = run_ble_service_tests()
+    print(f"ble_service: {'PASS' if ble_service_ok else 'FAIL'}")
 
     identity_ok = await run_identity_tests()
     print(f"identity: {'PASS' if identity_ok else 'FAIL'}")
@@ -136,6 +140,7 @@ async def main() -> int:
         and contract_parity_ok
         and dedup_contract_ok
         and identity_ok
+        and ble_service_ok
         and udp_ok
         and udp_parsing_ok
         and storage_ok

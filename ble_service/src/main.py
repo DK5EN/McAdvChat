@@ -189,6 +189,21 @@ def notification_callback(data: bytes) -> None:
 # --- State persistence ---
 
 
+def _resolved_device_name() -> str | None:
+    """The device name BlueZ resolved for the currently-connected device.
+
+    `adapter.connect()` populates `status.device.name` from the D-Bus `Name`
+    property, so by the time a connect (explicit or auto-reconnect) has
+    succeeded this is the real advertised name — e.g. "MC-b878-DK5EN-98".
+    Returns None when nothing is connected or BlueZ gave no name, so callers
+    can fall back rather than persist an empty string.
+    """
+    device = _adapter().status.device
+    if device is not None and device.name:
+        return str(device.name)
+    return None
+
+
 def _save_ble_state(mac: str, name: str | None = None) -> None:
     """Persist last-connected device to disk for restart recovery."""
     try:
@@ -464,7 +479,24 @@ async def _retry_connect(  # noqa: PLR0912, PLR0915 - consolidates two near-dupl
                 logger.info("%s successful to %s", label, mac)
                 state.reconnecting = False
                 state.reconnect_attempt = 0
-                _push_status_event(STATUS_CONNECTED, device_address=mac, device_name=name)
+                # Persist the name the adapter just resolved from BlueZ. Without
+                # this, `_save_ble_state` only ever ran from the /api/ble/connect
+                # route, so a device paired before the name-resolution fix (or
+                # connected by any path other than an explicit API call) kept
+                # `"device_name": null` in ble_state.json forever — every restart
+                # auto-reconnects, reloads the null, and logs "(None)" while
+                # /api/ble/status reports the real name. Observed live on
+                # mcapp.local after the 2026-07-31 deploy.
+                resolved = _resolved_device_name() or state.last_connected_name
+                if resolved and resolved != state.last_connected_name:
+                    state.last_connected_name = resolved
+                if resolved:
+                    _save_ble_state(mac, resolved)
+                _push_status_event(
+                    STATUS_CONNECTED,
+                    device_address=mac,
+                    device_name=state.last_connected_name or name,
+                )
                 _log_activity(profile.success_action, f"{profile.success_detail} {name}", "info")
                 return True
             logger.warning("%s attempt %d failed", label, attempt)
@@ -794,11 +826,7 @@ async def connect(request: ConnectRequest, _: bool = Depends(verify_api_key)) ->
             # point — fall back to it so ble_state.json and this log line
             # don't end up with "(no name)" while /api/ble/status correctly
             # reports the real name (observed on the live Pi).
-            resolved_name = request.device_name
-            if not resolved_name:
-                connected_device = _adapter().status.device
-                if connected_device is not None and connected_device.name:
-                    resolved_name = connected_device.name
+            resolved_name = request.device_name or _resolved_device_name()
             state.last_connected_name = resolved_name
             _save_ble_state(mac, resolved_name)
             _log_activity("connect_success", f"Connected to {mac}", "info")
