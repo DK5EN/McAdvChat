@@ -27,6 +27,7 @@ from ble_service_tests import run_ble_service_tests
 from config_migration_tests import run_config_migration_tests
 from update_runner_tests import run_update_runner_tests
 
+from mcapp.aprs_symbol_tests import run_aprs_symbol_tests
 from mcapp.ble_hydration_tests import run_ble_hydration_tests
 from mcapp.ble_protocol_tests import run_ble_protocol_tests
 from mcapp.classifier.tests import run_all_tests as run_classifier_tests
@@ -64,6 +65,9 @@ async def main() -> int:  # noqa: PLR0915 - flat suite registry; one visible lin
 
     dedup_contract_ok = run_dedup_contract_tests()
     print(f"dedup_contract: {'PASS' if dedup_contract_ok else 'FAIL'}")
+
+    aprs_symbol_ok = await run_aprs_symbol_tests()
+    print(f"aprs_symbol: {'PASS' if aprs_symbol_ok else 'FAIL'}")
 
     ble_service_ok = await run_ble_service_tests()
     print(f"ble_service: {'PASS' if ble_service_ok else 'FAIL'}")
@@ -143,6 +147,7 @@ async def main() -> int:  # noqa: PLR0915 - flat suite registry; one visible lin
         and send_path_ok
         and contract_parity_ok
         and dedup_contract_ok
+        and aprs_symbol_ok
         and identity_ok
         and ble_service_ok
         and udp_ok

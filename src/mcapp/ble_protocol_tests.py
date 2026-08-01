@@ -105,6 +105,39 @@ APRS_HUM = 42.1
 APRS_QFE = 940.3
 APRS_QNH = 956.9
 
+# --- APRS symbol table id: '/', '\', or an overlay (0-9 A-Z) ---------------
+# Built from chr(92) rather than a backslash literal, for the same reason
+# `udp_parsing_tests.py` mandates it: in Python source the correct value is
+# "\\" and the firmware's double-escape is "\\\\", which differ by two easily
+# miscounted characters. The BLE path decodes raw APRS text and must produce
+# exactly ONE character here — it is the only route that never doubles, and a
+# normalizer must never be added to it.
+APRS_BACKSLASH = chr(92)
+APRS_ONE_CHAR = 1
+# Same coordinates as APRS_N_E, so a failure reads as "the table id broke it"
+# rather than "the numbers moved".
+APRS_LAT_PREFIX = "!4812.34N"
+APRS_LON_MIDDLE = "01143.56E"
+APRS_SYMBOL_CODE = "#"
+# Every table id the MeshCom firmware is willing to transmit (`--symid` accepts
+# / \ 0-9 A-Z, validated in command_functions.cpp and loop_functions.cpp). The
+# boundary characters are here on purpose: an off-by-one in the character class
+# is invisible without them.
+APRS_ACCEPTED_TABLE_IDS = ("/", APRS_BACKSLASH, "0", "9", "A", "Z", "G")
+# Ids that must keep failing. Lowercase a-z marks the COMPRESSED position
+# format, which this uncompressed parser cannot decode; the four punctuation
+# characters each sit exactly one codepoint outside an accepted range, so they
+# fail a widened class that the accepted set alone would not notice.
+APRS_REJECTED_TABLE_IDS = ("g", "a", "z", ".", ":", "@", "[", "]")
+# A rejected id does not merely lose the symbol: the id sits in the MIDDLE of an
+# anchored pattern, so the whole match fails and the frame loses its
+# COORDINATES, which live nowhere else in the payload.
+APRS_NO_SYMBOL_CODE = f"{APRS_LAT_PREFIX}/{APRS_LON_MIDDLE}"
+APRS_QUESTION_CODE = f"{APRS_LAT_PREFIX}/{APRS_LON_MIDDLE}?"
+APRS_QUESTION_SYMBOL = "?"
+APRS_SPACE_CODE = f"{APRS_LAT_PREFIX}/{APRS_LON_MIDDLE} "
+APRS_SPACE_SYMBOL = " "
+
 # --- timestamp scaling ---
 MIN_MS_YEAR_2001 = 1_000_000_000_000  # a ms epoch > this proves ms (not s) scaling
 
@@ -358,6 +391,72 @@ def _test_aprs_position(results: list[tuple[str, bool]]) -> None:
     )
 
 
+def _test_aprs_symbol_table_ids(results: list[tuple[str, bool]]) -> None:
+    """The symbol table id: '/', a single backslash, or an overlay (0-9 A-Z).
+
+    This suite previously had NO backslash and NO overlay fixture at all, which
+    is how a parser stricter than the firmware that feeds it went unnoticed. The
+    corpus-driven twin of these cases lives in `aprs_symbol_tests.py`; the
+    duplication is deliberate redundancy at a seam, not waste.
+    """
+    for table_id in APRS_ACCEPTED_TABLE_IDS:
+        message = f"{APRS_LAT_PREFIX}{table_id}{APRS_LON_MIDDLE}{APRS_SYMBOL_CODE}"
+        parsed = parse_aprs_position(message)
+        _check(
+            results,
+            f"APRS table id {table_id!r} (U+{ord(table_id):04X}) parses, keeps its "
+            "coordinates, and echoes exactly one character",
+            parsed is not None
+            and _close(parsed["lat"], APRS_N_E_LAT)
+            and _close(parsed["lon"], APRS_N_E_LON)
+            and parsed.get("aprs_symbol_group") == table_id
+            and len(str(parsed.get("aprs_symbol_group"))) == APRS_ONE_CHAR
+            and parsed.get("aprs_symbol") == APRS_SYMBOL_CODE,
+        )
+
+    for table_id in APRS_REJECTED_TABLE_IDS:
+        message = f"{APRS_LAT_PREFIX}{table_id}{APRS_LON_MIDDLE}{APRS_SYMBOL_CODE}"
+        _check(
+            results,
+            f"APRS table id {table_id!r} (U+{ord(table_id):04X}) is rejected outright — "
+            "the whole position, coordinates included, returns None",
+            parse_aprs_position(message) is None,
+        )
+
+    # Absent symbol code -> the KEY is omitted, never defaulted to a placeholder.
+    # '?' was the old fallback and is itself a valid APRS code (info kiosk), so
+    # the placeholder published "we don't know" as a confident specific answer
+    # and overwrote a symbol the station had previously reported correctly.
+    no_code = parse_aprs_position(APRS_NO_SYMBOL_CODE)
+    _check(
+        results,
+        "APRS with no symbol code: aprs_symbol key is OMITTED (never defaulted to '?')",
+        no_code is not None
+        and "aprs_symbol" not in no_code
+        and no_code.get("aprs_symbol_group") == APRS_N_E_GROUP
+        and _close(no_code["lat"], APRS_N_E_LAT),
+    )
+
+    # The other half: a station that really does beacon '?' must keep it. A fix
+    # that maps '?' to absence passes the case above and fails this one.
+    question = parse_aprs_position(APRS_QUESTION_CODE)
+    _check(
+        results,
+        "APRS with a genuine '?' symbol code keeps it (it is a real symbol, not 'unknown')",
+        question is not None and question.get("aprs_symbol") == APRS_QUESTION_SYMBOL,
+    )
+
+    # The optional trailing group is [ -~], which starts at 0x20: a space is a
+    # captured code, not a missing one. Tightening the class to [!-~] would
+    # silently turn this into the absent case above.
+    space = parse_aprs_position(APRS_SPACE_CODE)
+    _check(
+        results,
+        "APRS with a ' ' symbol code captures it (the class [ -~] includes 0x20)",
+        space is not None and space.get("aprs_symbol") == APRS_SPACE_SYMBOL,
+    )
+
+
 def _test_timestamp(results: list[tuple[str, bool]]) -> None:
     # The documented fallback: invalid input parses "1970-01-01 00:00:00" via the
     # SAME local-wall-clock success path, so drive that reference through the
@@ -393,6 +492,7 @@ def run_ble_protocol_tests() -> bool:
     _test_fcs(results)
     _test_ack(results)
     _test_aprs_position(results)
+    _test_aprs_symbol_table_ids(results)
     _test_timestamp(results)
 
     for label, ok in results:

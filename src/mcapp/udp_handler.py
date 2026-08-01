@@ -18,7 +18,7 @@ from typing import Any, cast
 from .commands.parsing import strip_relay_path
 from .logging_setup import get_logger
 from .runtime_state import save_runtime_state
-from .util import FEET_TO_METERS, now_ms
+from .util import FEET_TO_METERS, now_ms, undouble_aprs_symbol_escapes
 
 logger = get_logger(__name__)
 
@@ -57,41 +57,77 @@ def _normalize_altitude_to_meters(message: dict[str, Any]) -> None:
         message["alt"] = round(message["alt"] * FEET_TO_METERS)
 
 
-# The MeshCom firmware hand-escapes a backslash in sendExtern()'s JSON builder
-# (extudp_functions.cpp:379/385) and then lets ArduinoJson escape it again, so the
-# alternate symbol table arrives here as two characters instead of one. Both fields
-# are single characters by APRS definition, so a two-backslash value is unambiguously
-# the firmware's double-escape and never a legitimate symbol. The BLE path decodes the
-# same beacon from raw APRS text and already yields one character — see
-# aprs-escape-bug.md for the per-path evidence.
-_APRS_SYMBOL_FIELDS = ("aprs_symbol", "aprs_symbol_group")
-_FIRMWARE_DOUBLED_BACKSLASH = "\\\\"  # two characters
-_APRS_ALTERNATE_TABLE = "\\"  # one character
+# The APRS symbol normalizer has exactly ONE definition, in `util`, shared with the
+# one-time repair job for rows already on disk
+# (`storage/ingest.backfill_aprs_symbol_escapes`): both need the identical rule, and
+# two copies of an escaping rule whose correctness rests on a one-character
+# difference is how that bug class comes back. Why this ingress is the only LIVE
+# caller is documented on the function itself.
+#
+# Re-bound to its historical private name because that is what this ingress has
+# always called and what `udp_parsing_tests.py` imports from this module. An
+# assignment, not `import ... as _name`: under `mypy --strict`
+# (`no_implicit_reexport`) an aliased import is not an export, a module-level
+# definition is.
+_undouble_aprs_symbol_escapes = undouble_aprs_symbol_escapes
+
+# Every top-level field of the Extern-UDP wire format is a JSON SCALAR. That is not
+# an assumption: `sendExtern()` builds the `pos`, `msg` and `tele` documents key by
+# key out of C strings and numbers (`extudp_functions.cpp:401-481`), and
+# `doc/UDP-2.0-impl.md` §2.1 enumerates the same flat field set. json.loads can only
+# produce a dict or a list on top of those scalars, so anything non-scalar arriving
+# here came from something that is not the firmware.
+_JSON_SCALAR_TYPES = (str, int, float, bool, type(None))
+
+# ...with exactly one exception, and it is not a firmware one: `extras` is the one
+# key MCProxy itself reads as a container — `storage/ingest.store_telemetry` merges
+# `data["extras"]` when it is a dict, filled by `ble_protocol.parse_aprs_position`'s
+# `/KEY=VALUE` capture. No firmware datagram carries it today, and it is the only
+# container-shaped read in the whole ingest path, but dropping a field the storage
+# layer explicitly supports would turn this guard into silent data loss the day a
+# sender does send it — so it is allowlisted here rather than rediscovered later
+# from a missing telemetry column.
+_NON_SCALAR_ALLOWED_FIELDS = frozenset({"extras"})
 
 
-def _undouble_aprs_symbol_escapes(message: dict[str, Any]) -> None:
-    """Collapse the firmware's double-escaped backslash back to one character.
+def _strip_non_scalar_fields(message: dict[str, Any]) -> list[str]:
+    """Remove top-level fields whose value is not a JSON scalar; return their names.
 
-    Deliberately an exact match on the two-character value, not a
-    ``str.replace()``: a blanket replace would also rewrite a longer string that
-    merely happens to contain two backslashes, and this normalization is only
-    ever correct for a field whose entire value is the doubled escape.
+    Port 1799 is unauthenticated (see `_is_trusted_node_source`), so the parsed
+    datagram is attacker-shaped, and a nested object where the wire format promises
+    a scalar used to travel all the way down into `store_message`. Measured on a
+    lora `pos` frame with one field replaced by `{}`, the damage varies by field
+    and none of it is a clean rejection:
 
-    Only this — the single Extern-UDP :1799 ingress — is normalized. Everything
-    else stays untouched on purpose: single-character overlay ids (``G``, ``M``,
-    ``0-9``, ``A-Z``) are valid APRS overlays rather than corruption, the
-    oevsv.at internet feed's ``KFR`` alias never reaches this socket and is the
-    frontend's concern, and genuine junk (a space, ``U+FFFD``) must keep failing
-    symbol resolution instead of being silently mapped to something plausible.
+    * `firmware` / `fw_sub` / `batt` — the WORST case. `_ingest_signal` completes
+      and COMMITs, then `_store_position`'s upsert dies on the bind, so the station
+      row survives HALF-POPULATED (rssi/snr/last_seen present, no coordinates, no
+      symbol) — worse than never having stored it.
+    * `hw_id` — dies inside `_ingest_signal` itself, after its `signal_log` INSERT:
+      an orphaned signal row, no station row.
+    * `msg_id` — dies on the dedup SELECT's bind, before any write.
+    * `rssi` / `snr` — `TypeError` from the range comparison; `src` — `AttributeError`
+      from `src.split`. All three are raised BEFORE SQLite is reached, which is why
+      widening a `try/except sqlite3.Error` around the DB calls would have closed
+      only part of this. Rejecting the shape at the one ingress that can produce it
+      covers every field at once.
 
-    ``dict.get()`` compared against a string constant tolerates both an absent
-    field and a non-string value (an int, ``None``) without raising, which
-    matters because the payload is attacker-shaped JSON off an unauthenticated
-    socket.
+    Severity is low and this is pre-existing (an attacker only corrupts the station
+    row of the callsign in their OWN datagram, and `main.py` already prints a full
+    traceback when it happens) — the point is the half-written row, not silence.
+
+    Dropping the offending FIELD rather than the whole datagram is deliberate: a
+    legitimate frame that picked up one junk key still delivers its position and
+    signal, and every field that survives is one SQLite can actually bind.
     """
-    for field in _APRS_SYMBOL_FIELDS:
-        if message.get(field) == _FIRMWARE_DOUBLED_BACKSLASH:
-            message[field] = _APRS_ALTERNATE_TABLE
+    dropped = [
+        key
+        for key, value in message.items()
+        if key not in _NON_SCALAR_ALLOWED_FIELDS and not isinstance(value, _JSON_SCALAR_TYPES)
+    ]
+    for key in dropped:
+        del message[key]
+    return dropped
 
 
 def is_allowed_char(ch: str) -> bool:  # noqa: PLR0911 - complex handler kept intact
@@ -283,6 +319,11 @@ class UDPHandler:
         # is unauthenticated, so this must not become a log amplifier.
         self._untrusted_source_ips: dict[str, None] = {}
         self._untrusted_cap_logged = False
+        # Same shape again, for sources that sent a field whose value is not a
+        # JSON scalar (`_strip_non_scalar_fields`). Bounded for the same reason:
+        # the port is unauthenticated, so a WARNING per malformed datagram would
+        # be a remotely-triggerable log amplifier.
+        self._non_scalar_source_ips: dict[str, None] = {}
         self._persist_disabled_logged = False
         # Anti-flap accounting for the identified-vs-identified case; see
         # `_TARGET_CHANGE_COOLDOWN_S`. `None` = no change has happened yet, so
@@ -377,6 +418,10 @@ class UDPHandler:
         # backslash is already canonical and would be corrupted by a second pass.
         _undouble_aprs_symbol_escapes(message)
 
+        # Same choke point, same reason: every publish path below (and therefore
+        # every SQLite bind derived from it) is covered exactly once.
+        self._reject_non_scalar_fields(message, addr[0])
+
         if "msg" not in message:
             if message.get("type") == "tele":
                 message["timestamp"] = now_ms()
@@ -438,6 +483,44 @@ class UDPHandler:
                 message.get("src_type", "<MISSING>"),
                 list(message.keys()),
             )
+
+    def _reject_non_scalar_fields(self, message: dict[str, Any], ip_str: str) -> None:
+        """Apply `_strip_non_scalar_fields` and make the drop diagnosable.
+
+        Two levels on purpose. The DEBUG line fires for EVERY drop, so an operator
+        chasing a sender that keeps losing a field always has the full picture with
+        `MCAPP_ENV=dev`. The WARNING — the one an untouched production log shows —
+        fires once per distinct source address and is bounded at
+        `_MAX_TRACKED_SOURCE_IPS`, matching `_note_untrusted_source`: :1799 is
+        unauthenticated, so anything that logs once per inbound datagram is a
+        remote-controlled log amplifier. Hitting the bound needs no notice of its
+        own here (unlike the tracking caps above, which stop the ONLY report):
+        the per-drop DEBUG line still covers every source.
+        """
+        dropped = _strip_non_scalar_fields(message)
+        if not dropped:
+            return
+
+        logger.debug(
+            "UDP: dropped non-scalar field(s) %s from a datagram sent by %s "
+            "(the Extern-UDP wire format is flat scalars only)",
+            dropped,
+            ip_str,
+        )
+        if ip_str in self._non_scalar_source_ips:
+            return
+        if len(self._non_scalar_source_ips) >= _MAX_TRACKED_SOURCE_IPS:
+            return
+        self._non_scalar_source_ips[ip_str] = None
+        logger.warning(
+            "UDP: datagram from %s carried non-scalar value(s) for top-level field(s) %s; "
+            "dropped those field(s) and kept the rest. The Extern-UDP wire format defines "
+            "only flat scalar fields; a nested object/array reaches SQLite as a bind "
+            "parameter and can leave that station's row half-written. Reported once per "
+            "source address.",
+            ip_str,
+            dropped,
+        )
 
     def _current_my_callsign(self) -> str | None:
         """Live read of the router's own callsign (Wave 1's `apply_callsign`

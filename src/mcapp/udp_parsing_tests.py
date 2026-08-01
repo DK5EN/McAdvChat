@@ -11,6 +11,8 @@ standalone parsing helpers that had no coverage before:
 * ``_undouble_aprs_symbol_escapes`` — the MeshCom firmware's double-escaped
   backslash on the alternate APRS symbol table (see ``aprs-escape-bug.md``),
   both as a unit and end-to-end through ``_process_received_message``.
+* ``_strip_non_scalar_fields`` — the container-shaped-value guard that runs at
+  the same ingress choke point, again both as a unit and end-to-end.
 * The ``NODE-<octet>`` pseudo-callsign derivation inside
   ``UDPHandler._process_received_message``.
 
@@ -35,6 +37,7 @@ from .udp_handler import (
     MAX_JSON_REPAIR_ATTEMPTS,
     UDPHandler,
     _normalize_altitude_to_meters,
+    _strip_non_scalar_fields,
     _undouble_aprs_symbol_escapes,
     strip_invalid_utf8,
     try_repair_json,
@@ -105,6 +108,34 @@ _CAPTURE_SENDER_IP = "192.168.68.57"
 # the real wire, so this fixture exists only to prove the normalizer runs ABOVE
 # the tele/msg branch rather than inside one of them.
 _TELE_SRC_CALLSIGN = "DK5EN-98"
+
+# --- non-scalar guard (`_strip_non_scalar_fields`) -------------------------
+# Every top-level field of the Extern-UDP wire format is a JSON scalar, so
+# json.loads can only produce a dict or a list on top of them — and both used to
+# travel down into `store_message` and die on the SQLite bind AFTER
+# `_ingest_signal` had already committed, leaving the station row
+# HALF-POPULATED (rssi/snr, no coordinates, no symbol). The guard drops the
+# offending FIELD, not the datagram, so a legitimate frame that picked up one
+# junk key still delivers its position.
+#
+# Both container shapes need a fixture: a dict and a list fail differently in
+# SQLite and an `isinstance` written against only one of them would pass here.
+_CONTAINER_DICT_VALUE = {"nested": 1}
+_CONTAINER_LIST_VALUE = [1, 2]
+# `extras` is the ONE allowlisted container key — `storage/ingest.store_telemetry`
+# merges it when it is a dict. Dropping it would turn this guard into silent
+# telemetry loss the day a sender does send it.
+_ALLOWLISTED_CONTAINER_FIELD = "extras"
+_EXTRAS_VALUE = {"CO2": 412.0}
+# JSON scalars, all of which must survive. `None` and `True` are the two that a
+# naive `isinstance(value, (str, int, float))` check would silently drop.
+_SCALAR_FIELD_VALUES: tuple[tuple[str, Any], ...] = (
+    ("src", "DL2JA-2"),
+    ("hw_id", 3),
+    ("lat", 48.2454),
+    ("gw", True),
+    ("alt", None),
+)
 
 
 class _CaptureRouter:
@@ -430,6 +461,136 @@ def _test_undouble_aprs_symbol_escapes() -> list[tuple[str, bool]]:
     return results
 
 
+def _test_strip_non_scalar_fields() -> list[tuple[str, bool]]:
+    """Unit cases for the container-shaped-value guard at the :1799 ingress.
+
+    Port 1799 is unauthenticated, so the parsed datagram is attacker-shaped. The
+    guard must reject the SHAPE (drop the field, keep the frame) rather than
+    raise, and it must not sweep up the scalars or the one allowlisted container.
+    """
+    results: list[tuple[str, bool]] = []
+
+    # (1) A dict where the wire format promises a scalar: field dropped, its name
+    #     reported, and the rest of the datagram intact.
+    with_dict: dict[str, Any] = {
+        "type": "pos",
+        "src": _TELE_SRC_CALLSIGN,
+        _SYMBOL_GROUP_FIELD: _CONTAINER_DICT_VALUE,
+    }
+    dropped_dict = _strip_non_scalar_fields(with_dict)
+    results.append(
+        (
+            "non-scalar: dict-valued aprs_symbol_group dropped, rest of the frame kept",
+            dropped_dict == [_SYMBOL_GROUP_FIELD]
+            and _SYMBOL_GROUP_FIELD not in with_dict
+            and with_dict == {"type": "pos", "src": _TELE_SRC_CALLSIGN},
+        )
+    )
+
+    # (2) The other container shape.
+    with_list: dict[str, Any] = {"type": "pos", _SYMBOL_CODE_FIELD: _CONTAINER_LIST_VALUE}
+    dropped_list = _strip_non_scalar_fields(with_list)
+    results.append(
+        (
+            "non-scalar: list-valued aprs_symbol dropped",
+            dropped_list == [_SYMBOL_CODE_FIELD] and _SYMBOL_CODE_FIELD not in with_list,
+        )
+    )
+
+    # (3) `extras` is allowlisted and its dict must survive.
+    with_extras: dict[str, Any] = {
+        "type": "tele",
+        _ALLOWLISTED_CONTAINER_FIELD: _EXTRAS_VALUE,
+        "junk": _CONTAINER_DICT_VALUE,
+    }
+    dropped_extras = _strip_non_scalar_fields(with_extras)
+    results.append(
+        (
+            (
+                "non-scalar: 'extras' is allowlisted — its dict survives while a sibling "
+                "container is still dropped"
+            ),
+            dropped_extras == ["junk"]
+            and with_extras.get(_ALLOWLISTED_CONTAINER_FIELD) == _EXTRAS_VALUE,
+        )
+    )
+
+    # (4) Every JSON scalar survives, including None and True.
+    for field, value in _SCALAR_FIELD_VALUES:
+        scalar_msg: dict[str, Any] = {field: value}
+        dropped_scalar = _strip_non_scalar_fields(scalar_msg)
+        results.append(
+            (
+                f"non-scalar: scalar field {field!r} ({type(value).__name__}) survives",
+                dropped_scalar == [] and field in scalar_msg and scalar_msg[field] == value,
+            )
+        )
+
+    # (5) Nothing to drop: the helper reports an empty list, invents no field.
+    clean: dict[str, Any] = {"type": "pos", "src": _TELE_SRC_CALLSIGN}
+    expected_clean = {"type": "pos", "src": _TELE_SRC_CALLSIGN}
+    results.append(
+        (
+            "non-scalar: an all-scalar datagram is untouched and reports no drops",
+            _strip_non_scalar_fields(clean) == [] and clean == expected_clean,
+        )
+    )
+    return results
+
+
+async def _test_non_scalar_end_to_end() -> list[tuple[str, bool]]:
+    """The guard must be CALLED at the ingress, above every publish branch.
+
+    A correct helper with a missing call site is exactly the regression the unit
+    cases above cannot see — and the failure mode it prevents is a half-written
+    station row, not an exception, so nothing else would notice either.
+    """
+    results: list[tuple[str, bool]] = []
+    datagram = json.dumps(
+        {
+            "src_type": "lora",
+            "type": "pos",
+            "src": _TELE_SRC_CALLSIGN,
+            "msg": "",
+            "lat": 48.2454,
+            "lon": 11.3693,
+            _SYMBOL_CODE_FIELD: _APRS_SYMBOL_CODE_HOUSE,
+            _SYMBOL_GROUP_FIELD: _CONTAINER_DICT_VALUE,
+        }
+    ).encode()
+
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        router = _CaptureRouter()
+        handler = UDPHandler(
+            listen_port=0,
+            target_host="127.0.0.1",
+            target_port=0,
+            message_router=router,
+            runtime_state_path=Path(tmp_dir) / "runtime.json",
+        )
+        try:
+            # White-box: drive the real ingress path.
+            await handler._process_received_message(datagram, (_CAPTURE_SENDER_IP, _SENDER_PORT))
+        finally:
+            handler.send_socket.close()
+
+    published: dict[str, Any] = router.calls[-1][2] if router.calls else {}
+    results.append(
+        (
+            "non-scalar e2e: the frame still reaches the router (field dropped, not datagram)",
+            bool(router.calls) and published.get("lat") is not None,
+        )
+    )
+    results.append(
+        (
+            "non-scalar e2e: the container-valued symbol group never reaches the router",
+            _SYMBOL_GROUP_FIELD not in published
+            and published.get(_SYMBOL_CODE_FIELD) == _APRS_SYMBOL_CODE_HOUSE,
+        )
+    )
+    return results
+
+
 async def _test_aprs_escape_end_to_end() -> list[tuple[str, bool]]:
     """End-to-end through ``UDPHandler._process_received_message``.
 
@@ -540,6 +701,8 @@ async def run_udp_parsing_tests() -> bool:
     results.extend(_test_normalize_altitude())
     results.extend(_test_undouble_aprs_symbol_escapes())
     results.extend(await _test_aprs_escape_end_to_end())
+    results.extend(_test_strip_non_scalar_fields())
+    results.extend(await _test_non_scalar_end_to_end())
     results.extend(await _test_pseudo_callsign())
 
     for label, passed in results:

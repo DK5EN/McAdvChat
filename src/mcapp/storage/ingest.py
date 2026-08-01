@@ -17,7 +17,13 @@ from statistics import mean
 from typing import Any
 
 from ..logging_setup import get_logger
-from ..util import FEET_TO_METERS, now_ms
+from ..util import (
+    APRS_ALTERNATE_TABLE,
+    FEET_TO_METERS,
+    FIRMWARE_DOUBLED_BACKSLASH,
+    now_ms,
+    undouble_aprs_symbol_escapes,
+)
 from ._base import StorageBase
 from .constants import (
     ACK_DIAG_WINDOW_MS,
@@ -42,32 +48,16 @@ _MAX_FORENSIC_HOPS = 4  # log raw data for messages routed over more hops
 _MIN_PLAUSIBLE_HPA = 850  # pressure below this is a firmware mapping error
 
 # --- APRS symbol double-escape (firmware bug, see backfill_aprs_symbol_escapes) --
-# Written as escaped Python literals on purpose: a raw literal would make the
-# one-vs-two character distinction that this whole backfill turns on impossible to
-# see. `_FIRMWARE_DOUBLED_BACKSLASH` is TWO 0x5C bytes (what the firmware sends),
-# `_APRS_ALTERNATE_TABLE` is ONE (the APRS alternate symbol table id).
-_FIRMWARE_DOUBLED_BACKSLASH = "\\\\"
-_APRS_ALTERNATE_TABLE = "\\"
-_APRS_SYMBOL_FIELDS = ("aprs_symbol", "aprs_symbol_group")
+# `FIRMWARE_DOUBLED_BACKSLASH` (TWO 0x5C characters, what the firmware sends),
+# `APRS_ALTERNATE_TABLE` (ONE, the real symbol table id) and the normalizer that
+# maps one to the other are defined ONCE, in `..util`, and shared with the
+# `udp_handler` ingress that cleans new traffic. This module used to carry its own
+# copy of all three — a second, silently divergable definition of a rule whose whole
+# correctness rests on a one-character difference. Only the backfill marker below is
+# genuinely local.
 _APRS_ESCAPE_BACKFILL_MARKER = "aprs_escape_backfill_done:v1"
 
 logger = get_logger(__name__)
-
-
-def _undouble_aprs_symbol_escapes(payload: dict[str, Any]) -> bool:
-    """Collapse a double-escaped backslash in `payload`'s APRS symbol fields, in place.
-
-    Returns True if anything changed. Only the exact two-character value is rewritten:
-    a legitimate single `\\`, an overlay id (`G`, `M`, ...), `/`, the oevsv.at feed's
-    `KFR` alias and honest garbage all pass through untouched, and a non-string value
-    simply never compares equal. See `backfill_aprs_symbol_escapes` for the root cause.
-    """
-    changed = False
-    for field in _APRS_SYMBOL_FIELDS:
-        if payload.get(field) == _FIRMWARE_DOUBLED_BACKSLASH:
-            payload[field] = _APRS_ALTERNATE_TABLE
-            changed = True
-    return changed
 
 
 class IngestMixin(StorageBase):
@@ -528,11 +518,11 @@ class IngestMixin(StorageBase):
         # ever built by string interpolation.
         positions_group_fixed = await self._mutate(
             "UPDATE station_positions SET aprs_symbol_group = ? WHERE aprs_symbol_group = ?",
-            (_APRS_ALTERNATE_TABLE, _FIRMWARE_DOUBLED_BACKSLASH),
+            (APRS_ALTERNATE_TABLE, FIRMWARE_DOUBLED_BACKSLASH),
         )
         positions_symbol_fixed = await self._mutate(
             "UPDATE station_positions SET aprs_symbol = ? WHERE aprs_symbol = ?",
-            (_APRS_ALTERNATE_TABLE, _FIRMWARE_DOUBLED_BACKSLASH),
+            (APRS_ALTERNATE_TABLE, FIRMWARE_DOUBLED_BACKSLASH),
         )
 
         # --- messages.raw_json: select narrowly, rewrite through json ------------
@@ -548,7 +538,7 @@ class IngestMixin(StorageBase):
             "            THEN json_extract(raw_json, '$.aprs_symbol_group') = ?"
             "              OR json_extract(raw_json, '$.aprs_symbol') = ?"
             "            ELSE 0 END",
-            (_FIRMWARE_DOUBLED_BACKSLASH, _FIRMWARE_DOUBLED_BACKSLASH),
+            (FIRMWARE_DOUBLED_BACKSLASH, FIRMWARE_DOUBLED_BACKSLASH),
         )
 
         updates: list[tuple[str, int]] = []
@@ -569,7 +559,7 @@ class IngestMixin(StorageBase):
             # written by `json.dumps` on the ingest path, so loads/dumps with the same
             # defaults reproduces the original text byte for byte apart from the two
             # values corrected here (dict order is JSON document order).
-            if not _undouble_aprs_symbol_escapes(payload):
+            if not undouble_aprs_symbol_escapes(payload):
                 continue
             updates.append((json.dumps(payload), row["id"]))
 

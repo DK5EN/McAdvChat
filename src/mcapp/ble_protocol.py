@@ -241,11 +241,71 @@ def timestamp_from_date_time(date: str, time_str: str) -> int:
 
 
 def parse_aprs_position(message: str) -> dict[str, Any] | None:  # noqa: PLR0912 - complex handler kept intact
-    """Parse APRS position format"""
+    """Parse an uncompressed APRS position report into a flat field dict.
 
-    # Extended APRS position format with optional symbol and symbol group
+    Returns None when `message` is not an APRS position at all. That None is
+    expensive: `transform_pos` turns it into `{}`, so the emitted pos frame has
+    no lat/lon/symbol whatsoever, and `_store_position`'s `if lat and lon` gate
+    then writes nothing — the station silently drops off the map. The position
+    exists ONLY in this ASCII payload (the binary `@!` footer carries hw/mod/
+    fcs/fw, never coordinates), so a None here has no rescue path downstream.
+    Hence the regex must accept everything the firmware is willing to transmit,
+    no more and no less (see the table-id note below).
+
+    Symbol fields:
+
+    * `aprs_symbol_group` — the symbol *table id*. Always present whenever this
+      function returns a dict, because the regex requires it.
+    * `aprs_symbol` — the symbol *code*. The key is **omitted entirely** when
+      the frame carries no code, rather than defaulted to a placeholder.
+      `"?"` (the previous fallback) is not a safe stand-in: it is itself a valid
+      APRS symbol code (info kiosk / file server), so "we don't know" was being
+      published as a confident, specific, wrong answer — and, because
+      `_store_position`'s UPSERT keeps the stored symbol only while the incoming
+      one is NULL or '', that synthesised `?` also overwrote a symbol the
+      station had previously reported correctly.
+
+      Omission is how every other optional field here already signals absence
+      (`alt`, `batt`, `group_N`, the weather fields, `extras`), and it is the
+      only representation that stays absent the whole way down: the key never
+      enters the SSE frame, `_store_position` binds SQL NULL via
+      `data.get("aprs_symbol")`, the UPSERT's `IS NOT NULL AND != ''` guard
+      therefore PRESERVES the station's earlier symbol, and `query.py`'s
+      truthiness guard leaves the field out of the read payload. An empty
+      string would behave identically in SQL but is merely falsy-but-present on
+      the wire — consumers would receive `"aprs_symbol": ""` and have to
+      special-case it. The webapp is being moved to treat a missing symbol
+      field as genuinely absent, so absence is now the well-handled signal.
+
+      To be explicit about the risk this trades against: a pin can only lose
+      its glyph when the station never supplied a real code in the first place.
+      A code that WAS reported is still parsed and still stored, and a frame
+      without one no longer clobbers it, so nothing that used to render a real
+      symbol starts rendering nothing.
+    """
+
+    # --- symbol table id: `/`, `\`, or an overlay character ---
+    # APRS allows a third form besides the two symbol tables: an *overlay* id,
+    # a single character from 0-9 A-Z, selecting the alternate table with that
+    # character drawn over the glyph. The accept-set below is byte-for-byte the
+    # firmware's own, which validates the same set in two places:
+    #   MeshCom-Firmware src/command_functions.cpp (--symid handler) — anything
+    #     outside `/ \ 0-9 A-Z` is rejected and the previous id restored,
+    #     with the diagnostic "Symbol Table nur / \ 0-9 A-Z";
+    #   MeshCom-Firmware src/loop_functions.cpp (beacon build) — same three
+    #     tests, falling back to `/` + `#`, above the comment
+    #     "Symbol Table / \ 0-9 A-Z  (compressed a-z)".
+    # Lowercase a-z stays deliberately EXCLUDED: in APRS it marks the
+    # *compressed* position format, which this uncompressed parser cannot
+    # decode and which the firmware refuses to transmit as a table id.
+    # This character class sits in the MIDDLE of an anchored pattern, so
+    # narrowing it does not merely lose the symbol — it fails the whole match
+    # and costs the frame its coordinates (see the docstring). Widening it is
+    # purely additive: `/` and `\` frames match exactly as before, only inputs
+    # that previously returned None can newly succeed.
     match = re.match(
-        r"!(\d{2})(\d{2}\.\d{2})([NS])([/\\])(\d{3})(\d{2}\.\d{2})([EW])([ -~]?)", message
+        r"!(\d{2})(\d{2}\.\d{2})([NS])([/\\0-9A-Z])(\d{3})(\d{2}\.\d{2})([EW])([ -~]?)",
+        message,
     )
     if not match:
         return None
@@ -260,13 +320,15 @@ def parse_aprs_position(message: str) -> dict[str, Any] | None:  # noqa: PLR0912
     if lon_dir == "W":
         lon = -lon
 
-    result = {
+    result: dict[str, Any] = {
         "transformer2": "APRS",
         "lat": round(lat, 4),
         "lon": round(lon, 4),
-        "aprs_symbol": symbol or "?",
         "aprs_symbol_group": symbol_group,
     }
+    # Absent symbol code -> absent key. Never a placeholder; see the docstring.
+    if symbol:
+        result["aprs_symbol"] = symbol
 
     # Altitude in feet: /A=001526
     alt_match = re.search(r"/A=(\d{6})", message)
