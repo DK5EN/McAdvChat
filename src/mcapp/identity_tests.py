@@ -35,6 +35,7 @@ from __future__ import annotations
 
 import ast
 import asyncio
+import contextlib
 import inspect
 import json
 import os
@@ -43,13 +44,13 @@ import tempfile
 import textwrap
 import threading
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
 from pathlib import Path
 from typing import Any
 
 from . import config_loader
 from . import main as main_module
-from .ble_client import BLEDevice, ConnectionState
+from .ble_client import BLEDevice, BLEMode, ConnectionState
 from .commands.constants import has_console
 from .commands.handler import create_command_handler
 from .config_loader import Config
@@ -884,11 +885,71 @@ async def _test_ble_gps_detection_persists_and_debounces(
         setattr(main_module, "save_runtime_state", original_save)  # noqa: B010 - deliberate monkeypatch
 
 
+# The exact command sequence `MessageRouter._query_ble_registers` issues, in
+# order. The ORDER is load-bearing, not incidental: "I" (callsign/firmware) and
+# "G" (GPS fix) go first so that a sweep cut short by BLE_REQUERY_TIMEOUT_S has
+# still delivered the two registers the rest of mcapp actually depends on.
+_EXPECTED_REGISTER_SWEEP = [
+    "--info",  # TYP: I  — FWVER/CALL/ID/HWID
+    "--pos",  # TYP: G  — GPS fix
+    "--nodeset",  # TYP: SN
+    "--aprsset",  # TYP: SA
+    "--seset",  # TYP: SE + S1 — two frames, longer delay
+    "--wifiset",  # TYP: SW + S2 — two frames, longer delay
+    "--wx",  # TYP: W
+    "--analogset",  # TYP: AN
+    "--io",  # TYP: IO
+    "--tel",  # TYP: TM
+]
+
+# Ceiling for awaiting a scheduled hydration sweep in this suite. Every delay
+# the sweep would otherwise pay is patched to zero, so a well-behaved sweep
+# finishes in milliseconds and this bound is only ever reached by a regression.
+_SWEEP_WAIT_S = 2.0
+# Ceiling for the wedged case, which is cut off by the (scoped) production
+# timeout rather than by finishing — 10x the timeout below, so it is generous
+# on a loaded machine and still fails loudly if the bound disappears.
+_WEDGED_WAIT_S = 1.0
+# BLE_REQUERY_TIMEOUT_S while the wedged case runs. Scoped to that one case:
+# it is the only case that WANTS the sweep cut off.
+_WEDGED_TIMEOUT_S = 0.1
+# Sentinel value for BLE_HYDRATE_BURST_CLEAR_DELAY_S — the delay a sweep pays
+# when it is scheduled with `after_hello=True`. Far beyond _SWEEP_WAIT_S on
+# purpose: any sweep below that completes inside the bound thereby proves it
+# was scheduled with `after_hello=False`.
+_BURST_SENTINEL_DELAY_S = 30.0
+
+
+class _StubBLEStatus:
+    """The subset of `BLEStatus` the hydration path reads: `state` for the two
+    connectivity probes, plus the three fields `_handle_ble_info_command` puts
+    into the `blueZ` frame the sweep broadcasts when it is done.
+
+    Those three are not decoration. `_run_ble_register_hydration` finishes by
+    calling that handler, so a state-only stand-in makes the closing push raise
+    AttributeError inside the sweep — swallowed by the task's `except
+    Exception`, which means the sweep still "passes" while exercising the error
+    path and logging a traceback into the test output.
+    """
+
+    def __init__(self, state: Any) -> None:
+        self.state = state
+        self.device_address = "AA:BB:CC:DD:EE:FF"
+        self.device_name = "MeshCom-stub"
+        self.mode = BLEMode.REMOTE
+
+
 class _StubBLEClient:
     """Minimal duck-type of the registered `ble_client` protocol, recording the
     commands `_query_ble_registers` sends. `hang` makes `send_command` block
     forever, standing in for a `ble_service` that answered "connected" and then
     wedged; `raising` makes even the connection probe explode.
+
+    `refresh_status` exists because `_run_ble_register_hydration` prefers it
+    over the cached `.status` (the real `BLEClientRemote` has it, and the sweep
+    deliberately re-validates the link against `ble_service` once it is off the
+    startup path). A stub without it would silently exercise the fallback
+    branch instead of the one production takes.
     """
 
     def __init__(self, state: Any, *, hang: bool = False, raising: bool = False) -> None:
@@ -896,12 +957,17 @@ class _StubBLEClient:
         self._hang = hang
         self._raising = raising
         self.commands: list[str] = []
+        self.refresh_calls = 0
 
     @property
     def status(self) -> Any:
         if self._raising:
             raise RuntimeError("simulated status failure")
-        return type("Status", (), {"state": self._state})()
+        return _StubBLEStatus(self._state)
+
+    async def refresh_status(self) -> Any:
+        self.refresh_calls += 1
+        return self.status
 
     async def send_command(self, cmd: str) -> bool:
         self.commands.append(cmd)
@@ -910,58 +976,165 @@ class _StubBLEClient:
         return True
 
 
+@contextlib.contextmanager
+def _fast_hydration_timings() -> Iterator[None]:
+    """Patch `main`'s hydration timing constants for the duration of a block,
+    and put every one of them back afterwards — they are module-level globals
+    the whole process shares, so a suite that leaks one slows or breaks every
+    later suite in the same runner.
+
+    The three spacing delays go to zero purely to keep the suite fast. The
+    fourth does the opposite: BLE_HYDRATE_BURST_CLEAR_DELAY_S is pinned to
+    _BURST_SENTINEL_DELAY_S so that `after_hello=True` becomes an unmissably
+    slow branch, which is how the cases here pin `after_hello=False` by
+    consequence instead of by mocking out the scheduler.
+
+    BLE_REQUERY_TIMEOUT_S is NOT touched here: it is per-case (see the wedged
+    case), because lowering it globally would cut the other sweeps off in the
+    middle of their command list.
+    """
+    patched = {
+        "BLE_QUERY_DELAY_STANDARD": 0.0,
+        "BLE_QUERY_DELAY_MULTIPART": 0.0,
+        "BLE_HYDRATE_QUIET_DELAY_S": 0.0,
+        "BLE_HYDRATE_BURST_CLEAR_DELAY_S": _BURST_SENTINEL_DELAY_S,
+    }
+    original = {name: getattr(main_module, name) for name in patched}
+    try:
+        for name, value in patched.items():
+            setattr(main_module, name, value)
+        yield
+    finally:
+        for name, value in original.items():
+            setattr(main_module, name, value)
+
+
+async def _await_scheduled_sweep(
+    task: asyncio.Task[None] | None, bound: float = _SWEEP_WAIT_S
+) -> bool:
+    """Await one scheduled hydration sweep; return True iff it actually ended
+    within `bound`.
+
+    `wait_for` rather than a bare `await` on purpose: "the sweep never
+    terminates" is precisely the regression these cases exist to catch, and it
+    has to surface as a FAIL, not as a hung headless test runner. A missing
+    handle (`None`, i.e. nothing was scheduled at all) is a failure too, which
+    is why this returns a bool instead of blind-indexing.
+    """
+    if task is None:
+        return False
+    try:
+        await asyncio.wait_for(task, bound)
+    except TimeoutError:
+        return False
+    return True
+
+
 async def _test_requery_reused_ble_connection(record: Callable[[str, bool], None]) -> None:
     """Wave 3: on a plain `mcapp` restart the remote `ble_service` may still be
     holding the BLE session from before, so `BLEClientRemote.start()` skips
     connect()/hello and the firmware never re-sends its post-hello config push
-    — including the "G" GPS register. `requery_reused_ble_connection` asks for
-    it explicitly.
+    — the whole register set, "I" and "G" included.
+    `requery_reused_ble_connection` asks for all of it explicitly.
+
+    It SCHEDULES that sweep now instead of awaiting it: ten spaced commands cost
+    ~9 s, and `build_app()` calls this before the SSE server binds. So these
+    cases drive the method and then await `router._ble_hydration_task`, which is
+    where the actual work — and the actual timeout bound — now lives.
 
     ADVISOR REGRESSION: `build_app()` awaits this INSIDE the `except Exception`
-    handler that falls back to DISABLED BLE mode for the whole process, and
-    before the SSE server binds. So the method must never raise and must never
-    run unbounded, whatever the client does.
+    handler that falls back to DISABLED BLE mode for the whole process. So the
+    method must never raise, and the background sweep it starts must never run
+    unbounded, whatever the client does.
     """
-    original_delay = main_module.BLE_QUERY_DELAY_STANDARD
     original_timeout = main_module.BLE_REQUERY_TIMEOUT_S
-    main_module.BLE_QUERY_DELAY_STANDARD = 0.0  # keep the suite fast
-    main_module.BLE_REQUERY_TIMEOUT_S = 0.1  # exercise the bound without a 10s test
-    try:
+    # BLE_REQUERY_TIMEOUT_S is deliberately NOT lowered for the block. Every
+    # case except the wedged one now awaits the sweep to completion, and a 0.1 s
+    # ceiling would cut those sweeps off mid-list and leave `commands` short —
+    # the assertions would then be pinning the timeout, not the command set.
+    # The wedged case scopes the low value to itself.
+    with _fast_hydration_timings():
         # No BLE client registered at all (disabled mode never registers one
-        # before this point on the failure path) — a clean no-op.
+        # before this point on the failure path) — a clean no-op, and in
+        # particular nothing scheduled to fire against a client that is absent.
         bare = MessageRouter(None)
         await bare.requery_reused_ble_connection()
-        record("requery: no registered BLE client is a silent no-op", True)
+        record(
+            "requery: no registered BLE client is a silent no-op — no sweep is scheduled",
+            bare._ble_hydration_task is None,
+        )
 
-        # Registered but not connected: nothing is asked of the device.
+        # Registered but not connected: nothing is asked of the device, and the
+        # rejection happens before scheduling rather than inside the sweep.
         router = MessageRouter(None)
         idle = _StubBLEClient(ConnectionState.DISCONNECTED)
         router.register_protocol("ble_client", idle)
         await router.requery_reused_ble_connection()
-        record("requery: a DISCONNECTED client is never queried", idle.commands == [])
+        record(
+            "requery: a DISCONNECTED client is never queried",
+            idle.commands == [] and router._ble_hydration_task is None,
+        )
 
-        # Connected: the GPS register is re-requested, alongside the two
-        # registers no connect ever auto-sends.
+        # Connected: the scheduled sweep re-requests EVERY register, in the
+        # order `_query_ble_registers` fixes. Nothing about a reused session
+        # gets the frontend off its XX0XXX/0.0.0 placeholders except this.
         router = MessageRouter(None)
         live = _StubBLEClient(ConnectionState.CONNECTED)
         router.register_protocol("ble_client", live)
         await router.requery_reused_ble_connection()
+        swept = await _await_scheduled_sweep(router._ble_hydration_task)
         record(
-            "requery: a reused CONNECTED session re-requests --pos (the 'G' GPS register)",
-            live.commands == ["--pos", "--io", "--tel"],
+            "requery: a reused CONNECTED session re-requests the WHOLE register set, in order",
+            swept and live.commands == _EXPECTED_REGISTER_SWEEP,
         )
 
-        # A wedged ble_service must not hold startup hostage.
+        # The scheduling contract itself: no hello happened on a reused
+        # connection, so there is no post-hello config burst to sit out and the
+        # sweep must be scheduled with `after_hello=False`. Pinned by
+        # consequence rather than by inspecting the call: the after_hello=True
+        # delay is patched to _BURST_SENTINEL_DELAY_S above, so a sweep that
+        # took that branch could not possibly deliver its commands inside
+        # _SWEEP_WAIT_S.
+        #
+        # It also pins the second half of the deal: the sweep runs seconds after
+        # scheduling, so it must re-validate the link against `ble_service`
+        # (`refresh_status`) instead of trusting the cached `.status` the caller
+        # already read. Asserted as "at least once" rather than exactly once —
+        # the closing info broadcast refreshes again, and that is a detail of
+        # `_handle_ble_info_command`, not of this contract.
         router = MessageRouter(None)
-        wedged = _StubBLEClient(ConnectionState.CONNECTED, hang=True)
-        router.register_protocol("ble_client", wedged)
-        started = time.monotonic()
+        prompt = _StubBLEClient(ConnectionState.CONNECTED)
+        router.register_protocol("ble_client", prompt)
         await router.requery_reused_ble_connection()
-        elapsed = time.monotonic() - started
+        prompt_swept = await _await_scheduled_sweep(router._ble_hydration_task)
         record(
-            "requery: a wedged BLE service is cut off at BLE_REQUERY_TIMEOUT_S, "
-            "it cannot stall build_app() before the SSE server binds",
-            elapsed < 1.0,
+            "requery: schedules with after_hello=False — a reused connection had no hello, "
+            "so the sweep must not sit out the post-hello burst window",
+            prompt_swept
+            and prompt.refresh_calls >= 1
+            and prompt.commands == _EXPECTED_REGISTER_SWEEP,
+        )
+
+        # A wedged ble_service must not pin the sweep forever. The bound moved
+        # off the caller (which now returns instantly no matter what) onto the
+        # background task, so this asserts against the TASK: it must start the
+        # sweep, block on the very first command, and still be cut off at
+        # BLE_REQUERY_TIMEOUT_S. Without that ceiling the task hangs for good —
+        # and takes the single-flight guard with it, so every later hydration
+        # request is skipped for the rest of the process lifetime.
+        main_module.BLE_REQUERY_TIMEOUT_S = _WEDGED_TIMEOUT_S  # scoped to this case only
+        try:
+            router = MessageRouter(None)
+            wedged = _StubBLEClient(ConnectionState.CONNECTED, hang=True)
+            router.register_protocol("ble_client", wedged)
+            await router.requery_reused_ble_connection()
+            cut_off = await _await_scheduled_sweep(router._ble_hydration_task, bound=_WEDGED_WAIT_S)
+        finally:
+            main_module.BLE_REQUERY_TIMEOUT_S = original_timeout
+        record(
+            "requery: a wedged BLE service is cut off at BLE_REQUERY_TIMEOUT_S — the "
+            "background sweep terminates instead of pinning the single-flight guard",
+            cut_off and wedged.commands == ["--info"],
         )
 
         # A raising client must not reach build_app's handler, whose recovery
@@ -974,10 +1147,10 @@ async def _test_requery_reused_ble_connection(record: Callable[[str, bool], None
             await router.requery_reused_ble_connection()
         except Exception:  # the whole point of this case is that nothing escapes
             raised = True
-        record("requery: a client that raises never propagates out of the method", not raised)
-    finally:
-        main_module.BLE_QUERY_DELAY_STANDARD = original_delay
-        main_module.BLE_REQUERY_TIMEOUT_S = original_timeout
+        record(
+            "requery: a client that raises never propagates out of the method",
+            not raised and broken.commands == [],
+        )
 
 
 class _StubScanBLEClient:

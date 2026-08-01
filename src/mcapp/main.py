@@ -80,7 +80,10 @@ SHUTDOWN_TIMEOUT_TOPIC_BEACONS_S = 5.0
 SHUTDOWN_TIMEOUT_BLE_S = 5.0
 SHUTDOWN_TIMEOUT_UDP_S = 3.0
 SHUTDOWN_TIMEOUT_SSE_S = 3.0
-# Registers the device auto-sends on BLE connect; cached for serving on SSE reconnect.
+# Config registers the device emits: once per genuine hello handshake as its own
+# post-hello burst, and otherwise only when explicitly asked (see
+# MessageRouter._query_ble_registers, which asks for all twelve). Cached here so
+# an SSE reconnect is served instantly instead of re-querying the radio.
 BLE_REGISTER_TYPES = ("I", "SN", "G", "SA", "SE", "S1", "SW", "S2", "W", "AN", "IO", "TM")
 
 # Callsign bases that mean "nobody has configured this yet". Each is a valid
@@ -103,14 +106,38 @@ BLE_HELLO_WAIT = 1.0  # Wait after hello handshake before queries
 BLE_QUERY_DELAY_STANDARD = 0.8  # Delay between standard register queries
 BLE_QUERY_DELAY_MULTIPART = 1.2  # Delay for multi-part responses (SE+S1, SW+S2)
 BLE_RETRY_BASE_DELAY = 0.5  # Base delay for exponential backoff retries
-# Ceiling for the one-shot register re-query fired at startup against a BLE
-# connection the ble_service kept alive across an mcapp restart. Nominal cost is
-# 3 * BLE_QUERY_DELAY_STANDARD (2.4 s) plus three loopback HTTP calls; the
-# unbounded worst case is 3 commands * BLE_CMD_MAX_RETRIES * the remote client's
-# 30 s request timeout ≈ 4.5 minutes of a build_app() that has not started the
-# SSE server yet. This is a GPS nicety, not a startup dependency — see
-# requery_reused_ble_connection.
-BLE_REQUERY_TIMEOUT_S = 10.0
+# Head start handed to the node's OWN post-hello config burst before a
+# scheduled hydration sweep starts pushing register commands of its own.
+#
+# MeshCom firmware, after a hello handshake, queues its whole config batch and
+# then refuses to hand anything to the phone for 3000 ms, after which it drains
+# one frame per >=300 ms. Twelve registers therefore occupy roughly
+# T_hello+3 s .. T_hello+9 s. `POST /api/ble/ensure_connected` returns from
+# ble_service at ~2.6 s measured from the request, and the hello is sent inside
+# ble_service's post-connect init, i.e. BEFORE that response — so the burst is
+# over by ~9 s measured from the moment we get to schedule anything. Issuing
+# our own commands into that window is pure waste (the answers are already
+# queued) and pushes the firmware's ring buffer for nothing, so wait it out
+# with ~3 s of margin.
+BLE_HYDRATE_BURST_CLEAR_DELAY_S = 12.0
+# Same knob for the hydration paths where NO hello happened and therefore no
+# burst exists: the startup re-query against a connection ble_service kept
+# alive across an mcapp restart, and the refill after an mcapp<->ble_service
+# SSE drop wiped the register cache while the radio link stayed up. Non-zero
+# only so the scheduling caller gets to return first and any traffic already
+# in flight settles before the sweep starts.
+BLE_HYDRATE_QUIET_DELAY_S = 1.0
+# Ceiling for ONE scheduled hydration sweep (the register commands plus the
+# closing device-info push; the initial delay above is deliberately outside the
+# budget, being a deterministic sleep rather than something that can wedge).
+# Nominal cost is 8 * BLE_QUERY_DELAY_STANDARD + 2 * BLE_QUERY_DELAY_MULTIPART
+# = 8.8 s of spacing plus ten loopback HTTP calls; the unbounded worst case is
+# 10 commands * BLE_CMD_MAX_RETRIES * the remote client's 30 s request timeout
+# = 15 minutes. The sweep runs as a detached background task now, so this no
+# longer gates startup — but a wedged ble_service must still not leave a task
+# pinned for a quarter of an hour, blocking every later hydration through the
+# single-flight guard. See MessageRouter.schedule_ble_register_hydration.
+BLE_REQUERY_TIMEOUT_S = 25.0
 
 # Minimum movement, in degrees, before the node's live GPS position is written
 # back to the runtime overlay. NOT a debounce against jitter alone: MeshCom
@@ -152,6 +179,13 @@ class MessageRouter:
         self._logger = get_logger(f"{__name__}.MessageRouter")
         self.cached_gps: dict[str, float] | None = None
         self.cached_ble_registers: dict[str, Any] = {}
+        # The one in-flight register-hydration sweep, or None. Held on the
+        # router (not a bare local in whichever coroutine spawned it) for two
+        # reasons: asyncio only keeps weak references to running tasks, so a
+        # fire-and-forget local can be garbage-collected mid-sweep, and
+        # _shutdown_services needs a handle to cancel it before the BLE client
+        # is torn down under it. See schedule_ble_register_hydration.
+        self._ble_hydration_task: asyncio.Task[None] | None = None
 
         if message_storage_handler:
             self.subscribe("mesh_message", self._storage_handler)
@@ -743,35 +777,83 @@ class MessageRouter:
                 return True
         return False  # All attempts exhausted
 
+    async def _settle_hello_and_sync_time(self, client: Any, *, sync_time: bool = True) -> None:
+        """Let a just-completed hello handshake settle, then push the device
+        clock. Only meaningful immediately after a FRESH connect.
+
+        CRITICAL: MeshCom firmware requires the 0x10 hello before it will
+        process A0 commands at all ("the phone app must send 0x10 hello message
+        before other commands will be processed"), so anything aimed at the
+        node in the first moments after connect has to wait BLE_HELLO_WAIT
+        first. Note this is the INBOUND direction and is unrelated to the 3 s
+        outbound send-freeze that governs the node's own config burst — see
+        BLE_HYDRATE_BURST_CLEAR_DELAY_S for that one.
+
+        The time sync itself is a firmware requirement, not a nicety: "send
+        0x20 with UNIX timestamp to synchronize device clock (especially
+        important for devices without GPS or RTC battery)". Non-fatal — a node
+        with a bad clock is still a working node.
+
+        Factored out of `_query_ble_registers` when the legacy connect handler
+        stopped sweeping registers inline: that handler still owns the
+        fresh-connect clock sync, and this is the one implementation both
+        callers share rather than a copy.
+        """
+        logger.debug("Waiting for hello handshake to complete")
+        await asyncio.sleep(BLE_HELLO_WAIT)
+        if not sync_time:
+            return
+        try:
+            await client.set_command("--settime")
+            logger.info("Device time synchronized after connection")
+        except Exception as e:
+            logger.warning("Time sync failed (non-critical): %s", e)
+
     async def _query_ble_registers(
         self, wait_for_hello: bool = True, sync_time: bool = True
     ) -> None:
         """
-        Query BLE device registers this proxy cannot rely on the device to
-        (re-)send by itself for every caller of this method.
+        Ask the node for EVERY config register, explicitly, one text command
+        at a time.
 
-        The device DOES auto-send 8 registers — I, SN, G, SA, SE+S1, SW+S2,
-        W, AN — but only as part of its own post-hello config-push batch
-        (confirmed in firmware: esp32_main.cpp/nrf52_main.cpp's `config_cmds`,
-        which literally includes "--pos", the source of "G"). That auto-send
-        fires once per genuine hello handshake — which is exactly what does
-        NOT happen when this process (mcapp) restarts while the remote
-        `ble_service` kept its BLE session alive across the restart:
-        `BLEClientRemote.start()` finds the device already `connected` and
-        never redoes connect()/hello, so the firmware never re-sends "G"
-        either. `cached_gps` resets to `None` on every mcapp restart
-        (build_app), so without an explicit re-query GPS — and therefore
-        weather location — stays stale until either the webapp explicitly
-        reconnects or the BLE service's ~300s keepalive `--pos` eventually
-        lands (see ble_service/src/ble_adapter.py's KEEPALIVE_INTERVAL_S).
-        `--pos` is therefore included below too: redundant (and cheap/
-        idempotent) on a connect that just auto-sent everything, load-bearing
-        on a reused connection.
+        The mental model this method used to be written around was wrong, and
+        the `XX0XXX` / `0.0.0` / `00:00:00:00` placeholders the frontend showed
+        forever are what it cost. The node does auto-send its twelve registers
+        (I, SN, G, SA, SE+S1, SW+S2, W, AN, IO, TM) — but ONLY as its own
+        post-hello config burst, exactly once per genuine hello handshake
+        (firmware: esp32_main.cpp/nrf52_main.cpp's `config_cmds`). mcapp
+        merely caches whatever of that burst happens to fly past
+        (`_wire_ble_caches`). Every path that does not produce a fresh hello
+        therefore leaves the cache empty or stale, and there are several:
 
-        This method also queries the two registers never auto-sent by any
-        connect, fresh or reused:
-        - --io: TYP: IO (GPIO status)
-        - --tel: TYP: TM (telemetry config)
+        * an mcapp restart while `ble_service` keeps the BLE session alive —
+          `BLEClientRemote.start()` sees `connected` and never redoes
+          connect()/hello (see `requery_reused_ble_connection`);
+        * `POST /api/ble/ensure_connected`, which returns to the webapp before
+          the burst has even started and used to hydrate nothing at all;
+        * an mcapp<->ble_service SSE drop, which wipes `cached_ble_registers`
+          via `_clear_ble_cache_on_disconnect` while the radio link is often
+          still perfectly alive, and nothing refilled it.
+
+        So: every register IS re-requestable, and this method requests all of
+        them. The mapping below is exact and was verified against firmware
+        source and against a live node — the answer to `--info` on the real
+        radio is a "TYP":"I" frame carrying FWVER/CALL/ID/HWID, which is
+        precisely the payload the frontend renders. Re-sending the 0x10 hello
+        to re-trigger the batch is NOT an option and must not be reintroduced:
+        it re-runs the node's `sendMheard()` into the same ring buffer and
+        re-runs PIN auth, where a wrong hash drops the link.
+
+        Spacing is load-bearing, not politeness. Two text commands landing in
+        one firmware main-loop tick means only the last one executes, so every
+        command is followed by a sleep. `--seset` and `--wifiset` each answer
+        with TWO frames (SE+S1, SW+S2) and get the longer
+        BLE_QUERY_DELAY_MULTIPART.
+
+        Callers are responsible for not starting a sweep inside the node's own
+        post-hello burst window — see BLE_HYDRATE_BURST_CLEAR_DELAY_S and
+        `schedule_ble_register_hydration`, which is how every non-legacy path
+        reaches this method.
 
         Args:
             wait_for_hello: If True, wait 1s before querying (ensure hello complete)
@@ -781,72 +863,229 @@ class MessageRouter:
         if not client:
             return
 
-        # CRITICAL: MeshCom firmware requires 0x10 hello message before
-        # processing A0 commands. Wait for device to process hello handshake.
-        # Per firmware docs: "The phone app must send 0x10 hello message
-        # before other commands will be processed."
         if wait_for_hello:
-            logger.debug("Waiting for hello handshake to complete")
-            await asyncio.sleep(BLE_HELLO_WAIT)
+            await self._settle_hello_and_sync_time(client, sync_time=sync_time)
 
-            # Automatically sync device time after hello handshake completes.
-            # Per firmware spec (page 898): "Send 0x20 with UNIX timestamp to
-            # synchronize device clock (especially important for devices without
-            # GPS or RTC battery)."
-            if sync_time:
-                try:
-                    await client.set_command("--settime")
-                    logger.info("Device time synchronized after connection")
-                except Exception as e:
-                    logger.warning("Time sync failed (non-critical): %s", e)
-
-        # --pos first (cheapest way to close the cold-start GPS gap — see the
-        # docstring above), then the two registers no connect ever auto-sends.
-        non_auto_registers = [
-            ("--pos", BLE_QUERY_DELAY_STANDARD),  # TYP: G (GPS) — see docstring
-            ("--io", BLE_QUERY_DELAY_STANDARD),  # TYP: IO (GPIO status)
-            ("--tel", BLE_QUERY_DELAY_STANDARD),  # TYP: TM (telemetry config)
+        # command -> register(s) it makes the node re-emit. Ordered so the two
+        # registers the rest of mcapp actually depends on land first: "I"
+        # (callsign/firmware — what `_detect_node_identity` and the frontend
+        # header read) and "G" (the GPS fix that seeds the weather location).
+        # A sweep cut short by BLE_REQUERY_TIMEOUT_S then still delivered the
+        # load-bearing part.
+        register_queries = [
+            ("--info", BLE_QUERY_DELAY_STANDARD),  # TYP: I  — FWVER/CALL/ID/HWID
+            ("--pos", BLE_QUERY_DELAY_STANDARD),  # TYP: G  — GPS fix
+            ("--nodeset", BLE_QUERY_DELAY_STANDARD),  # TYP: SN — node settings
+            ("--aprsset", BLE_QUERY_DELAY_STANDARD),  # TYP: SA — APRS settings
+            ("--seset", BLE_QUERY_DELAY_MULTIPART),  # TYP: SE + S1 — two frames
+            ("--wifiset", BLE_QUERY_DELAY_MULTIPART),  # TYP: SW + S2 — two frames
+            ("--wx", BLE_QUERY_DELAY_STANDARD),  # TYP: W  — weather sensors
+            ("--analogset", BLE_QUERY_DELAY_STANDARD),  # TYP: AN — analog inputs
+            ("--io", BLE_QUERY_DELAY_STANDARD),  # TYP: IO — GPIO status
+            ("--tel", BLE_QUERY_DELAY_STANDARD),  # TYP: TM — telemetry config
         ]
 
-        for cmd, delay in non_auto_registers:
+        for cmd, delay in register_queries:
             success = await self._send_ble_command_with_retry(client, cmd)
             if not success:
                 logger.warning("Register query %s failed (non-critical)", cmd)
             await asyncio.sleep(delay)
 
-        logger.debug("Register queries complete (POS + IO + TM)")
+        logger.debug(
+            "Register queries complete (%d commands covering %d registers)",
+            len(register_queries),
+            len(BLE_REGISTER_TYPES),
+        )
+
+    async def _run_ble_register_hydration(self, initial_delay: float, reason: str) -> None:
+        """Body of one hydration sweep. Never call directly — go through
+        `schedule_ble_register_hydration`, which owns the single-flight guard
+        and the task handle.
+
+        Three things happen here, in order, and the order matters:
+
+        1. Sleep `initial_delay`. For a sweep triggered by a fresh connect this
+           is what keeps our commands OUT of the node's own post-hello burst
+           (BLE_HYDRATE_BURST_CLEAR_DELAY_S); for the no-hello paths it is just
+           enough to let the caller return first (BLE_HYDRATE_QUIET_DELAY_S).
+        2. Re-check that the link is actually up, and — where the client
+           supports it — re-check it against `ble_service` rather than the
+           local cache. The cache is deliberately distrusted at this point:
+           seconds have passed since scheduling, and in the SSE-recovery case
+           the cache says DISCONNECTED precisely because the SSE stream (not
+           the radio) dropped. `refresh_status()` is what corrects that, and it
+           is safe to spend an HTTP round trip on here in a way it was not in
+           the old inline-at-startup version, because nothing is waiting.
+        3. Sweep every register, then push the device-info frame — the second
+           half of what the legacy `connect BLE` command did via
+           `_handle_ble_info_command(websocket, query_registers=False)`.
+           `None` for the websocket makes it a broadcast: a scheduled sweep has
+           no originating socket, and every connected client wants the result.
+
+        NOT RE-ENTRANT, AND CANNOT BECOME SO. `_handle_ble_info_command` now
+        SCHEDULES a sweep of its own when `query_registers` is True, so step 3
+        passes False explicitly. That is what keeps the composition acyclic: a
+        sweep can never schedule a sweep. Even if that False were ever lost the
+        result would be a skip, not a deadlock — `schedule_ble_register_hydration`
+        is synchronous and would simply observe its own task as in-flight — but
+        the flag is the real guarantee, not the guard.
+
+        NEVER RAISES, by construction. It runs detached, so an escaping
+        exception would land in the event loop's unhandled-exception handler
+        (a bare "Task exception was never retrieved" traceback with no context)
+        and, worse, would leave the frontend on placeholder values with nothing
+        in the log tying the two together. Timeout and failure are logged and
+        swallowed; `CancelledError` is a `BaseException` and so passes through
+        both handlers untouched, which is what shutdown needs.
+        """
+        try:
+            await asyncio.sleep(initial_delay)
+            client = self._get_ble_client()
+            if client is None:
+                return
+            # `client` is deliberately `Any` (the protocol registry is
+            # untyped), so both probes live inside the try rather than
+            # trusting a duck-typed object not to blow up.
+            if hasattr(client, "refresh_status"):
+                status = await client.refresh_status()
+            else:
+                status = client.status
+            if status.state != ConnectionState.CONNECTED:
+                logger.debug("BLE register hydration (%s): link not connected, skipping", reason)
+                return
+            logger.info("BLE register hydration starting (%s)", reason)
+            async with asyncio.timeout(BLE_REQUERY_TIMEOUT_S):
+                await self._query_ble_registers(wait_for_hello=False)
+                await self._handle_ble_info_command(None, query_registers=False)
+            logger.info("BLE register hydration complete (%s)", reason)
+        except TimeoutError:
+            logger.warning(
+                "BLE register hydration (%s) timed out after %.0fs — partial register set "
+                "cached; the next connect or SSE recovery retries",
+                reason,
+                BLE_REQUERY_TIMEOUT_S,
+            )
+        except Exception:
+            logger.exception("BLE register hydration (%s) failed", reason)
+
+    def schedule_ble_register_hydration(self, *, reason: str, after_hello: bool) -> bool:
+        """Schedule a full register sweep in the background. Returns True if
+        this call started one, False if it was skipped.
+
+        THE ENTRY POINT for every non-legacy path that needs
+        `cached_ble_registers` populated: the `POST /api/ble/ensure_connected`
+        route, the startup re-query against a reused connection, and
+        `BLEClientRemote`'s SSE-recovery hook. All three have the same two
+        constraints — the sweep costs ~9 s of deliberate command spacing, and
+        none of them may pay that cost inline (an HTTP route would hang, and
+        `build_app()` would hold the SSE server's bind hostage).
+
+        `after_hello` selects the initial delay and is the caller's assertion
+        about whether a hello handshake just happened, i.e. whether the node is
+        currently draining its own post-hello config burst. True (a fresh
+        connect) waits BLE_HYDRATE_BURST_CLEAR_DELAY_S for that window to
+        close; False (reused connection, SSE recovery) uses the short
+        BLE_HYDRATE_QUIET_DELAY_S. Expressed as a flag rather than a raw delay
+        so `ble_client_remote` can call this without importing timing
+        constants from `main` — that import direction is a cycle.
+
+        SINGLE-FLIGHT, RESOLVED AS *SKIP*, NOT SUPERSEDE. A second request
+        arriving while a sweep is scheduled or running is dropped (logged at
+        debug, reported as False). Two interleaved sequences would violate the
+        one-command-per-tick spacing the whole method depends on, so doing
+        nothing is not the only option — but skip beats cancel-and-restart for
+        one specific reason: the sweep is fully idempotent and re-reads every
+        register anyway, so a skipped request loses nothing, whereas
+        superseding restarts the ~9 s clock and a user impatiently re-clicking
+        "connect" every few seconds could keep cancelling the sweep just
+        before it finishes and never see a single register. Skip guarantees
+        forward progress; supersede does not.
+
+        The known cost of that choice: a request that would have used the LONG
+        burst-clearing delay is skipped in favour of an already-scheduled sweep
+        that used the short one, so a reconnect landing inside an in-flight
+        sweep can overlap the node's burst. That is wasteful (duplicate frames,
+        drained at the firmware's own >=300 ms pace) but not harmful, and it
+        needs a second connect within ~10 s of a restart to happen at all.
+
+        Synchronous on purpose: callers are HTTP handlers and an SSE reader
+        loop that must not acquire another await point, and there is nothing
+        here to await. Returns False rather than raising when no event loop is
+        running (a non-async test harness), so scheduling can never be the
+        thing that breaks a caller.
+        """
+        if self._ble_hydration_task is not None and not self._ble_hydration_task.done():
+            logger.debug(
+                "BLE register hydration (%s) skipped: a sweep is already in flight", reason
+            )
+            return False
+
+        delay = BLE_HYDRATE_BURST_CLEAR_DELAY_S if after_hello else BLE_HYDRATE_QUIET_DELAY_S
+        # Probe for the loop BEFORE building the coroutine. `create_task` on a
+        # freshly-constructed coroutine looks like the natural spelling, but the
+        # coroutine object is created first and `create_task` is what raises, so
+        # on the no-loop path it is left un-awaited and CPython emits a bare
+        # "coroutine ... was never awaited" RuntimeWarning at collection time.
+        try:
+            asyncio.get_running_loop()
+        except RuntimeError:
+            logger.warning(
+                "BLE register hydration (%s) not scheduled: no running event loop", reason
+            )
+            return False
+        self._ble_hydration_task = asyncio.create_task(
+            self._run_ble_register_hydration(delay, reason)
+        )
+        logger.debug("BLE register hydration (%s) scheduled in %.0fs", reason, delay)
+        return True
+
+    async def cancel_ble_register_hydration(self) -> None:
+        """Cancel and reap an in-flight hydration sweep. Called from the
+        shutdown ladder BEFORE the BLE client is stopped, so the sweep cannot
+        keep firing register commands at a client being torn down under it —
+        and so the ~9 s of `asyncio.sleep` in the middle of a sweep does not
+        outlive the process's own shutdown budget."""
+        task = self._ble_hydration_task
+        self._ble_hydration_task = None
+        if task is None or task.done():
+            return
+        task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await task
 
     async def requery_reused_ble_connection(self) -> None:
-        """Fire the same one-shot register query a fresh BLE connect gets, for
+        """Schedule the register sweep a fresh BLE connect would have got, for
         the case where this process (mcapp) starts up and finds the remote
         `ble_service` already holding a connection from BEFORE the restart.
 
         `ble_service` is a separate, long-lived process; a plain `mcapp`
         restart never re-triggers the device's own hello handshake, so the
-        firmware's auto-config push (which is what normally delivers a fresh
-        "G" GPS register — see `_query_ble_registers`'s docstring) never
-        fires either. Called once from `build_app()` right after
+        firmware's auto-config push (the only thing that normally delivers the
+        register set — see `_query_ble_registers`'s docstring) never fires
+        either. Called once from `build_app()` right after
         `ble_client.start()`; a no-op when nothing is connected yet (e.g.
         disabled BLE mode, or the device just isn't paired right now).
 
-        SELF-CONTAINED BY CONSTRUCTION, because the caller cannot afford
-        either failure mode:
+        SCHEDULES, IT NO LONGER SWEEPS INLINE. It used to `await` the sweep,
+        which was affordable while that meant three commands (~2.4 s) and is
+        not now that it means ten (~9 s): `build_app()` calls this before the
+        SSE server binds, so every second spent here is a second the proxy
+        answers nothing on :8080. The bound that used to protect startup
+        (BLE_REQUERY_TIMEOUT_S) now protects the background task instead.
 
-        * Bounded by BLE_REQUERY_TIMEOUT_S. `build_app()` awaits this inline
-          and only starts the SSE server afterwards, so an unbounded wait
-          here is an unbounded wait before the proxy answers on :8080 at all.
-          A ble_service that reported "connected" and then wedged would
-          otherwise hold startup for minutes (see BLE_REQUERY_TIMEOUT_S).
-        * Never raises. The call site sits inside `build_app()`'s
-          "Failed to initialize BLE client" handler, whose recovery is to
-          tear the working remote client down and fall back to DISABLED BLE
-          mode for the entire process lifetime. Letting a failed GPS nicety
-          reach that handler would trade the mesh link for a weather seed.
+        Still self-contained by construction, because the caller cannot afford
+        the other failure mode either: this NEVER RAISES. The call site sits
+        inside `build_app()`'s "Failed to initialize BLE client" handler, whose
+        recovery is to tear the working remote client down and fall back to
+        DISABLED BLE mode for the entire process lifetime. Letting a failed
+        register refresh reach that handler would trade the mesh link for a
+        weather seed.
 
         `client.status` is the local cache, deliberately, not an
         `await refresh_status()`: `start()` has just refreshed it from the
         remote service one statement earlier, so a second HTTP round trip
-        would only add a way for startup to hang.
+        would only add a way for startup to hang. The sweep itself re-checks
+        against the service once it is safely off the startup path.
         """
         try:
             client = self._get_ble_client()
@@ -855,13 +1094,9 @@ class MessageRouter:
             # trusting a duck-typed object's `.status` not to blow up.
             if client is None or client.status.state != ConnectionState.CONNECTED:
                 return
-            async with asyncio.timeout(BLE_REQUERY_TIMEOUT_S):
-                await self._query_ble_registers(wait_for_hello=False)
-        except TimeoutError:
-            logger.warning(
-                "Startup register re-query on the reused BLE connection timed out after %.0fs "
-                "(non-critical: GPS/weather will refresh on the next keepalive)",
-                BLE_REQUERY_TIMEOUT_S,
+            self.schedule_ble_register_hydration(
+                reason="startup re-query of a reused BLE connection",
+                after_hello=False,  # no connect happened, so no burst to clear
             )
         except Exception:
             logger.exception("Startup register re-query on the reused BLE connection failed")
@@ -923,13 +1158,44 @@ class MessageRouter:
         MAC: str,  # noqa: N803 - webapp wire-format field
         websocket: Any | None = None,
     ) -> None:
-        """Handle BLE connect command"""
+        """Handle the legacy `connect BLE` router command.
+
+        STILL LIVE CODE. The webapp's main connect flow moved to
+        `POST /api/ble/ensure_connected`, but `retryConnect()` still sends this
+        command, so this path has to stay correct — it is not dead.
+
+        It used to sweep the registers INLINE
+        (`_query_ble_registers(wait_for_hello=not already_connected)`) and only
+        then answer the caller. That was wrong twice over, and the second half
+        is the interesting one:
+
+        * It blocked the command handler for the whole sweep — ~3.4 s when the
+          sweep was three commands, and ~9 s now that it is ten.
+        * On the fresh-connect branch it fired those commands ~1-2 s after the
+          hello, i.e. squarely INSIDE the node's 3 s send-freeze and the burst
+          drain that follows it (see BLE_HYDRATE_BURST_CLEAR_DELAY_S). So it
+          paid the full latency to ask for registers the node had already
+          queued and was about to send anyway — and pushed its ring buffer
+          while doing it. The answers that came back were the burst's, not the
+          query's.
+
+        So the sweep is scheduled instead, with `after_hello` derived from what
+        actually happened on THIS invocation: a fresh connect just did a hello
+        and the node is mid-burst (True -> wait the burst out), while the
+        `already_connected` branch did no hello at all and has no burst to
+        clear (False -> the short quiet delay).
+
+        The synchronous half of the old contract is unchanged: the caller
+        (`retryConnect()`'s websocket) still gets its `blueZ` info frame from
+        `_handle_ble_info_command`, on the same socket, before this returns.
+        Only the register re-query moved off the critical path.
+        """
         client = self._get_ble_client()
         if not client:
             logger.warning("BLE client not available for connect")
             return
 
-        # Check if already connected — skip reconnect, just query registers
+        # Check if already connected — skip reconnect, just re-query registers
         if hasattr(client, "refresh_status"):
             status = await client.refresh_status()
         else:
@@ -940,7 +1206,6 @@ class MessageRouter:
         if not already_connected:
             await client.connect(MAC)
             # Note: hello handshake is sent during connect()
-            # _query_ble_registers will wait for it to complete
             # Re-check status after connect
             if hasattr(client, "refresh_status"):
                 status = await client.refresh_status()
@@ -948,11 +1213,24 @@ class MessageRouter:
                 status = client.status
 
         if status.state == ConnectionState.CONNECTED:
-            # Query registers: wait for hello if just connected, skip wait if already connected
-            await self._query_ble_registers(wait_for_hello=not already_connected)
-            # Send connection info (device_name, device_address) to frontend
-            # Don't query registers again - we just did it above
+            # Kept inline, and kept ahead of the info frame, exactly where the
+            # old sweep's prologue ran it: the device clock sync is a cheap
+            # one-shot that only a FRESH connect owes the node, and running it
+            # before the info frame preserves the previous ordering so a webapp
+            # reacting to that frame cannot collide with it in one firmware tick.
+            if not already_connected:
+                await self._settle_hello_and_sync_time(client)
+            # Send connection info (device_name, device_address) to frontend.
+            # query_registers=False: the scheduled sweep below owns that now,
+            # and letting this ALSO schedule would just hit the single-flight
+            # guard and log a spurious skip.
             await self._handle_ble_info_command(websocket, query_registers=False)
+            self.schedule_ble_register_hydration(
+                reason="legacy 'connect BLE' command",
+                # Fresh connect -> the node is draining its post-hello burst.
+                # Already connected -> no hello happened, nothing to wait out.
+                after_hello=not already_connected,
+            )
 
     async def _handle_ble_disconnect_command(self) -> None:
         """Handle BLE disconnect command"""
@@ -976,11 +1254,24 @@ class MessageRouter:
         """
         Handle BLE info command - send current BLE status to requesting client.
 
+        The `blueZ` info frame is published SYNCHRONOUSLY and unconditionally,
+        to the originating websocket when one is passed and as a broadcast when
+        it is not. That is the contract every caller relies on and it has not
+        changed — `retryConnect()` waits for this frame, and the scheduled
+        hydration sweep uses the broadcast form to tell all clients its refresh
+        landed.
+
+        What did change is the optional register re-query: it is SCHEDULED now
+        rather than awaited, so asking for BLE info no longer blocks the
+        command handler for the ~9 s a full twelve-register sweep costs.
+
         Args:
             websocket: WebSocket to send response to (None = broadcast via SSE)
-            query_registers: Whether to query device registers (default True).
-                            Set to False when called after connection to avoid
-                            duplicate queries (connect handler already queries).
+            query_registers: Whether to also schedule a register sweep (default
+                            True). Set to False when called after a connect, or
+                            from inside the hydration task itself, so the sweep
+                            is not requested twice — a second request would only
+                            hit the single-flight guard and log a skip.
         """
         client = self._get_ble_client()
         if not client:
@@ -1023,10 +1314,14 @@ class MessageRouter:
         else:
             await self.publish("ble", "ble_status", ble_info)
 
-        # Request register dump from device so frontend gets config data
-        # Only if requested (avoid duplicate queries when called after connection)
+        # Request a register dump so the frontend gets config data — scheduled,
+        # not awaited, and only when asked for (see the docstring). No connect
+        # happened on this path, so there is no post-hello burst to wait out.
         if is_connected and query_registers:
-            await self._query_ble_registers(wait_for_hello=False)
+            self.schedule_ble_register_hydration(
+                reason="legacy 'info BLE' command",
+                after_hello=False,
+            )
 
     async def _backend_resolve_ip(self, hostname: str) -> None:
         """Resolve hostname to IP address and publish result."""
@@ -1977,6 +2272,12 @@ async def _shutdown_services(ctx: AppContext) -> None:
 
     await ctx.command_handler.stop_dedup_cleanup()
     await ctx.command_handler.stop_pending_responses()
+
+    # A hydration sweep can sit for ~12 s in its burst-clearing sleep and then
+    # spend ~9 s issuing register commands, so it must be reaped BEFORE the BLE
+    # client below is stopped — otherwise it keeps pushing commands into a
+    # client that is being torn down under it.
+    await ctx.message_router.cancel_ble_register_hydration()
 
     # Clean shutdown sequence with timeouts
     try:

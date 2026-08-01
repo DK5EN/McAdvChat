@@ -27,6 +27,7 @@ from ble_service_tests import run_ble_service_tests
 from config_migration_tests import run_config_migration_tests
 from update_runner_tests import run_update_runner_tests
 
+from mcapp.ble_hydration_tests import run_ble_hydration_tests
 from mcapp.ble_protocol_tests import run_ble_protocol_tests
 from mcapp.classifier.tests import run_all_tests as run_classifier_tests
 from mcapp.commands.dedup_tests import run_dedup_tests
@@ -112,6 +113,9 @@ async def main() -> int:  # noqa: PLR0915 - flat suite registry; one visible lin
     ble_protocol_ok = run_ble_protocol_tests()
     print(f"ble_protocol: {'PASS' if ble_protocol_ok else 'FAIL'}")
 
+    ble_hydration_ok = await run_ble_hydration_tests()
+    print(f"ble_hydration: {'PASS' if ble_hydration_ok else 'FAIL'}")
+
     update_runner_ok = run_update_runner_tests()
     print(f"update_runner: {'PASS' if update_runner_ok else 'FAIL'}")
 
@@ -155,6 +159,7 @@ async def main() -> int:  # noqa: PLR0915 - flat suite registry; one visible lin
         and meteo_ok
         and push_ok
         and ble_protocol_ok
+        and ble_hydration_ok
         and update_runner_ok
         and config_migration_ok
         and commands_ok

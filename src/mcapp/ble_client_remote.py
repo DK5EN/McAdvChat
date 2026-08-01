@@ -123,6 +123,11 @@ class BLEClientRemote(BLEClientBase):
         self._connect_cooldown: float = CONNECT_COOLDOWN_S
         self._sse_disconnect_buffer: float = SSE_DISCONNECT_GRACE_S
         self._sse_backoff: float = SSE_BACKOFF_INITIAL_S
+        # True between "we told the frontend the BLE link was lost because the
+        # SSE stream stayed down past the grace period" and "the SSE stream
+        # came back". Only that one publish sets it, so the flag means exactly
+        # "a cache wipe we caused needs undoing" — see _rehydrate_after_sse_recovery.
+        self._sse_lost_published = False
 
     def _headers(self) -> dict[str, str]:
         """Get request headers with API key"""
@@ -660,6 +665,7 @@ class BLEClientRemote(BLEClientBase):
                 ):
                     response.raise_for_status()
                     self._sse_backoff = SSE_BACKOFF_INITIAL_S  # Reset on successful connection
+                    self._rehydrate_after_sse_recovery()
 
                     event_type: str = ""
                     event_data: str = ""
@@ -688,30 +694,7 @@ class BLEClientRemote(BLEClientBase):
                 break
             except Exception as e:
                 if self._running:
-                    # Buffer before declaring disconnect -- brief SSE blips (e.g. 1-2s network
-                    # hiccup) should not trigger a disconnect notification. If the SSE reconnects
-                    # within _sse_disconnect_buffer seconds the device is still considered
-                    # connected and no notification is sent.
-                    if self._status.state == ConnectionState.CONNECTED:
-                        was_connected_device = self._status.device_address
-                        logger.info(
-                            "BLE service SSE dropped while connected — "
-                            "waiting %.1fs before notifying frontend",
-                            self._sse_disconnect_buffer,
-                        )
-                        await asyncio.sleep(self._sse_disconnect_buffer)
-                        # Only notify if still disconnected (SSE hasn't recovered yet)
-                        if (
-                            self._running
-                            and self._status.state == ConnectionState.CONNECTED
-                            and self._status.device_address == was_connected_device
-                        ):
-                            logger.info("BLE service SSE still down — notifying frontend")
-                            self._status.state = ConnectionState.DISCONNECTED
-                            self._status.device_address = None
-                            await self._publish_status(
-                                "disconnect BLE", "lost", "BLE service connection lost"
-                            )
+                    await self._announce_link_lost_after_grace()
                     logger.warning(
                         "SSE connection error: %s, reconnecting in %ds...", e, self._sse_backoff
                     )
@@ -724,6 +707,91 @@ class BLEClientRemote(BLEClientBase):
             else:
                 # Reset backoff on clean exit from stream (shouldn't normally happen)
                 self._sse_backoff = SSE_BACKOFF_INITIAL_S
+
+    async def _announce_link_lost_after_grace(self) -> None:
+        """Tell the frontend the BLE link is gone, but only once an SSE drop
+        has outlived SSE_DISCONNECT_GRACE_S.
+
+        Buffer before declaring a disconnect: brief SSE blips (a 1-2 s network
+        hiccup, a ble_service reload) must not flap the frontend's connection
+        state. If the stream recovers within `_sse_disconnect_buffer` seconds
+        the device is still considered connected and nothing is published; the
+        re-check after the sleep also compares `device_address`, so a
+        reconnect to a DIFFERENT node in the meantime does not get mislabelled
+        as the old one going away.
+
+        Extracted out of `_sse_loop`'s exception arm purely for readability —
+        the loop is already at ruff's branch ceiling.
+        """
+        if self._status.state != ConnectionState.CONNECTED:
+            return
+        was_connected_device = self._status.device_address
+        logger.info(
+            "BLE service SSE dropped while connected — waiting %.1fs before notifying frontend",
+            self._sse_disconnect_buffer,
+        )
+        await asyncio.sleep(self._sse_disconnect_buffer)
+        # Only notify if still disconnected (SSE hasn't recovered yet)
+        if not (
+            self._running
+            and self._status.state == ConnectionState.CONNECTED
+            and self._status.device_address == was_connected_device
+        ):
+            return
+        logger.info("BLE service SSE still down — notifying frontend")
+        self._status.state = ConnectionState.DISCONNECTED
+        self._status.device_address = None
+        # This publish makes mcapp's _clear_ble_cache_on_disconnect empty
+        # cached_ble_registers, even though the RADIO link is very often still
+        # up (ble_service restart, deploy, network blip). Remember that we did
+        # it, so _rehydrate_after_sse_recovery can refill what we threw away.
+        self._sse_lost_published = True
+        await self._publish_status("disconnect BLE", "lost", "BLE service connection lost")
+
+    def _rehydrate_after_sse_recovery(self) -> None:
+        """Refill mcapp's BLE register cache after an SSE drop emptied it.
+
+        The mcapp<->ble_service SSE stream is a plain HTTP stream between two
+        local processes, and it goes down for entirely mundane reasons: a
+        ble_service restart, a deploy, a momentary network hiccup. When it
+        stays down past SSE_DISCONNECT_GRACE_S the loop above publishes
+        `("disconnect BLE", "lost")`, which mcapp's
+        `_clear_ble_cache_on_disconnect` treats as a real disconnect and wipes
+        `cached_ble_registers` — while the RADIO link between ble_service and
+        the node is, in this exact scenario, usually still perfectly alive.
+
+        Nothing refilled that cache. The node only re-sends its config burst
+        after a genuine hello handshake, and no hello happens when an HTTP
+        stream reconnects, so every SSE blip used to permanently degrade the
+        frontend to placeholder values until the user manually reconnected.
+        This closes that loop: one explicit register sweep, scheduled on the
+        router, using the SHORT no-burst delay because there was no hello to
+        wait out.
+
+        Fires only when this client is the one that published the loss (the
+        `_sse_lost_published` latch), so a first-ever stream connect at startup
+        does not trigger it — `build_app()`'s `requery_reused_ble_connection`
+        already owns that case, and the router's single-flight guard would drop
+        the duplicate anyway.
+
+        Deliberately does NOT probe the link itself. The local status still
+        says DISCONNECTED here (the grace-period handler set it), so any check
+        this method could make would be against exactly the stale value the
+        sweep exists to correct; the sweep re-checks with a real
+        `refresh_status()` round trip once it starts, which also restores
+        `self._status` to CONNECTED, and it no-ops if the radio really did go
+        away. Reached through `getattr` rather than an import to keep this
+        module free of a `main` import — that direction is a cycle, since
+        `main` imports the BLE client factory that imports this module.
+        """
+        if not self._sse_lost_published:
+            return
+        self._sse_lost_published = False
+        schedule = getattr(self.message_router, "schedule_ble_register_hydration", None)
+        if schedule is None:
+            return
+        logger.info("SSE stream recovered — scheduling BLE register re-hydration")
+        schedule(reason="mcapp<->ble_service SSE stream recovered", after_hello=False)
 
     async def _handle_notification(self, data: str) -> None:
         """Handle incoming SSE notification"""
