@@ -8,6 +8,9 @@ standalone parsing helpers that had no coverage before:
 * ``try_repair_json`` — bounded malformed-JSON repair (CO-08 cap).
 * ``strip_invalid_utf8`` — the character whitelist path.
 * ``_normalize_altitude_to_meters`` — APRS feet → meters conversion.
+* ``_undouble_aprs_symbol_escapes`` — the MeshCom firmware's double-escaped
+  backslash on the alternate APRS symbol table (see ``aprs-escape-bug.md``),
+  both as a unit and end-to-end through ``_process_received_message``.
 * The ``NODE-<octet>`` pseudo-callsign derivation inside
   ``UDPHandler._process_received_message``.
 
@@ -32,6 +35,7 @@ from .udp_handler import (
     MAX_JSON_REPAIR_ATTEMPTS,
     UDPHandler,
     _normalize_altitude_to_meters,
+    _undouble_aprs_symbol_escapes,
     strip_invalid_utf8,
     try_repair_json,
 )
@@ -47,6 +51,60 @@ _JUNK_BEYOND_BOUND = MAX_JSON_REPAIR_ATTEMPTS * 2
 
 # Extern-UDP listen port; only used to shape a realistic sender address tuple.
 _SENDER_PORT = 1799
+
+# --- APRS symbol double-escape (aprs-escape-bug.md) ------------------------
+# Everything below is built from chr(92) rather than backslash literals on
+# purpose: in Python source the wrong value is written "\\\\" and the right one
+# "\\", which differ by two easily-miscounted characters. Spelling them as
+# "one backslash" and "two backslashes" — and asserting on len() — lets a
+# reviewer tell them apart without counting escapes.
+_BACKSLASH = chr(92)
+_ONE_CHAR = 1
+_TWO_CHARS = 2
+# What APRS defines and what the frontend can resolve: the alternate symbol table.
+_APRS_ALTERNATE_TABLE = _BACKSLASH
+# What sendExtern() actually puts on :1799 today — hand-escaped, then escaped
+# again by ArduinoJson, so json.loads yields two characters.
+_FIRMWARE_DOUBLED_BACKSLASH = _BACKSLASH * _TWO_CHARS
+
+_SYMBOL_GROUP_FIELD = "aprs_symbol_group"
+_SYMBOL_CODE_FIELD = "aprs_symbol"
+
+# Values that must survive untouched.
+_APRS_PRIMARY_TABLE = "/"
+_APRS_OVERLAY_ID = "G"  # a legitimate single-char overlay, not corruption
+_OEVSV_INTERNET_ALIAS = "KFR"  # the oevsv.at feed's alias; never reaches :1799
+_APRS_SYMBOL_CODE_HOUSE = "-"  # DL2JA-2's symbol code in the capture below
+# Attacker-shaped JSON off an unauthenticated socket: a number where the wire
+# contract promises a string.
+_NON_STRING_SYMBOL_VALUE = 7
+# A longer string that merely CONTAINS two backslashes. Pins the exact-match
+# choice: str.replace() would mangle this, the implemented equality check
+# leaves it alone.
+_TEXT_CONTAINING_DOUBLED_BACKSLASH = f"pre{_FIRMWARE_DOUBLED_BACKSLASH}post"
+
+# Verbatim live capture, Extern-UDP :1799 from DK5EN-98 (192.168.68.57): a
+# position beacon relayed via DM6CS-12,DF2SI-12,DL2JA-2, the station that
+# renders as a grey "?" instead of the blue house. Written as a RAW bytes
+# literal, so what stands here is byte-for-byte what the socket delivered —
+# four 0x5C bytes for the symbol group, which json.loads collapses to the two
+# characters the firmware wrongly emitted. `_test_aprs_escape_end_to_end`
+# re-checks that decode, so a typo here fails loudly instead of quietly making
+# the end-to-end case pass for the wrong reason.
+_DOUBLED_POS_DATAGRAM = (
+    rb'{"src_type":"lora","type":"pos","src":"DM6CS-12,DF2SI-12,DL2JA-2",'
+    rb'"msg":"","lat":48.2454,"lat_dir":"N","long":11.3693,"long_dir":"E",'
+    rb'"aprs_symbol":"-","aprs_symbol_group":"\\\\","hw_id":3,'
+    rb'"msg_id":"46494345","alt":1621,"batt":83,"firmware":35,"fw_sub":"p",'
+    rb'"rssi":-109,"snr":-4}'
+)
+# The capture's sender: a trusted private IPv4, so the outbound-target learning
+# path runs — hence the temp `runtime_state_path` at the call site.
+_CAPTURE_SENDER_IP = "192.168.68.57"
+# `src` for the synthetic telemetry frame; telemetry never carries a symbol on
+# the real wire, so this fixture exists only to prove the normalizer runs ABOVE
+# the tele/msg branch rather than inside one of them.
+_TELE_SRC_CALLSIGN = "DK5EN-98"
 
 
 class _CaptureRouter:
@@ -247,12 +305,241 @@ async def _test_pseudo_callsign() -> list[tuple[str, bool]]:
     return results
 
 
+def _apply_undouble(message: dict[str, Any]) -> bool:
+    """Run the normalizer and report whether it survived, instead of letting an
+    exception abort the whole suite.
+
+    The "absent field" and "non-string value" cases exist precisely because the
+    payload is attacker-shaped JSON off an unauthenticated socket: a missing key
+    or an int where a string is due must be a silent no-op, never a
+    KeyError/TypeError. If it ever raises, that has to print as one labelled
+    FAIL line like every other case here rather than as a traceback that hides
+    the cases after it.
+    """
+    try:
+        _undouble_aprs_symbol_escapes(message)
+    except Exception:
+        return False
+    return True
+
+
+def _test_undouble_aprs_symbol_escapes() -> list[tuple[str, bool]]:
+    """Unit cases for the firmware double-escape fix (``aprs-escape-bug.md``).
+
+    MeshCom's ``sendExtern()`` hand-escapes a backslash and then lets
+    ArduinoJson escape it a second time, so the alternate APRS symbol table
+    arrives on :1799 as TWO characters where ONE is meant. Only that exact
+    two-character value is rewritten — see the "unchanged" cases below for the
+    values that must survive verbatim.
+    """
+    results: list[tuple[str, bool]] = []
+
+    # (0) Guard the fixtures before any case leans on them: should the "doubled"
+    #     and "single" constants ever collapse to the same value, every case
+    #     below would pass vacuously.
+    results.append(
+        (
+            "undouble fixtures: doubled value is 2 chars, alternate table is 1 char",
+            len(_FIRMWARE_DOUBLED_BACKSLASH) == _TWO_CHARS
+            and len(_APRS_ALTERNATE_TABLE) == _ONE_CHAR,
+        )
+    )
+
+    # (1) THE BUG: a doubled symbol group collapses to the single character.
+    group_doubled: dict[str, Any] = {_SYMBOL_GROUP_FIELD: _FIRMWARE_DOUBLED_BACKSLASH}
+    _undouble_aprs_symbol_escapes(group_doubled)
+    results.append(
+        (
+            "undouble: doubled aprs_symbol_group -> 1-char alternate table",
+            group_doubled == {_SYMBOL_GROUP_FIELD: _APRS_ALTERNATE_TABLE}
+            and len(group_doubled[_SYMBOL_GROUP_FIELD]) == _ONE_CHAR,
+        )
+    )
+
+    # (2) The symmetric field. `escape_symbol` (extudp_functions.cpp:379) carries
+    #     the identical hand-escape, so a `\` SYMBOL CODE is structurally exposed
+    #     to the same bug. No station transmits one today — this case is what
+    #     stops the field being "simplified" away for lack of a failing sample.
+    symbol_doubled: dict[str, Any] = {_SYMBOL_CODE_FIELD: _FIRMWARE_DOUBLED_BACKSLASH}
+    _undouble_aprs_symbol_escapes(symbol_doubled)
+    results.append(
+        (
+            "undouble: doubled aprs_symbol -> 1-char alternate table (symmetric field)",
+            symbol_doubled == {_SYMBOL_CODE_FIELD: _APRS_ALTERNATE_TABLE}
+            and len(symbol_doubled[_SYMBOL_CODE_FIELD]) == _ONE_CHAR,
+        )
+    )
+
+    # (3) Idempotence: an already-correct single backslash survives repeated
+    #     application. The BLE path yields exactly this value, and the backfill
+    #     may re-run, so a second pass must never eat the character.
+    already_single: dict[str, Any] = {_SYMBOL_GROUP_FIELD: _APRS_ALTERNATE_TABLE}
+    _undouble_aprs_symbol_escapes(already_single)
+    _undouble_aprs_symbol_escapes(already_single)
+    results.append(
+        (
+            "undouble: already 1-char backslash unchanged under repeat application",
+            already_single == {_SYMBOL_GROUP_FIELD: _APRS_ALTERNATE_TABLE}
+            and len(already_single[_SYMBOL_GROUP_FIELD]) == _ONE_CHAR,
+        )
+    )
+
+    # (4)-(6) plus one bonus: everything that must survive verbatim.
+    #     `KFR` is the oevsv.at internet feed's alias for the same backslash; it
+    #     never appears on :1799 and is the frontend's concern, so pinning it as
+    #     "unchanged" keeps a dead `KFR` branch out of this path. The last row
+    #     pins the exact-match choice: `str.replace()` would mangle a longer
+    #     string that merely contains two backslashes.
+    for label, value in (
+        ("primary table '/'", _APRS_PRIMARY_TABLE),
+        ("valid overlay id 'G'", _APRS_OVERLAY_ID),
+        ("oevsv.at alias 'KFR'", _OEVSV_INTERNET_ALIAS),
+        ("longer text merely containing two backslashes", _TEXT_CONTAINING_DOUBLED_BACKSLASH),
+    ):
+        untouched: dict[str, Any] = {_SYMBOL_GROUP_FIELD: value}
+        _undouble_aprs_symbol_escapes(untouched)
+        results.append(
+            (
+                f"undouble: {label} left unchanged",
+                untouched == {_SYMBOL_GROUP_FIELD: value},
+            )
+        )
+
+    # (7) Neither field present: no KeyError, and no field conjured into being.
+    #     Most frames on :1799 (tele, ack, non-position msg) look like this.
+    absent: dict[str, Any] = {"type": "msg", "src": _TELE_SRC_CALLSIGN}
+    expected_absent = {"type": "msg", "src": _TELE_SRC_CALLSIGN}
+    absent_ok = _apply_undouble(absent)
+    results.append(
+        (
+            "undouble: symbol fields absent -> no KeyError, no field invented",
+            absent_ok and absent == expected_absent,
+        )
+    )
+
+    # (8) Non-string value: no exception, value untouched.
+    non_string: dict[str, Any] = {_SYMBOL_GROUP_FIELD: _NON_STRING_SYMBOL_VALUE}
+    expected_non_string = {_SYMBOL_GROUP_FIELD: _NON_STRING_SYMBOL_VALUE}
+    non_string_ok = _apply_undouble(non_string)
+    results.append(
+        (
+            "undouble: non-string aprs_symbol_group -> no exception, value untouched",
+            non_string_ok and non_string == expected_non_string,
+        )
+    )
+    return results
+
+
+async def _test_aprs_escape_end_to_end() -> list[tuple[str, bool]]:
+    """End-to-end through ``UDPHandler._process_received_message``.
+
+    These cases assert on what reached the ROUTER, not on what the helper
+    returns. The normalizer is only worth anything if `_process_received_message`
+    calls it, and calls it *above* both the `tele` and the `msg` branch — a
+    correct helper paired with a missing or mis-placed call site is exactly the
+    regression this covers, and no unit case can see it.
+
+    `runtime_state_path` is pinned into a temp dir for the same reason as
+    `_test_pseudo_callsign`: `_CAPTURE_SENDER_IP` is a trusted private IPv4, so
+    the outbound-target learning path really runs, and a test must never be able
+    to write production state (`/var/lib/mcapp/runtime.json`).
+    """
+    results: list[tuple[str, bool]] = []
+
+    # Fixture guard: the raw capture must really decode to the two-character
+    # form. A typo in the wire literal would otherwise let the case below pass
+    # for the wrong reason (nothing to fix, so nothing to break).
+    on_the_wire: dict[str, Any] = json.loads(_DOUBLED_POS_DATAGRAM)
+    wire_group = on_the_wire[_SYMBOL_GROUP_FIELD]
+    results.append(
+        (
+            "aprs escape e2e: live capture decodes to the 2-char doubled group",
+            wire_group == _FIRMWARE_DOUBLED_BACKSLASH and len(wire_group) == _TWO_CHARS,
+        )
+    )
+
+    # Telemetry carries no symbol on the real wire; this frame exists purely to
+    # exercise the OTHER publish path out of `_process_received_message`.
+    tele_datagram = json.dumps(
+        {
+            "type": "tele",
+            "src": _TELE_SRC_CALLSIGN,
+            _SYMBOL_GROUP_FIELD: _FIRMWARE_DOUBLED_BACKSLASH,
+        }
+    ).encode()
+
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        runtime_path = Path(tmp_dir) / "runtime.json"
+        sender = (_CAPTURE_SENDER_IP, _SENDER_PORT)
+
+        pos_router = _CaptureRouter()
+        pos_handler = UDPHandler(
+            listen_port=0,
+            target_host="127.0.0.1",
+            target_port=0,
+            message_router=pos_router,
+            runtime_state_path=runtime_path,
+        )
+        try:
+            # White-box: drive the real ingress path with the captured datagram.
+            await pos_handler._process_received_message(_DOUBLED_POS_DATAGRAM, sender)
+        finally:
+            pos_handler.send_socket.close()
+
+        tele_router = _CaptureRouter()
+        tele_handler = UDPHandler(
+            listen_port=0,
+            target_host="127.0.0.1",
+            target_port=0,
+            message_router=tele_router,
+            runtime_state_path=runtime_path,
+        )
+        try:
+            await tele_handler._process_received_message(tele_datagram, sender)
+        finally:
+            tele_handler.send_socket.close()
+
+    results.append(("aprs escape e2e: pos datagram reached the router", bool(pos_router.calls)))
+
+    published_pos: dict[str, Any] = pos_router.calls[-1][2] if pos_router.calls else {}
+    published_group = published_pos.get(_SYMBOL_GROUP_FIELD)
+    results.append(
+        (
+            "aprs escape e2e: PUBLISHED aprs_symbol_group is the 1-char alternate table",
+            isinstance(published_group, str)
+            and published_group == _APRS_ALTERNATE_TABLE
+            and len(published_group) == _ONE_CHAR,
+        )
+    )
+    results.append(
+        (
+            "aprs escape e2e: PUBLISHED aprs_symbol (already correct) untouched",
+            published_pos.get(_SYMBOL_CODE_FIELD) == _APRS_SYMBOL_CODE_HOUSE,
+        )
+    )
+
+    published_tele: dict[str, Any] = tele_router.calls[-1][2] if tele_router.calls else {}
+    tele_group = published_tele.get(_SYMBOL_GROUP_FIELD)
+    results.append(
+        (
+            "aprs escape e2e: tele branch normalized too (call site above both branches)",
+            bool(tele_router.calls)
+            and isinstance(tele_group, str)
+            and tele_group == _APRS_ALTERNATE_TABLE
+            and len(tele_group) == _ONE_CHAR,
+        )
+    )
+    return results
+
+
 async def run_udp_parsing_tests() -> bool:
     """Run the pure-parsing helper tests; return True iff all pass."""
     results: list[tuple[str, bool]] = []
     results.extend(_test_try_repair_json())
     results.extend(_test_strip_invalid_utf8())
     results.extend(_test_normalize_altitude())
+    results.extend(_test_undouble_aprs_symbol_escapes())
+    results.extend(await _test_aprs_escape_end_to_end())
     results.extend(await _test_pseudo_callsign())
 
     for label, passed in results:

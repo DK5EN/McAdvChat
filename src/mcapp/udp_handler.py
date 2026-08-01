@@ -57,6 +57,43 @@ def _normalize_altitude_to_meters(message: dict[str, Any]) -> None:
         message["alt"] = round(message["alt"] * FEET_TO_METERS)
 
 
+# The MeshCom firmware hand-escapes a backslash in sendExtern()'s JSON builder
+# (extudp_functions.cpp:379/385) and then lets ArduinoJson escape it again, so the
+# alternate symbol table arrives here as two characters instead of one. Both fields
+# are single characters by APRS definition, so a two-backslash value is unambiguously
+# the firmware's double-escape and never a legitimate symbol. The BLE path decodes the
+# same beacon from raw APRS text and already yields one character — see
+# aprs-escape-bug.md for the per-path evidence.
+_APRS_SYMBOL_FIELDS = ("aprs_symbol", "aprs_symbol_group")
+_FIRMWARE_DOUBLED_BACKSLASH = "\\\\"  # two characters
+_APRS_ALTERNATE_TABLE = "\\"  # one character
+
+
+def _undouble_aprs_symbol_escapes(message: dict[str, Any]) -> None:
+    """Collapse the firmware's double-escaped backslash back to one character.
+
+    Deliberately an exact match on the two-character value, not a
+    ``str.replace()``: a blanket replace would also rewrite a longer string that
+    merely happens to contain two backslashes, and this normalization is only
+    ever correct for a field whose entire value is the doubled escape.
+
+    Only this — the single Extern-UDP :1799 ingress — is normalized. Everything
+    else stays untouched on purpose: single-character overlay ids (``G``, ``M``,
+    ``0-9``, ``A-Z``) are valid APRS overlays rather than corruption, the
+    oevsv.at internet feed's ``KFR`` alias never reaches this socket and is the
+    frontend's concern, and genuine junk (a space, ``U+FFFD``) must keep failing
+    symbol resolution instead of being silently mapped to something plausible.
+
+    ``dict.get()`` compared against a string constant tolerates both an absent
+    field and a non-string value (an int, ``None``) without raising, which
+    matters because the payload is attacker-shaped JSON off an unauthenticated
+    socket.
+    """
+    for field in _APRS_SYMBOL_FIELDS:
+        if message.get(field) == _FIRMWARE_DOUBLED_BACKSLASH:
+            message[field] = _APRS_ALTERNATE_TABLE
+
+
 def is_allowed_char(ch: str) -> bool:  # noqa: PLR0911 - complex handler kept intact
     """Check if character is allowed in our charset"""
     codepoint = ord(ch)
@@ -329,6 +366,16 @@ class UDPHandler:
 
         if not message:
             return
+
+        # Before ANY branch below, so every publish path out of this method is
+        # covered: this is the one choke point where the firmware's raw
+        # sendExtern() JSON enters MCProxy, and MessageRouter re-serializes the
+        # routed dict, so normalizing here cleans live SSE frames,
+        # messages.raw_json and station_positions in a single move. Must not be
+        # pushed down into a branch, and must not move into MessageRouter.publish
+        # or storage/ingest.py — those are shared with the BLE path, whose single
+        # backslash is already canonical and would be corrupted by a second pass.
+        _undouble_aprs_symbol_escapes(message)
 
         if "msg" not in message:
             if message.get("type") == "tele":

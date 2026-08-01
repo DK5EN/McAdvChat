@@ -3,7 +3,9 @@
 Moved out of sqlite_storage.py (ST-04). Owns store_message/store_telemetry (the
 dual-write path into messages + station_positions/signal_log), the in-memory
 5-minute signal_buckets accumulator, and the UDP-2.0 Track U signal-ingestion
-helpers (_ingest_signal, backfill_signal_log).
+helpers (_ingest_signal, backfill_signal_log), plus the one-time
+backfill_aprs_symbol_escapes repair job for the firmware's double-escaped APRS
+symbol table id.
 """
 
 import contextlib
@@ -39,7 +41,33 @@ from .constants import (
 _MAX_FORENSIC_HOPS = 4  # log raw data for messages routed over more hops
 _MIN_PLAUSIBLE_HPA = 850  # pressure below this is a firmware mapping error
 
+# --- APRS symbol double-escape (firmware bug, see backfill_aprs_symbol_escapes) --
+# Written as escaped Python literals on purpose: a raw literal would make the
+# one-vs-two character distinction that this whole backfill turns on impossible to
+# see. `_FIRMWARE_DOUBLED_BACKSLASH` is TWO 0x5C bytes (what the firmware sends),
+# `_APRS_ALTERNATE_TABLE` is ONE (the APRS alternate symbol table id).
+_FIRMWARE_DOUBLED_BACKSLASH = "\\\\"
+_APRS_ALTERNATE_TABLE = "\\"
+_APRS_SYMBOL_FIELDS = ("aprs_symbol", "aprs_symbol_group")
+_APRS_ESCAPE_BACKFILL_MARKER = "aprs_escape_backfill_done:v1"
+
 logger = get_logger(__name__)
+
+
+def _undouble_aprs_symbol_escapes(payload: dict[str, Any]) -> bool:
+    """Collapse a double-escaped backslash in `payload`'s APRS symbol fields, in place.
+
+    Returns True if anything changed. Only the exact two-character value is rewritten:
+    a legitimate single `\\`, an overlay id (`G`, `M`, ...), `/`, the oevsv.at feed's
+    `KFR` alias and honest garbage all pass through untouched, and a non-string value
+    simply never compares equal. See `backfill_aprs_symbol_escapes` for the root cause.
+    """
+    changed = False
+    for field in _APRS_SYMBOL_FIELDS:
+        if payload.get(field) == _FIRMWARE_DOUBLED_BACKSLASH:
+            payload[field] = _APRS_ALTERNATE_TABLE
+            changed = True
+    return changed
 
 
 class IngestMixin(StorageBase):
@@ -441,6 +469,125 @@ class IngestMixin(StorageBase):
             params,
         )
         logger.info("Signal backfill: rebuilt %d signal_buckets rows", len(params))
+
+    async def backfill_aprs_symbol_escapes(self) -> dict[str, Any]:
+        """One-time backfill: collapse the firmware's double-escaped APRS backslash.
+
+        The MeshCom firmware hand-escapes a backslash in `sendExtern()`'s JSON
+        builder (`extudp_functions.cpp:379/385`) and then hands the already-escaped
+        string to ArduinoJson, which escapes it a second time. Every position beacon
+        using the *alternate* APRS symbol table therefore arrives on Extern-UDP :1799
+        with a two-character `\\\\` where the one-character `\\` (0x5C) is meant, and
+        MCProxy stored that verbatim: the frontend cannot resolve the symbol and
+        renders a grey placeholder instead of the icon. The BLE path is unaffected —
+        `parse_aprs_position` decodes raw APRS text and its `([/\\\\])` group captures
+        exactly one character. Full evidence: `aprs-escape-bug.md`.
+
+        The ingress fix in `udp_handler.py` only cleans *new* traffic, so this repairs
+        the rows already on disk, in both places the value lives:
+
+        * `station_positions.aprs_symbol_group` / `.aprs_symbol` — **required**. This
+          is what `storage/query.py` reads to build the position payload, i.e. the
+          table that decides whether the icon appears at all.
+        * `messages.raw_json` — not read for normal display, but the v2 migration in
+          `storage/migrations.py` rebuilds `station_positions` from
+          `json_extract(raw_json, '$.aprs_symbol_group')`. Leaving history dirty means
+          that migration resurrects the bug if it ever re-runs.
+
+        Both symbol fields are single characters by APRS definition, so a value of
+        exactly two backslashes is unambiguously the firmware's double-escape and never
+        a legitimate symbol. Every predicate below is an exact equality against that
+        two-character value, bound as a parameter — never a substring replace, which
+        would mangle a message body that legitimately contains two backslashes, and
+        never an interpolated literal, where one backslash too few or too many is
+        invisible in review.
+
+        Guarded by an `aprs_escape_backfill_done:v1` marker in the shared meta table
+        (same shape as `backfill_signal_log`). Idempotent regardless of the marker:
+        after the first pass the two-character value no longer exists, so every
+        predicate matches zero rows and a second run is a no-op. A single-character
+        `\\` is never touched, in either direction.
+
+        The `messages` scan is unindexed (`json_extract` in the WHERE clause) and runs
+        off the startup critical path — see `_maybe_backfill_aprs_symbol_escapes`.
+        """
+        marker_key = _APRS_ESCAPE_BACKFILL_MARKER
+        if await self.get_meta(marker_key):
+            logger.info("APRS escape backfill marker present (%s), skipping", marker_key)
+            return {
+                "skipped": True,
+                "positions_group_fixed": 0,
+                "positions_symbol_fixed": 0,
+                "raw_json_scanned": 0,
+                "raw_json_fixed": 0,
+                "raw_json_unparsable": 0,
+            }
+
+        # --- station_positions: two plain UPDATEs, one per column ---------------
+        # Spelled out rather than looped over a column name, so no SQL identifier is
+        # ever built by string interpolation.
+        positions_group_fixed = await self._mutate(
+            "UPDATE station_positions SET aprs_symbol_group = ? WHERE aprs_symbol_group = ?",
+            (_APRS_ALTERNATE_TABLE, _FIRMWARE_DOUBLED_BACKSLASH),
+        )
+        positions_symbol_fixed = await self._mutate(
+            "UPDATE station_positions SET aprs_symbol = ? WHERE aprs_symbol = ?",
+            (_APRS_ALTERNATE_TABLE, _FIRMWARE_DOUBLED_BACKSLASH),
+        )
+
+        # --- messages.raw_json: select narrowly, rewrite through json ------------
+        # The CASE is load-bearing: `json_extract` raises "malformed JSON" and aborts
+        # the whole statement on a single bad row, and SQLite does not promise that a
+        # leading `json_valid(...) AND ...` term is evaluated first. CASE *is*
+        # documented to evaluate its THEN only for the matching WHEN, which makes the
+        # guard hold whatever the query planner decides to do with the terms.
+        rows = await self._query(
+            "SELECT id, raw_json FROM messages"
+            " WHERE raw_json IS NOT NULL"
+            "   AND CASE WHEN json_valid(raw_json)"
+            "            THEN json_extract(raw_json, '$.aprs_symbol_group') = ?"
+            "              OR json_extract(raw_json, '$.aprs_symbol') = ?"
+            "            ELSE 0 END",
+            (_FIRMWARE_DOUBLED_BACKSLASH, _FIRMWARE_DOUBLED_BACKSLASH),
+        )
+
+        updates: list[tuple[str, int]] = []
+        raw_json_unparsable = 0
+        for row in rows:
+            try:
+                payload = json.loads(row["raw_json"])
+            except (json.JSONDecodeError, TypeError):
+                # Cannot happen behind the json_valid() guard, but a row that slipped
+                # through must be skipped, not allowed to abort the whole backfill.
+                raw_json_unparsable += 1
+                continue
+            if not isinstance(payload, dict):
+                raw_json_unparsable += 1
+                continue
+            # Rewrite the two symbol keys only, and only on an exact two-character
+            # match; every other key round-trips through json untouched. `raw_json` is
+            # written by `json.dumps` on the ingest path, so loads/dumps with the same
+            # defaults reproduces the original text byte for byte apart from the two
+            # values corrected here (dict order is JSON document order).
+            if not _undouble_aprs_symbol_escapes(payload):
+                continue
+            updates.append((json.dumps(payload), row["id"]))
+
+        if updates:
+            await self._execute_many("UPDATE messages SET raw_json = ? WHERE id = ?", updates)
+
+        await self.set_meta(marker_key, datetime.now(UTC).isoformat())
+
+        summary: dict[str, Any] = {
+            "skipped": False,
+            "positions_group_fixed": positions_group_fixed,
+            "positions_symbol_fixed": positions_symbol_fixed,
+            "raw_json_scanned": len(rows),
+            "raw_json_fixed": len(updates),
+            "raw_json_unparsable": raw_json_unparsable,
+        }
+        logger.info("APRS escape backfill complete: %s", summary)
+        return summary
 
     async def _handle_ack(
         self, ack_for_msg_id: str, ack_type: Any, ack_type_text: str, timestamp: int

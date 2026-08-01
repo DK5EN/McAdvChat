@@ -2170,6 +2170,25 @@ async def _maybe_backfill_signal_log(storage_handler: SQLiteStorage) -> None:
         logger.exception("Signal backfill failed")
 
 
+async def _maybe_backfill_aprs_symbol_escapes(storage_handler: SQLiteStorage) -> None:
+    """One-time repair of the firmware's double-escaped APRS symbol table id.
+
+    Rows ingested before the Extern-UDP de-escape landed hold a two-character `\\\\`
+    where the one-character alternate-table `\\` belongs, so the frontend renders a grey
+    placeholder instead of the icon (root cause: `extudp_functions.cpp` pre-escapes the
+    backslash and ArduinoJson escapes it again — see `aprs-escape-bug.md`).
+
+    Marker-guarded and idempotent inside the storage layer; scheduled as a background
+    one-shot so its unindexed `messages` scan never delays the SSE server binding, and
+    swallowing here so a repair job can never take startup down with it — a proxy that
+    comes up with the wrong symbol beats a proxy that does not come up.
+    """
+    try:
+        await storage_handler.backfill_aprs_symbol_escapes()
+    except Exception:
+        logger.exception("APRS symbol escape backfill failed")
+
+
 async def _classifier_stats_broadcast(
     classifier: Classifier,
     storage_handler: SQLiteStorage,
@@ -2209,6 +2228,7 @@ class _BackgroundTasks:
     classifier_stats_task: asyncio.Task[None]
     backfill_task: asyncio.Task[None]
     signal_backfill_task: asyncio.Task[None]
+    aprs_escape_backfill_task: asyncio.Task[None]
     sperrliste_task: asyncio.Task[None]
 
 
@@ -2216,13 +2236,17 @@ def _start_background_tasks(
     ctx: AppContext, cfg: Config, stop_event: asyncio.Event
 ) -> _BackgroundTasks:
     """Start the nightly-prune, classifier-backfill, signal-backfill,
-    classifier-stats-broadcast, and sperrliste-refresh background tasks."""
+    APRS-escape-backfill, classifier-stats-broadcast, and sperrliste-refresh
+    background tasks."""
     prune_task = asyncio.create_task(_nightly_prune(ctx.storage_handler, cfg, stop_event))
     # Reference lives for the app's lifetime (run() awaits until shutdown)
     backfill_task = asyncio.create_task(
         _maybe_backfill_classifier(ctx.classifier, ctx.storage_handler, ctx.sse_manager)
     )
     signal_backfill_task = asyncio.create_task(_maybe_backfill_signal_log(ctx.storage_handler))
+    aprs_escape_backfill_task = asyncio.create_task(
+        _maybe_backfill_aprs_symbol_escapes(ctx.storage_handler)
+    )
     classifier_stats_task = asyncio.create_task(
         _classifier_stats_broadcast(
             ctx.classifier, ctx.storage_handler, ctx.sse_manager, stop_event
@@ -2240,6 +2264,7 @@ def _start_background_tasks(
         classifier_stats_task=classifier_stats_task,
         backfill_task=backfill_task,
         signal_backfill_task=signal_backfill_task,
+        aprs_escape_backfill_task=aprs_escape_backfill_task,
         sperrliste_task=sperrliste_task,
     )
 
