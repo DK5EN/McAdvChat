@@ -11,6 +11,13 @@ standalone parsing helpers that had no coverage before:
 * ``_undouble_aprs_symbol_escapes`` — the MeshCom firmware's double-escaped
   backslash on the alternate APRS symbol table (see ``aprs-escape-bug.md``),
   both as a unit and end-to-end through ``_process_received_message``.
+* ``_unescape_firmware_msg_body`` — the SAME firmware double-escape, one field
+  over: ``sendExtern()`` runs a text message's body through ``strEsc()`` before
+  ArduinoJson escapes it again, so a user's quotes reached the UI with a stray
+  backslash in front of each. Also covered as a unit and end-to-end. The two
+  normalizers pull in opposite directions on the same character, which is why
+  both carry ``type``-scoped cases: a ``pos`` payload's lone backslash is a real
+  APRS table id and must survive the msg-body pass untouched.
 * ``_strip_non_scalar_fields`` — the container-shaped-value guard that runs at
   the same ingress choke point, again both as a unit and end-to-end.
 * The ``NODE-<octet>`` pseudo-callsign derivation inside
@@ -39,6 +46,7 @@ from .udp_handler import (
     _normalize_altitude_to_meters,
     _strip_non_scalar_fields,
     _undouble_aprs_symbol_escapes,
+    _unescape_firmware_msg_body,
     strip_invalid_utf8,
     try_repair_json,
 )
@@ -461,6 +469,116 @@ def _test_undouble_aprs_symbol_escapes() -> list[tuple[str, bool]]:
     return results
 
 
+def _test_unescape_firmware_msg_body() -> list[tuple[str, bool]]:
+    """Unit cases for inverting the firmware's ``strEsc()`` on a text-message body.
+
+    ``sendExtern()`` runs the body through ``strEsc`` (``extudp_functions.cpp:504``,
+    definition at ``:645``), which prepends a backslash to every quote and every
+    backslash, then hands the result to ArduinoJson, which escapes it a second time.
+    After json.loads undoes ArduinoJson's layer, strEsc's layer is still there — and
+    reached the UI verbatim. Reported as: the quotes around a word rendered with a
+    stray backslash in front of each one.
+
+    Same ``chr(92)`` discipline as the APRS block above, for the same reason: the
+    difference between right and wrong here is one backslash, and a literal spells
+    that difference in a way no reviewer can count reliably. ``_ESC`` below is the
+    firmware's own rule, applied in Python, so the fixtures cannot drift from the
+    algorithm they pin.
+
+    The dangerous direction is OVER-stripping: ``pos`` payloads carry a genuine
+    one-character backslash as the APRS alternate symbol-table id, and removing it
+    would reintroduce exactly the bug ``_undouble_aprs_symbol_escapes`` exists to
+    fix. Hence cases (4) and (5).
+    """
+    results: list[tuple[str, bool]] = []
+
+    def _str_esc(text: str) -> str:
+        """The firmware's strEsc, in Python: one backslash before a quote or backslash."""
+        return "".join((_BACKSLASH + c) if c in ('"', _BACKSLASH) else c for c in text)
+
+    # (1) The reported bug, rebuilt through the firmware's own rule.
+    original = 'kann gut sein, dass die alles "aufheizen".'
+    reported: dict[str, Any] = {"type": "msg", "msg": _str_esc(original)}
+    # Guard the fixture itself: the input must really differ from the expected
+    # output, or this case would pass on a normalizer that does nothing.
+    fixture_ok = reported["msg"] != original and _BACKSLASH in reported["msg"]
+    changed = _unescape_firmware_msg_body(reported)
+    results.append(
+        (
+            "msg body: strEsc'd quotes -> bare quotes",
+            fixture_ok and changed and reported["msg"] == original,
+        )
+    )
+
+    # (2) Exactly invertible, including for text that ALREADY contained a backslash
+    #     (which strEsc doubles). A naive str.replace chain gets this one wrong.
+    with_backslash = "path C:" + _BACKSLASH + 'dir and a "quoted" word'
+    round_trip: dict[str, Any] = {"type": "msg", "msg": _str_esc(with_backslash)}
+    _unescape_firmware_msg_body(round_trip)
+    results.append(
+        (
+            "msg body: strEsc round-trip restores text containing a backslash",
+            round_trip["msg"] == with_backslash,
+        )
+    )
+
+    # (3) Idempotence. A second pass must NOT keep eating backslashes: after the
+    #     first pass no surviving backslash is followed by a quote or backslash.
+    once: dict[str, Any] = {"type": "msg", "msg": _str_esc('say "hi"')}
+    _unescape_firmware_msg_body(once)
+    after_first = once["msg"]
+    second_changed = _unescape_firmware_msg_body(once)
+    results.append(
+        (
+            "msg body: second pass is a no-op, not a second strip",
+            after_first == 'say "hi"' and not second_changed and once["msg"] == 'say "hi"',
+        )
+    )
+
+    # (4) A `pos` payload is never strEsc'd (`:408` sets msg to the empty string);
+    #     its lone backslash IS the APRS alternate table id and must survive.
+    beacon_text = "!4824.47N" + _BACKSLASH + "01144.28E-MeshCom Freising"
+    position: dict[str, Any] = {"type": "pos", "msg": beacon_text}
+    pos_changed = _unescape_firmware_msg_body(position)
+    results.append(
+        (
+            "msg body: type=pos untouched (APRS table id is not an escape)",
+            not pos_changed
+            and position["msg"] == beacon_text
+            and position["msg"].count(_BACKSLASH) == _ONE_CHAR,
+        )
+    )
+
+    # (5) Even inside a `msg`, a backslash NOT followed by a quote or backslash is
+    #     data — strEsc could never have produced it. Leave it alone.
+    lone_text = "grid JN58" + _BACKSLASH + "12 ok"
+    lone: dict[str, Any] = {"type": "msg", "msg": lone_text}
+    lone_changed = _unescape_firmware_msg_body(lone)
+    results.append(
+        (
+            "msg body: lone backslash before a non-escapable char is preserved",
+            not lone_changed and lone["msg"] == lone_text,
+        )
+    )
+
+    # (6) Absent / non-string / backslash-free bodies: no exception, no field
+    #     invented. Port 1799 is unauthenticated, so the payload is attacker-shaped.
+    absent: dict[str, Any] = {"type": "msg"}
+    non_string: dict[str, Any] = {"type": "msg", "msg": _NON_STRING_SYMBOL_VALUE}
+    clean: dict[str, Any] = {"type": "msg", "msg": "nothing to do here"}
+    tolerant = (
+        not _unescape_firmware_msg_body(absent)
+        and absent == {"type": "msg"}
+        and not _unescape_firmware_msg_body(non_string)
+        and non_string["msg"] == _NON_STRING_SYMBOL_VALUE
+        and not _unescape_firmware_msg_body(clean)
+        and clean["msg"] == "nothing to do here"
+    )
+    results.append(("msg body: absent/non-string/clean -> no exception, untouched", tolerant))
+
+    return results
+
+
 def _test_strip_non_scalar_fields() -> list[tuple[str, bool]]:
     """Unit cases for the container-shaped-value guard at the :1799 ingress.
 
@@ -693,6 +811,74 @@ async def _test_aprs_escape_end_to_end() -> list[tuple[str, bool]]:
     return results
 
 
+async def _test_msg_escape_end_to_end() -> list[tuple[str, bool]]:
+    """End-to-end through ``UDPHandler._process_received_message`` for the msg body.
+
+    Same reasoning as ``_test_aprs_escape_end_to_end``: a correct helper paired with
+    a missing call site is the regression that matters, and no unit case can see it.
+    Asserts on what reached the ROUTER.
+
+    The datagram is built the way the firmware builds it — ``strEsc`` applied in
+    Python, then ``json.dumps`` standing in for ArduinoJson's second escape — so the
+    fixture pins the real double-escape rather than a guess at its wire form.
+    """
+    results: list[tuple[str, bool]] = []
+
+    original_text = 'die alles "aufheizen".'
+    str_esced = "".join((_BACKSLASH + c) if c in ('"', _BACKSLASH) else c for c in original_text)
+    msg_datagram = json.dumps(
+        {
+            "src_type": "node",
+            "type": "msg",
+            "src": _TELE_SRC_CALLSIGN,
+            "dst": "262",
+            "msg": str_esced,
+            "msg_id": "1AE1E0C4",
+        }
+    ).encode()
+
+    # Fixture guard: what json.loads hands the ingress must really still carry
+    # strEsc's layer, or the case below would pass for the wrong reason.
+    decoded: dict[str, Any] = json.loads(msg_datagram)
+    results.append(
+        (
+            "msg escape e2e: fixture decodes to the still-escaped body",
+            decoded["msg"] == str_esced and _BACKSLASH in decoded["msg"],
+        )
+    )
+
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        runtime_path = Path(tmp_dir) / "runtime.json"
+        sender = (_CAPTURE_SENDER_IP, _SENDER_PORT)
+
+        msg_router = _CaptureRouter()
+        msg_handler = UDPHandler(
+            listen_port=0,
+            target_host="127.0.0.1",
+            target_port=0,
+            message_router=msg_router,
+            runtime_state_path=runtime_path,
+        )
+        try:
+            await msg_handler._process_received_message(msg_datagram, sender)
+        finally:
+            msg_handler.send_socket.close()
+
+    results.append(("msg escape e2e: msg datagram reached the router", bool(msg_router.calls)))
+
+    published: dict[str, Any] = msg_router.calls[-1][2] if msg_router.calls else {}
+    published_body = published.get("msg")
+    results.append(
+        (
+            "msg escape e2e: PUBLISHED body has no leftover strEsc backslash",
+            isinstance(published_body, str)
+            and published_body == original_text
+            and _BACKSLASH not in published_body,
+        )
+    )
+    return results
+
+
 async def run_udp_parsing_tests() -> bool:
     """Run the pure-parsing helper tests; return True iff all pass."""
     results: list[tuple[str, bool]] = []
@@ -700,7 +886,9 @@ async def run_udp_parsing_tests() -> bool:
     results.extend(_test_strip_invalid_utf8())
     results.extend(_test_normalize_altitude())
     results.extend(_test_undouble_aprs_symbol_escapes())
+    results.extend(_test_unescape_firmware_msg_body())
     results.extend(await _test_aprs_escape_end_to_end())
+    results.extend(await _test_msg_escape_end_to_end())
     results.extend(_test_strip_non_scalar_fields())
     results.extend(await _test_non_scalar_end_to_end())
     results.extend(await _test_pseudo_callsign())

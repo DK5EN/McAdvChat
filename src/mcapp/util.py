@@ -75,3 +75,74 @@ def undouble_aprs_symbol_escapes(payload: dict[str, Any]) -> bool:
             payload[field] = APRS_ALTERNATE_TABLE
             changed = True
     return changed
+
+
+# --- Message-body double-escape (same firmware bug, different field) --------
+# `sendExtern()` builds the text-message document with
+# `cJson["msg"] = strEsc(aprsmsg.msg_payload)` (`extudp_functions.cpp:504`), and
+# `strEsc` (`:645-659`) prepends a backslash to every `"` and every `\`. That string
+# is then handed to ArduinoJson, which escapes it AGAIN during serialization. So a
+# message typed as `die alles "aufheizen".` arrives here, after json.loads has undone
+# ArduinoJson's layer, still carrying strEsc's layer: `die alles \"aufheizen\".` —
+# and MCProxy stored and re-served that verbatim, backslashes visible in the UI.
+#
+# Scope is narrow and load-bearing. `strEsc` is applied at exactly ONE site, in the
+# `msg_type_b_lora == 0x3A` (text) branch. The `pos` branch sets `cJson["msg"] = ""`
+# (`:408`) and the telemetry branch builds its own document, so neither is ever
+# strEsc'd. Confirmed against the live DB: the only Extern-UDP `type == "msg"` row
+# carrying a backslash was the corrupted one, while every backslash-bearing position
+# beacon was `src_type == "ble_remote"` — the BLE path, whose single backslash is the
+# genuine APRS alternate-table id and which must never be touched by this.
+_ESCAPABLE_BY_STR_ESC = ('"', "\\")
+
+
+def unescape_firmware_msg_body(payload: dict[str, Any]) -> bool:
+    """Invert the firmware's `strEsc()` on a text message's body, in place.
+
+    Returns True iff anything changed, matching `undouble_aprs_symbol_escapes`'s
+    contract so a future backfill over stored rows can share this one definition
+    rather than growing a second copy of the rule.
+
+    A left-to-right scan, NOT `str.replace("\\\\\\"", "\\"")`. `strEsc` inserts one
+    backslash before each `"` and each `\\`, so the inverse must consume the pair and
+    move past it. A blanket replace would rescan characters it had already emitted
+    and collapse sequences the firmware never produced — e.g. the literal text
+    `a\\\\"b` (backslash, backslash, quote) escapes to `a\\\\\\\\\\"b`, which a replace
+    chain can unwind to the wrong string, while the scan below restores it exactly.
+
+    Only `type == "msg"` payloads are touched, because only that branch of
+    `sendExtern()` calls `strEsc`. A `pos` payload's backslash is a real APRS symbol
+    table id and stripping it would reintroduce the very bug
+    `undouble_aprs_symbol_escapes` exists to fix.
+
+    Only ONE ingress may call this: the Extern-UDP :1799 socket in `udp_handler`. It
+    must not move into `MessageRouter.publish` or `storage/ingest.py` — those are
+    shared with the BLE path, which never passes through `strEsc` and whose text is
+    already canonical.
+
+    Non-`str` / absent `msg` is left alone rather than raising: the payload is
+    attacker-shaped JSON off an unauthenticated socket.
+    """
+    if payload.get("type") != "msg":
+        return False
+    body = payload.get("msg")
+    if not isinstance(body, str) or "\\" not in body:
+        return False
+
+    out: list[str] = []
+    i = 0
+    end = len(body)
+    while i < end:
+        char = body[i]
+        if char == "\\" and i + 1 < end and body[i + 1] in _ESCAPABLE_BY_STR_ESC:
+            out.append(body[i + 1])
+            i += 2
+            continue
+        out.append(char)
+        i += 1
+
+    unescaped = "".join(out)
+    if unescaped == body:
+        return False
+    payload["msg"] = unescaped
+    return True

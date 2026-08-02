@@ -18,7 +18,12 @@ from typing import Any, cast
 from .commands.parsing import strip_relay_path
 from .logging_setup import get_logger
 from .runtime_state import save_runtime_state
-from .util import FEET_TO_METERS, now_ms, undouble_aprs_symbol_escapes
+from .util import (
+    FEET_TO_METERS,
+    now_ms,
+    undouble_aprs_symbol_escapes,
+    unescape_firmware_msg_body,
+)
 
 logger = get_logger(__name__)
 
@@ -70,6 +75,11 @@ def _normalize_altitude_to_meters(message: dict[str, Any]) -> None:
 # (`no_implicit_reexport`) an aliased import is not an export, a module-level
 # definition is.
 _undouble_aprs_symbol_escapes = undouble_aprs_symbol_escapes
+
+# Same rebinding rule as above, for the same reasons: `util` owns the single
+# definition, this ingress is the only live caller, and the private name is what the
+# parsing suite imports from this module.
+_unescape_firmware_msg_body = unescape_firmware_msg_body
 
 # Every top-level field of the Extern-UDP wire format is a JSON SCALAR. That is not
 # an assumption: `sendExtern()` builds the `pos`, `msg` and `tele` documents key by
@@ -417,6 +427,14 @@ class UDPHandler:
         # or storage/ingest.py — those are shared with the BLE path, whose single
         # backslash is already canonical and would be corrupted by a second pass.
         _undouble_aprs_symbol_escapes(message)
+
+        # Same choke point, same firmware bug, different field: `sendExtern()` runs
+        # the text-message body through `strEsc()` before handing it to ArduinoJson,
+        # so every `"` and `\` a user typed arrives here with a spurious backslash in
+        # front of it. Gated to `type == "msg"` inside the helper — a `pos` payload's
+        # backslash is a real APRS symbol table id, and the line above exists to
+        # protect it.
+        _unescape_firmware_msg_body(message)
 
         # Same choke point, same reason: every publish path below (and therefore
         # every SQLite bind derived from it) is covered exactly once.
