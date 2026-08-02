@@ -44,6 +44,7 @@ from mcapp.push_tests import run_push_tests
 from mcapp.send_path_tests import run_send_path_tests
 from mcapp.sqlite_storage import run_startup_tests as run_storage_tests
 from mcapp.sse_handler import run_startup_tests as run_sse_tests
+from mcapp.storage.connection_lifecycle_tests import run_connection_lifecycle_tests
 from mcapp.storage.conversation_key_tests import run_conversation_key_tests
 from mcapp.storage.migration_chain_tests import run_migration_chain_tests
 from mcapp.storage.query_tests import run_query_tests
@@ -108,6 +109,9 @@ async def main() -> int:  # noqa: PLR0915 - flat suite registry; one visible lin
     migration_chain_ok = await run_migration_chain_tests()
     print(f"migration_chain: {'PASS' if migration_chain_ok else 'FAIL'}")
 
+    connection_lifecycle_ok = await run_connection_lifecycle_tests()
+    print(f"connection_lifecycle: {'PASS' if connection_lifecycle_ok else 'FAIL'}")
+
     meteo_ok = run_meteo_tests()
     print(f"meteo: {'PASS' if meteo_ok else 'FAIL'}")
 
@@ -161,6 +165,7 @@ async def main() -> int:  # noqa: PLR0915 - flat suite registry; one visible lin
         and conversation_key_ok
         and query_ok
         and migration_chain_ok
+        and connection_lifecycle_ok
         and meteo_ok
         and push_ok
         and ble_protocol_ok

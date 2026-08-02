@@ -7,6 +7,7 @@ tables the webapp uses for UI state (not message data itself).
 import asyncio
 import json
 import sqlite3
+from contextlib import closing
 from typing import Any, cast
 
 from ..commands.parsing import is_group
@@ -124,7 +125,10 @@ class PrefsMixin(StorageBase):
 
         def _run() -> tuple[int, bool, list[str]]:
             personal = False
-            with sqlite3.connect(self.db_path, timeout=SQLITE_BUSY_TIMEOUT_S) as conn:
+            with (
+                closing(sqlite3.connect(self.db_path, timeout=SQLITE_BUSY_TIMEOUT_S)) as conn,
+                conn,
+            ):
                 if dst == "Time":
                     cursor = conn.execute(
                         "DELETE FROM messages WHERE conversation_key = '*'"
@@ -222,7 +226,10 @@ class PrefsMixin(StorageBase):
         """Bulk replace all rows in a flat identifier-list table."""
 
         def _run() -> None:
-            with sqlite3.connect(self.db_path, timeout=SQLITE_BUSY_TIMEOUT_S) as conn:
+            with (
+                closing(sqlite3.connect(self.db_path, timeout=SQLITE_BUSY_TIMEOUT_S)) as conn,
+                conn,
+            ):
                 conn.execute(f"DELETE FROM {table}")  # noqa: S608 - table from fixed whitelist
                 if values:
                     conn.executemany(

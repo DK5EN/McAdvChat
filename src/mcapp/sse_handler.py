@@ -23,7 +23,7 @@ import sqlite3
 import tempfile
 import time
 from collections.abc import AsyncIterator
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, closing
 from typing import Any, ClassVar
 
 from . import __version__
@@ -1023,7 +1023,7 @@ async def run_startup_tests() -> bool:  # noqa: PLR0915 - regression suite kept 
             # chat): store_message's _should_filter_message drops NEW ones, so
             # inserting directly mirrors the only rows the 'Time' branch can
             # still remove.
-            with sqlite3.connect(storage.db_path) as raw_conn:
+            with closing(sqlite3.connect(storage.db_path)) as raw_conn, raw_conn:
                 raw_conn.execute(
                     "INSERT INTO messages"
                     " (msg_id, src, dst, msg, type, timestamp, conversation_key)"

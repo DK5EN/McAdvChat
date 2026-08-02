@@ -20,6 +20,7 @@ import json
 import sqlite3
 import tempfile
 from collections.abc import Sequence
+from contextlib import closing
 from pathlib import Path
 from typing import Any
 
@@ -82,11 +83,23 @@ class SQLiteStorage(MigrationsMixin, IngestMixin, QueryMixin, PrefsMixin, Classi
         """Wire the classifier so store_message() annotates new rows inline."""
         self._classifier = classifier
 
+    # ── Connection plumbing ────────────────────────────────────────────────
+    # NOTE: `closing()` is load-bearing, not decoration. `with
+    # sqlite3.connect(...) as conn:` never closes the connection — sqlite3's
+    # context manager is a *transaction* manager, so the handle survives until
+    # the cyclic GC reaches it, holding an fd and its page cache. That leak ran
+    # in production for the life of this project. Two shapes, never fewer:
+    #   reads   `with closing(connect(...)) as conn:`
+    #   writes  `with closing(connect(...)) as conn, conn:`  (bare conn commits)
+    # See storage/connection_lifecycle_tests.py for the full writeup and the
+    # regression coverage, and doc/connection-leak-fable-verdict.md for the
+    # measurements and the WAL-checkpoint trade-off this fix accepts.
+
     async def _query(self, query: str, params: tuple[Any, ...] = ()) -> list[dict[str, Any]]:
         """Run a SELECT in the thread pool and return the matched rows."""
 
         def _run() -> list[dict[str, Any]]:
-            with sqlite3.connect(self.db_path, timeout=SQLITE_BUSY_TIMEOUT_S) as conn:
+            with closing(sqlite3.connect(self.db_path, timeout=SQLITE_BUSY_TIMEOUT_S)) as conn:
                 conn.row_factory = sqlite3.Row
                 cursor = conn.execute(query, params)
                 return [dict(row) for row in cursor.fetchall()]
@@ -97,7 +110,10 @@ class SQLiteStorage(MigrationsMixin, IngestMixin, QueryMixin, PrefsMixin, Classi
         """Run an INSERT/UPDATE/DELETE in the thread pool and return the row count."""
 
         def _run() -> int:
-            with sqlite3.connect(self.db_path, timeout=SQLITE_BUSY_TIMEOUT_S) as conn:
+            with (
+                closing(sqlite3.connect(self.db_path, timeout=SQLITE_BUSY_TIMEOUT_S)) as conn,
+                conn,
+            ):
                 cursor = conn.execute(query, params)
                 conn.commit()
                 return cursor.rowcount
@@ -108,7 +124,10 @@ class SQLiteStorage(MigrationsMixin, IngestMixin, QueryMixin, PrefsMixin, Classi
         """Execute many queries in thread pool."""
 
         def _run() -> None:
-            with sqlite3.connect(self.db_path, timeout=SQLITE_BUSY_TIMEOUT_S) as conn:
+            with (
+                closing(sqlite3.connect(self.db_path, timeout=SQLITE_BUSY_TIMEOUT_S)) as conn,
+                conn,
+            ):
                 conn.executemany(query, params_list)
                 conn.commit()
 
@@ -731,7 +750,7 @@ async def run_startup_tests() -> bool:  # noqa: PLR0915 - test suite lists one c
         v18_db_path = Path(tmp_dir) / "udp2_v18_test.db"
 
         def _create_v18_db() -> None:
-            with sqlite3.connect(v18_db_path) as conn:
+            with closing(sqlite3.connect(v18_db_path)) as conn, conn:
                 # v2 introduced signal_log/station_positions; a real v18 DB already has them.
                 conn.executescript(CREATE_SCHEMA_SQL)
                 conn.executescript(CREATE_SCHEMA_V2_SQL)

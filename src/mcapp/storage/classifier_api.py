@@ -8,6 +8,7 @@ against this storage without any meshcom_mock imports.
 import asyncio
 import json
 import sqlite3
+from contextlib import closing
 from typing import Any
 
 from ..classifier.types import ms_to_zulu
@@ -58,7 +59,10 @@ class ClassifierApiMixin(StorageBase):
         tags_json = json.dumps(extra_tags) if extra_tags else None
 
         def _run() -> int:
-            with sqlite3.connect(self.db_path, timeout=SQLITE_BUSY_TIMEOUT_S) as conn:
+            with (
+                closing(sqlite3.connect(self.db_path, timeout=SQLITE_BUSY_TIMEOUT_S)) as conn,
+                conn,
+            ):
                 cursor = conn.execute(
                     "INSERT INTO classifier_rules "
                     "(name, pattern, scope, category, extra_tags, priority, "
@@ -217,7 +221,10 @@ class ClassifierApiMixin(StorageBase):
         now_zulu = ms_to_zulu(now_ms)
 
         def _run() -> None:
-            with sqlite3.connect(self.db_path, timeout=SQLITE_BUSY_TIMEOUT_S) as conn:
+            with (
+                closing(sqlite3.connect(self.db_path, timeout=SQLITE_BUSY_TIMEOUT_S)) as conn,
+                conn,
+            ):
                 conn.execute(
                     "INSERT OR IGNORE INTO beacon_templates "
                     "(template_hash, example_msg, example_src, srcs, count, "
@@ -282,7 +289,10 @@ class ClassifierApiMixin(StorageBase):
         placeholders = ",".join("?" * len(human_categories))
 
         def _clear_by_category() -> int:
-            with sqlite3.connect(self.db_path, timeout=SQLITE_BUSY_TIMEOUT_S) as conn:
+            with (
+                closing(sqlite3.connect(self.db_path, timeout=SQLITE_BUSY_TIMEOUT_S)) as conn,
+                conn,
+            ):
                 cur = conn.execute(
                     f"UPDATE beacon_templates SET auto_beacon = 0 "  # noqa: S608 - identifiers from fixed set; values parameterized
                     f"WHERE user_action IS NULL AND auto_beacon = 1 "

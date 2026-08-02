@@ -7,6 +7,7 @@ is historical record and must never be rewritten, only relocated.
 import asyncio
 import re
 import sqlite3
+from contextlib import closing
 
 from ..logging_setup import get_logger
 from ._base import StorageBase
@@ -36,7 +37,10 @@ class MigrationsMixin(StorageBase):
             conn.commit()
 
         def _init_db() -> None:  # noqa: PLR0912, PLR0915 - complex handler kept intact
-            with sqlite3.connect(self.db_path, timeout=SQLITE_BUSY_TIMEOUT_S) as conn:
+            with (
+                closing(sqlite3.connect(self.db_path, timeout=SQLITE_BUSY_TIMEOUT_S)) as conn,
+                conn,
+            ):
                 # Enable WAL mode for better concurrent read/write performance
                 conn.execute("PRAGMA journal_mode=WAL")
 
