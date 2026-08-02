@@ -24,8 +24,8 @@ in ``doc/connection-leak-fable-verdict.md``; they are deliberately not repeated
 here, because a leaked-fd count depends on when the cyclic GC happened to run and
 is not reproducible without that context.
 
-The two tests here are NOT equally strong, and the difference is worth knowing
-before trusting a green run:
+Two of the tests below are NOT equally strong, and the difference is worth
+knowing before trusting a green run:
 
   * ``no leaked connections`` is a true regression test, verified in both
     directions on this repo: every connection left open before the fix, none
@@ -48,6 +48,7 @@ connection's own view.
 All timestamps are milliseconds (project-wide invariant).
 """
 
+import ast
 import sqlite3
 import tempfile
 import threading
@@ -70,6 +71,11 @@ BASE_TS = 1_770_000_000_000  # fixed ms timestamp so the suite is deterministic
 # loop, leaving "no leaks" trivially true because almost nothing ran.
 MIN_TRACKED_CONNECTS = 40
 
+# Computed once at import time (sync context) rather than inside the async test
+# that uses it: `.resolve()` touches the filesystem and ASYNC240 flags pathlib
+# I/O methods called from an `async def`.
+_MCAPP_PACKAGE_ROOT = Path(__file__).resolve().parent.parent  # .../src/mcapp
+
 
 class _TrackedConnection(sqlite3.Connection):
     """Connection subclass that reports its own ``close()`` to the active tracker."""
@@ -86,17 +92,25 @@ class _TrackedConnection(sqlite3.Connection):
 class _ConnectionTracker:
     """Records every sqlite3 Connection handed out while installed, and which closed.
 
-    Patches the ``sqlite3.connect`` attribute on the module object. Every call
-    site in this project resolves ``sqlite3.connect(...)`` at call time, so one
-    patch covers sqlite_storage, storage/* and sse_handler alike — including
-    connections opened inside ``asyncio.to_thread`` worker threads.
+    Patches BOTH the ``sqlite3.connect`` and ``sqlite3.dbapi2.connect`` module
+    attributes. Every call site in this project resolves ``sqlite3.connect(...)``
+    or ``sqlite3.dbapi2.connect(...)`` at call time, so patching both attributes
+    covers sqlite_storage, storage/* and sse_handler alike — including
+    connections opened inside ``asyncio.to_thread`` worker threads. The two names
+    are distinct attribute bindings of the same underlying function
+    (``sqlite3/__init__.py`` does ``from sqlite3.dbapi2 import *``), so patching
+    one does NOT patch the other — both must be assigned and restored.
 
-    Two known blind spots, both currently unreachable (verified by grep: this repo
-    has no ``from sqlite3 import connect`` and no ``dbapi2`` use). Patching the
-    ``sqlite3.connect`` attribute does NOT cover ``sqlite3.dbapi2.connect``, nor a
-    name already bound by ``from sqlite3 import connect`` — a leak introduced
-    through either form would be invisible here and the suite would pass. If such
-    an import ever appears, this tracker must be widened to match.
+    One blind spot remains, and it cannot be closed by interception: a name
+    already bound by ``from sqlite3 import connect`` (or
+    ``from sqlite3.dbapi2 import connect``) is resolved into the IMPORTING
+    module's namespace at that module's import time, before this tracker ever
+    installs its patch — reassigning the attribute afterwards does not reach a
+    reference that already exists elsewhere. A leak introduced through that form
+    would be invisible to interception and the suite would pass. Rather than a
+    blind spot, this is guarded by DETECTION: ``_test_no_unpatchable_sqlite_imports``
+    scans every ``.py`` file under the ``mcapp`` package for that import form and
+    fails the suite if it finds one, before the leak itself could ever occur.
 
     Closure is detected by observing ``Connection.close()`` via a `factory=`
     subclass, NOT by probing the handle. Probing is not a usable instrument here:
@@ -125,6 +139,7 @@ class _ConnectionTracker:
         self._closed: set[int] = set()
         self._lock = threading.Lock()  # connections are opened in worker threads
         self._real = sqlite3.connect
+        self._real_dbapi2 = sqlite3.dbapi2.connect
 
     def mark_closed(self, conn_id: int) -> None:
         with self._lock:
@@ -140,12 +155,17 @@ class _ConnectionTracker:
 
         _TrackedConnection.tracker = self
         sqlite3.connect = _tracked  # type: ignore[assignment]  # deliberate test seam
+        # Distinct attribute binding of the same function (see class docstring) —
+        # must be patched separately or a caller resolving through this name
+        # entirely escapes tracking.
+        sqlite3.dbapi2.connect = _tracked  # type: ignore[assignment]  # deliberate test seam
         return self
 
     def __exit__(self, *exc: object) -> None:
         # Restore `connect` BEFORE nulling the tracker: the reverse order leaves a
         # window where a freshly-tracked connection's close() goes unrecorded.
         sqlite3.connect = self._real
+        sqlite3.dbapi2.connect = self._real_dbapi2
         _TrackedConnection.tracker = None
 
     def still_open(self) -> int:
@@ -154,14 +174,51 @@ class _ConnectionTracker:
             return sum(1 for conn in self.handles if id(conn) not in self._closed)
 
 
+def _find_unpatchable_sqlite_imports(package_root: Path) -> list[str]:
+    """Scan ``.py`` files under ``package_root`` for the one form `_ConnectionTracker`
+    cannot intercept: ``from sqlite3 import connect`` or
+    ``from sqlite3.dbapi2 import connect`` (with or without ``as``).
+
+    Both bind ``connect`` straight into the importing module's namespace at that
+    module's import time — reassigning ``sqlite3.connect`` /
+    ``sqlite3.dbapi2.connect`` afterwards never reaches that reference, so a
+    connection opened through it would be invisible to the tracker and this
+    suite would report PASS on a real leak. Returns one ``"path:lineno"`` string
+    per offending import, empty if none found. AST-based rather than a text/regex
+    match so it does not fire on the substring appearing in a comment or string.
+    """
+    offenders: list[str] = []
+    for path in sorted(package_root.rglob("*.py")):
+        try:
+            tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+        except (OSError, SyntaxError, UnicodeDecodeError):  # pragma: no cover - defensive
+            continue
+        for node in ast.walk(tree):
+            if isinstance(node, ast.ImportFrom) and node.module in (
+                "sqlite3",
+                "sqlite3.dbapi2",
+            ):
+                offenders.extend(
+                    f"{path}:{node.lineno}" for alias in node.names if alias.name == "connect"
+                )
+    return offenders
+
+
 async def _drive_every_connect_site(storage: Any) -> None:
-    """Exercise each storage module that opens its own connection.
+    """Exercise every storage module that opens its own connection.
 
     Deliberately not just `store_message` + `_query`: those only reach
-    `sqlite_storage`'s three shared helpers plus the migrator. The classifier and
-    prefs mixins open their own connections, and a dropped `closing()` there would
-    otherwise ship green because the leaking code never runs inside the tracked
-    window.
+    `sqlite_storage`'s three shared helpers plus the migrator. The classifier,
+    prefs and query mixins open their own connections, and a dropped `closing()`
+    there would otherwise ship green because the leaking code never runs inside
+    the tracked window.
+
+    Coverage is complete for production code as of this writing. The one
+    remaining `db_write` in the package that this cannot reach is the fixture
+    insert inside `sse_handler.run_startup_tests` — it lives in that module's own
+    embedded test harness, not behind any storage method, so no call from here
+    can drive it. If it ever leaks, that is bounded to a single handle per test
+    run, not production.
     """
     for i in range(25):
         await storage.store_message(
@@ -189,6 +246,12 @@ async def _drive_every_connect_site(storage: Any) -> None:
     # storage/prefs.py — _set_identifier_list and delete_messages_by_dst
     await storage.set_kickban_callsigns(["OE1ABC-1"])
     await storage.delete_messages_by_dst("*")
+
+    # storage/query.py — get_smart_initial_with_summary is the one read path that
+    # opens its own connection rather than going through `_query`. It is also the
+    # SSE hot path (every client connect builds this payload), so a leak here
+    # would scale with reconnects.
+    await storage.get_smart_initial_with_summary()
 
 
 async def _test_no_leaked_connections(results: list[tuple[str, bool]]) -> None:
@@ -283,12 +346,53 @@ async def _test_writes_are_committed(results: list[tuple[str, bool]]) -> None:
         results.append(("prefs write is durable", prefs_ok))
 
 
+async def _test_no_unpatchable_sqlite_imports(results: list[tuple[str, bool]]) -> None:
+    """The one blind spot interception cannot close must stay detected, not just documented.
+
+    Guards against a future ``from sqlite3 import connect`` (or
+    ``from sqlite3.dbapi2 import connect``) anywhere under the ``mcapp`` package —
+    either form would open connections invisible to `_ConnectionTracker`, and
+    this suite would silently PASS on the resulting leak. See
+    `_find_unpatchable_sqlite_imports` and the `_ConnectionTracker` docstring.
+    """
+    offenders = _find_unpatchable_sqlite_imports(_MCAPP_PACKAGE_ROOT)
+    label = "no `from sqlite3[.dbapi2] import connect` under mcapp"
+    if offenders:
+        label += f" (found: {', '.join(offenders)}; tracker cannot see connections opened this way)"
+    results.append((label, not offenders))
+
+
+async def _test_tracker_detects_known_leak(results: list[tuple[str, bool]]) -> None:
+    """Self-check: the tracker must still catch the exact broken pattern it exists to catch.
+
+    Guards the measurement instrument itself. A prior version of this tracker
+    (probing handle state instead of observing `close()`) silently reported
+    PASS on leaky code — see the class docstring. Uses its own tracker instance
+    and its own temp DB, so it does not perturb the counts
+    `_test_no_leaked_connections` reads.
+    """
+    with tempfile.TemporaryDirectory() as tmpdir:
+        db_path = Path(tmpdir) / "self_check.db"
+        with _ConnectionTracker() as tracker:
+            with sqlite3.connect(db_path) as conn:  # deliberately broken: no closing()
+                conn.execute("CREATE TABLE t (x INTEGER)")
+            detected = tracker.still_open()
+            # Close from the thread that opened it: this test runs on the main
+            # thread, so a plain close() works here — unlike the storage layer's
+            # asyncio.to_thread connections, which raise if closed off-thread.
+            conn.close()
+
+    results.append((f"tracker detects a known leak (still_open={detected})", detected == 1))
+
+
 async def run_connection_lifecycle_tests() -> bool:
     """Run the SQLite connection-lifecycle suite. Returns True iff all pass."""
     results: list[tuple[str, bool]] = []
 
     await _test_no_leaked_connections(results)
     await _test_writes_are_committed(results)
+    await _test_no_unpatchable_sqlite_imports(results)
+    await _test_tracker_detects_known_leak(results)
 
     for label, ok in results:
         print(f"    {'✅ PASS' if ok else '❌ FAIL'} | {label}")

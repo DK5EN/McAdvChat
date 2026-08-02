@@ -19,11 +19,10 @@ import contextlib
 import json
 import logging
 import pathlib
-import sqlite3
 import tempfile
 import time
 from collections.abc import AsyncIterator
-from contextlib import asynccontextmanager, closing
+from contextlib import asynccontextmanager
 from typing import Any, ClassVar
 
 from . import __version__
@@ -33,6 +32,7 @@ from .commands.parsing import SPAM_GROUP
 from .logging_setup import get_logger
 from .schemas import DeleteMessagesRequest
 from .sqlite_storage import SQLiteStorage, create_sqlite_storage
+from .storage.constants import db_write
 from .util import now_ms
 
 SSE_CLIENT_QUEUE_SIZE = 256
@@ -1023,7 +1023,7 @@ async def run_startup_tests() -> bool:  # noqa: PLR0915 - regression suite kept 
             # chat): store_message's _should_filter_message drops NEW ones, so
             # inserting directly mirrors the only rows the 'Time' branch can
             # still remove.
-            with closing(sqlite3.connect(storage.db_path)) as raw_conn, raw_conn:
+            with db_write(storage.db_path) as raw_conn:
                 raw_conn.execute(
                     "INSERT INTO messages"
                     " (msg_id, src, dst, msg, type, timestamp, conversation_key)"

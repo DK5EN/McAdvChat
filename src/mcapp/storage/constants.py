@@ -2,6 +2,10 @@
 SQLiteStorage mixins (ST-04). Moved verbatim out of sqlite_storage.py.
 """
 
+import sqlite3
+from collections.abc import Iterator
+from contextlib import closing, contextmanager
+from pathlib import Path
 from typing import NamedTuple
 
 from ..commands.parsing import is_group
@@ -126,6 +130,38 @@ def compute_conversation_key(src: str, dst: str) -> str | None:
     base_dst = target.split("-")[0]
     pair = sorted([base_src, base_dst])
     return f"{pair[0]}<>{pair[1]}"
+
+
+@contextmanager
+def db_read(db_path: Path | str) -> Iterator[sqlite3.Connection]:
+    """Open a SQLite connection for a read, guaranteed to close.
+
+    ``with sqlite3.connect(...) as conn:`` is a TRANSACTION manager, not a
+    resource manager — ``__exit__`` only commits or rolls back and never
+    closes, so the connection (an fd, a page cache, a lookaside arena) lived
+    until the cyclic GC happened to reach it. That leaked in production for
+    the life of this project; ``closing()`` is the piece that actually closes
+    it. See storage/connection_lifecycle_tests.py for the regression coverage
+    and doc/connection-leak-fable-verdict.md for the incident writeup.
+    """
+    with closing(sqlite3.connect(db_path, timeout=SQLITE_BUSY_TIMEOUT_S)) as conn:
+        yield conn
+
+
+@contextmanager
+def db_write(db_path: Path | str) -> Iterator[sqlite3.Connection]:
+    """Open a SQLite connection for a write: guaranteed close AND commit/rollback.
+
+    Same leak as ``db_read`` above (``closing()`` closes), plus a second
+    failure mode this pairs it against: ``closing()`` alone drops sqlite3's
+    transaction manager, so a write that relied on the implicit commit rolls
+    back silently on close with no error anywhere. The bare ``conn`` context
+    manager supplies that back (commits on success, rolls back on error);
+    ``closing`` still does the closing. Both are required, in this order. See
+    storage/connection_lifecycle_tests.py for the regression coverage.
+    """
+    with closing(sqlite3.connect(db_path, timeout=SQLITE_BUSY_TIMEOUT_S)) as conn, conn:
+        yield conn
 
 
 CREATE_SCHEMA_SQL = """

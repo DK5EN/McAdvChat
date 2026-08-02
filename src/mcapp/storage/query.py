@@ -43,12 +43,12 @@ from .constants import (
     PRUNE_TARGET_FRACTION,
     SECONDS_PER_DAY,
     SEVEN_DAYS_MS,
-    SQLITE_BUSY_TIMEOUT_S,
     STATION_RETENTION_DAYS,
     TELEMETRY_BUCKET_MS,
     VALID_RSSI_RANGE,
     VALID_SNR_RANGE,
     compute_conversation_key,
+    db_read,
     escape_like,
 )
 
@@ -328,11 +328,10 @@ class QueryMixin(StorageBase):
         window_cutoff_ms = now_ms() - LONG_RETENTION_DAYS * SECONDS_PER_DAY * 1000
 
         def _run() -> tuple[dict[str, Any], dict[str, Any]]:
-            conn = sqlite3.connect(self.db_path, timeout=SQLITE_BUSY_TIMEOUT_S)
-            conn.row_factory = sqlite3.Row
-            conn.execute("PRAGMA journal_mode=WAL")
-            conn.execute("PRAGMA query_only=ON")
-            try:
+            with db_read(self.db_path) as conn:
+                conn.row_factory = sqlite3.Row
+                conn.execute("PRAGMA journal_mode=WAL")
+                conn.execute("PRAGMA query_only=ON")
                 # 1. Messages: window function, partition by conversation_key
                 msg_rows = conn.execute(
                     f"SELECT {_MSG_SELECT} FROM ("  # noqa: S608 - identifiers from fixed set; values parameterized
@@ -385,8 +384,6 @@ class QueryMixin(StorageBase):
 
                 initial = {"messages": messages, "positions": positions, "acks": acks}
                 return initial, summary
-            finally:
-                conn.close()
 
         initial, summary = await asyncio.to_thread(_run)
         logger.debug(

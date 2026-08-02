@@ -23,9 +23,7 @@ All timestamps are milliseconds (project-wide invariant).
 """
 
 import asyncio
-import sqlite3
 import tempfile
-from contextlib import closing
 from pathlib import Path
 from typing import Any
 
@@ -35,6 +33,7 @@ from .constants import (
     CREATE_SCHEMA_SQL,
     CREATE_SCHEMA_V2_SQL,
     compute_conversation_key,
+    db_write,
 )
 
 logger = get_logger(__name__)
@@ -78,7 +77,7 @@ async def _test_full_chain_from_base(results: list[tuple[str, bool]]) -> None:
             # schema_version row → current_version == 0. station_positions /
             # signal_log / signal_buckets do not exist yet (v2 creates them), so
             # the migrator drives the full chain from the very first step.
-            with closing(sqlite3.connect(db_path)) as conn, conn:
+            with db_write(db_path) as conn:
                 conn.executescript(CREATE_SCHEMA_SQL)
                 # A 'msg' row that will be ACKed (v4 must set send_success = 1).
                 conn.execute(
@@ -205,7 +204,7 @@ async def _test_v18_conversation_rekey(results: list[tuple[str, bool]]) -> None:
             # v18 step reads/writes), station_positions + signal_log from the v2
             # SQL (signal_log intentionally still lacks the `source` column that v19
             # adds), and schema_version pinned at 17 so initialize() runs v18→v21.
-            with closing(sqlite3.connect(db_path)) as conn, conn:
+            with db_write(db_path) as conn:
                 conn.executescript(CREATE_SCHEMA_SQL)
                 conn.executescript(CREATE_SCHEMA_V2_SQL)
                 conn.execute("ALTER TABLE messages ADD COLUMN conversation_key TEXT")
