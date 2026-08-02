@@ -38,7 +38,7 @@ from .constants import (
 
 logger = get_logger(__name__)
 
-FINAL_SCHEMA_VERSION = 21
+FINAL_SCHEMA_VERSION = 22
 BASE_TS = 1_770_000_000_000  # fixed ms timestamp so the suite is deterministic
 
 
@@ -52,6 +52,7 @@ async def run_migration_chain_tests() -> bool:
 
     await _test_full_chain_from_base(results)
     await _test_v18_conversation_rekey(results)
+    await _test_v22_signal_via_column(results)
 
     for label, ok in results:
         print(f"    {'✅ PASS' if ok else '❌ FAIL'} | {label}")
@@ -277,6 +278,92 @@ async def _test_v18_conversation_rekey(results: list[tuple[str, bool]]) -> None:
                 (
                     "v18 re-key: non-routed control row is left untouched (step is scoped)",
                     bool(ctrl_row) and ctrl_row[0]["conversation_key"] == ctrl_key,
+                )
+            )
+        finally:
+            await storage.close()
+
+
+async def _test_v22_signal_via_column(results: list[tuple[str, bool]]) -> None:
+    """Seed a pre-v22 fixture (station_positions genuinely lacking signal_via) and
+    assert the v22 step adds the column while preserving existing row data.
+
+    `CREATE_SCHEMA_V2_SQL` now bakes `signal_via` in (it is also used to create
+    station_positions from scratch during a full v0 chain, per this repo's
+    convention of keeping that constant at the current ideal shape — see the
+    v18 test above for the same pattern with 'lon'/'long'). So a fixture built
+    from that constant would already have the column and never exercise the
+    real `ALTER TABLE ... ADD COLUMN` path. This test drops the column right
+    back off after creating the table, reproducing exactly what a real,
+    already-migrated-to-v21 production DB looks like.
+    """
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        db_path = Path(tmp_dir) / "migration_chain_v22.db"
+
+        existing_callsign = "OE1PRE-1"
+        existing_lat = 48.15
+        existing_lon = 16.23
+        existing_rssi = -95
+        existing_snr = 6.0
+
+        def _create_v21_db() -> None:
+            with db_write(db_path) as conn:
+                conn.executescript(CREATE_SCHEMA_SQL)
+                conn.executescript(CREATE_SCHEMA_V2_SQL)
+                conn.execute("ALTER TABLE station_positions DROP COLUMN signal_via")
+                conn.execute("DELETE FROM schema_version")
+                conn.execute("INSERT INTO schema_version (version) VALUES (21)")
+                conn.execute(
+                    "INSERT INTO station_positions"
+                    " (callsign, lat, lon, rssi, snr, last_seen)"
+                    " VALUES (?, ?, ?, ?, ?, ?)",
+                    (
+                        existing_callsign,
+                        existing_lat,
+                        existing_lon,
+                        existing_rssi,
+                        existing_snr,
+                        BASE_TS,
+                    ),
+                )
+                conn.commit()
+
+        await asyncio.to_thread(_create_v21_db)
+
+        try:
+            storage = await create_sqlite_storage(db_path)
+        except Exception:
+            logger.exception("v22 signal_via migration raised")
+            results.append(("v22 signal_via: migrator runs v21→v22 without error", False))
+            return
+
+        results.append(("v22 signal_via: migrator runs v21→v22 without error", True))
+        try:
+            version = await _schema_version(storage)
+            results.append(
+                (
+                    "v22 signal_via: final schema_version marker is 22",
+                    version == FINAL_SCHEMA_VERSION,
+                )
+            )
+
+            row = await storage._query(
+                "SELECT * FROM station_positions WHERE callsign = ?", (existing_callsign,)
+            )
+            results.append(
+                (
+                    "v22 signal_via: pre-existing row survives the migration with signal_via = ''",
+                    bool(row) and row[0]["signal_via"] == "",
+                )
+            )
+            results.append(
+                (
+                    "v22 signal_via: pre-existing row's own data (lat/lon/rssi/snr) is untouched",
+                    bool(row)
+                    and row[0]["lat"] == existing_lat
+                    and row[0]["lon"] == existing_lon
+                    and row[0]["rssi"] == existing_rssi
+                    and row[0]["snr"] == existing_snr,
                 )
             )
         finally:

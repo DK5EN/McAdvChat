@@ -30,6 +30,7 @@ from .storage.constants import (
     BUCKET_SECONDS,
     CREATE_SCHEMA_SQL,
     CREATE_SCHEMA_V2_SQL,
+    LATEST_SCHEMA_VERSION,
     db_read,
     db_write,
 )
@@ -735,7 +736,7 @@ async def run_startup_tests() -> bool:  # noqa: PLR0915 - test suite lists one c
         finally:
             await storage.close()
 
-    # 8. Migration v18 → HEAD (currently v21): an existing v18 DB (signal_log without
+    # 8. Migration v18 → HEAD: an existing v18 DB (signal_log without
     # `source`) must migrate cleanly and idempotently — startup on an old DB succeeds
     # (UDP 2.0 Track U, Wave U2). The v19 source-column backfill is spot-checked
     # explicitly; the final version assertion tracks whatever the latest migration is.
@@ -778,8 +779,8 @@ async def run_startup_tests() -> bool:  # noqa: PLR0915 - test suite lists one c
                 )
                 results.append(
                     (
-                        "v18→HEAD migration: schema at v21",
-                        schema_version == 21,  # noqa: PLR2004 - expected schema version
+                        f"v18→HEAD migration: schema at v{LATEST_SCHEMA_VERSION}",
+                        schema_version == LATEST_SCHEMA_VERSION,
                     )
                 )
             finally:

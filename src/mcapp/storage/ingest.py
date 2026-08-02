@@ -163,11 +163,21 @@ class IngestMixin(StorageBase):
         )
 
     async def _upsert_station_position(
-        self, callsign: str, data: dict[str, Any], update_type: str
+        self, callsign: str, data: dict[str, Any], update_type: str, *, signal_via: str = ""
     ) -> None:
         """Upsert station_positions table based on packet type.
 
         update_type: 'signal' (MHeard) or 'position' (position beacon)
+
+        `signal_via` is ONLY meaningful (and only ever written) on the 'signal'
+        branch: the callsign of the station whose transmission actually delivered
+        the `rssi`/`snr` carried on THIS SAME call — the row's own callsign for a
+        direct reception, the last hop of the relay chain otherwise. It must be
+        derived fresh from the same frame that produced rssi/snr (see
+        store_message/_ingest_signal) and written atomically with them; the
+        'position' branch never touches this column, so a stale relay path can
+        never be paired with a fresh measurement (that pairing is the original bug
+        this column exists to fix).
 
         `.get("timestamp")` with a fallback is NOT enough: a frame carrying an explicit
         `"timestamp": null` returns None, not the default. Combined with SQLite's scalar
@@ -183,12 +193,13 @@ class IngestMixin(StorageBase):
 
         if update_type == "signal":
             await self._mutate(
-                """INSERT INTO station_positions (callsign, rssi, snr, signal_ts, last_seen,
-                       hw_id, lora_mod, mesh)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                """INSERT INTO station_positions (callsign, rssi, snr, signal_via,
+                       signal_ts, last_seen, hw_id, lora_mod, mesh)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
                    ON CONFLICT(callsign) DO UPDATE SET
                        rssi = excluded.rssi,
                        snr = excluded.snr,
+                       signal_via = excluded.signal_via,
                        signal_ts = excluded.signal_ts,
                        last_seen = MAX(COALESCE(station_positions.last_seen, 0),
                                        COALESCE(excluded.last_seen, 0)),
@@ -200,6 +211,7 @@ class IngestMixin(StorageBase):
                     callsign,
                     data.get("rssi"),
                     data.get("snr"),
+                    signal_via,
                     timestamp,
                     timestamp,
                     data.get("hw_id"),
@@ -295,6 +307,7 @@ class IngestMixin(StorageBase):
         rssi: int | None,
         snr: int | None,
         timestamp: int,
+        signal_via: str,
     ) -> bool:
         """Route a signal-bearing packet into signal_log/signal_buckets/station_positions.
 
@@ -303,6 +316,14 @@ class IngestMixin(StorageBase):
         packets received over RF (src_type "lora", msg_type "pos" or "msg" — "node"/"udp"
         src_types are the local node's own traffic and carry a 0/0 signal sentinel, so they
         are excluded by src_type rather than relying solely on the range check).
+
+        `signal_via` is the caller-derived (store_message) callsign of whichever station's
+        transmission actually delivered this rssi/snr: the last hop of the relay path, or
+        `callsign` itself when there is no path (direct reception / BLE MHeard). It is used
+        to key BOTH the signal_buckets accumulation (the chart must describe the link that
+        was actually measured, not the packet's originator) and station_positions.signal_via
+        — signal_log keeps its existing originator-keyed rows (`source` already distinguishes
+        transport there and it feeds backfill/diagnostics, not attribution).
 
         Returns `is_mheard` (the BLE-MHeard sub-condition) since the caller's legacy
         messages-table throttle branch keys off it too.
@@ -335,10 +356,12 @@ class IngestMixin(StorageBase):
                 " VALUES (?, ?, ?, ?, ?)",
                 (callsign, timestamp, rssi, snr, source),
             )
-            # Accumulate into bucket and flush completed ones
-            completed = self._accumulate_signal(callsign, timestamp, rssi, snr)
+            # Accumulate into bucket and flush completed ones. Keyed by signal_via
+            # (the last hop that actually delivered this reading), not the packet's
+            # originator `callsign` — see this method's docstring.
+            completed = self._accumulate_signal(signal_via, timestamp, rssi, snr)
             await self._flush_completed_buckets(completed)
-            await self._upsert_station_position(callsign, message, "signal")
+            await self._upsert_station_position(callsign, message, "signal", signal_via=signal_via)
 
         return is_mheard
 
@@ -782,6 +805,12 @@ class IngestMixin(StorageBase):
         relay_via = ",".join(p.strip() for p in parts[1:]) if len(parts) > 1 else ""
         msg_via = via_field or relay_via
 
+        # Whose transmission actually delivered this frame's rssi/snr: the last hop
+        # of the relay path, or the station itself when there is no path (direct
+        # reception / BLE MHeard, which never carries a path). `relay_via` already
+        # drops the originator (parts[1:]), so for src='A,B,C' this is 'C'.
+        signal_via = msg_via.rsplit(",", maxsplit=1)[-1].strip() if msg_via else callsign
+
         # Forensic logging: capture raw data for messages with >4 hops
         hop_count = len(msg_via.split(",")) if msg_via else 0
         if hop_count > _MAX_FORENSIC_HOPS:
@@ -884,6 +913,7 @@ class IngestMixin(StorageBase):
             rssi=rssi,
             snr=snr,
             timestamp=timestamp,
+            signal_via=signal_via,
         )
         is_position = msg_type == "pos" and not is_mheard
 

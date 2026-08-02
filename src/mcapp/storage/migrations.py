@@ -369,6 +369,39 @@ class MigrationsMixin(StorageBase):
                     )
                     _set_schema_version(conn, 21)
 
+                if current_version < 22:  # noqa: PLR2004 - schema migration step
+                    # station_positions.rssi/snr describe exactly ONE radio link — the
+                    # LAST HOP to us — but were stored keyed only by the originating
+                    # station, so most rows attributed the reading to the wrong
+                    # station. signal_via records WHOSE link the rssi/snr on that row
+                    # actually belongs to (see ingest.py's _upsert_station_position
+                    # "signal" branch, the only writer of this column).
+                    #
+                    # No backfill: which station delivered a HISTORICAL rssi/snr
+                    # reading is not recoverable from anything already stored (the
+                    # per-frame relay path that would answer it was never persisted
+                    # standalone), so every pre-migration row gets '' rather than a
+                    # guess. '' correctly means "unknown" — the frontend fails closed
+                    # on it, and each row self-heals the next time that station's
+                    # signal is ingested.
+                    try:
+                        conn.execute(
+                            "ALTER TABLE station_positions ADD COLUMN signal_via TEXT DEFAULT ''"
+                        )
+                    except sqlite3.OperationalError:
+                        logger.debug(
+                            "Column signal_via already exists in station_positions, skipping"
+                        )
+                    logger.info(
+                        "Migration v%d → v22: added station_positions.signal_via column"
+                        " (existing rows left as '' — unknown, not backfilled)",
+                        current_version,
+                    )
+                    # Adding a step after this one? Bump LATEST_SCHEMA_VERSION in
+                    # storage/constants.py in the same commit — the startup suite
+                    # asserts every migration chain terminates there.
+                    _set_schema_version(conn, 22)
+
         await asyncio.to_thread(_init_db)
 
         # Initialize bucket accumulators from existing signal_log

@@ -476,6 +476,58 @@ async def run_query_tests() -> bool:  # noqa: PLR0915 - test suite lists one cas
                     any("out-of-range dst zero" in m for m in zero_page["messages"]),
                 )
             )
+
+            # --- signal_via key presence (station_positions_rssi_via.md fix) ---------
+            # `_build_position_dict` must emit the "signal_via" KEY on every row
+            # carrying an rssi, even when the stored value is '' (unknown / legacy,
+            # pre-v22 row) — presence, not truthiness, is how the client tells a live
+            # single-frame observation (safe to derive attribution from) apart from
+            # an aggregated/legacy snapshot row (must NOT derive: its via_shortest is
+            # a historical shortest path unrelated to who actually delivered THIS
+            # reading). A row with no rssi at all must omit the key entirely.
+            _base_row: dict[str, Any] = {
+                "callsign": "SIGVIA-1",
+                "source": "local",
+                "via_shortest": "",
+                "via_paths": "[]",
+                "last_seen": now_ms(),
+                "lat": None,
+                "lon": None,
+                "alt": None,
+                "lat_dir": "",
+                "lon_dir": "",
+                "hw_id": None,
+                "firmware": None,
+                "fw_sub": None,
+                "aprs_symbol": None,
+                "aprs_symbol_group": None,
+                "batt": None,
+                "gw": None,
+                "lora_mod": None,
+                "mesh": None,
+                "snr": None,
+                "signal_via": "",
+            }
+            with_rssi_row = dict(_base_row, rssi=-95, signal_via="")
+            with_rssi_dict = storage._build_position_dict(with_rssi_row)
+            results.append(
+                (
+                    (
+                        "_build_position_dict: emits 'signal_via' key for an rssi row"
+                        " even when the stored value is '' (unknown/legacy)"
+                    ),
+                    "signal_via" in with_rssi_dict and with_rssi_dict["signal_via"] == "",
+                )
+            )
+
+            no_rssi_row = dict(_base_row, rssi=None, signal_via="")
+            no_rssi_dict = storage._build_position_dict(no_rssi_row)
+            results.append(
+                (
+                    "_build_position_dict: omits 'signal_via' key for a row with no rssi",
+                    "signal_via" not in no_rssi_dict,
+                )
+            )
         finally:
             await storage.close()
 

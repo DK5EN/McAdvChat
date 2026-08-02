@@ -284,6 +284,17 @@ class QueryMixin(StorageBase):
         # Signal quality (from MHeard beacons)
         if row["rssi"] is not None:
             pos_data["rssi"] = row["rssi"]
+            # KEY presence (not truthiness) is load-bearing here, unlike via_paths
+            # above. The client uses whether "signal_via" is present at all to tell
+            # a live single-frame observation (this write path — safe to derive
+            # attribution from) apart from an aggregated/legacy snapshot row that
+            # never got it (its via_shortest is a historical shortest path, unrelated
+            # to which station actually delivered THIS rssi/snr — deriving from it
+            # would silently reproduce the wrong-station bug this column exists to
+            # fix). So emit the key on every rssi row even when the stored value is
+            # '' (unknown, pre-migration row): omitting it would look identical to a
+            # legacy row to the client and re-invite that derivation.
+            pos_data["signal_via"] = row["signal_via"] or ""
         if row["snr"] is not None:
             pos_data["snr"] = row["snr"]
         # MHeard-specific fields

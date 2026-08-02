@@ -10,6 +10,18 @@ from typing import NamedTuple
 
 from ..commands.parsing import is_group
 
+# The schema version a fresh install lands on, and the version every migration
+# chain must terminate at. BUMP THIS in the same commit as any new `if
+# current_version < N` step in migrations.py.
+#
+# It exists because the startup suite used to hard-code the number in its
+# "v18 → HEAD" assertion while its own comment claimed the assertion "tracks
+# whatever the latest migration is". It did not, so adding a migration broke a
+# passing suite for a reason unrelated to the change being made. This is not
+# circular with migrations.py: the step numbers there are independent literals,
+# so forgetting either half fails loudly.
+LATEST_SCHEMA_VERSION = 22
+
 # Constants matching message_storage.py
 BUCKET_SECONDS = 5 * 60
 VALID_RSSI_RANGE = (-140, -30)
@@ -220,6 +232,7 @@ CREATE TABLE IF NOT EXISTS station_positions (
     gw              INTEGER DEFAULT 0,
     rssi            INTEGER,
     snr             REAL,
+    signal_via      TEXT DEFAULT '',
     via_shortest    TEXT DEFAULT '',
     via_paths       TEXT DEFAULT '[]',
     position_ts     INTEGER,
