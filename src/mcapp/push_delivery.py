@@ -30,6 +30,7 @@ import asyncio
 import base64
 import contextlib
 import json
+import os
 import stat
 import time
 from collections import OrderedDict
@@ -59,6 +60,29 @@ QUEUE_MAXSIZE = 1000
 DEFAULT_VAPID_SUBJECT = "mailto:admin@example.com"
 
 VAPID_PATH = Path("/var/lib/mcapp/vapid.json")
+
+
+def vapid_path() -> Path:
+    """Where the VAPID keypair is persisted.
+
+    `MESHCOM_VAPID_PATH` overrides everything — the escape hatch for a packaging
+    layout that puts state somewhere else. Otherwise production writes to
+    `/var/lib/mcapp` (the systemd StateDirectory) and a dev machine, which has no
+    business creating a root-owned directory, writes under the user's state dir.
+    """
+    override = os.getenv("MESHCOM_VAPID_PATH")
+    if override:
+        return Path(override)
+    if os.getenv("MCAPP_ENV") == "dev":
+        return user_state_dir() / "vapid.json"
+    return VAPID_PATH
+
+
+def user_state_dir() -> Path:
+    """Per-user state directory (XDG_STATE_HOME, else ~/.local/state/mcapp)."""
+    xdg = os.getenv("XDG_STATE_HOME")
+    base = Path(xdg) if xdg else Path.home() / ".local" / "state"
+    return base / "mcapp"
 
 
 # ── dst/src resolution (contract `dst_resolution` / `src_resolution`) ──────
@@ -362,13 +386,31 @@ def generate_vapid_keypair(subject: str = DEFAULT_VAPID_SUBJECT) -> dict[str, st
     }
 
 
+def _with_subject_override(keypair: dict[str, str]) -> dict[str, str]:
+    """Apply `MESHCOM_VAPID_SUB` to an already-built keypair.
+
+    Applied on LOAD, not only on generation, and that is the point: the symptom
+    this override exists for is Apple returning 403 `BadJwtToken` for a `sub`
+    with no TLD. That is discovered on an install whose keypair already exists,
+    and regenerating one to change a claim would invalidate every stored
+    subscription. The `sub` is a JWT claim, not key material.
+    """
+    override = os.getenv("MESHCOM_VAPID_SUB")
+    if override and keypair.get("subject") != override:
+        return {**keypair, "subject": override}
+    return keypair
+
+
 def load_or_create_vapid(
-    path: Path = VAPID_PATH,
+    path: Path | None = None,
     generator: Callable[[], dict[str, str]] = generate_vapid_keypair,
 ) -> dict[str, str]:
     """Load the persisted VAPID keypair, generating + persisting one on first
     use so it survives slot swaps (contract `vapid`: generated once per
     install, never committed).
+
+    `path` defaults to `vapid_path()`, resolved per CALL rather than baked in at
+    import so `MESHCOM_VAPID_PATH` / `MCAPP_ENV` are actually honoured.
 
     `generator` is an injectable seam — tests pass a fake so real EC crypto
     never runs in the suite.
@@ -377,9 +419,12 @@ def load_or_create_vapid(
     `build_push_router`) with no try/except anywhere on the path, so any exception
     here took down the ENTIRE proxy — UDP ingest, BLE, SSE — not just Web Push. A
     truncated `vapid.json` (power loss mid-write on a Pi with no fsync) or an
-    unwritable `/var/lib/mcapp` used to mean `mcapp.service` never started again,
+    unwritable state directory used to mean `mcapp.service` never started again,
     with nothing in the log pointing at push. Push degrades to "no delivery" instead.
     """
+    if path is None:
+        path = vapid_path()
+
     if path.exists():
         try:
             loaded = json.loads(path.read_text(encoding="utf-8"))
@@ -387,7 +432,8 @@ def load_or_create_vapid(
             logger.exception("VAPID keyfile at %s is unreadable/corrupt; regenerating", path)
         else:
             if isinstance(loaded, dict) and loaded.get("private_key") and loaded.get("public_key"):
-                return cast("dict[str, str]", loaded)
+                _tighten_vapid_mode(path)
+                return _with_subject_override(cast("dict[str, str]", loaded))
             logger.warning("VAPID keyfile at %s has an unexpected shape; regenerating", path)
 
     try:
@@ -396,15 +442,66 @@ def load_or_create_vapid(
         logger.exception("VAPID keypair generation failed; Web Push disabled for this run")
         return {"private_key": "", "public_key": "", "subject": DEFAULT_VAPID_SUBJECT}
 
+    keypair = _with_subject_override(keypair)
+
+    if _persist_vapid(path, keypair):
+        return keypair
+
+    # The preferred location is unwritable. Before giving up, try the per-user
+    # state dir: an EPHEMERAL key is the worst outcome, because it changes on
+    # every restart and silently invalidates every stored push subscription.
+    # A stable key in a second-choice location keeps push working; the warning
+    # above is what tells an operator the primary path needs fixing.
+    fallback = user_state_dir() / path.name
+    if fallback != path and _persist_vapid(fallback, keypair):
+        logger.warning("Persisted VAPID keypair to %s instead", fallback)
+        return keypair
+
+    logger.warning(
+        "VAPID keypair is EPHEMERAL — it changes on restart and every existing "
+        "push subscription will stop delivering. Fix write access to %s.",
+        path.parent,
+    )
+    return keypair
+
+
+def _tighten_vapid_mode(path: Path) -> None:
+    """Narrow an existing keyfile to 0600 if it is wider.
+
+    The chmod on the write path only ever applied to files this code CREATED,
+    so a keyfile written before that chmod existed kept its 0644 for good —
+    which is precisely the exposure the write path guards against: a raw P-256
+    private scalar readable by any local account, enough to forge VAPID JWTs
+    authenticating as this node. Checked on every load so an already-deployed
+    install repairs itself rather than waiting for a key regeneration that
+    would invalidate every stored subscription.
+    """
+    try:
+        current = stat.S_IMODE(path.stat().st_mode)
+        if current & ~(stat.S_IRUSR | stat.S_IWUSR):
+            path.chmod(stat.S_IRUSR | stat.S_IWUSR)
+            logger.warning("Tightened VAPID keyfile %s from %o to 0600", path, current)
+    except OSError as exc:
+        logger.warning("Could not tighten permissions on VAPID keyfile %s: %s", path, exc)
+
+
+def _persist_vapid(path: Path, keypair: dict[str, str]) -> bool:
+    """Write the keypair to `path` (0600). True on success.
+
+    Logs a message, NOT a traceback: an unwritable state directory is an
+    environment condition with a self-explanatory errno, and the stack frames
+    only bury the one line an operator needs.
+    """
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(json.dumps(keypair), encoding="utf-8")
         # 0600: this is a raw P-256 private scalar. At the default 0644 any local
         # account could read it and forge VAPID JWTs authenticating as this node.
         path.chmod(stat.S_IRUSR | stat.S_IWUSR)
-    except OSError:
-        logger.exception("Could not persist VAPID keypair to %s; using an ephemeral key", path)
-    return keypair
+    except OSError as exc:
+        logger.warning("Could not persist VAPID keypair to %s: %s", path, exc)
+        return False
+    return True
 
 
 # ── Background dispatcher: the ONLY place that calls webpush_fn ────────────

@@ -29,10 +29,12 @@ import asyncio
 import contextlib
 import hashlib
 import json
+import os
 import pathlib
 import stat
 import tempfile
 import time
+from collections.abc import Iterator
 from typing import TYPE_CHECKING, Any, cast
 
 from pywebpush import WebPushException
@@ -49,6 +51,8 @@ from .push_delivery import (
     is_sender_blocked,
     load_or_create_vapid,
     matches,
+    user_state_dir,
+    vapid_path,
 )
 from .sqlite_storage import create_sqlite_storage
 from .sse_routes.push import (
@@ -643,6 +647,28 @@ def _test_vapid_persistence(record: _RecordFn) -> None:
             stat.S_IMODE(path.stat().st_mode) == _EXPECTED_VAPID_FILE_MODE,
         )
 
+    # REGRESSION: the chmod only ever ran on the WRITE path, so a keyfile created
+    # before that chmod existed kept its 0644 forever. Production was found at
+    # exactly that: a world-readable raw P-256 private scalar, enough for any
+    # local account to forge VAPID JWTs as this node.
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        loose = pathlib.Path(tmp_dir) / "vapid.json"
+        loose.write_text(
+            json.dumps({"private_key": "p", "public_key": "k", "subject": "mailto:a@b.example"}),
+            encoding="utf-8",
+        )
+        loose.chmod(0o644)
+        calls["n"] = 0
+        kept = load_or_create_vapid(path=loose, generator=_fake_generator)
+        record(
+            "vapid: loading a pre-existing 0644 keyfile tightens it to 0600 in place",
+            stat.S_IMODE(loose.stat().st_mode) == _EXPECTED_VAPID_FILE_MODE,
+        )
+        record(
+            "vapid: tightening does NOT regenerate — the existing key is preserved",
+            kept["private_key"] == "p" and calls["n"] == 0,
+        )
+
     # REGRESSION: load_or_create_vapid runs inside build_app() with no try/except on the
     # path, so a raise here took down the whole proxy (UDP + BLE + SSE), not just push.
     with tempfile.TemporaryDirectory() as tmp_dir:
@@ -675,6 +701,127 @@ def _test_vapid_persistence(record: _RecordFn) -> None:
             "vapid: keygen failure degrades to an empty keypair, never raises",
             degraded["private_key"] == "" and degraded["public_key"] == "",
         )
+
+    _test_vapid_path_resolution(record)
+    _test_vapid_unwritable_fallback(record)
+    _test_vapid_subject_override(record)
+
+
+@contextlib.contextmanager
+def _env(**pairs: str | None) -> Iterator[None]:
+    """Temporarily set/clear env vars, restoring whatever was there before."""
+    saved = {k: os.environ.get(k) for k in pairs}
+    try:
+        for key, value in pairs.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
+        yield
+    finally:
+        for key, value in saved.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
+
+
+def _test_vapid_path_resolution(record: _RecordFn) -> None:
+    """The path must be resolved per CALL, not frozen at import.
+
+    REGRESSION: `path: Path = VAPID_PATH` as a default argument is evaluated
+    once at import, so no environment variable could ever influence it — the
+    production call site `load_or_create_vapid()` passes no path at all.
+    """
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        explicit = pathlib.Path(tmp_dir) / "custom" / "vapid.json"
+        with _env(MESHCOM_VAPID_PATH=str(explicit), MCAPP_ENV=None):
+            record("vapid: MESHCOM_VAPID_PATH wins outright", vapid_path() == explicit)
+
+        with _env(MESHCOM_VAPID_PATH=None, MCAPP_ENV="dev", XDG_STATE_HOME=tmp_dir):
+            resolved = vapid_path()
+            record(
+                "vapid: MCAPP_ENV=dev resolves under the user state dir, not /var/lib/mcapp",
+                resolved == pathlib.Path(tmp_dir) / "mcapp" / "vapid.json",
+            )
+
+        with _env(MESHCOM_VAPID_PATH=None, MCAPP_ENV=None):
+            record(
+                "vapid: production default is still /var/lib/mcapp/vapid.json",
+                vapid_path() == pathlib.Path("/var/lib/mcapp/vapid.json"),
+            )
+
+
+def _test_vapid_unwritable_fallback(record: _RecordFn) -> None:
+    """An unwritable state dir must NOT degrade straight to an ephemeral key.
+
+    REGRESSION: it used to log a full traceback and return an unpersisted
+    keypair. An ephemeral key changes on every restart, which silently
+    invalidates every stored push subscription — strictly worse than persisting
+    to a second-choice location.
+    """
+
+    def _gen() -> dict[str, str]:
+        return {"private_key": "p", "public_key": "k", "subject": "mailto:a@b.example"}
+
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        blocked = pathlib.Path(tmp_dir) / "blocked"
+        blocked.write_text("not a directory", encoding="utf-8")  # mkdir here must fail
+        target = blocked / "vapid.json"
+
+        with _env(XDG_STATE_HOME=str(pathlib.Path(tmp_dir) / "state")):
+            first = load_or_create_vapid(path=target, generator=_gen)
+            fallback = user_state_dir() / "vapid.json"
+            record(
+                "vapid: an unwritable primary path falls back to the user state dir",
+                fallback.exists(),
+            )
+            record(
+                "vapid: the fallback keypair is the real one, not an empty/disabled stub",
+                first["private_key"] == "p",
+            )
+            record(
+                "vapid: the fallback file is 0600 like the primary",
+                fallback.exists()
+                and stat.S_IMODE(fallback.stat().st_mode) == _EXPECTED_VAPID_FILE_MODE,
+            )
+
+
+def _test_vapid_subject_override(record: _RecordFn) -> None:
+    """MESHCOM_VAPID_SUB is documented in CLAUDE.md; it was never implemented.
+
+    It must apply on LOAD, not only on generation: the 403 `BadJwtToken` it
+    exists to fix is found on an install whose keypair already exists, and the
+    subject is a JWT claim, not key material — regenerating to change it would
+    invalidate every stored subscription.
+    """
+
+    def _gen() -> dict[str, str]:
+        return {"private_key": "p", "public_key": "k", "subject": "mailto:admin@example.com"}
+
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        path = pathlib.Path(tmp_dir) / "vapid.json"
+        with _env(MESHCOM_VAPID_SUB="mailto:ham@example.org"):
+            created = load_or_create_vapid(path=path, generator=_gen)
+            record(
+                "vapid: MESHCOM_VAPID_SUB overrides the subject at generation",
+                created["subject"] == "mailto:ham@example.org",
+            )
+            reloaded = load_or_create_vapid(path=path, generator=_gen)
+            record(
+                "vapid: MESHCOM_VAPID_SUB also overrides on load of an EXISTING keyfile",
+                reloaded["subject"] == "mailto:ham@example.org",
+            )
+            record(
+                "vapid: the override changes only the claim, never the key material",
+                reloaded["private_key"] == "p" and reloaded["public_key"] == "k",
+            )
+        with _env(MESHCOM_VAPID_SUB=None):
+            record(
+                "vapid: without the override the persisted subject is used unchanged",
+                load_or_create_vapid(path=path, generator=_gen)["subject"]
+                == "mailto:ham@example.org",
+            )
 
 
 def _test_node_local_noise_filter(record: _RecordFn) -> None:
