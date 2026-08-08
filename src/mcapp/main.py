@@ -43,6 +43,7 @@ from .runtime_state import (
     save_runtime_state as save_runtime_state,  # noqa: PLC0414 - explicit re-export for mypy
 )
 from .suppression import get_suppression_reason, should_suppress_outbound
+from .system_converge import converge_watchdog
 from .udp_handler import UDPHandler
 
 # Optional imports for new features
@@ -2221,8 +2222,8 @@ async def _classifier_stats_broadcast(
 @dataclass
 class _BackgroundTasks:
     """Handles kept alive for the app's lifetime (main() holds the only
-    reference). Only prune/stats/sperrliste are cancelled at shutdown — the
-    backfill tasks are one-shots left to finish or be reaped by process exit."""
+    reference). Only prune/stats/sperrliste/converge are cancelled at shutdown —
+    the backfill tasks are one-shots left to finish or be reaped by process exit."""
 
     prune_task: asyncio.Task[None]
     classifier_stats_task: asyncio.Task[None]
@@ -2230,14 +2231,15 @@ class _BackgroundTasks:
     signal_backfill_task: asyncio.Task[None]
     aprs_escape_backfill_task: asyncio.Task[None]
     sperrliste_task: asyncio.Task[None]
+    converge_task: asyncio.Task[None]
 
 
 def _start_background_tasks(
     ctx: AppContext, cfg: Config, stop_event: asyncio.Event
 ) -> _BackgroundTasks:
     """Start the nightly-prune, classifier-backfill, signal-backfill,
-    APRS-escape-backfill, classifier-stats-broadcast, and sperrliste-refresh
-    background tasks."""
+    APRS-escape-backfill, classifier-stats-broadcast, sperrliste-refresh, and
+    system-epoch converge-watchdog background tasks."""
     prune_task = asyncio.create_task(_nightly_prune(ctx.storage_handler, cfg, stop_event))
     # Reference lives for the app's lifetime (run() awaits until shutdown)
     backfill_task = asyncio.create_task(
@@ -2259,6 +2261,11 @@ def _start_background_tasks(
     sperrliste_task = asyncio.create_task(
         ctx.command_handler.load_sperrliste(stop_event=stop_event)
     )
+    # Fleet self-heal: detects a stale system epoch (pre-epoch box, or one still
+    # mid-update via an old runner) and triggers the update runner's converge
+    # mode once it goes idle. No-op everywhere except a real fielded Linux box —
+    # see system_converge.py for the full gating.
+    converge_task = asyncio.create_task(converge_watchdog(stop_event))
     return _BackgroundTasks(
         prune_task=prune_task,
         classifier_stats_task=classifier_stats_task,
@@ -2266,20 +2273,24 @@ def _start_background_tasks(
         signal_backfill_task=signal_backfill_task,
         aprs_escape_backfill_task=aprs_escape_backfill_task,
         sperrliste_task=sperrliste_task,
+        converge_task=converge_task,
     )
 
 
 async def _cancel_background_tasks(tasks: _BackgroundTasks) -> None:
-    """Cancel the three long-running loops; backfill tasks are one-shots, left alone."""
+    """Cancel the four long-running loops; backfill tasks are one-shots, left alone."""
     tasks.prune_task.cancel()
     tasks.classifier_stats_task.cancel()
     tasks.sperrliste_task.cancel()
+    tasks.converge_task.cancel()
     with contextlib.suppress(asyncio.CancelledError):
         await tasks.prune_task
     with contextlib.suppress(asyncio.CancelledError):
         await tasks.classifier_stats_task
     with contextlib.suppress(asyncio.CancelledError):
         await tasks.sperrliste_task
+    with contextlib.suppress(asyncio.CancelledError):
+        await tasks.converge_task
 
 
 async def _shutdown_services(ctx: AppContext) -> None:

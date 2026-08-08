@@ -6,8 +6,13 @@ A minimal HTTP server (stdlib only, no dependencies) that:
 - Streams bootstrap output as SSE on GET /stream
 - Exposes status on GET /status
 - Runs health checks after completion
-- Auto-rolls back on health failure
+- Auto-rolls back on health failure (update/rollback modes only)
 - Self-terminates after completion
+
+Modes (--mode): "update" (deploy + activate + health check, rolls back on
+failure), "rollback" (revert to the previous slot), "converge" (re-run the
+active slot's own bootstrap in --converge mode to bring system-level state
+up to date; no snapshot, no slot swap, no rollback on failure).
 
 Launched by McApp via: sudo systemd-run --scope --unit=mcapp-update \
     python3 /path/to/update-runner.py --mode update [--dev]
@@ -416,7 +421,7 @@ def _check_ble() -> bool:
 # ──────────────────────────────────────────────────────────────
 
 
-def run_update(bus: EventBus, dev_mode: bool = False) -> dict:  # noqa: PLR0915 - complex handler kept intact
+def run_update(bus: EventBus, dev_mode: bool = False) -> dict:  # noqa: PLR0912, PLR0915 - complex handler kept intact
     """Execute the full update cycle. Returns result dict."""
     start_time = time.time()
 
@@ -550,6 +555,51 @@ def run_update(bus: EventBus, dev_mode: bool = False) -> dict:  # noqa: PLR0915 
         )
 
         if run_health_checks(bus):
+            # Phase 5b: Converge system state to what the just-deployed release
+            # expects. Deliberately runs the NEW slot's own bootstrap (not the
+            # OLD one that drove this deploy) — only it knows the new release's
+            # system requirements. Runs only after health checks pass: converge
+            # mutates system state that slot-rollback cannot undo, so it must
+            # not run before the deploy is accepted, and its own failure must
+            # never trigger a rollback here.
+            bus.publish(
+                "phase",
+                {
+                    "phase": "converge",
+                    "progress": 92,
+                    "message": "Converging system state...",
+                },
+            )
+
+            new_bootstrap = SLOTS_DIR / f"slot-{target_slot}" / "bootstrap" / "mcapp.sh"
+            if not new_bootstrap.exists():
+                converge_result = "skipped"
+                bus.publish(
+                    "log",
+                    {
+                        "line": "No bootstrap in new slot, skipping converge",
+                        "phase": "converge",
+                    },
+                )
+            else:
+                converge_cmd = ["bash", str(new_bootstrap), "--converge"]
+                print(f"[UPDATE-RUNNER] converge cmd: {converge_cmd}", flush=True)
+                converge_ok = _run_bootstrap_streaming(converge_cmd, env, bus)
+                converge_result = "ok" if converge_ok else "failed"
+
+            # Report-only re-check — never feeds back into rollback or status.
+            bus.publish(
+                "health",
+                {
+                    "check": "webapp_http",
+                    "passed": _check_http("http://localhost/webapp/index.html"),
+                },
+            )
+            bus.publish(
+                "health",
+                {"check": "lighttpd_proxy", "passed": _check_http("http://localhost/health")},
+            )
+
             bus.publish(
                 "phase", {"phase": "complete", "progress": 100, "message": "Update successful"}
             )
@@ -557,6 +607,7 @@ def run_update(bus: EventBus, dev_mode: bool = False) -> dict:  # noqa: PLR0915 
                 "status": "success",
                 "version": version,
                 "slot": target_slot,
+                "converge": converge_result,
                 "duration_s": int(time.time() - start_time),
             }
 
@@ -632,6 +683,68 @@ def run_rollback(bus: EventBus) -> dict:
         "status": "success" if health_ok else "warning",
         "version": version,
         "slot": rollback_target,
+        "health_ok": health_ok,
+        "duration_s": int(time.time() - start_time),
+    }
+
+
+def run_converge(bus: EventBus) -> dict:
+    """Re-run the active slot's own bootstrap in --converge mode.
+
+    Brings system-level state (packages, firewall, web front door) up to the
+    epoch the currently installed release expects. No snapshot, no slot swap,
+    and no rollback under any outcome — a failed converge leaves a
+    degraded-but-working box; mcapp's watchdog retries later.
+    """
+    start_time = time.time()
+
+    active_slot = get_active_slot()
+    bootstrap_path = None
+    if active_slot is not None:
+        candidate = SLOTS_DIR / f"slot-{active_slot}" / "bootstrap" / "mcapp.sh"
+        if candidate.exists():
+            bootstrap_path = candidate
+
+    if bootstrap_path is None:
+        # Converge must ONLY use the local slot's bootstrap (version-pinned) —
+        # never fall back to _download_bootstrap, which could pull a mismatched
+        # release's system expectations.
+        bus.publish(
+            "phase",
+            {"phase": "failed", "progress": 100, "message": "No local bootstrap found"},
+        )
+        return {
+            "status": "failed",
+            "reason": "no_local_bootstrap",
+            "duration_s": int(time.time() - start_time),
+        }
+
+    bus.publish(
+        "phase", {"phase": "converge", "progress": 10, "message": "Converging system state..."}
+    )
+
+    env = build_bootstrap_env(home, os.environ.copy())
+    cmd = ["bash", str(bootstrap_path), "--converge"]
+
+    print(f"[UPDATE-RUNNER] converge cmd: {cmd}", flush=True)
+    success = _run_bootstrap_streaming(cmd, env, bus)
+
+    if not success:
+        bus.publish("phase", {"phase": "failed", "progress": 100, "message": "Converge failed"})
+        return {
+            "status": "failed",
+            "reason": "converge_error",
+            "duration_s": int(time.time() - start_time),
+        }
+
+    bus.publish(
+        "phase", {"phase": "health_check", "progress": 80, "message": "Running health checks..."}
+    )
+
+    health_ok = run_health_checks(bus)
+
+    return {
+        "status": "success" if health_ok else "warning",
         "health_ok": health_ok,
         "duration_s": int(time.time() - start_time),
     }
@@ -853,13 +966,13 @@ class UpdateHandler(http.server.BaseHTTPRequestHandler):
 # ──────────────────────────────────────────────────────────────
 
 
-def main():  # noqa: PLR0915 - complex handler kept intact
+def main():  # noqa: PLR0912, PLR0915 - complex handler kept intact
     global SLOTS_DIR, META_DIR, home
 
     parser = argparse.ArgumentParser(description="McApp Update Runner")
     parser.add_argument(
         "--mode",
-        choices=["update", "rollback"],
+        choices=["update", "rollback", "converge"],
         help="Operation mode (required unless --args-file given)",
     )
     parser.add_argument("--dev", action="store_true", help="Use development pre-release")
@@ -930,7 +1043,12 @@ def main():  # noqa: PLR0915 - complex handler kept intact
     )
 
     # Run the operation
-    result = run_update(bus, dev_mode=args.dev) if args.mode == "update" else run_rollback(bus)
+    if args.mode == "update":
+        result = run_update(bus, dev_mode=args.dev)
+    elif args.mode == "rollback":
+        result = run_rollback(bus)
+    else:
+        result = run_converge(bus)
 
     print(f"[UPDATE-RUNNER] Finished: {json.dumps(result)}", flush=True)
 

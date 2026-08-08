@@ -33,12 +33,16 @@ from .logging_setup import get_logger
 from .schemas import DeleteMessagesRequest
 from .sqlite_storage import SQLiteStorage, create_sqlite_storage
 from .storage.constants import db_write
+from .system_converge import (
+    REQUIRED_SYSTEM_EPOCH,
+    UPDATE_ARGS_FILE,
+    UPDATE_RUNNER_PORT,
+    UPDATE_TRIGGER_FILE,
+    read_installed_epoch,
+)
 from .util import now_ms
 
 SSE_CLIENT_QUEUE_SIZE = 256
-UPDATE_ARGS_FILE = pathlib.Path("/var/lib/mcapp/update-args.json")
-UPDATE_TRIGGER_FILE = pathlib.Path("/var/lib/mcapp/update-trigger")
-UPDATE_RUNNER_PORT = 2985  # ⚠ must match scripts/update-runner.py's listen port
 SLOT_COUNT = 3  # ⚠ must match scripts/update-runner.py's NUM_SLOTS
 SERVER_SHUTDOWN_TIMEOUT = 5.0
 DEFAULT_SSE_PORT = 2981
@@ -450,6 +454,11 @@ class SSEManager:
     ) -> dict[str, Any]:
         """Launch the standalone update runner via systemd .path trigger.
 
+        `mode` is one of "update", "rollback", or "converge" (converge re-runs
+        the current slot's `mcapp.sh --converge` to bring system-level state
+        -- packages, firewall, web front door -- up to `REQUIRED_SYSTEM_EPOCH`
+        without touching slots or restarting mcapp; see system_converge.py).
+
         `request_host` is the Host the client used to reach this API; it is used
         to build the stream/status URLs so a remote browser connects to the Pi
         (not its own loopback). See reachable_runner_host.
@@ -503,7 +512,15 @@ class SSEManager:
         meta_dir = slots_dir / "meta"
 
         if not slots_dir.exists():
-            return {"slots": [], "active_slot": None, "can_rollback": False}
+            return {
+                "slots": [],
+                "active_slot": None,
+                "can_rollback": False,
+                "system_epoch": {
+                    "installed": read_installed_epoch(),
+                    "required": REQUIRED_SYSTEM_EPOCH,
+                },
+            }
 
         # Get active slot
         active_slot = None
@@ -542,6 +559,10 @@ class SSEManager:
             "active_slot": active_slot,
             "can_rollback": rollback_target is not None,
             "rollback_target": rollback_target,
+            "system_epoch": {
+                "installed": read_installed_epoch(),
+                "required": REQUIRED_SYSTEM_EPOCH,
+            },
         }
 
     # Mapping (type, msg) pairs → SSE event name for response messages

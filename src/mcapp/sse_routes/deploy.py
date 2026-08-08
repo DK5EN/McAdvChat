@@ -102,6 +102,18 @@ def build_deploy_router(manager: SSEManager) -> APIRouter:
             "rollback", request_host=request.headers.get("host")
         )
 
+    @router.post("/api/update/converge")
+    async def start_converge(request: Request) -> dict[str, str]:
+        """Launch the update runner in converge mode.
+
+        Manual trigger for the system-state converge (packages, firewall, web
+        front door) — normally fired automatically by the converge watchdog
+        (system_converge.py) or, post-update, by the update runner itself.
+        """
+        return await manager.launch_update_runner(
+            "converge", request_host=request.headers.get("host")
+        )
+
     @router.get("/api/update/slots")
     async def get_slots() -> dict[str, Any]:
         """Get slot metadata (versions, active slot, rollback target)."""

@@ -13,6 +13,8 @@
 #   --reconfigure Re-prompt for configuration values
 #   --fix         Repair mode: reinstall broken components
 #   --skip        Skip system setup & packages, deploy only
+#   --converge    Converge system-level state (packages, firewall, web front
+#                 door) to this release's epoch; deploy nothing
 #   --dev         Install latest development pre-release
 #   --tag TAG     Install a specific release tag (e.g. v1.5.1)
 #   --quiet       Minimal output (for cron jobs)
@@ -23,7 +25,13 @@ set -eo pipefail
 #──────────────────────────────────────────────────────────────────
 # CONSTANTS
 #──────────────────────────────────────────────────────────────────
-readonly SCRIPT_VERSION="2.4.0"
+readonly SCRIPT_VERSION="2.5.0"
+
+# Integer version of the system-level machine state (packages, firewall, web
+# front door). Bump this when setup_system/install_packages output changes in
+# a way existing installs must converge to. Independent of the app version
+# and of the DB schema version.
+readonly SYSTEM_EPOCH=1
 
 # Detect piped mode (curl | bash) — BASH_SOURCE is empty when piped
 if [[ -n "${BASH_SOURCE[0]:-}" && "${BASH_SOURCE[0]}" != "bash" ]]; then
@@ -78,6 +86,33 @@ init_paths() {
   OLD_VENV_DIR="${real_home}/venv"
 }
 
+#──────────────────────────────────────────────────────────────────
+# SYSTEM EPOCH
+#──────────────────────────────────────────────────────────────────
+readonly SYSTEM_EPOCH_FILE="/var/lib/mcapp/system-epoch"
+
+# Prints the installed system epoch (integer). Prints 0 if the marker file is
+# missing or does not contain a plain integer.
+get_installed_epoch() {
+  local v
+  if [[ ! -f "$SYSTEM_EPOCH_FILE" ]]; then
+    echo 0
+    return
+  fi
+  v=$(<"$SYSTEM_EPOCH_FILE")
+  if [[ "$v" =~ ^[0-9]+$ ]]; then
+    echo "$v"
+  else
+    echo 0
+  fi
+}
+
+# Writes the current SYSTEM_EPOCH to the marker file (root-written).
+write_system_epoch() {
+  mkdir -p "$(dirname "$SYSTEM_EPOCH_FILE")"
+  echo "$SYSTEM_EPOCH" > "$SYSTEM_EPOCH_FILE"
+}
+
 # Colors for output
 readonly RED='\033[0;31m'
 readonly GREEN='\033[0;32m'
@@ -96,6 +131,7 @@ QUIET=false
 DEV_MODE=false
 PIN_TAG=""
 SKIP_TO_DEPLOY=false
+CONVERGE_MODE=false
 
 #──────────────────────────────────────────────────────────────────
 # LOGGING
@@ -223,6 +259,10 @@ parse_args() {
         SKIP_TO_DEPLOY=true
         shift
         ;;
+      --converge)
+        CONVERGE_MODE=true
+        shift
+        ;;
       --dev)
         DEV_MODE=true
         GITHUB_RAW_BASE="https://raw.githubusercontent.com/DK5EN/McApp/development"
@@ -251,6 +291,11 @@ parse_args() {
         ;;
     esac
   done
+
+  if [[ "$CONVERGE_MODE" == "true" && "$SKIP_TO_DEPLOY" == "true" ]]; then
+    log_error "--converge and --skip are mutually exclusive"
+    exit 1
+  fi
 }
 
 show_help() {
@@ -266,6 +311,8 @@ Options:
   --reconfigure Re-prompt for configuration values
   --fix         Repair mode: reinstall broken components
   --skip        Skip system setup & packages, deploy only
+  --converge    Converge system-level state (packages, firewall, web front
+                door) to this release's epoch; deploy nothing
   --dev         Install latest development pre-release
   --tag TAG     Install a specific release tag (e.g. v1.5.1, v1.6.0)
   --quiet       Minimal output (for cron jobs)
@@ -294,6 +341,9 @@ Examples:
 
   # Install a specific version (for bisecting regressions)
   sudo ./mcapp.sh --skip --tag v1.5.1
+
+  # Converge system-level state to this release's epoch (deploys nothing)
+  sudo ./mcapp.sh --converge
 
   # Change configuration
   sudo ./mcapp.sh --reconfigure
@@ -347,6 +397,40 @@ main() {
     exit 0
   fi
 
+  if [[ "$CONVERGE_MODE" == "true" ]]; then
+    # --converge: bring system-level state (packages, firewall, web front
+    # door) up to this release's epoch. Never deploys the app, never touches
+    # slots, never falls through to Phase 5.
+    if [[ "$state" == "fresh" || "$state" == "incomplete" ]]; then
+      log_error "--converge requires an existing installation (state: ${state})"
+      exit 1
+    fi
+
+    local installed_epoch
+    installed_epoch=$(get_installed_epoch)
+    if [[ "$installed_epoch" -ge "$SYSTEM_EPOCH" ]]; then
+      log_info "System state up to date (epoch ${SYSTEM_EPOCH})"
+      exit 0
+    fi
+
+    log_step "Converging system state (epoch ${installed_epoch} -> ${SYSTEM_EPOCH})..."
+    log_step "Configuring system..."
+    setup_system
+
+    log_step "Installing packages..."
+    install_packages
+
+    write_system_epoch
+
+    log_step "Running health checks..."
+    if ! health_check; then
+      log_error "Health checks failed - check logs above"
+      exit 1
+    fi
+
+    exit 0
+  fi
+
   if [[ "$SKIP_TO_DEPLOY" == "true" ]]; then
     # --skip: jump straight to deploy, service restart, and health check
     if [[ "$state" == "fresh" || "$state" == "incomplete" ]]; then
@@ -355,19 +439,19 @@ main() {
     fi
     log_info "Skipping system setup and packages (--skip)"
 
-    # --skip is the path the web updater uses (update-runner.py always runs
-    # `mcapp.sh --skip`), which otherwise never runs install_packages() and so
-    # would never install the Caddy front door or move lighttpd off :80.
-    # ensure_web_frontend() is idempotent (steady-state no-op, no restart), so
-    # running it here every update is safe and closes that gap.
+    # --skip stays deploy-only plus the idempotent ensure_web_frontend()
+    # (steady-state no-op, no restart) — it does not run setup_system() or
+    # install_packages(), so it cannot by itself bring a box up to a new
+    # SYSTEM_EPOCH (e.g. a new firewall rule or package). Full system-level
+    # convergence is owned by `--converge`, gated on SYSTEM_EPOCH vs the
+    # installed marker at /var/lib/mcapp/system-epoch: a no-op once the box
+    # is current, otherwise setup_system + install_packages + health_check.
     #
-    # SEEDING CAVEAT: update-runner.py drives each update using the CURRENTLY
-    # ACTIVE (pre-update) slot's mcapp.sh (update-runner.py:366-371), not the
-    # incoming release's. So this fix only becomes the driver once a release
-    # CONTAINING it is the active slot. The FIRST release that carries this
-    # change must therefore be seeded by a one-time manual full run
-    # (`sudo mcapp.sh` WITHOUT --skip) on each Pi — documented for the
-    # maintainer. After that, subsequent web-updater runs self-heal.
+    # `--converge` is invoked from two places: scripts/update-runner.py runs
+    # it (via the newly deployed slot's bootstrap) after every successful
+    # update, and mcapp's converge watchdog triggers it for boxes whose
+    # update was driven by a pre-epoch runner that doesn't know the
+    # converge phase exists.
     log_step "Ensuring web front end (lighttpd :8082 + Caddy :80/:443)..."
     ensure_web_frontend
   else
@@ -394,6 +478,7 @@ main() {
     # Phase 4: Package installation
     log_step "Installing packages..."
     install_packages
+    write_system_epoch
   fi
 
   # Phase 5: Application deployment
