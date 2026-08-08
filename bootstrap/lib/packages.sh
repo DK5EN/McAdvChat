@@ -414,6 +414,44 @@ caddy_config_marker() {
   echo "mcapp-caddy-config-version: ${CADDY_CONFIG_VERSION} host=$(caddy_render_host)"
 }
 
+# The version marker a Caddyfile (template or installed copy) declares itself,
+# or "" if the file is missing/unmarked. Used to refuse a template that does not
+# belong to the code about to render it — see pick_caddy_template().
+caddy_template_version() {
+  local file="$1"
+  [[ -f "$file" ]] || return 0
+  sed -n 's/^# *mcapp-caddy-config-version: *\([0-9][0-9]*\).*/\1/p' "$file" | head -1
+}
+
+# Echo the path of a template whose OWN version matches CADDY_CONFIG_VERSION,
+# or "" if no local candidate qualifies (caller then downloads).
+#
+# The version and the content MUST come from the same release. The marker line
+# is written from the constant in THIS file while the body comes from the
+# template, so a mismatched pair writes old content under a new marker claim:
+# the staleness check then never matches again and every subsequent run
+# rewrites the config and restarts Caddy, forever.
+#
+# INSTALL_DIR is checked LAST and only when it matches, never preferred. During
+# an upgrade configure_caddy() runs from install_packages(), BEFORE deploy_app()
+# swaps the slot symlink, so INSTALL_DIR still points at the PREVIOUS release —
+# the one source guaranteed to be stale. Preferring it is exactly how v3 shipped
+# and silently did not take effect: the v2 template was rendered and installed
+# while the log reported the v3 marker.
+pick_caddy_template() {
+  local candidate
+  for candidate in \
+    "${SCRIPT_DIR:+${SCRIPT_DIR}/templates/caddy/Caddyfile.mcapp}" \
+    "${INSTALL_DIR:+${INSTALL_DIR}/bootstrap/templates/caddy/Caddyfile.mcapp}"; do
+    [[ -n "$candidate" && -f "$candidate" ]] || continue
+    if [[ "$(caddy_template_version "$candidate")" == "$CADDY_CONFIG_VERSION" ]]; then
+      echo "$candidate"
+      return 0
+    fi
+  done
+  echo ""
+}
+
 install_caddy() {
   log_info "Installing Caddy..."
 
@@ -490,13 +528,11 @@ configure_caddy() {
   if [[ -f "$caddy_conf" ]] && grep -qF "$version_marker" "$caddy_conf" 2>/dev/null; then
     log_info "  Caddyfile already up to date (${version_marker})"
   else
-    # Find template: installed copy, local script dir, or download from GitHub
-    local tmpl=""
-    if [[ -f "${INSTALL_DIR:-}/bootstrap/templates/caddy/Caddyfile.mcapp" ]]; then
-      tmpl="${INSTALL_DIR}/bootstrap/templates/caddy/Caddyfile.mcapp"
-    elif [[ -n "${SCRIPT_DIR:-}" && -f "${SCRIPT_DIR}/templates/caddy/Caddyfile.mcapp" ]]; then
-      tmpl="${SCRIPT_DIR}/templates/caddy/Caddyfile.mcapp"
-    fi
+    # Find a template that BELONGS to this code (see pick_caddy_template);
+    # otherwise fall through to the GitHub copy, which is the same tree the
+    # piped installer itself was fetched from.
+    local tmpl
+    tmpl=$(pick_caddy_template)
 
     # Render @@HOST@@ -> `hostname -s` into a STAGING file and validate that,
     # rather than writing straight to $caddy_conf. The old flow overwrote the
@@ -511,16 +547,31 @@ configure_caddy() {
     }
 
     if [[ -n "$tmpl" ]]; then
+      log_info "  Using Caddyfile template ${tmpl}"
       sed "s|@@HOST@@|${render_host}|g" "$tmpl" > "$staged"
     else
-      # Piped mode: download from GitHub (set -o pipefail makes a failed curl
-      # fail the pipeline, so a truncated download cannot reach $caddy_conf)
+      # No local template matches this code — piped mode, or an upgrade where
+      # the deployed slot still carries the previous release. Download from the
+      # same tree this installer came from (set -o pipefail makes a failed curl
+      # fail the pipeline, so a truncated download cannot reach $caddy_conf).
+      log_info "  No local template at version ${CADDY_CONFIG_VERSION} — downloading"
       if ! curl -fsSL "${GITHUB_RAW_BASE}/bootstrap/templates/caddy/Caddyfile.mcapp" \
         | sed "s|@@HOST@@|${render_host}|g" > "$staged"; then
         rm -f "$staged"
         log_warn "  Could not download Caddyfile template — leaving Caddy config as-is"
         return 0
       fi
+    fi
+
+    # Refuse to install content that does not carry the marker we are about to
+    # claim. Without this the mismatch is invisible: the success line is built
+    # from the constant, not from the file, so it reports a version the file
+    # does not contain and the next run rewrites all over again.
+    if ! grep -qF "$version_marker" "$staged"; then
+      log_warn "  Rendered Caddyfile declares version $(caddy_template_version "$staged"), expected ${CADDY_CONFIG_VERSION}"
+      log_warn "  Template/code version skew — keeping the existing config"
+      rm -f "$staged"
+      return 0
     fi
 
     # HOME=/root is pinned so `caddy validate` provisions its throwaway

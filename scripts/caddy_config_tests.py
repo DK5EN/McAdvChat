@@ -11,7 +11,7 @@ site and got Caddy's no-site-matched reply: an **empty 200**. Not a 404, not an
 error page; a white page. The installer's own success summary printed the IP URL
 unconditionally, so it advertised exactly such a blank page as an access point.
 
-Three invariants are pinned here, one per moving part of the fix:
+Four invariants are pinned here, one per moving part of the fix:
 
 1. **Template** — :80 is a catch-all (no host matcher) so every name works, and
    :443 carries an explicit multi-name SAN list (a bare :443 has no name to
@@ -20,7 +20,13 @@ Three invariants are pinned here, one per moving part of the fix:
 2. **caddy_site()** — must still find the probe target now that the :443 line is
    a comma-separated list; the pre-v3 ``-F:`` parse matched none of it and
    silently fell back to ``$(hostname).local``.
-3. **probe_access_point()** — must reject an empty 200. This is the invariant
+3. **pick_caddy_template()** — must refuse a template whose own version does not
+   match the code rendering it. v3 first shipped without this and did not take
+   effect at all: configure_caddy() runs from install_packages(), BEFORE
+   deploy_app() swaps the slot symlink, so INSTALL_DIR still pointed at the
+   PREVIOUS release. The v2 template was rendered and installed while the
+   success line — built from the constant, not the file — reported v3.
+4. **probe_access_point()** — must reject an empty 200. This is the invariant
    most likely to be "simplified" away, because ``curl -f`` looks sufficient
    and is not: it reports success on the exact response that renders blank.
 
@@ -36,6 +42,7 @@ import re
 import shutil
 import socket
 import subprocess
+import tempfile
 import threading
 from collections.abc import Iterator
 from contextlib import contextmanager
@@ -144,21 +151,27 @@ def _test_template() -> None:
         "version marker carries both version and host= (a rename must count as stale)",
     )
 
-    declared = re.search(
-        r"^readonly CADDY_CONFIG_VERSION=(\d+)",
-        _PACKAGES_SH.read_text(encoding="utf-8"),
-        re.MULTILINE,
-    )
+    declared = _declared_version()
     _check(
-        marker is not None and declared is not None and marker.group(1) == declared.group(1),
+        marker is not None and declared is not None and marker.group(1) == declared,
         "template marker version == CADDY_CONFIG_VERSION in packages.sh "
         f"(template={marker.group(1) if marker else '?'}, "
-        f"packages.sh={declared.group(1) if declared else '?'}) — a mismatch means "
+        f"packages.sh={declared or '?'}) — a mismatch means "
         "upgrades either never re-render or re-render on every run",
     )
 
 
 # ── 2. caddy_site() must parse the comma-separated :443 list ──────────────
+
+
+def _declared_version() -> str | None:
+    """CADDY_CONFIG_VERSION as declared in packages.sh."""
+    match = re.search(
+        r"^readonly CADDY_CONFIG_VERSION=(\d+)",
+        _PACKAGES_SH.read_text(encoding="utf-8"),
+        re.MULTILINE,
+    )
+    return match.group(1) if match else None
 
 
 def _extract_caddy_site_awk() -> str | None:
@@ -215,7 +228,97 @@ def _test_caddy_site() -> None:
         _check(got == expected, f"caddy_site: {label} (got {got!r}, want {expected!r})")
 
 
-# ── 3. probe_access_point() must reject the empty 200 ─────────────────────
+# ── 3. pick_caddy_template() must refuse a template from another release ──
+
+
+def _bash_out(script: str) -> str:
+    """Run a bash snippet and return its stdout, stripped."""
+    assert _BASH is not None
+    return subprocess.run(  # noqa: S603 - fixed argv, _BASH is a resolved absolute path
+        [_BASH, "-c", script],
+        capture_output=True,
+        text=True,
+        timeout=30,
+        check=False,
+    ).stdout.strip()
+
+
+def _write_template(path: Path, version: str) -> Path:
+    """A minimal template carrying `version` in its marker line."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        f"# mcapp-caddy-config-version: {version} host=@@HOST@@\n:80 {{\n}}\n", encoding="utf-8"
+    )
+    return path
+
+
+def _test_template_pick() -> None:
+    if not _check(_BASH is not None, "bash is available to source packages.sh"):
+        return
+    current = _declared_version()
+    if not _check(current is not None, "CADDY_CONFIG_VERSION is readable from packages.sh"):
+        return
+    stale = str(int(current or "3") - 1)
+
+    def pick(script_dir: str, install_dir: str) -> str:
+        return _bash_out(
+            f'SCRIPT_DIR="{script_dir}"; INSTALL_DIR="{install_dir}"; '
+            f'source "{_PACKAGES_SH}"; pick_caddy_template'
+        )
+
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        script_dir = root / "checkout"
+        install_dir = root / "slot"
+        script_tmpl = script_dir / "templates" / "caddy" / "Caddyfile.mcapp"
+        install_tmpl = install_dir / "bootstrap" / "templates" / "caddy" / "Caddyfile.mcapp"
+
+        # THE REGRESSION: during an upgrade configure_caddy() runs before the
+        # slot symlink is swapped, so INSTALL_DIR still holds the PREVIOUS
+        # release. Picking it renders old content under a new marker claim.
+        _write_template(install_tmpl, stale)
+        _check(
+            pick("", str(install_dir)) == "",
+            f"a stale INSTALL_DIR template (v{stale}) is REFUSED, so the caller downloads instead "
+            "— preferring it is what made v3 ship without taking effect",
+        )
+
+        # An INSTALL_DIR template at the right version is fine to use.
+        _write_template(install_tmpl, current or "3")
+        _check(
+            pick("", str(install_dir)) == str(install_tmpl),
+            "an INSTALL_DIR template at the current version IS used",
+        )
+
+        # A local checkout (non-piped mode) wins over the deployed slot.
+        _write_template(script_tmpl, current or "3")
+        _write_template(install_tmpl, stale)
+        _check(
+            pick(str(script_dir), str(install_dir)) == str(script_tmpl),
+            "SCRIPT_DIR (the checkout being run) is preferred over the deployed slot",
+        )
+
+        # Nothing configured at all: piped mode.
+        _check(
+            pick("", "") == "",
+            "piped mode (no SCRIPT_DIR, no INSTALL_DIR) yields no local template",
+        )
+
+        # Version parsing itself.
+        marked = _write_template(root / "marked.caddy", "7")
+        _check(
+            _bash_out(f'source "{_PACKAGES_SH}"; caddy_template_version "{marked}"') == "7",
+            "caddy_template_version reads the version out of a marker line",
+        )
+        unmarked = root / "unmarked.caddy"
+        unmarked.write_text(":80 {\n}\n", encoding="utf-8")
+        _check(
+            _bash_out(f'source "{_PACKAGES_SH}"; caddy_template_version "{unmarked}"') == "",
+            "caddy_template_version yields nothing for an unmarked file (ssl-tunnel-setup's)",
+        )
+
+
+# ── 4. probe_access_point() must reject the empty 200 ─────────────────────
 
 
 class _Handler(http.server.BaseHTTPRequestHandler):
@@ -307,6 +410,7 @@ def run_caddy_config_tests() -> bool:
     _failures.clear()
     _test_template()
     _test_caddy_site()
+    _test_template_pick()
     _test_probe()
     if _failures:
         print(f"\n  {len(_failures)} check(s) failed:")
