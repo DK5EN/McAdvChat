@@ -86,6 +86,10 @@ upstream, so a contract edit starts there and reaches this repo by split + pull.
 
 Add columns/tables via a `current_version < N` block in the chain in `storage/migrations.py` (driven from `sqlite_storage.initialize()`) and bump `FINAL_SCHEMA_VERSION`.
 
+## System Epoch
+
+System-level machine state (packages, firewall, web front door) is versioned by `SYSTEM_EPOCH` in `bootstrap/mcapp.sh` and mirrored by `REQUIRED_SYSTEM_EPOCH` in `src/mcapp/system_converge.py` — bump both together, a startup test enforces parity. Installed state is marked at `/var/lib/mcapp/system-epoch`; `mcapp.sh --converge` runs `setup_system` + `install_packages` idempotently to bring a box up to date. The update runner converges the newly deployed slot after every successful update, and the app's converge watchdog self-heals boxes whose update was driven by a pre-epoch runner.
+
 ## Web Push
 
 Web Push to browser / iOS-PWA clients, sharing one wire contract with mc-chat so both backends behave identically.

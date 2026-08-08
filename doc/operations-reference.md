@@ -4,12 +4,13 @@ Content preserved from CLAUDE.md — deployment, configuration, health checks, f
 
 ## BLE Testing Modes
 
-| Scenario | BLE Mode | Setup |
-|----------|----------|-------|
-| Non-BLE features | `disabled` | `export MCAPP_BLE_MODE=disabled` |
-| Production / Testing with BLE | `remote` | Deploy BLE service on Pi, point URL to it |
+| Scenario                      | BLE Mode   | Setup                                     |
+| ----------------------------- | ---------- | ----------------------------------------- |
+| Non-BLE features              | `disabled` | `export MCAPP_BLE_MODE=disabled`          |
+| Production / Testing with BLE | `remote`   | Deploy BLE service on Pi, point URL to it |
 
 Remote BLE testing:
+
 ```bash
 # On Pi: Start BLE service
 cd ble_service
@@ -25,6 +26,7 @@ uv run mcapp
 ## Configuration
 
 Configuration lives in `/etc/mcapp/config.json`:
+
 - `UDP_PORT_list/send`: Port 1799 for MeshCom node
 - `SSE_ENABLED/SSE_HOST/SSE_PORT`: SSE/REST API (0.0.0.0:2981, proxied via lighttpd)
 - `CALL_SIGN`: Node callsign for command handling
@@ -40,11 +42,11 @@ Dev config: `/etc/mcapp/config.dev.json` (auto-selected when `MCAPP_ENV=dev`)
 
 ```json
 {
-  "BLE_MODE": "remote",          // "remote" | "disabled" (local mode removed, use BLE service)
-  "BLE_REMOTE_URL": "",          // URL for remote BLE service (e.g., http://pi.local:8081)
-  "BLE_API_KEY": "auto-generated",  // API key for remote service authentication
-  "BLE_DEVICE_NAME": "",         // Auto-connect device name (e.g., "MC-XXXXXX")
-  "BLE_DEVICE_ADDRESS": ""       // Auto-connect device MAC address
+  "BLE_MODE": "remote", // "remote" | "disabled" (local mode removed, use BLE service)
+  "BLE_REMOTE_URL": "", // URL for remote BLE service (e.g., http://pi.local:8081)
+  "BLE_API_KEY": "auto-generated", // API key for remote service authentication
+  "BLE_DEVICE_NAME": "", // Auto-connect device name (e.g., "MC-XXXXXX")
+  "BLE_DEVICE_ADDRESS": "" // Auto-connect device MAC address
 }
 ```
 
@@ -53,6 +55,7 @@ Dev config: `/etc/mcapp/config.dev.json` (auto-selected when `MCAPP_ENV=dev`)
 **BLE API Key:** The bootstrap generates a random 16-char key (using `secrets` module) at install time. Both sides use it: McApp sends it as `X-API-Key` header, the BLE service validates it via `BLE_SERVICE_API_KEY` env var. The BLE service has no hardcoded fallback — if no key is set, it runs unauthenticated (with a startup warning).
 
 **Environment variable overrides** (useful for testing):
+
 - `MCAPP_BLE_MODE` - Override BLE mode without editing config
 - `MCAPP_BLE_URL` - Override remote BLE service URL
 - `MCAPP_BLE_API_KEY` - Override API key
@@ -73,6 +76,7 @@ curl -fsSL https://raw.githubusercontent.com/DK5EN/McApp/main/bootstrap/mcapp.sh
 ```
 
 The bootstrap script:
+
 1. Auto-detects state (fresh/migrate/upgrade)
 2. Prompts for configuration on first install
 3. Creates Python venv in `~/mcapp-venv` using uv
@@ -122,6 +126,9 @@ sudo ./mcapp.sh --force       # Force reinstall everything
 sudo ./mcapp.sh --fix         # Repair broken installation
 sudo ./mcapp.sh --reconfigure # Re-prompt for config values
 sudo ./mcapp.sh --quiet       # Minimal output (for cron)
+sudo ./mcapp.sh --converge    # Converge system-level state (packages, firewall, web front
+                               # door) to this release's epoch; deploys nothing; no-op when
+                               # /var/lib/mcapp/system-epoch is already current
 ```
 
 ### BLE Service Deployment (Optional)
@@ -146,6 +153,7 @@ sudo systemctl enable --now mcapp-ble
 ```
 
 The BLE service exposes:
+
 - `GET /api/ble/status` - Connection status
 - `GET /api/ble/devices` - Scan for devices
 - `POST /api/ble/connect` - Connect to device
@@ -167,6 +175,7 @@ sudo ./scripts/ssl-tunnel-setup.sh
 This adds Caddy as a TLS reverse proxy with automated Let's Encrypt DNS-01 certificates and DDNS updates. Supports DuckDNS, Cloudflare, deSEC.io, and Cloudflare Tunnel.
 
 **Architecture with TLS:**
+
 ```
 Browser (HTTPS) → Caddy:443 (TLS) → lighttpd:80 → {
     /webapp/  → static files
@@ -184,11 +193,13 @@ Commands for checking system health on the Pi via SSH. The Pi locale is German, 
 **IMPORTANT quoting rule:** When running `python3 -c` over SSH, use single quotes for the Python code and `\"` for strings inside Python. Never use f-strings with dict key access — use `%` formatting instead. Nested double quotes in f-strings break the SSH quoting.
 
 ### System overview
+
 ```bash
 ssh mcapp.local "uptime && echo '---' && free -h && echo '---' && df -h / /tmp /var/log && echo '---' && vcgencmd measure_temp && echo '---' && cat /proc/loadavg"
 ```
 
 ### Service statuses
+
 ```bash
 ssh mcapp.local "sudo systemctl status mcapp.service --no-pager -l 2>&1 | head -20"
 ssh mcapp.local "sudo systemctl status lighttpd.service --no-pager 2>&1 | head -10"
@@ -196,11 +207,13 @@ ssh mcapp.local "sudo systemctl status bluetooth.service --no-pager 2>&1 | head 
 ```
 
 ### Process memory usage
+
 ```bash
 ssh mcapp.local "ps aux | grep -E 'mcapp|uv.*run' | grep -v grep"
 ```
 
 ### Database stats (use % formatting, NOT f-strings)
+
 ```bash
 ssh mcapp.local "python3 -c '
 import sqlite3, os
@@ -218,6 +231,7 @@ conn.close()
 ```
 
 ### Log checks
+
 ```bash
 # Overnight logs (pruning runs at 04:00)
 ssh mcapp.local "sudo journalctl -u mcapp.service --since '2026-02-13 22:00' --until '2026-02-14 06:00' --no-pager | tail -100"
@@ -242,27 +256,30 @@ The update runner (`scripts/update-runner.py`) is a standalone Python HTTP serve
 **Launch mechanism:** A systemd `.path` trigger watches for `/var/lib/mcapp/update-trigger`. When the frontend calls `POST /api/update/start`, the SSE handler writes an args file and trigger file, systemd detects the trigger and launches `mcapp-update.service`.
 
 **Systemd units** (templates in `bootstrap/templates/`):
+
 - `mcapp-update.path` — Watches for `/var/lib/mcapp/update-trigger`
 - `mcapp-update.service` — Oneshot service running `update-runner.py` with 15-minute timeout
 
 **Update runner endpoints (port 2985):**
 
-| Endpoint | Method | Purpose |
-|----------|--------|---------|
-| `/stream` | GET | SSE stream — real-time bootstrap output (`phase`, `log`, `health`, `result` events) |
-| `/status` | GET | JSON — mode, result, slot info, active slot, can_rollback flag |
-| `/slots` | GET | JSON — version, deployed_at, active flags for all 3 slots |
+| Endpoint  | Method | Purpose                                                                             |
+| --------- | ------ | ----------------------------------------------------------------------------------- |
+| `/stream` | GET    | SSE stream — real-time bootstrap output (`phase`, `log`, `health`, `result` events) |
+| `/status` | GET    | JSON — mode, result, slot info, active slot, can_rollback flag                      |
+| `/slots`  | GET    | JSON — version, deployed_at, active flags for all 3 slots                           |
 
 **Main API endpoints (port 2981, proxied via port 80):**
 
-| Endpoint | Method | Purpose |
-|----------|--------|---------|
-| `/api/update/check` | GET | Check GitHub for available releases (5-min cache) |
-| `/api/update/start` | POST | Launch update runner (optional body: `{"dev": true}`) |
-| `/api/update/rollback` | POST | Launch rollback runner |
-| `/api/update/slots` | GET | Get slot metadata and active status |
+| Endpoint               | Method | Purpose                                               |
+| ---------------------- | ------ | ----------------------------------------------------- |
+| `/api/update/check`    | GET    | Check GitHub for available releases (5-min cache)     |
+| `/api/update/start`    | POST   | Launch update runner (optional body: `{"dev": true}`) |
+| `/api/update/rollback` | POST   | Launch rollback runner                                |
+| `/api/update/slots`    | GET    | Get slot metadata and active status                   |
+| `/api/update/converge` | POST   | Launch update runner in converge mode (system epoch)  |
 
 **Slot architecture on Pi:**
+
 ```
 ~/mcapp-slots/
 ├── current → symlink to active slot-N
@@ -280,6 +297,7 @@ The update runner (`scripts/update-runner.py`) is a standalone Python HTTP serve
 ```
 
 **Update sequence:**
+
 1. **Prepare** — determine active vs target slot
 2. **Snapshot** — backup `/etc/mcapp/`, systemd units, lighttpd config, and SQLite DB (WAL-safe online backup)
 3. **Bootstrap** — run `bootstrap/mcapp.sh --skip [--dev]` into target slot (15-min timeout)
@@ -287,29 +305,60 @@ The update runner (`scripts/update-runner.py`) is a standalone Python HTTP serve
 5. **Health check** — 8 retries × 3s: mcapp service, lighttpd, webapp HTTP, SSE health, lighttpd proxy
 6. **Auto-rollback** — on health failure: restore previous slot's symlink, /etc snapshot, and database backup
 
+### System epoch & converge
+
+`SYSTEM_EPOCH` is a single integer versioning the _system-level_ machine state (packages, firewall, web front door) — independent of the app version and of `FINAL_SCHEMA_VERSION`. Installed state is marked by `/var/lib/mcapp/system-epoch` (single integer line, written by root). Source of truth is `readonly SYSTEM_EPOCH=1` in `bootstrap/mcapp.sh`, mirrored by `REQUIRED_SYSTEM_EPOCH` in `src/mcapp/system_converge.py`; a gated startup test parses `mcapp.sh` and enforces the two stay equal.
+
+The update runner (`scripts/update-runner.py`) has three modes:
+
+- `update` — deploy + activate + health check, rolls back on failure
+- `rollback` — revert to the previous slot
+- `converge` — re-run the active slot's own `mcapp.sh --converge` to bring system-level state up to date; no snapshot, no slot swap, no rollback on failure
+
+`run_update` runs the newly deployed slot's `mcapp.sh --converge` after health checks pass, so every successful update also converges system state.
+
+**Fleet upgrade story:** pre-epoch boxes (<= v1.6.13) update via the OLD update runner driven by the OLD `bootstrap/mcapp.sh --skip`, which never installs Caddy or opens :443 — the box lands on new code with a degraded, HTTP-only front door. The new app's converge watchdog (`src/mcapp/system_converge.py`) detects the stale epoch, waits for the update runner to go idle (~1-2 min settle), and triggers `converge` mode automatically via the same trigger-file mechanism as the webapp's Update button. It makes one trigger attempt per boot and re-checks every 6 hours; on failure (e.g. no WAN) the box stays degraded-but-working over HTTP rather than retry-looping.
+
+**Troubleshooting:**
+
+```bash
+# Installed system epoch on the Pi
+ssh mcapp.local "cat /var/lib/mcapp/system-epoch"
+
+# Watchdog activity in the logs
+ssh mcapp.local "sudo journalctl -u mcapp.service | grep 'Converge watchdog'"
+
+# Manual trigger via the API (mirrors the webapp Update button)
+curl -X POST http://mcapp.local/api/update/converge
+
+# Manual fallback, run directly on the Pi
+sudo ~/mcapp-slots/current/bootstrap/mcapp.sh --converge
+```
+
 ## Firewall Configuration
 
 McApp uses host-based firewall to protect the Raspberry Pi. The bootstrap script automatically configures:
+
 - **nftables** on Debian Trixie (and newer)
 - **iptables** on Debian Bookworm (legacy fallback)
 
 ### Allowed Ports
 
-| Port | Protocol | Service | Access |
-|------|----------|---------|--------|
-| 22 | TCP | SSH | Rate limited (6/min external, LAN exempt) |
-| 80 | TCP | lighttpd | All traffic (serves webapp + proxies API) |
-| 1799 | UDP | MeshCom | All traffic (LoRa mesh communication) |
-| 2985 | TCP | Update Runner | All traffic (OTA update SSE stream) |
-| 5353 | UDP | mDNS | Multicast only (224.0.0.251) |
+| Port | Protocol | Service       | Access                                    |
+| ---- | -------- | ------------- | ----------------------------------------- |
+| 22   | TCP      | SSH           | Rate limited (6/min external, LAN exempt) |
+| 80   | TCP      | lighttpd      | All traffic (serves webapp + proxies API) |
+| 1799 | UDP      | MeshCom       | All traffic (LoRa mesh communication)     |
+| 2985 | TCP      | Update Runner | All traffic (OTA update SSE stream)       |
+| 5353 | UDP      | mDNS          | Multicast only (224.0.0.251)              |
 
 **LAN exemption for SSH:** Connections from RFC 1918 private IP ranges (192.168.0.0/16, 10.0.0.0/8, 172.16.0.0/12) are NOT rate limited.
 
 ### Internal-Only Ports (Not Exposed)
 
-| Port | Protocol | Service | Why Not Exposed |
-|------|----------|---------|-----------------|
-| 2981 | TCP | FastAPI SSE/REST | Proxied via lighttpd on port 80 |
+| Port | Protocol | Service          | Why Not Exposed                 |
+| ---- | -------- | ---------------- | ------------------------------- |
+| 2981 | TCP      | FastAPI SSE/REST | Proxied via lighttpd on port 80 |
 
 **Note:** Older firewall configurations (before Feb 2026) exposed ports 2980 and 2981 directly. These are now internal-only. The bootstrap script automatically removes them during upgrade.
 
@@ -331,12 +380,14 @@ All other unmatched traffic is **rejected** (not dropped) — the catch-all rule
 ### Firewall Logs
 
 **Log format:**
+
 - nftables: `[nftables DROP] ` prefix (logged before reject)
 - iptables: `[iptables DROP] ` prefix (logged before reject)
 
 **Rate limiting:** 10 rejects per minute are logged (prevents log spam while maintaining visibility)
 
 **View rejected traffic:**
+
 ```bash
 # Watch firewall drops in real-time
 sudo journalctl -kf | grep DROP
@@ -356,18 +407,21 @@ sudo journalctl -k --since today | grep DROP
 **To allow additional ports (example: custom service on port 8080):**
 
 For **nftables** (edit `/etc/nftables.conf`):
+
 ```nft
 # Add before the log rule
 tcp dport 8080 accept
 ```
 
 For **iptables** (edit `/etc/iptables/rules.v4`):
+
 ```bash
 # Add before the log rule
 iptables -A INPUT -p tcp --dport 8080 -j ACCEPT
 ```
 
 **Apply changes:**
+
 ```bash
 # nftables
 sudo systemctl restart nftables
@@ -385,6 +439,7 @@ sudo iptables-restore < /etc/iptables/rules.v4
 **Symptom:** `bluetoothctl power on` fails with "Failed to set power on: org.bluez.Error.Failed"
 
 **Diagnosis:**
+
 ```bash
 rfkill list bluetooth
 # Shows: Soft blocked: yes
@@ -395,6 +450,7 @@ rfkill list bluetooth
 **Solution:** The bootstrap script automatically installs `unblock-bluetooth.service` which runs `rfkill unblock bluetooth` after the Bluetooth service starts.
 
 **Manual fix (if not using bootstrap):**
+
 ```bash
 # Create systemd service
 cat <<'EOF' | sudo tee /etc/systemd/system/unblock-bluetooth.service
