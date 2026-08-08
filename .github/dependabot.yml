@@ -36,6 +36,8 @@ updates:
       # the ones that need a real read (cryptography 49->50 and websockets
       # 16->17 both landed silently under open `>=` constraints).
       python-minor-patch:
+        patterns:
+          - "*"
         update-types:
           - "minor"
           - "patch"
@@ -50,6 +52,8 @@ updates:
       prefix: "[chore]"
     groups:
       actions:
+        patterns:
+          - "*"
         update-types:
           - "major"
           - "minor"
