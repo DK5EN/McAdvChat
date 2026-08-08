@@ -9,14 +9,67 @@ run confirms it on real hardware (SD card timing, BLE, real mesh).
 Design background: `implementation-update-epoch.md` (repo root). Mechanism
 docs: `doc/operations-reference.md`, section "System epoch & converge".
 
+## This run: mcapp.local (reset planned around 2026-08-09)
+
+For this specific engagement the target IS the production box: Martin
+deliberately resets mcapp.local's SD card for the test, and the box returns
+to production duty afterwards. A fresh agent picking this up: use
+`mcapp.local` wherever the generic steps say `pi-test.local`, and use the
+concrete values below instead of the examples.
+
+**Flash prerequisites** (set in Raspberry Pi Imager before boot): hostname
+`mcapp`, user `martin` (passwordless sudo, SSH key), WiFi `ORBI63`.
+Hardware: Raspberry Pi Zero 2W, Debian 13.x (trixie era) image.
+
+**Step 2 answers for this box:**
+
+| Prompt         | Value          |
+| -------------- | -------------- |
+| Callsign       | `DK5EN-98`     |
+| Latitude       | `48.123`       |
+| Longitude      | `17.321`       |
+| City           | `Freising`     |
+| User info text | `Martin McApp` |
+
+`DK5EN-98` is the connected MeshCom node. An older config carried
+`DK5EN-14` — outdated and not connected, do not use it. Because
+`DK5EN-98.local` resolves on this LAN, the "Re-enter configuration?" prompt
+will NOT appear — the non-interactive answer string is therefore:
+
+```bash
+printf 'DK5EN-98\n48.123\n17.321\nFreising\n\ny\n'
+```
+
+**Step 4:** use `{"dev": true}` until a stable release >= v1.6.14 exists;
+the box runs the latest v1.6.14-dev.N after the test until that stable is
+cut.
+
+**After the test — restore production state:**
+
+- Backups from 2026-08-08 live on Martin's Mac at
+  `~/WebDev/mcapp-local-backup-2026-08-08/` (outside any git repo):
+  WAL-safe `messages.db` (32 MB — message history, prefs, blocklists, push
+  subscriptions), `vapid.json` (0600), `config.json` (carries the stale
+  `-14` callsign, reference only), `Caddyfile` (reference only — the
+  bootstrap regenerates it; standard LAN template, `tls internal`, no
+  DNS-provider tokens exist).
+- To restore history: stop mcapp, copy `messages.db` to
+  `/var/lib/mcapp/messages.db`, delete any `-wal`/`-shm` siblings, chown to
+  `martin`, start mcapp. Restore `vapid.json` (mode 0600, owner `martin`)
+  in the same step so existing push subscriptions keep working — without
+  the DB it is moot, browsers simply re-subscribe.
+- Re-pair BLE to the `DK5EN-98` node via the webapp's BLE dialog + PIN.
+  `BLE_API_KEY` (and VAPID, if not restored) regenerate themselves.
+
 ## Prerequisites
 
 - Raspberry Pi (Zero 2W or better) flashed with a fresh Raspberry Pi OS
   **Lite** image (arm64, Trixie era), booted, on the LAN, with WAN access.
 - SSH reachable (example below uses `pi-test.local`; substitute the real
   hostname or IP) as a user with passwordless sudo.
-- The Pi must NOT be `mcapp.local` — never run this test against the
-  production box.
+- Normally this test must never target the production box. The 2026-08 run
+  is the sanctioned exception: mcapp.local is deliberately reset for it —
+  see "This run: mcapp.local" above, including the restore steps.
 - Sanity check the image first (Pi OS ships all three; minimal cloud/VM
   images may not, which breaks v1.6.13's installer during config write):
 
