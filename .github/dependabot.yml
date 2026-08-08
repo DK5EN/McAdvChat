@@ -1,0 +1,56 @@
+version: 2
+
+# Dependabot opens PRs against a repository's DEFAULT branch unless told
+# otherwise, and this repo's GitHub default is still `main` (production).
+# `target-branch: development` is therefore set on every ecosystem below — it is
+# the working branch (see CLAUDE.md, "Git branches"), the only branch CI gates,
+# and the branch scripts/release.sh cuts from. Without it every dependency PR
+# would land on production, bypassing the dev pre-release path entirely.
+#
+# Setting it explicitly rather than relying on the default also means flipping
+# the GitHub default branch later cannot silently re-point these PRs.
+updates:
+  # Python: the uv ecosystem understands pyproject.toml + uv.lock, which is what
+  # this repo actually resolves from — `pip` would read the pyproject constraints
+  # and leave uv.lock (the file that pins production) untouched.
+  #
+  # Directory "/" covers the whole uv workspace, root plus the ble_service
+  # member. CAVEAT: ble_service ALSO ships a standalone ble_service/uv.lock used
+  # for independent Pi deployment, and Dependabot will not regenerate that one —
+  # `uv lock` inside the workspace resolves to the root lock. After merging a uv
+  # PR, refresh it by hand: copy ble_service/{pyproject.toml,uv.lock} to a temp
+  # dir OUTSIDE the workspace, `uv lock --upgrade --directory <tmp>`, copy back.
+  - package-ecosystem: "uv"
+    directory: "/"
+    target-branch: "development"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+    open-pull-requests-limit: 5
+    commit-message:
+      # Matches this repo's "[type] description" convention (CLAUDE.md).
+      prefix: "[chore]"
+    groups:
+      # One PR for the routine churn: patch/minor bumps land together so the
+      # gate runs once instead of five times. Majors stay separate — they are
+      # the ones that need a real read (cryptography 49->50 and websockets
+      # 16->17 both landed silently under open `>=` constraints).
+      python-minor-patch:
+        update-types:
+          - "minor"
+          - "patch"
+
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    target-branch: "development"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+    commit-message:
+      prefix: "[chore]"
+    groups:
+      actions:
+        update-types:
+          - "major"
+          - "minor"
+          - "patch"
