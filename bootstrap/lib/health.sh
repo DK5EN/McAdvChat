@@ -242,8 +242,35 @@ check_versions() {
 # NETWORK NAME DETECTION
 #──────────────────────────────────────────────────────────────────
 
+# Does this host:scheme pair actually serve McApp, i.e. is it a real access
+# point rather than a name that merely resolves?
+#
+# The answer must be the /health JSON. "Any HTTP response" is not good enough,
+# and neither is `curl -f` on its own: when Caddy's front door does not
+# recognise a Host header it replies with an EMPTY 200 — no body, no
+# content-type. curl -f sees 200 and reports success, so a check built on exit
+# status alone happily advertises a URL that renders a blank page in the
+# browser. Matching the "status" key in the body is what separates a genuinely
+# proxied answer from a name the front door does not serve. See
+# scripts/caddy_config_tests.py, which pins exactly that distinction.
+#
+# Deliberately array-free so it stays runnable under bash 3.2 (macOS) for the
+# regression suite; the rest of this installer is bash-4-only by design.
+probe_access_point() {
+  local host="$1" scheme="$2" body=""
+  if [[ "$scheme" == "https" ]]; then
+    # LAN HTTPS uses Caddy's internal CA, which is not in the local trust store
+    body=$(curl -fsSk --connect-timeout 2 --max-time 4 "https://${host}/health" 2>/dev/null) || return 1
+  else
+    body=$(curl -fsS --connect-timeout 2 --max-time 4 "http://${host}/health" 2>/dev/null) || return 1
+  fi
+  [[ "$body" == *'"status"'* ]]
+}
+
 # Populates NETWORK_URLS[] and NETWORK_LABELS[] with verified access points.
-# Uses getent hosts as the sole verification mechanism (always available on Debian).
+# Two-stage verification: `getent hosts` (cheap, weeds out names that do not
+# resolve at all) and then a real HTTP probe of the candidate — see
+# probe_access_point for why name resolution alone was never enough.
 # Sets AVAHI_RUNNING to true/false for the mDNS warning.
 detect_network_names() {
   NETWORK_URLS=()
@@ -259,13 +286,18 @@ detect_network_names() {
   # Associative array for deduplication (requires Bash 4+)
   declare -A seen_hosts
 
-  # Helper: add a URL if the host hasn't been seen yet
+  # Helper: add a URL if the host hasn't been seen yet AND it passes the probe
   _add_url() {
     local host="$1" scheme="$2" label="$3"
     if [[ -z "$host" || -n "${seen_hosts[$host]+x}" ]]; then
       return
     fi
+    # Mark as seen before probing, so a candidate that fails here is not
+    # retried by a later rule that happens to derive the same name.
     seen_hosts["$host"]=1
+    if ! probe_access_point "$host" "$scheme"; then
+      return
+    fi
     NETWORK_URLS+=("${scheme}://${host}/webapp")
     NETWORK_LABELS+=("$label")
   }
@@ -331,9 +363,20 @@ detect_network_names() {
     done
   fi
 
-  # 7. IP address (always added, no verification needed)
+  # 7. IP address — probed like every other candidate. It used to be added
+  # unconditionally ("no verification needed"), which is precisely how the
+  # summary ended up printing a blank-page URL: before the :80 catch-all in
+  # Caddyfile.mcapp v3, a request by IP matched no site and got the empty 200.
   if [[ -n "$ip_addr" ]]; then
     _add_url "$ip_addr" "http" "IP"
+  fi
+
+  # Nothing passed. Rather than print an empty Access Points box, fall back to
+  # the IP and label it plainly as unverified — this is the honest outcome when
+  # Caddy is down or still restarting, and it must not read as a working install.
+  if [[ ${#NETWORK_URLS[@]} -eq 0 && -n "$ip_addr" ]]; then
+    NETWORK_URLS+=("http://${ip_addr}/webapp")
+    NETWORK_LABELS+=("IP, UNVERIFIED")
   fi
 
   unset -f _add_url

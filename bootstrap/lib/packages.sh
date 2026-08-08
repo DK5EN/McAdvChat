@@ -388,7 +388,31 @@ EOF
 # LIGHTTPD_MCAPP_CONF_VERSION above). Keep this number in sync with the
 # "mcapp-caddy-config-version:" comment in
 # bootstrap/templates/caddy/Caddyfile.mcapp.
-readonly CADDY_CONFIG_VERSION=2
+readonly CADDY_CONFIG_VERSION=3
+
+# Short hostname the Caddyfile template is rendered with (@@HOST@@). Falls back
+# to "mcapp" when `hostname -s` is empty or is not a valid DNS label: an empty
+# render would emit the bogus site address ".local:443" and `caddy validate`
+# would reject the whole config, taking the front door down over a cosmetic
+# hostname problem.
+caddy_render_host() {
+  local h=""
+  h=$(hostname -s 2>/dev/null || true)
+  if [[ ! "$h" =~ ^[A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?$ ]]; then
+    h="mcapp"
+  fi
+  echo "$h"
+}
+
+# The full marker line written into (and grepped back out of) the Caddyfile.
+# It carries the HOSTNAME as well as the version, so renaming the box makes the
+# installed config stale and triggers a re-render. Before v3 the marker was
+# version-only and the site addresses were the hard-coded literal "mcapp.local",
+# so a renamed Pi kept serving a name nobody could resolve — and every request
+# under the real name fell through to Caddy's empty-200 no-site-matched reply.
+caddy_config_marker() {
+  echo "mcapp-caddy-config-version: ${CADDY_CONFIG_VERSION} host=$(caddy_render_host)"
+}
 
 install_caddy() {
   log_info "Installing Caddy..."
@@ -435,7 +459,8 @@ configure_caddy() {
   fi
 
   local caddy_conf="/etc/caddy/Caddyfile"
-  local version_marker="mcapp-caddy-config-version: ${CADDY_CONFIG_VERSION}"
+  local version_marker
+  version_marker=$(caddy_config_marker)
 
   mkdir -p /etc/caddy
 
@@ -463,7 +488,7 @@ configure_caddy() {
   # default back, see remove_tls() in ssl-tunnel-setup.sh.
   local rewrote=false
   if [[ -f "$caddy_conf" ]] && grep -qF "$version_marker" "$caddy_conf" 2>/dev/null; then
-    log_info "  Caddyfile already up to date (version ${CADDY_CONFIG_VERSION})"
+    log_info "  Caddyfile already up to date (${version_marker})"
   else
     # Find template: installed copy, local script dir, or download from GitHub
     local tmpl=""
@@ -473,24 +498,52 @@ configure_caddy() {
       tmpl="${SCRIPT_DIR}/templates/caddy/Caddyfile.mcapp"
     fi
 
+    # Render @@HOST@@ -> `hostname -s` into a STAGING file and validate that,
+    # rather than writing straight to $caddy_conf. The old flow overwrote the
+    # live Caddyfile first and only then validated: a bad template left the good
+    # config destroyed on disk while the running Caddy kept serving from memory,
+    # so the box died at the next restart instead of at install time.
+    local render_host staged
+    render_host=$(caddy_render_host)
+    staged=$(mktemp) || {
+      log_warn "  Could not create temp file — skipping Caddy configuration"
+      return 0
+    }
+
     if [[ -n "$tmpl" ]]; then
-      cp "$tmpl" "$caddy_conf"
+      sed "s|@@HOST@@|${render_host}|g" "$tmpl" > "$staged"
     else
-      # Piped mode: download from GitHub
-      curl -fsSL "${GITHUB_RAW_BASE}/bootstrap/templates/caddy/Caddyfile.mcapp" -o "$caddy_conf"
+      # Piped mode: download from GitHub (set -o pipefail makes a failed curl
+      # fail the pipeline, so a truncated download cannot reach $caddy_conf)
+      if ! curl -fsSL "${GITHUB_RAW_BASE}/bootstrap/templates/caddy/Caddyfile.mcapp" \
+        | sed "s|@@HOST@@|${render_host}|g" > "$staged"; then
+        rm -f "$staged"
+        log_warn "  Could not download Caddyfile template — leaving Caddy config as-is"
+        return 0
+      fi
     fi
 
+    # HOME=/root is pinned so `caddy validate` provisions its throwaway
+    # `tls internal` PKI CA under /root (not whatever $HOME the caller set):
+    # with HOME=/home/<user> it would MkdirAll a root-owned 0700 ~/.local/share
+    # into that user's home and break the later `sudo -u <user> uv sync`
+    # (defense-in-depth; the update-runner already forces HOME=root's home).
+    if ! HOME=/root caddy validate --config "$staged" --adapter caddyfile &>/dev/null; then
+      log_warn "  Rendered Caddyfile failed validation — keeping the existing config"
+      log_warn "  Debug: caddy validate --config ${staged} --adapter caddyfile"
+      return 0
+    fi
+
+    install -m 644 "$staged" "$caddy_conf"
+    rm -f "$staged"
     rewrote=true
-    log_info "  Caddyfile written to ${caddy_conf} (version ${CADDY_CONFIG_VERSION})"
+    log_info "  Caddyfile written to ${caddy_conf} (${version_marker})"
   fi
 
-  # Validate before (re)starting — a bad config must never take down a
-  # previously-working Caddy instance (mirrors the lighttpd -t guard above).
-  # HOME=/root is pinned so `caddy validate` provisions its throwaway
-  # `tls internal` PKI CA under /root (not whatever $HOME the caller set):
-  # with HOME=/home/<user> it would MkdirAll a root-owned 0700 ~/.local/share
-  # into that user's home and break the later `sudo -u <user> uv sync`
-  # (defense-in-depth; the update-runner already forces HOME=root's home).
+  # Re-validate what is actually on disk before (re)starting — a bad config must
+  # never take down a previously-working Caddy instance (mirrors the lighttpd -t
+  # guard above). On the rewrite path this re-checks the file just installed; on
+  # the up-to-date path it is the only check an already-present config gets.
   if ! HOME=/root caddy validate --config "$caddy_conf" --adapter caddyfile &>/dev/null; then
     log_warn "  Caddy config validation failed — leaving caddy service as-is"
     log_warn "  Run: caddy validate --config ${caddy_conf} --adapter caddyfile"
@@ -542,7 +595,18 @@ configure_caddy() {
 # to $(hostname).local.
 caddy_site() {
   local site=""
-  site=$(awk -F: '/^[A-Za-z0-9._-]+:443[[:space:]]*\{/{print $1; exit}' /etc/caddy/Caddyfile 2>/dev/null)
+  # Take the FIRST "<name>:443" token on the first site-address line (the line
+  # opening a block, i.e. ending in "{"). Since v3 the LAN default lists several
+  # comma-separated addresses — "mcapp.local:443, mcapp.fritz.box:443, ... {" —
+  # and the old `-F:` + `^name:443[[:space:]]*{` pattern matched none of them,
+  # which silently sent the HTTPS probe and the CA warm-up to the $(hostname).local
+  # fallback. First in the list is the .local name, which is the one avahi can
+  # actually resolve, so it stays the right probe target.
+  site=$(awk '/:443/ && /\{[[:space:]]*$/ {
+    if (match($0, /[A-Za-z0-9._-]+:443/)) {
+      s = substr($0, RSTART, RLENGTH); sub(/:443$/, "", s); print s; exit
+    }
+  }' /etc/caddy/Caddyfile 2>/dev/null)
   local cfg="${CONFIG_FILE:-/etc/mcapp/config.json}"
   if [[ -z "$site" && -f "$cfg" ]] && command -v jq &>/dev/null; then
     site=$(jq -r '.TLS_HOSTNAME // ""' "$cfg" 2>/dev/null)

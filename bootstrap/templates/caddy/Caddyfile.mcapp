@@ -1,8 +1,17 @@
-# mcapp-caddy-config-version: 2
-# (keep this number in sync with CADDY_CONFIG_VERSION in bootstrap/lib/packages.sh —
-#  configure_caddy() only rewrites this file when the marker version bumps)
+# mcapp-caddy-config-version: 3 host=@@HOST@@
+# (keep the version number in sync with CADDY_CONFIG_VERSION in
+#  bootstrap/lib/packages.sh — configure_caddy() rewrites this file whenever the
+#  marker line above stops matching. The marker carries the HOSTNAME as well as
+#  the version, so renaming the box also counts as stale and re-renders: up to
+#  v2 the site addresses were the hard-coded literal "mcapp.local", which meant
+#  a Pi named anything else served a front door nobody could reach.)
 #
-# LAN-HTTPS default Caddyfile for mcapp.local.
+# This is a TEMPLATE, not a drop-in config: @@HOST@@ is substituted with
+# `hostname -s` by configure_caddy() (bootstrap/lib/packages.sh) at install
+# time. `caddy validate` on this file as-committed will fail — that is expected;
+# validate the rendered result instead.
+#
+# LAN-HTTPS default Caddyfile.
 #
 # Caddy is the public front door on :80 and :443. lighttpd is the backend,
 # bound to 127.0.0.1:8082 (see configure_lighttpd() in bootstrap/lib/packages.sh)
@@ -72,16 +81,40 @@
 	}
 }
 
-# Plain HTTP — serves the FULL site, no redirect to HTTPS. This is a LAN
-# convenience default: ham radio LAN clients often haven't installed the
+# Plain HTTP — a CATCH-ALL site (no host matcher), serving the FULL site with no
+# redirect to HTTPS.
+#
+# Catch-all is deliberate and load-bearing. A LAN box is reached under many
+# names depending on whose router is in the rack: @@HOST@@.local (mDNS/avahi —
+# the Apple/Bonjour path), @@HOST@@.fritz.box (Fritz!Box DHCP-DNS), .home.arpa
+# or .lan or .home (OpenWrt and friends), whatever `search` domain resolv.conf
+# hands out, the reverse-DNS name, and the bare IP. A host-matched :80 block
+# answers exactly ONE of those and gives every other name Caddy's no-site-matched
+# response — an empty 200, i.e. a blank page rather than an honest error. Up to
+# v2 that is what everyone not typing "mcapp.local" got, including anyone using
+# the IP address that the installer's own success summary prints.
+#
+# No redirect to HTTPS: ham radio LAN clients often haven't installed the
 # internal CA (see /root.crt above) yet, so forcing HTTPS would lock them out.
-mcapp.local:80 {
+:80 {
 	import mcapp_routes
 }
 
-# HTTPS via Caddy's internal CA (self-signed — mcapp.local is not a publicly
-# resolvable domain, so public ACME issuance is not possible here).
-mcapp.local:443 {
+# HTTPS via Caddy's internal CA. These names are self-signed — they are not
+# publicly resolvable, so public ACME issuance is not possible here.
+#
+# Unlike :80 this CANNOT be a catch-all: a bare :443 site has no name to issue a
+# certificate for, so the handshake fails. Every name that should work over
+# HTTPS must therefore be listed here as its own site address; Caddy issues one
+# internal-CA leaf per name. The list covers the suffixes LAN routers actually
+# hand out: .local (mDNS/avahi), .fritz.box (AVM), .home.arpa (RFC 8375), and
+# .lan / .home (OpenWrt and friends). Add more by appending
+# "@@HOST@@.<suffix>:443," — a name that does not resolve on a given LAN costs
+# nothing, it is simply never requested. Site addresses must stay on one line.
+#
+# Access by bare IP stays HTTP-only on purpose: the DHCP address is not stable
+# enough to bake into a certificate, and the :80 catch-all above already serves it.
+@@HOST@@.local:443, @@HOST@@.fritz.box:443, @@HOST@@.home.arpa:443, @@HOST@@.lan:443, @@HOST@@.home:443 {
 	tls internal {
 		curves x25519mlkem768 x25519
 		protocols tls1.3 tls1.3

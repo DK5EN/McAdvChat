@@ -518,8 +518,18 @@ report_caddy_state() {
     tls_enabled=$(jq -r '.TLS_ENABLED // false' "$CONFIG_FILE" 2>/dev/null)
   fi
 
-  if [[ -f "$caddyfile" ]] && grep -qF "mcapp-caddy-config-version: ${CADDY_CONFIG_VERSION:-0}" "$caddyfile" 2>/dev/null; then
-    echo "  Caddyfile:      up to date (version ${CADDY_CONFIG_VERSION})"
+  # Use the full marker (version AND hostname) so the dry run reports the same
+  # verdict configure_caddy() will act on — a renamed box is stale even at the
+  # current version, because the rendered :443 site addresses embed the hostname.
+  local caddy_marker=""
+  if declare -F caddy_config_marker &>/dev/null; then
+    caddy_marker=$(caddy_config_marker)
+  else
+    caddy_marker="mcapp-caddy-config-version: ${CADDY_CONFIG_VERSION:-0}"
+  fi
+
+  if [[ -f "$caddyfile" ]] && grep -qF "$caddy_marker" "$caddyfile" 2>/dev/null; then
+    echo "  Caddyfile:      up to date (${caddy_marker})"
   elif [[ "$tls_enabled" == "true" ]]; then
     echo "  Caddyfile:      owned by ssl-tunnel-setup.sh (TLS_ENABLED in config.json) — untouched"
   elif [[ -f "$caddyfile" ]]; then

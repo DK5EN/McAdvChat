@@ -24,6 +24,7 @@ import asyncio
 import sys
 
 from ble_service_tests import run_ble_service_tests
+from caddy_config_tests import run_caddy_config_tests
 from config_migration_tests import run_config_migration_tests
 from update_runner_tests import run_update_runner_tests
 
@@ -131,6 +132,9 @@ async def main() -> int:  # noqa: PLR0915 - flat suite registry; one visible lin
     update_runner_ok = run_update_runner_tests()
     print(f"update_runner: {'PASS' if update_runner_ok else 'FAIL'}")
 
+    caddy_config_ok = run_caddy_config_tests()
+    print(f"caddy_config: {'PASS' if caddy_config_ok else 'FAIL'}")
+
     # The only suite that can be legitimately inapplicable: it drives a
     # bash-4-only installer function and macOS ships bash 3.2. It therefore
     # returns its own status label so a skip is never printed as "PASS".
@@ -176,6 +180,7 @@ async def main() -> int:  # noqa: PLR0915 - flat suite registry; one visible lin
         and ble_protocol_ok
         and ble_hydration_ok
         and update_runner_ok
+        and caddy_config_ok
         and config_migration_ok
         and commands_ok
     )
