@@ -1,8 +1,30 @@
 # Bug: mHeard page renders zero stations on a fresh install
 
-Status: OPEN (found 2026-08-09 during the OrbStack Fritz!Box simulation).
-Not yet root-caused; evidence below is complete enough to reproduce and
-investigate without the original VM.
+Status: ROOT-CAUSED 2026-08-09 (found the same day during the OrbStack
+Fritz!Box simulation). Fix plan awaiting sign-off:
+`doc/plan-mheard-fresh-install-fix.md`.
+
+## Root cause (verified by repro, no VM needed)
+
+Two independent "at least 10 datapoints" gates, one per repo:
+
+- backend `MIN_DATAPOINTS_FOR_STATS = 10` in `_build_chart_series`
+  (`storage/query.py:722-726`, `storage/constants.py:36`)
+- frontend `MIN_MHEARD_DATAPOINTS = 10` in `qualifiedCallsigns`
+  (webapp `src/stores/MHeardStore.ts:40,78-91`)
+
+A "datapoint" is **a 5-minute bucket in which the station was heard**, not a
+packet — `_accumulate_signal()` collapses every reception inside one 5-minute
+window into one `signal_buckets` row. The fresh box's 40 `signal_log` rows
+collapsed into 16 buckets across several stations, so no callsign reached 10,
+`_build_chart_series` returned `[]`, and the sidebar rendered `Stations (0)`.
+
+Seeding an ephemeral DB with N buckets for each of three callsigns and calling
+`process_mheard_store_parallel()` shows a clean cliff at exactly 10: N ≤ 9
+returns 0 stations, N ≥ 10 returns all three. The 4-row legacy run hit the same
+gate. The 30d/1y tabs need 10 distinct _hours_, so they are strictly harder.
+Suspects 1, 2 and 4 below are cleared; 3 was closest, but the mechanism is the
+count filter, not the series shape.
 
 ## Symptom
 
@@ -33,11 +55,12 @@ Messages page renders the same stations with RSSI/SNR just fine.
 
 ## Why it matters
 
-Every fresh fleet install may show an empty mHeard view for an unknown
-period (possibly indefinitely), which reads as "McApp is broken" to a new
+Every fresh fleet install shows an empty mHeard view until some station has
+been heard in 10 separate 5-minute windows — hours, not minutes, and never
+under 10 hours for the 30d/1y tabs. It reads as "McApp is broken" to a new
 user even though ingestion is healthy.
 
-## Suspects (unverified)
+## Suspects at filing time (all now adjudicated — see Root cause above)
 
 1. Webapp-side: the `mheard stats` SSE reply is correlated to the
    requesting `client_id` — a fresh box / fresh SSE session may mis-match
