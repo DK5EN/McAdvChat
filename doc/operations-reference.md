@@ -38,6 +38,26 @@ Configuration lives in `/etc/mcapp/config.json`:
 
 Dev config: `/etc/mcapp/config.dev.json` (auto-selected when `MCAPP_ENV=dev`)
 
+### UDP node target, learning, and NAT deployments
+
+`MESHCOM_IOT_TARGET` names the MeshCom node (default `<CALLSIGN>.local`). On a
+real LAN the exact value barely matters: the outbound target is **learned**
+from inbound node traffic (trust gate: private IPv4 sources only, see
+`_is_trusted_node_source` in `udp_handler.py`) — `/api/status` then reports
+`udp_target_kind: identified`.
+
+That self-healing does NOT work behind NAT/port-forwarding (OrbStack/Docker
+style), where every inbound datagram arrives with a loopback source that the
+trust gate deliberately refuses. Receiving works; sending silently dies with
+`UDP_SEND failed ... Temporary failure in name resolution` in the journal.
+Fix: set `MESHCOM_IOT_TARGET` to the node's real IP explicitly (outbound
+through NAT is fine). Verified 2026-08-09 in the OrbStack simulation.
+
+A failed UDP send is reported to the webapp as a `msg:status` SSE event
+(`send_failed: true` plus `src`/`dst`/`msg`/`reason` for content correlation
+— no msg_id exists before the firmware mints one), alongside the existing
+global error toast.
+
 ### BLE Configuration
 
 ```json

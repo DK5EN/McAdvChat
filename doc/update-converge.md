@@ -255,6 +255,15 @@ recovery at any time: `sudo ~/mcapp-slots/current/bootstrap/mcapp.sh
 
 ## Known gotchas
 
+- **OrbStack/NAT VMs cannot self-learn the UDP node target.** OrbStack's
+  port-forward rewrites every inbound UDP source to `127.0.0.1`, which the
+  outbound-target trust gate refuses by design — receiving works, sending
+  fails with `UDP_SEND failed ... name resolution` in the journal (webapp
+  gets a `msg:status` `send_failed` event). For VM tests that need outbound
+  mesh traffic, set `MESHCOM_IOT_TARGET` in `/etc/mcapp/config.json` to the
+  node's real LAN IP and restart mcapp. Also note: the node applies
+  `--extudpip` changes only at boot.
+
 - **Never install the baseline piped** — see step 1. This also means fleet
   boxes freshly installed via the README's piped command in recent weeks
   already carry the new front door; only June-era installs are degraded.

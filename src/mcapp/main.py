@@ -1487,6 +1487,7 @@ class MessageRouter:
                         "timestamp": now_ms(),
                     },
                 )
+                await self._publish_send_failed(normalized_data, str(e))
         else:
             self._logger.warning("UDP handler not available, can't send message")
             await self.publish(
@@ -1499,6 +1500,33 @@ class MessageRouter:
                     "timestamp": now_ms(),
                 },
             )
+            await self._publish_send_failed(normalized_data, "UDP handler not available")
+
+    async def _publish_send_failed(self, normalized_data: dict[str, Any], reason: str) -> None:
+        """Tell the webapp a specific outbound message did not leave this box.
+
+        The generic `websocket_message` error above is a global toast; it cannot
+        clear the sending bubble of the message that failed, so an unreachable
+        or unresolvable node (`MESHCOM_IOT_TARGET` typo, node renamed, NAT'd
+        deployment whose inbound sources are all loopback and therefore excluded
+        from outbound-target learning) left the webapp stuck on "Sending…"
+        forever with only a journal line as evidence. There is no msg_id yet at
+        this point — the firmware mints it on the mesh — so the event carries
+        the message content and the webapp correlates by (src, dst, msg), the
+        same matching it already uses for the echoed frame.
+        """
+        await self.publish(
+            "system",
+            "msg_status",
+            {
+                "send_failed": True,
+                "src": normalized_data.get("src"),
+                "dst": normalized_data.get("dst"),
+                "msg": normalized_data.get("msg"),
+                "reason": reason,
+                "timestamp": now_ms(),
+            },
+        )
 
     async def _ble_message_handler(self, routed_message: dict[str, Any]) -> None:
         """Handle BLE messages from WebSocket and route to BLE client"""

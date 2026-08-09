@@ -171,6 +171,13 @@ async def _test_udp_send_failure_surfaces_and_preserves_fanout(
 
     router.subscribe("websocket_message", _capture_error)
 
+    statuses: list[dict[str, Any]] = []
+
+    async def _capture_status(routed: dict[str, Any]) -> None:
+        statuses.append(routed["data"])
+
+    router.subscribe("msg_status", _capture_status)
+
     other_calls: list[dict[str, Any]] = []
 
     async def _other_subscriber(routed: dict[str, Any]) -> None:
@@ -184,6 +191,19 @@ async def _test_udp_send_failure_surfaces_and_preserves_fanout(
     record(
         "UDP send failure: still surfaces a websocket_message error to the operator",
         len(errors) == 1 and "Failed to send UDP message" in str(errors[0].get("msg", "")),
+    )
+    # The global error toast cannot clear the affected message's sending bubble,
+    # so the failure must ALSO go out as a per-message msg_status event the
+    # webapp can correlate by content (there is no msg_id before the firmware
+    # mints one) — otherwise an unreachable node leaves "Sending…" forever.
+    record(
+        "UDP send failure: per-message msg_status carries send_failed + content",
+        len(statuses) == 1
+        and statuses[0].get("send_failed") is True
+        and statuses[0].get("dst") == "20"
+        and statuses[0].get("msg") == "hi"
+        and statuses[0].get("src") == router.my_callsign
+        and "servname" in str(statuses[0].get("reason", "")),
     )
     record(
         "UDP send failure: OTHER udp_message subscribers still run (router fan-out survives)",
