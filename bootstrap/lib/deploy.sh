@@ -207,6 +207,7 @@ deploy_app() {
   local force="${1:-false}"
   local dev_mode="${2:-false}"
   local pin_tag="${3:-}"
+  local remote_version="${4:-}"
 
   # Initialize slot layout (creates dirs, migrates legacy if needed)
   init_slot_layout
@@ -215,9 +216,15 @@ deploy_app() {
   local old_version
   old_version=$(get_installed_mcapp_version)
 
-  # Resolve the version we intend to run, and which slot is active right now.
-  local remote_version active_slot active_version
-  remote_version=$(resolve_target_version "$dev_mode" "$pin_tag")
+  # remote_version is normally resolved once by the caller (mcapp.sh's
+  # resolve_install_ref(), via MCAPP_INSTALL_APP_VERSION) and passed in, so
+  # this does not make a second, independently-resolved API call — a release
+  # cut between the two calls would otherwise give libs from tag A and app
+  # from tag B (§3.1). Resolve here too so deploy_app stays usable standalone.
+  local active_slot active_version
+  if [[ -z "$remote_version" ]]; then
+    remote_version=$(resolve_target_version "$dev_mode" "$pin_tag")
+  fi
   active_slot=$(get_active_slot)
   active_version=$(slot_recorded_version "$active_slot")
 
