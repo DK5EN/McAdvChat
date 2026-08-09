@@ -1,8 +1,26 @@
 # Bug: mHeard page renders zero stations on a fresh install
 
-Status: ROOT-CAUSED 2026-08-09 (found the same day during the OrbStack
-Fritz!Box simulation). Fix plan awaiting sign-off:
-`doc/plan-mheard-fresh-install-fix.md`.
+Status: **RESOLVED 2026-08-09** (found, root-caused and fixed the same day,
+during the OrbStack Fritz!Box simulation).
+
+Fixed by an adaptive floor applied symmetrically on both sides: keep 10 as the
+_preferred_ threshold, fall back to a floor of 1 only when the preferred
+threshold qualifies nobody. Dense installs never take the fallback, so their
+output is unchanged.
+
+| Repo    | Commit    | What                                                                          |
+| ------- | --------- | ----------------------------------------------------------------------------- |
+| MCProxy | `fc80c48` | sparse floor in `_build_chart_series`, `signal_log` fallback, earlier flush   |
+| webapp  | `6a8dc23` | adaptive `qualifiedCallsigns` + `isSparse`, visible markers, sparse hint line |
+
+Plan (as implemented): `doc/plan-mheard-fresh-install-fix.md`.
+
+**Definition worth keeping, because it is the whole bug:** a "datapoint" is a
+**5-minute bucket in which the station was heard at all**, not a packet. The
+gate never asked "did we hear this station 10 times" — it asked "did we hear it
+in 10 _distinct 5-minute windows_". For a neighbour beaconing every ~30 min
+that is ~5 hours; the 30d/1y tabs roll up hourly and so need 10 distinct
+_hours_, which no amount of mesh chatter can deliver in under 10 hours.
 
 ## Root cause (verified by repro, no VM needed)
 

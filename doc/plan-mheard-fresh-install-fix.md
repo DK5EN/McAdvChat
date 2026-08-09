@@ -1,7 +1,11 @@
 # Implementation plan: fresh-install mHeard renders zero stations
 
-Status: SIGNED OFF 2026-08-09 — all four open decisions settled (§6), ready to implement.
-Not started.
+Status: **IMPLEMENTED 2026-08-09** — Wave 1 `fc80c48` (MCProxy), Wave 2 `6a8dc23` (webapp).
+Wave 3 (W3.1 local acceptance, W3.2 `mcapp.local` confirmation) is still outstanding and
+needs a human at a browser; W3.3 is done. Bug doc closed: `doc/bug-mheard-fresh-install.md`.
+
+One claim in W1.2 below was **wrong** and is corrected in place — see the CORRECTION note there.
+
 Bug: `doc/bug-mheard-fresh-install.md` (found 2026-08-09, OrbStack fresh install v1.6.14-dev.28).
 Repos touched: `MCProxy` (backend) and `webapp` (frontend). Commit each independently.
 
@@ -163,9 +167,24 @@ Files are disjoint per wave; each wave is independently verifiable and committab
 **W1.2 Legacy fallback reads `signal_log` (S1)** — `src/mcapp/storage/query.py`
 
 - Change the fallback query to scan `signal_log` (`callsign, timestamp, rssi, snr`, same
-  `VALID_RSSI_RANGE`/`VALID_SNR_RANGE` guards, same 7-day cutoff), keyed by `callsign` — which is
-  already the last-hop key `_ingest_signal` writes for the bucket path. This drops the
-  comma-splitting of `src` and makes both branches agree on the station key.
+  `VALID_RSSI_RANGE`/`VALID_SNR_RANGE` guards, same 7-day cutoff), keyed by `callsign`. This drops
+  the comma-splitting of `src`.
+
+> **CORRECTION (found during implementation, 2026-08-09).** This item originally claimed
+> `signal_log.callsign` "is already the last-hop key `_ingest_signal` writes for the bucket path"
+> and that the change "makes both branches agree on the station key". **Both claims are false.**
+> `ingest.py:325` says so explicitly: `signal_log` keeps **originator-keyed** rows (`callsign` =
+> first comma-component of `src`), while `signal_buckets` and `station_positions.signal_via` are
+> keyed by `signal_via`, the last relay hop that actually delivered the measurement. The two keys
+> coincide only for direct, non-relayed receptions.
+>
+> The change shipped anyway because it is still a clear improvement — one row per measurement
+> instead of one row per comma-component, so a relayed packet no longer credits the same reading to
+> every hop in its path — but it does **not** unify the station key across the two branches. Doing
+> that properly needs a `signal_via` column on `signal_log`, i.e. a schema migration, which is out
+> of scope here. Note also that W1.3 makes this fallback much rarer: once accumulators are flushed
+> before the query, `signal_buckets` is empty only on a genuinely cold start.
+
 - Keep the existing INFO line, retargeted: `"signal_buckets empty, falling back to signal_log scan"`.
 - Retain `backfill_signal_log()` as the path that gets historical `messages` rows into `signal_log`;
   the read path should not be a second, divergent implementation of that migration.
@@ -294,13 +313,13 @@ notes so the next reader does not re-derive it.
 
 ## 5. Risk
 
-| Risk                                                                     | Mitigation                                                                                                                                     |
-| ------------------------------------------------------------------------ | ---------------------------------------------------------------------------------------------------------------------------------------------- |
-| Sparse fallback floods a busy site's sidebar                             | It cannot trigger there — it fires only when _no_ station reaches 10. Guarded by an explicit test.                                             |
-| Payload growth on the 7-day dump                                         | Only in the sparse branch, where the whole dataset is by definition tiny (16 rows on the observed box).                                        |
-| `signal_log` fallback changes station keys vs. the old `messages` scan   | Intentional: it aligns the fallback with the bucket path, which is authoritative. Covered by W1.4.                                             |
-| Moving `_flush_all_accumulators()` earlier adds a write to the read path | Already on that path today, just later; writes are `INSERT OR REPLACE` and idempotent.                                                         |
-| Two thresholds now live in two repos and can drift                       | They are independent by design (different windows); both are named constants with tests pinning the strict _and_ sparse branches on each side. |
+| Risk                                                                     | Mitigation                                                                                                                                                                                     |
+| ------------------------------------------------------------------------ | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Sparse fallback floods a busy site's sidebar                             | It cannot trigger there — it fires only when _no_ station reaches 10. Guarded by an explicit test.                                                                                             |
+| Payload growth on the 7-day dump                                         | Only in the sparse branch, where the whole dataset is by definition tiny (16 rows on the observed box).                                                                                        |
+| `signal_log` fallback changes station keys vs. the old `messages` scan   | Intentional, but see the W1.2 CORRECTION: it does **not** align the fallback with the bucket path (originator vs. last hop). It does stop crediting one reading to every hop. Covered by W1.4. |
+| Moving `_flush_all_accumulators()` earlier adds a write to the read path | Already on that path today, just later; writes are `INSERT OR REPLACE` and idempotent.                                                                                                         |
+| Two thresholds now live in two repos and can drift                       | They are independent by design (different windows); both are named constants with tests pinning the strict _and_ sparse branches on each side.                                                 |
 
 ## 6. Decisions (settled 2026-08-09)
 
