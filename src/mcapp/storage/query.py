@@ -43,6 +43,7 @@ from .constants import (
     PRUNE_TARGET_FRACTION,
     SECONDS_PER_DAY,
     SEVEN_DAYS_MS,
+    SPARSE_MIN_DATAPOINTS,
     STATION_RETENTION_DAYS,
     TELEMETRY_BUCKET_MS,
     VALID_RSSI_RANGE,
@@ -540,6 +541,16 @@ class QueryMixin(StorageBase):
         if progress_callback:
             await progress_callback("start", "Querying database...")
 
+        # Flush in-memory partial buckets BEFORE either branch below queries
+        # signal_buckets. Moved here from inside the `if bucket_rows:` branch: when
+        # signal_buckets is empty (the fresh-install case) the newest bucket per
+        # station still lives only in RAM (_accumulate_signal only writes a bucket
+        # out once the SAME callsign is heard again in a later window), so the old
+        # placement meant the very first page load after ingestion started saw
+        # nothing. Flush writes are INSERT OR REPLACE, so re-flushing an
+        # already-persisted bucket here is idempotent.
+        await self._flush_all_accumulators()
+
         # Try reading from pre-aggregated signal_buckets first
         bucket_rows = await self._query(
             "SELECT callsign, bucket_ts, rssi_avg, rssi_min, rssi_max,"
@@ -552,8 +563,6 @@ class QueryMixin(StorageBase):
         if bucket_rows:
             # Use pre-aggregated data — much faster
             logger.debug("Using %d pre-aggregated signal_buckets", len(bucket_rows))
-            # Also flush any in-memory partial buckets before building result
-            await self._flush_all_accumulators()
             return await self._build_chart_series(
                 bucket_rows,
                 gap_threshold_s=GAP_THRESHOLD_MULTIPLIER * BUCKET_SECONDS,
@@ -561,12 +570,16 @@ class QueryMixin(StorageBase):
                 progress_callback=progress_callback,
             )
 
-        # --- Fallback: legacy scan from messages table ---
-        logger.info("signal_buckets empty, falling back to legacy messages scan")
+        # --- Fallback: scan signal_log, the authoritative per-measurement table ---
+        # (not `messages`: signal_log is written by every signal-bearing packet via
+        # _ingest_signal, ingest.py, so it is a superset of what the `messages` scan
+        # ever saw and keys off the same `callsign` column the bucket path accumulates
+        # under — no comma-splitting of `src` needed here).
+        logger.info("signal_buckets empty, falling back to signal_log scan")
 
         query = """
-            SELECT src, timestamp, rssi, snr
-            FROM messages
+            SELECT callsign, timestamp, rssi, snr
+            FROM signal_log
             WHERE timestamp >= ?
                 AND rssi IS NOT NULL AND snr IS NOT NULL
                 AND rssi BETWEEN ? AND ?
@@ -591,16 +604,14 @@ class QueryMixin(StorageBase):
         )
 
         for row in rows:
-            src = row["src"]
-            if not src:
+            call = row["callsign"]
+            if not call:
                 continue
             timestamp_ms = row["timestamp"]
             bucket_time = int(timestamp_ms // 1000 // BUCKET_SECONDS * BUCKET_SECONDS)
-            callsigns = [s.strip() for s in src.split(",")]
-            for call in callsigns:
-                key = (bucket_time, call)
-                buckets[key]["rssi"].append(row["rssi"])
-                buckets[key]["snr"].append(row["snr"])
+            key = (bucket_time, call)
+            buckets[key]["rssi"].append(row["rssi"])
+            buckets[key]["snr"].append(row["snr"])
 
         bucket_rows = self._legacy_buckets_to_rows(buckets)
         return await self._build_chart_series(
@@ -724,6 +735,25 @@ class QueryMixin(StorageBase):
             for cs, entries in callsign_data.items()
             if len(entries) >= MIN_DATAPOINTS_FOR_STATS
         }
+
+        if not qualified and callsign_data:
+            # Fresh-install / sparse-mesh case: nobody has 10 distinct 5-minute
+            # buckets yet. Rather than show an empty chart for hours, fall back to
+            # a floor of 1 so every station heard at least once is shown. Dense
+            # installs never take this branch — see
+            # doc/plan-mheard-fresh-install-fix.md §2.
+            qualified = {
+                cs: entries
+                for cs, entries in callsign_data.items()
+                if len(entries) >= SPARSE_MIN_DATAPOINTS
+            }
+            logger.info(
+                "mheard: no station reached %d buckets, falling back to sparse floor"
+                " %d (%d stations)",
+                MIN_DATAPOINTS_FOR_STATS,
+                SPARSE_MIN_DATAPOINTS,
+                len(qualified),
+            )
 
         if progress_callback:
             await progress_callback(

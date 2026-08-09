@@ -528,6 +528,106 @@ async def run_query_tests() -> bool:  # noqa: PLR0915 - test suite lists one cas
                     "signal_via" not in no_rssi_dict,
                 )
             )
+
+            # --- mheard sparse-floor fallback (doc/plan-mheard-fresh-install-fix.md) --
+            # A "datapoint" is a distinct 5-min signal_buckets row per callsign, not a
+            # packet. `_build_chart_series` used to hard-drop any callsign below
+            # MIN_DATAPOINTS_FOR_STATS (10) with no fallback — a fresh install with
+            # sparse history rendered an empty mHeard chart for hours. The fix adds an
+            # adaptive floor: fall back to SPARSE_MIN_DATAPOINTS (1) only when NO
+            # callsign reaches the strict threshold.
+            recent_bucket_start = (now_ms() // _FIVE_MIN_MS) * _FIVE_MIN_MS
+            sparse_stats = (-95.0, -100, -90, 5.0, 3.0, 7.0)
+
+            async def _seed_n_buckets(callsign: str, n: int) -> None:
+                for i in range(n):
+                    await _seed_5min(
+                        callsign, recent_bucket_start - i * _FIVE_MIN_MS, sparse_stats, 1
+                    )
+
+            # (1) 9 buckets per callsign (below the strict floor of 10) for THREE
+            # callsigns still returns every station via the sparse floor. This is the
+            # fresh-install repro from the bug report and FAILS on pre-fix code (which
+            # has no fallback and returns []).
+            await _wipe_buckets()
+            sparse_callsigns = ["SPARSE1", "SPARSE2", "SPARSE3"]
+            for cs in sparse_callsigns:
+                await _seed_n_buckets(cs, 9)
+            sparse_series = await storage.process_mheard_store_parallel()
+            sparse_series_callsigns = {e["callsign"] for e in sparse_series}
+            results.append(
+                (
+                    ("mheard: 9 buckets per callsign still returns all stations via sparse floor"),
+                    len(sparse_series) > 0 and sparse_series_callsigns == set(sparse_callsigns),
+                )
+            )
+
+            # (2) When at least one callsign reaches the strict threshold, the sparse
+            # fallback must NOT engage — the dense-box no-regression guard.
+            await _wipe_buckets()
+            await _seed_n_buckets("DENSE1", 12)
+            await _seed_n_buckets("DENSE2", 2)
+            dense_series = await storage.process_mheard_store_parallel()
+            dense_series_callsigns = {e["callsign"] for e in dense_series}
+            results.append(
+                (
+                    (
+                        "mheard: 10+ buckets keeps the strict threshold"
+                        " (sparse floor does not fire when someone qualifies)"
+                    ),
+                    dense_series_callsigns == {"DENSE1"},
+                )
+            )
+
+            # (3) Empty DB (no signal_buckets, no signal_log rows in the window):
+            # empty list out, no exception.
+            await _wipe_buckets()
+            await storage._mutate("DELETE FROM signal_log")
+            empty_series = await storage.process_mheard_store_parallel()
+            results.append(
+                (
+                    "mheard: empty DB returns empty series",
+                    empty_series == [],
+                )
+            )
+
+            # (4) Legacy fallback reads signal_log (not `messages`) when
+            # signal_buckets is empty. Seed signal_log directly (never touching
+            # signal_buckets) and confirm the station comes back through the sparse
+            # floor — proving the fallback query actually reads signal_log.
+            await _wipe_buckets()
+            await storage._mutate("DELETE FROM signal_log")
+            siglog_ts = now_ms()
+            for _ in range(3):
+                await storage._mutate(
+                    "INSERT INTO signal_log (callsign, timestamp, rssi, snr, source)"
+                    " VALUES (?, ?, ?, ?, ?)",
+                    ("SIGLOGCS", siglog_ts, -95, 5.0, "mheard"),
+                )
+            siglog_series = await storage.process_mheard_store_parallel()
+            siglog_series_callsigns = {e["callsign"] for e in siglog_series}
+            results.append(
+                (
+                    "mheard: legacy fallback reads signal_log",
+                    siglog_series_callsigns == {"SIGLOGCS"},
+                )
+            )
+            await storage._mutate("DELETE FROM signal_log")
+
+            # (5) Monthly/yearly variants (through _query_rolled_up_buckets) also
+            # honour the sparse floor.
+            await _wipe_buckets()
+            for cs in sparse_callsigns:
+                await _seed_n_buckets(cs, 9)
+            monthly_series = await storage.process_mheard_monthly()
+            monthly_series_callsigns = {e["callsign"] for e in monthly_series}
+            results.append(
+                (
+                    "mheard: monthly/yearly honour the sparse floor",
+                    len(monthly_series) > 0 and monthly_series_callsigns == set(sparse_callsigns),
+                )
+            )
+            await _wipe_buckets()
         finally:
             await storage.close()
 

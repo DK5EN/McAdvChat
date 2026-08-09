@@ -34,6 +34,10 @@ HOURLY_BUCKET_MS = 3600000
 HOURLY_GAP_THRESHOLD = 6 * 3600  # 6 hours in seconds
 GAP_THRESHOLD_MULTIPLIER = 6
 MIN_DATAPOINTS_FOR_STATS = 10
+# Fallback floor for _build_chart_series when NO callsign reaches
+# MIN_DATAPOINTS_FOR_STATS (fresh-install / sparse-mesh case). Applies only in
+# that circumstance — see doc/plan-mheard-fresh-install-fix.md §2.
+SPARSE_MIN_DATAPOINTS = 1
 SQLITE_BUSY_TIMEOUT_S = 60  # tolerate nightly VACUUM holding the DB longer than the 5s default
 SIGNAL_BACKFILL_WINDOW_HOURS = 192  # 8 days — matches signal_log's own prune retention
 SIGNAL_BACKFILL_BATCH_SIZE = 500
