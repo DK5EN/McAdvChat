@@ -351,6 +351,17 @@ fetch_bootstrap_tree() {
     local checksum_name="mcapp-${ref}.tar.gz.sha256"
     local release_url="https://github.com/${GITHUB_REPO}/releases/download/${ref}"
 
+    # Save under the asset's REAL name. release.sh generates the checksum as
+    # `shasum -a 256 mcapp-<ref>.tar.gz > mcapp-<ref>.tar.gz.sha256`, so the
+    # file's single content line names `mcapp-<ref>.tar.gz`; `sha256sum -c`
+    # resolves that name relative to $tmp_dir. Downloading to a placeholder
+    # name made verification fail for every VALID tarball ("No such file or
+    # directory"), and the mismatch branch returns 1 without falling back to
+    # codeload — i.e. it broke the primary path for every piped install.
+    # lib/deploy.sh's download_and_install_release() has always done this
+    # correctly; match it.
+    archive="${tmp_dir}/${tarball_name}"
+
     if curl -fsSL --connect-timeout 10 -o "$archive" "${release_url}/${tarball_name}" 2>/dev/null; then
       if curl -fsSL --connect-timeout 10 -o "${tmp_dir}/${checksum_name}" \
         "${release_url}/${checksum_name}" 2>/dev/null; then
