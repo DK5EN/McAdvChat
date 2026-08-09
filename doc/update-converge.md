@@ -95,12 +95,21 @@ ssh pi-test.local "python3 --version && which curl script && sudo -n true && ech
 
 ## Step 1 — Install v1.6.13 the way the fleet got it (NOT piped)
 
-**Do not use `curl | sudo bash` for this step.** Piped mode downloads the
-bootstrap **libs from the development branch tip** (`GITHUB_RAW_BASE` in
-mcapp.sh), which would install today's Caddy-aware libs and silently
-converge the box at install time — destroying the degraded baseline this
-test exists to reproduce. Install from the v1.6.13 tag tree instead, so the
-tag's own June-era libs are used:
+**Do not use `curl | sudo bash` for this step.** Piped installs are now
+pinned per resolved release tag — script, bootstrap libs, templates, and app
+all come from the same ref (see
+`doc/2026-08-09_1600-bootstrap-tag-pinning-plan.md`) — but that does not
+make `curl .../main/bootstrap/mcapp.sh | sudo bash -s -- --tag v1.6.13` a
+way to reproduce this baseline: `v1.6.13` predates both Caddy support and
+the pinning fix itself, so its libs don't define `ensure_web_frontend` or
+`caddy_config_marker`, and today's script aborts cleanly at the post-source
+skew guard (`v1.6.13's bootstrap libs do not provide: ensure_web_frontend
+caddy_config_marker`) rather than proceeding. That guard is a strict
+improvement over the old failure mode — it used to silently install today's
+Caddy-aware libs against a June-tagged app and destroy the degraded baseline
+this test exists to reproduce — but it means this baseline still has to come
+from the v1.6.13 tag tree directly, non-piped, so the tag's own June-era
+libs run start to finish:
 
 ```bash
 ssh pi-test.local "cd /tmp \

@@ -1,9 +1,26 @@
 # Pin piped-install bootstrap libs per tag — implementation plan
 
-Status: **signed off 2026-08-09** (decisions D1-D5 in §4), not started
+Status: **Phase 1 IMPLEMENTED 2026-08-09** (`6f685e0`), Phase 2 in progress, Phase 3 not started.
 Date: 2026-08-09
 Scope: `bootstrap/mcapp.sh`, `bootstrap/lib/{packages,deploy,detect}.sh`, one new startup test suite, docs
 Ships as: its own release (no other feature riding along), VM smoke matrix before the Pi
+
+**The VM smoke matrix in §6 has NOT been run — it needs a human with OrbStack, and it is the gate
+this change actually depends on.** `bootstrap/mcapp.sh` is the front door for every fresh install
+in the field, so nothing here should reach `main` on the strength of the unit suite alone.
+
+Two claims in this plan were **wrong** and are corrected in place: §1 item 2 (the
+`update-converge.md` workaround does _not_ disappear for pre-fix tags) and §6 smoke case 3 (which
+is unreachable as written). Both corrections are marked CORRECTED/CORRECTION below.
+
+Notes from implementation:
+
+- `bootstrap/lib/detect.sh` and `bootstrap/lib/packages.sh` needed **no edits**: rebasing
+  `GITHUB_RAW_BASE` centrally in `mcapp.sh` pins their existing consumers for free, which is
+  exactly the §3.3 `SCRIPT_DIR` lever working as designed.
+- §5 item 6's tripwire has **four** sanctioned hardcoded-branch exceptions, not two. Beyond the
+  usage comment and the `mcapp-update` aliases, the D2 API-failure fallback
+  (`fallback_branch="main"`/`"development"`) and `show_help()`'s example URL are both legitimate.
 
 ---
 
@@ -35,7 +52,19 @@ Three consequences:
    Saturday: the "v1.6.13 baseline" attempt ran June's script with August's libs, which installed
    Caddy into a supposedly-old install and destroyed the baseline. `doc/update-converge.md:95-105`
    already carries the workaround ("do NOT use piped mode for this step") — that note exists because
-   of this bug and gets deleted by this fix.
+   of this bug.
+
+   > **CORRECTION (verified during implementation, 2026-08-09).** This said the workaround "gets
+   > deleted by this fix". It does not, for `v1.6.13` specifically. That tag predates both Caddy
+   > support and this fix, so its libs define neither `ensure_web_frontend` nor
+   > `caddy_config_marker` (confirmed by `git grep` against the tag) and the new §3.5 skew guard
+   > **aborts** the run. And the guard's own suggested remedy — "run that release's own installer" —
+   > does not help either, because `v1.6.13`'s `mcapp.sh` still hardcodes
+   > `GITHUB_REPO_BRANCH_DEFAULT="development"` (line 37), i.e. the very bug this plan fixes.
+   > Reproducing a **pre-fix** tag's original state still requires the non-piped tag-tree install.
+   > `doc/update-converge.md` Step 1 was rewritten to explain this rather than deleted. The
+   > workaround does go away for any tag cut **after** this fix ships.
+
 3. **Templates have the same flaw.** `configure_lighttpd()` (`packages.sh:253`) and
    `configure_caddy()` (`packages.sh:558`) fall back to `${GITHUB_RAW_BASE}/bootstrap/templates/…`,
    and `download_webapp()` (`deploy.sh:572-573`) fetches the legacy webapp archive from the same
@@ -267,19 +296,19 @@ prerelease branch — before the production release goes out.
 
 **VM smoke matrix** (OrbStack Debian trixie containers, as used for the epoch rollout):
 
-| #   | Command                                             | Expect                                                                   |
-| --- | --------------------------------------------------- | ------------------------------------------------------------------------ |
-| 1   | piped, fresh, no flags                              | logs the resolved tag; libs+templates from it; healthy install           |
-| 2   | piped, fresh, `--dev`                               | resolves latest prerelease; same tag everywhere                          |
-| 3   | piped, fresh, `--tag v1.6.13`                       | **no** Caddy in the resulting box (this is the Saturday repro, inverted) |
-| 4   | piped re-run on #1's box (idempotence)              | no-op, no slot rotation                                                  |
-| 5   | piped `--skip` and `--converge` on an existing box  | unchanged behavior                                                       |
-| 6   | API blocked (nftables-drop `api.github.com`), fresh | aborts with the `--tag` hint                                             |
-| 7   | API blocked, existing install                       | warns, falls back to `main`, completes                                   |
-| 8   | corrupted asset (local stub serving a bad sha256)   | refuses, exits non-zero, box untouched                                   |
-| 9   | non-piped run from a checkout                       | unchanged (local libs, local templates, no network for libs)             |
-| 10  | `bash /tmp/mcapp.sh --skip` (no sibling `lib/`)     | fetches the pinned tree instead of "Cannot find library files" (§3.7)    |
-| 11  | `--ref development` on a fresh box                  | reproduces today's branch-tip behavior — the field rollback works        |
+| #   | Command                                             | Expect                                                                                                                                                                                                                                                                                                                                                                                                           |
+| --- | --------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| 1   | piped, fresh, no flags                              | logs the resolved tag; libs+templates from it; healthy install                                                                                                                                                                                                                                                                                                                                                   |
+| 2   | piped, fresh, `--dev`                               | resolves latest prerelease; same tag everywhere                                                                                                                                                                                                                                                                                                                                                                  |
+| 3   | piped, fresh, `--tag v1.6.13`                       | **CORRECTED:** aborts at the §3.5 skew guard naming `ensure_web_frontend` / `caddy_config_marker`. The original expectation ("no Caddy in the resulting box") is unreachable — `v1.6.13`'s libs predate those functions, so the run refuses rather than installing. Refusing is the correct outcome; assert the abort and the message, not a Caddy-free box. Use a post-fix tag to smoke the happy `--tag` path. |
+| 4   | piped re-run on #1's box (idempotence)              | no-op, no slot rotation                                                                                                                                                                                                                                                                                                                                                                                          |
+| 5   | piped `--skip` and `--converge` on an existing box  | unchanged behavior                                                                                                                                                                                                                                                                                                                                                                                               |
+| 6   | API blocked (nftables-drop `api.github.com`), fresh | aborts with the `--tag` hint                                                                                                                                                                                                                                                                                                                                                                                     |
+| 7   | API blocked, existing install                       | warns, falls back to `main`, completes                                                                                                                                                                                                                                                                                                                                                                           |
+| 8   | corrupted asset (local stub serving a bad sha256)   | refuses, exits non-zero, box untouched                                                                                                                                                                                                                                                                                                                                                                           |
+| 9   | non-piped run from a checkout                       | unchanged (local libs, local templates, no network for libs)                                                                                                                                                                                                                                                                                                                                                     |
+| 10  | `bash /tmp/mcapp.sh --skip` (no sibling `lib/`)     | fetches the pinned tree instead of "Cannot find library files" (§3.7)                                                                                                                                                                                                                                                                                                                                            |
+| 11  | `--ref development` on a fresh box                  | reproduces today's branch-tip behavior — the field rollback works                                                                                                                                                                                                                                                                                                                                                |
 
 **Pi run:** #1 and #4 on a spare card, then `mcapp.local` update path end-to-end
 (`update-runner` → deploy → `--converge`) to confirm nothing in the update flow regressed.
