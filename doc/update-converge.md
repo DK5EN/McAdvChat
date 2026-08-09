@@ -58,8 +58,18 @@ cut.
   `martin`, start mcapp. Restore `vapid.json` (mode 0600, owner `martin`)
   in the same step so existing push subscriptions keep working — without
   the DB it is moot, browsers simply re-subscribe.
-- Re-pair BLE to the `DK5EN-98` node via the webapp's BLE dialog + PIN.
+- Re-pair BLE to the `DK5EN-98` node via the webapp's BLE dialog.
   `BLE_API_KEY` (and VAPID, if not restored) regenerate themselves.
+  (2026-08-09 run: scan + implicit-pairing connect worked first try, no PIN
+  prompt, full register hydration in ~30 s.)
+- **Caddy's internal CA is minted fresh on every rebuild** and its private
+  key (`/var/lib/caddy/.local/share/caddy/pki/authorities/local/root.key`)
+  was NOT part of the 2026-08-08 backup — old client trust is gone for
+  good. Every device that trusted the previous root must delete the stale
+  "Caddy Local Authority" entry (macOS keychain, iOS profile) and install
+  the new root via the webapp banner's "Install certificate" link (serves
+  `/root.crt`). Future resets: back up that pki directory too if client
+  trust should survive the rebuild.
 
 ## Prerequisites
 
