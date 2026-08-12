@@ -47,6 +47,12 @@ from .constants import (
 _MAX_FORENSIC_HOPS = 4  # log raw data for messages routed over more hops
 _MIN_PLAUSIBLE_HPA = 850  # pressure below this is a firmware mapping error
 
+# A `pos` frame is a weather beacon if it carries any sensor reading. Every APRS
+# weather extension the firmware emits is listed, not just the `/P=`+`/T=`+`/H=`
+# trio: a BME680 station publishes gas resistance (`/G=`) and an MCU811 CO2 (`/C=`)
+# on beacons that may carry nothing else, and a shorter list silently ignored those.
+_WEATHER_BEACON_FIELDS = ("temp1", "temp2", "hum", "hum2", "qfe", "qnh", "gas", "co2")
+
 # --- APRS symbol double-escape (firmware bug, see backfill_aprs_symbol_escapes) --
 # `FIRMWARE_DOUBLED_BACKSLASH` (TWO 0x5C characters, what the firmware sends),
 # `APRS_ALTERNATE_TABLE` (ONE, the real symbol table id) and the normalizer that
@@ -697,7 +703,7 @@ class IngestMixin(StorageBase):
             await self._upsert_station_position(callsign, pos_data, "position")
 
         # Weather station beacons carry telemetry in APRS extensions
-        if any(pos_data.get(f) for f in ("temp1", "hum", "qfe", "qnh")):
+        if any(pos_data.get(f) for f in _WEATHER_BEACON_FIELDS):
             await self.store_telemetry(callsign, pos_data)
 
     async def _store_mheard(self, src: str, rssi: Any, snr: Any, timestamp: int, raw: str) -> bool:
@@ -889,6 +895,19 @@ class IngestMixin(StorageBase):
         # from the redundant `messages` row it was meant to skip. Comparing the resolved
         # sender (first comma-component of the stored relay path, matching this method's
         # own `callsign`) still dedups the same beacon arriving over several mesh paths.
+        #
+        # One thing the duplicate is NOT redundant for: weather. The same beacon reaches
+        # us over two transports carrying DIFFERENT payloads. The Extern-UDP `pos`
+        # datagram has `msg:""` — the firmware pre-parses the APRS text away and ships
+        # only lat/lon/alt/batt — while the BLE copy carries the full APRS string with
+        # its `/P=` station pressure. UDP is the faster path, so it lands first and the
+        # BLE copy hits this gate; returning outright dropped the ONLY carrier of `/P=`
+        # in the system. (The `tele` datagram that rides along with the UDP `pos` cannot
+        # substitute: its `qfe` key is fed from the firmware's `/F=` field — a small
+        # integer, not a pressure — so `_MIN_PLAUSIBLE_HPA` correctly discards it, and
+        # the document has no `press` key at all. `extudp_functions.cpp:471-481`.)
+        # Salvaging telemetry here is safe against a genuine double-delivered datagram:
+        # `store_telemetry` has its own 60 s window that merges rather than duplicates.
         if msg_id is not None:
             existing = await self._query(
                 "SELECT 1 FROM messages WHERE msg_id = ? AND timestamp > ?"
@@ -898,6 +917,8 @@ class IngestMixin(StorageBase):
                 (msg_id, timestamp - DEDUP_WINDOW_MS, callsign.upper()),
             )
             if existing:
+                if msg_type == "pos" and any(message.get(f) for f in _WEATHER_BEACON_FIELDS):
+                    await self.store_telemetry(callsign, {**message, "via": relay_via})
                 return
 
         # --- Dual-write to new tables ---
@@ -1095,6 +1116,22 @@ class IngestMixin(StorageBase):
         if qfe is not None and qfe < _MIN_PLAUSIBLE_HPA:
             qfe = None
 
+        # Altitude for frames that carry none of their own — APRS `T#` telemetry and,
+        # far more often, the Extern-UDP `tele` datagram, whose field set
+        # (`extudp_functions.cpp:471-481`) is batt/temp1/temp2/hum/qfe/qnh/gas/co2 with
+        # no `alt` at all. Resolved HERE, before the barometric fallback below, because
+        # that fallback needs it: while this lookup sat after the fallback, every
+        # `/Q=`-sending station reaching us over UDP kept `alt=None` at decision time,
+        # so `qnh and alt` was never true and the QNH→QFE derivation never once fired.
+        if alt is None:
+            rows_result = await self._query(
+                "SELECT alt FROM station_positions WHERE callsign = ?",
+                (callsign,),
+            )
+            rows = rows_result
+            if rows:
+                alt = rows[0].get("alt")
+
         # If QFE missing but QNH + altitude available, calculate QFE (barometric formula)
         qnh = data.get("qnh")
         # Only use plausible QNH values
@@ -1158,16 +1195,6 @@ class IngestMixin(StorageBase):
                     "DELETE FROM telemetry WHERE callsign = ? AND timestamp > ?",
                     (callsign, timestamp - TELEMETRY_DEDUP_WINDOW_MS),
                 )
-
-        # For T# telemetry packets (no altitude), look up from station_positions
-        if alt is None:
-            rows_result = await self._query(
-                "SELECT alt FROM station_positions WHERE callsign = ?",
-                (callsign,),
-            )
-            rows = rows_result
-            if rows:
-                alt = rows[0].get("alt")
 
         logger.debug(
             "Telemetry from %s: temp1=%s temp2=%s hum=%s qfe=%s alt=%s batt=%s",

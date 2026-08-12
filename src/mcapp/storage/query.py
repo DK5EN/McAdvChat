@@ -1098,11 +1098,13 @@ class QueryMixin(StorageBase):
                 MIN(hum) AS hum_min, MAX(hum) AS hum_max,
                 MIN(hum2) AS hum2_min, MAX(hum2) AS hum2_max,
                 MIN(qfe) AS qfe_min, MAX(qfe) AS qfe_max,
+                MIN(gas) AS gas_min, MAX(gas) AS gas_max,
                 MIN(alt) AS alt_min, MAX(alt) AS alt_max,
                 COUNT(*) AS count
             FROM telemetry
             WHERE timestamp > ?
-              AND (temp1 IS NOT NULL OR hum IS NOT NULL OR qfe IS NOT NULL)
+              AND (temp1 IS NOT NULL OR hum IS NOT NULL OR qfe IS NOT NULL
+                   OR gas IS NOT NULL)
             GROUP BY callsign, bucket_ts
             ORDER BY callsign, bucket_ts
             """,  # noqa: S608 - identifiers from fixed set; values parameterized

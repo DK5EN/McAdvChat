@@ -27,6 +27,9 @@ from .logging_setup import get_logger
 from .storage._base import StorageBase
 from .storage.classifier_api import ClassifierApiMixin
 from .storage.constants import (
+    BARO_EXPONENT,
+    BARO_LAPSE_RATE_K_PER_M,
+    BARO_STD_TEMP_K,
     BUCKET_SECONDS,
     CREATE_SCHEMA_SQL,
     CREATE_SCHEMA_V2_SQL,
@@ -34,7 +37,7 @@ from .storage.constants import (
     db_read,
     db_write,
 )
-from .storage.ingest import IngestMixin
+from .storage.ingest import _MIN_PLAUSIBLE_HPA, IngestMixin
 from .storage.migrations import MigrationsMixin
 from .storage.prefs import PrefsMixin
 from .storage.query import QueryMixin
@@ -637,6 +640,149 @@ async def run_startup_tests() -> bool:  # noqa: PLR0915 - test suite lists one c
                 (
                     "backfill: idempotent re-run is a no-op (marker present)",
                     summary2["skipped"] is True,
+                )
+            )
+
+            async def _telemetry_rows(callsign: str) -> list[dict[str, Any]]:
+                return await storage._query(  # noqa: SLF001 - white-box startup test
+                    "SELECT temp1, hum, qfe, gas, alt FROM telemetry"
+                    " WHERE callsign = ? ORDER BY timestamp",
+                    (callsign,),
+                )
+
+            # 10. Extern-UDP `tele` datagram: QNH → QFE derivation must fire even though
+            # the datagram carries no altitude of its own. The firmware's tele document
+            # (`extudp_functions.cpp:471-481`) is batt/temp1/temp2/hum/qfe/qnh/gas/co2
+            # with no `alt` key, and its `qfe` is fed from the APRS `/F=` field — a small
+            # integer, not a pressure, hence 0/implausible here. The altitude therefore
+            # has to come from station_positions, and it has to be resolved BEFORE the
+            # barometric fallback reads it: while that lookup ran after the fallback,
+            # `alt` was still None at the decision and the derivation never fired, so
+            # every `/Q=`-sending station reaching us over UDP charted an empty pressure.
+            cs10 = "OE1XYZ-30"
+            alt10 = 542
+            pos10 = {
+                "msg_id": "CCCC0001",
+                "src": cs10,
+                "dst": "*",
+                "msg": "",
+                "type": "pos",
+                "src_type": "lora",
+                "timestamp": base_ts + 20,
+                "rssi": -101,
+                "snr": 4,
+                "lat": 48.22,
+                "lon": 11.68,
+                "alt": alt10,
+            }
+            await storage.store_message(pos10, json.dumps(pos10))
+            tele10 = {
+                "src": cs10,
+                "type": "tele",
+                "src_type": "lora",
+                "timestamp": base_ts + 21,
+                "batt": 74,
+                "temp1": 33.5,
+                "temp2": 22.4,
+                "hum": 0,
+                "qfe": 0,  # the `/F=` integer, discarded by _MIN_PLAUSIBLE_HPA
+                "qnh": 1026.8,
+                "gas": 0,
+                "co2": 0,
+            }
+            await storage.store_message(tele10, json.dumps(tele10))
+            expected_qfe10 = round(
+                tele10["qnh"]
+                * (1 - BARO_LAPSE_RATE_K_PER_M * alt10 / BARO_STD_TEMP_K) ** BARO_EXPONENT,
+                1,
+            )
+            tele10_rows = await _telemetry_rows(cs10)
+            t10 = tele10_rows[0] if tele10_rows else {}
+            results.append(
+                (
+                    (
+                        "udp tele: altitude resolved from station_positions before the"
+                        f" QNH→QFE fallback (qfe == {expected_qfe10})"
+                    ),
+                    len(tele10_rows) == 1 and _approx(t10.get("qfe"), expected_qfe10),
+                )
+            )
+            results.append(
+                (
+                    "udp tele: the implausible `/F=`-sourced qfe is not stored raw",
+                    (t10_qfe := t10.get("qfe")) is not None and t10_qfe >= _MIN_PLAUSIBLE_HPA,
+                )
+            )
+
+            # 11. The same beacon over both transports: the Extern-UDP `pos` datagram
+            # arrives first with `msg:""` (the firmware pre-parses the APRS text away),
+            # the BLE copy follows ~200 ms later carrying the full APRS string and its
+            # `/P=` station pressure. The BLE copy is a `messages`/signal duplicate but
+            # the ONLY carrier of the pressure, so the dedup gate must salvage its
+            # telemetry instead of returning outright — while still not double-counting
+            # the frame into `messages` or `signal_log`.
+            cs11 = "OE1XYZ-31"
+            qfe11 = 960.0
+            udp11 = {
+                "msg_id": "CCCC0002",
+                "src": cs11,
+                "dst": "*",
+                "msg": "",
+                "type": "pos",
+                "src_type": "lora",
+                "timestamp": base_ts + 30,
+                "rssi": -119,
+                "snr": -16,
+                "lat": 48.423,
+                "lon": 11.7866,
+                "alt": 0,
+                "batt": 61,
+            }
+            await storage.store_message(udp11, json.dumps(udp11))
+            results.append(
+                (
+                    "dual-transport beacon: udp `pos` alone stores no telemetry",
+                    not await _telemetry_rows(cs11),
+                )
+            )
+            ble11 = {
+                **udp11,
+                "src_type": "ble_remote",
+                "timestamp": base_ts + 30 + 200,
+                "msg": "!4825.38N\\01147.20E-/B=060/P=960.0/H=28.5/T=31.1/G=251.7/V=3",
+                "temp1": 31.1,
+                "hum": 28.5,
+                "qfe": qfe11,
+                "gas": 251.7,
+            }
+            await storage.store_message(ble11, json.dumps(ble11))
+            msg11_rows = await storage._query(  # noqa: SLF001 - white-box startup test
+                "SELECT 1 FROM messages WHERE msg_id = ?", ("CCCC0002",)
+            )
+            tele11_rows = await _telemetry_rows(cs11)
+            t11 = tele11_rows[0] if tele11_rows else {}
+            results.append(
+                (
+                    "dual-transport beacon: deduped BLE copy still stores its `/P=` pressure",
+                    len(tele11_rows) == 1 and _approx(t11.get("qfe"), qfe11),
+                )
+            )
+            results.append(
+                (
+                    "dual-transport beacon: gas resistance survives the dedup gate too",
+                    _approx(t11.get("gas"), 251.7),
+                )
+            )
+            results.append(
+                (
+                    "dual-transport beacon: still exactly one messages row (no dup)",
+                    len(msg11_rows) == 1,
+                )
+            )
+            results.append(
+                (
+                    "dual-transport beacon: still exactly one signal_log row (no double-count)",
+                    await _signal_row_count(cs11) == 1,
                 )
             )
 
