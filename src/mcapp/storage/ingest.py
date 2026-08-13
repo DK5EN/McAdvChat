@@ -74,6 +74,21 @@ _MAX_FORENSIC_HOPS = 4  # log raw data for messages routed over more hops
 # traffic; 1100 hPa gives the same margin above the recorded high.
 _QFE_PLAUSIBLE_HPA_RANGE = (300, 1100)
 
+# QNH gets its OWN, much tighter range, and must never be folded back into the QFE one.
+# QNH is sea-level-normalised BY DEFINITION, so altitude never pushes it down — the
+# whole V4a argument for a wide QFE floor does not apply to it, and a tight bound here
+# costs nothing. This existed as a `> 850` floor until the QFE constant was renamed and
+# this line was migrated to its lower bound (300) along with it: one constant, two users,
+# two different physical quantities. That opened (300, 850] to junk, and the classic
+# wrong-unit bug lands squarely in it — an Extern-UDP feeder sending mmHg (~760) for hPa
+# is stored, unvalidated, straight into `node_press_asl` (`extudp_functions.cpp:180-183`)
+# and reaches us on all three qnh paths. Reproduced: qnh=760 at alt=500 fabricated a
+# 716.0 hPa "pressure", and for a feeder station this derivation is the ONLY qfe source
+# (the firmware emits `/Q=` precisely for nodes with no real sensor), so nothing ever
+# corrects it. An upper bound is included for free: Pa-unit junk (101325) would otherwise
+# sail through a bare floor.
+_QNH_PLAUSIBLE_HPA_RANGE = (850, 1100)
+
 # A `pos` frame is a weather beacon if it carries any sensor reading. Every APRS
 # weather extension the firmware emits is listed, not just the `/P=`+`/T=`+`/H=`
 # trio: a BME680 station publishes gas resistance (`/G=`) and an MCU811 CO2 (`/C=`)
@@ -1221,7 +1236,11 @@ class IngestMixin(StorageBase):
         qfe_reading: Reading
         if raw_qfe is not None:
             qfe_reading = measured(raw_qfe)
-        elif qnh_raw and alt and qnh_raw > _QFE_PLAUSIBLE_HPA_RANGE[0]:
+        elif (
+            qnh_raw
+            and alt
+            and _QNH_PLAUSIBLE_HPA_RANGE[0] <= qnh_raw <= _QNH_PLAUSIBLE_HPA_RANGE[1]
+        ):
             qfe_reading = derived(
                 round(
                     qnh_raw

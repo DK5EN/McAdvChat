@@ -1255,6 +1255,90 @@ async def run_startup_tests() -> bool:  # noqa: PLR0915 - test suite lists one c
                 )
             )
 
+            # 18b. The QNH gate has its OWN bound. QNH is sea-level-normalised by
+            # definition, so the wide QFE floor that Alpine stations need must never be
+            # reused for it. When the QFE constant was renamed, this gate was migrated to
+            # its lower bound (300) — one constant, two physically different quantities —
+            # which opened (300, 850] to junk. An Extern-UDP feeder sending mmHg (~760)
+            # for hPa is stored unvalidated by the firmware and reaches us on all three
+            # qnh paths; at alt=500 that fabricated a 716.0 hPa "pressure", and for a
+            # feeder station this derivation is the only qfe source, so nothing corrects
+            # it. Kills: reusing _QFE_PLAUSIBLE_HPA_RANGE (or any floor below 850) here.
+            cs18b = "OE1XYZ-46"
+            pos18b = {
+                "msg_id": "CCCC0018",
+                "src": cs18b,
+                "dst": "*",
+                "msg": "",
+                "type": "pos",
+                "src_type": "lora",
+                "timestamp": base_ts + 8000,
+                "rssi": -100,
+                "snr": 5,
+                "lat": 48.2,
+                "lon": 11.6,
+                "alt": 500,
+            }
+            await storage.store_message(pos18b, json.dumps(pos18b))
+            junk_qnh18b = {
+                "src": cs18b,
+                "type": "tele",
+                "src_type": "node",
+                "timestamp": base_ts + 8010,
+                "temp1": 20.0,
+                "qfe": 0,
+                "qnh": 760.0,  # mmHg mistaken for hPa
+            }
+            await storage.store_message(junk_qnh18b, json.dumps(junk_qnh18b))
+            rows18b = await _telemetry_rows(cs18b)
+            results.append(
+                (
+                    "QNH gate: an implausible qnh (760, mmHg-for-hPa) derives no qfe",
+                    len(rows18b) == 1 and not rows18b[0].get("qfe"),
+                )
+            )
+            # ...and a genuine QNH still derives, so the bound is not simply "reject all".
+            cs18c = "OE1XYZ-47"
+            pos18c = {**pos18b, "msg_id": "CCCC0019", "src": cs18c, "timestamp": base_ts + 8100}
+            await storage.store_message(pos18c, json.dumps(pos18c))
+            good_qnh18c = {**junk_qnh18b, "src": cs18c, "timestamp": base_ts + 8110, "qnh": 1013.2}
+            await storage.store_message(good_qnh18c, json.dumps(good_qnh18c))
+            rows18c = await _telemetry_rows(cs18c)
+            expected18c = round(
+                1013.2 * (1 - BARO_LAPSE_RATE_K_PER_M * 500 / BARO_STD_TEMP_K) ** BARO_EXPONENT, 1
+            )
+            results.append(
+                (
+                    f"QNH gate: a genuine qnh (1013.2) still derives qfe ({expected18c})",
+                    len(rows18c) == 1 and _approx(rows18c[0].get("qfe"), expected18c),
+                )
+            )
+
+            # 18d. The QFE garbage-range check itself. Without this case, DELETING the
+            # range check entirely left every suite green (advisor mutation W3) — the
+            # bound was documented, reasoned about at length, and completely uncovered.
+            # Kills: removing _QFE_PLAUSIBLE_HPA_RANGE's upper bound or the check.
+            cs18d = "OE1XYZ-48"
+            pos18d = {**pos18b, "msg_id": "CCCC0020", "src": cs18d, "timestamp": base_ts + 8200}
+            await storage.store_message(pos18d, json.dumps(pos18d))
+            garbage18d = {
+                "src": cs18d,
+                "type": "tele",
+                "src_type": "node",
+                "timestamp": base_ts + 8210,
+                "temp1": 20.0,
+                "qfe": 5000.0,  # not a pressure by any unit
+                "qnh": 0,
+            }
+            await storage.store_message(garbage18d, json.dumps(garbage18d))
+            rows18d = await _telemetry_rows(cs18d)
+            results.append(
+                (
+                    "QFE range: an out-of-range qfe (5000) is not stored",
+                    len(rows18d) == 1 and not rows18d[0].get("qfe"),
+                )
+            )
+
             # 19. Task 2 / V8 seam, dual-transport sibling of case 11: the UDP `pos`
             # datagram lands first with no telemetry, then a BLE copy — built from a
             # RAW APRS string through the real `parse_aprs_position()`, not a

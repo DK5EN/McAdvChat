@@ -221,8 +221,10 @@ class Action(Enum):
     its own steers a caller straight back into V1:
 
     * Bind the MERGED values (`values_for()`), never the raw incoming
-      frame's. `station_positions` fills via `COALESCE(NULLIF(excluded.x,
-      0), …)`, so binding a replayed frame's raw values lets stale readings
+      frame's. `station_positions` fills via `COALESCE(excluded.x, …)` (the
+      `NULLIF(x, 0)` guards were removed once sentinel decoding moved upstream,
+      so a genuine 0 now reaches the cache), and binding raw frame values on a
+      path that just decided they must not win the `telemetry` row lets stale readings
       overwrite current ones on the very path that just decided they must
       not win the `telemetry` row.
     * Bind `max(existing_ts, incoming_ts)` for `telemetry_ts`, not the
