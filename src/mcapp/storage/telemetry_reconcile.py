@@ -286,10 +286,25 @@ def reconcile(
 
     `incoming_is_newer` states whether the incoming frame's timestamp is
     chronologically after the existing row's — it decides ties between two
-    readings of equal provenance (see `_choose`) and is required, not
-    optional, so a caller cannot forget it and fall back to assuming
-    "incoming" means "newer" (V1). When `existing` is `None` there is no
-    tie to break and the value is unused, but it must still be supplied.
+    readings of equal provenance (see `_choose`) AND whether the incoming
+    frame may re-stamp the row (see the `Action` selection below). It is
+    required, not optional, so a caller cannot forget it and fall back to
+    assuming "incoming" means "newer" (V1). When `existing` is `None` there
+    is no tie to break and the value is unused, but it must still be
+    supplied.
+
+    Equal timestamps count as NOT newer: derive it as
+    `incoming_ts > existing_ts`, so an exactly-simultaneous frame leaves the
+    existing row's values and identity alone. Deterministic, and it means a
+    frame redelivered with an unchanged timestamp is inert rather than
+    churning the row.
+
+    The caller must derive this from the two stored timestamps, NOT from
+    which frame it happened to receive first — that assumption is the whole
+    of V1. `ble_service` buffers notifications in a `deque(maxlen=1000)`
+    whenever the SSE consumer is away (every restart, every deploy) and then
+    replays them carrying their ORIGINAL timestamps, so "arrived second" and
+    "measured later" are routinely different things.
 
     Returns the `Action` the caller should take and the merged reading for
     every field in `ALL_FIELDS`. Both `existing` (if not `None`) and
@@ -334,7 +349,19 @@ def reconcile(
         incoming[field].prov is Provenance.MEASURED and merged[field] == incoming[field]
         for field in changed
     )
-    action = Action.REPLACE_EXISTING if measured_win else Action.UPDATE_EXISTING
+    # `incoming_is_newer` gates the ACTION as well as the per-field values. The two
+    # decisions are separate and only the first one is about which number is right:
+    # REPLACE_EXISTING additionally tells the caller to re-stamp the row with the
+    # incoming frame's timestamp, so an OLDER frame must never earn it, even when it
+    # legitimately wins a field (an ABSENT-fill or a DERIVED->MEASURED upgrade from a
+    # replayed frame is real information and is kept — it just must not drag the row's
+    # identity backwards). Letting it through re-opens V3: a row re-stamped into the
+    # past falls outside the next live frame's dedup window, which then INSERTs a
+    # duplicate. `station_positions.telemetry_ts` would move backwards too — unlike
+    # `last_seen`, it has no MAX() guard.
+    action = (
+        Action.REPLACE_EXISTING if (measured_win and incoming_is_newer) else Action.UPDATE_EXISTING
+    )
     return action, merged
 
 

@@ -278,6 +278,65 @@ def _test_precedence_and_timing(results: list[tuple[str, bool]]) -> None:
         act is not Action.REPLACE_EXISTING,
     )
 
+    # The ACTION dimension, not just the values. REPLACE_EXISTING additionally tells
+    # the caller to re-stamp the row with the incoming frame's timestamp, so an OLDER
+    # frame must never earn it however legitimately it wins a field. Until these two
+    # cases existed the whole enum was unpinned: `UPDATE_EXISTING` appeared nowhere in
+    # this file, and a `reconcile` that returned REPLACE_EXISTING unconditionally
+    # passed 54/54.
+    # Kills: M-always-replace, and dropping `incoming_is_newer` from the action gate.
+    act, merged = reconcile(
+        readings(qfe=derived(962.6)), readings(qfe=measured(966.5)), incoming_is_newer=False
+    )
+    _check(
+        results,
+        "action: an OLDER frame winning a field is UPDATE_EXISTING, never REPLACE",
+        act is Action.UPDATE_EXISTING,
+    )
+    _check(
+        results,
+        "action: ...and its better value is still kept (older measured beats derived)",
+        _close(merged["qfe"].value, 966.5),
+    )
+    act, merged = reconcile(
+        readings(qfe=measured(958.4)), readings(gas=measured(251.7)), incoming_is_newer=False
+    )
+    _check(
+        results,
+        "action: an OLDER frame's ABSENT-fill is UPDATE_EXISTING, never REPLACE",
+        act is Action.UPDATE_EXISTING and _close(merged["gas"].value, 251.7),
+    )
+    # Kills: gating the action on chronology alone and losing the measured distinction.
+    act, _ = reconcile(
+        readings(qfe=derived(962.6)), readings(qfe=measured(966.5)), incoming_is_newer=True
+    )
+    _check(
+        results,
+        "action: a NEWER frame winning a field with a measurement is REPLACE_EXISTING",
+        act is Action.REPLACE_EXISTING,
+    )
+    # Kills: gating the action on chronology ALONE (dropping `measured_win`). A newer
+    # frame that only contributes a DERIVED estimate has not made a new observation —
+    # it filled a gap by calculation — so it must patch the row, not take over its
+    # identity and timestamp. Both halves of the gate are load-bearing.
+    act, merged = reconcile(
+        readings(temp1=measured(21.5)), readings(qfe=derived(962.6)), incoming_is_newer=True
+    )
+    _check(
+        results,
+        "action: a NEWER frame contributing only a DERIVED value is UPDATE_EXISTING",
+        act is Action.UPDATE_EXISTING and _close(merged["qfe"].value, 962.6),
+    )
+    # Equal timestamps are 'not newer' by the documented derivation.
+    same_ts = reconcile(
+        readings(temp1=measured(21.5)), readings(temp1=measured(99.9)), incoming_is_newer=False
+    )
+    _check(
+        results,
+        "action: equal timestamps (not-newer) leave the existing value and identity alone",
+        same_ts[0] is Action.SKIP and _close(same_ts[1]["temp1"].value, 21.5),
+    )
+
 
 def _test_merge_extras(results: list[tuple[str, bool]]) -> None:
     """`extras` is a bag of unrecognised /KEY= values, not an observation with
