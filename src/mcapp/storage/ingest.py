@@ -1253,7 +1253,13 @@ class IngestMixin(StorageBase):
 
         # Node QNH is unreliable; frontend calculates QNH from qfe + alt. The
         # `telemetry`/`station_positions` qnh column is therefore always NULL —
-        # `qnh_raw` above only ever feeds the qfe derivation.
+        # `qnh_raw` above only ever feeds the qfe derivation. `telemetry` still binds
+        # an explicit None (its INSERT lists every column); the station_positions
+        # upsert below does not name `qnh` AT ALL, deliberately: while it bound None
+        # through a `COALESCE(excluded.qnh, station_positions.qnh)`, no write could
+        # ever change the column but no write could clear it either, so pre-policy
+        # values froze there permanently and were served for months (scrubbed by
+        # migration v23, `_scrub_frozen_station_cache`).
 
         incoming = readings(
             temp1=_wire_reading("temp1"),
@@ -1420,16 +1426,15 @@ class IngestMixin(StorageBase):
         telemetry_ts = max(existing_ts, timestamp)
         await self._mutate(
             """INSERT INTO station_positions
-                   (callsign, temp1, temp2, hum, hum2, qfe, qnh, gas, co2, batt,
+                   (callsign, temp1, temp2, hum, hum2, qfe, gas, co2, batt,
                     telemetry_ts, last_seen, extras)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                ON CONFLICT(callsign) DO UPDATE SET
                    temp1 = COALESCE(excluded.temp1, station_positions.temp1),
                    temp2 = COALESCE(excluded.temp2, station_positions.temp2),
                    hum = COALESCE(excluded.hum, station_positions.hum),
                    hum2 = COALESCE(excluded.hum2, station_positions.hum2),
                    qfe = COALESCE(excluded.qfe, station_positions.qfe),
-                   qnh = COALESCE(excluded.qnh, station_positions.qnh),
                    gas = COALESCE(excluded.gas, station_positions.gas),
                    co2 = COALESCE(excluded.co2, station_positions.co2),
                    batt = COALESCE(excluded.batt, station_positions.batt),
@@ -1446,7 +1451,6 @@ class IngestMixin(StorageBase):
                 vals["hum"],
                 vals["hum2"],
                 vals["qfe"],
-                None,
                 vals["gas"],
                 vals["co2"],
                 vals["batt"],

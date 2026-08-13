@@ -10,11 +10,11 @@ end-to-end outcome plus two named spot-checks.
 
 Coverage:
   * DB A — full chain from the pre-migration base schema (no ``schema_version``
-    row → ``current_version == 0``): drives every step v2→v21 and asserts the
-    final schema marker is 21, plus the **v4 ACK-collapse** spot-check
+    row → ``current_version == 0``): drives every step v2→HEAD and asserts the
+    final schema marker is ``FINAL_SCHEMA_VERSION``, plus the **v4 ACK-collapse** spot-check
     (``_migrate_v3_to_v4`` step 8: ACK rows link ``send_success`` onto their
     original ``msg`` then are deleted).
-  * DB B — focused v17→v21 fixture with the post-v4 ``conversation_key`` column:
+  * DB B — focused v17→HEAD fixture with the post-v4 ``conversation_key`` column:
     the **v18 conversation-key re-key** spot-check (a via-routed ``'VIA,TARGET'``
     row carrying a stale old-scheme key is re-keyed to ``compute_conversation_key``,
     while a non-routed control row is left untouched — proving the step is scoped).
@@ -38,7 +38,7 @@ from .constants import (
 
 logger = get_logger(__name__)
 
-FINAL_SCHEMA_VERSION = 22
+FINAL_SCHEMA_VERSION = 23
 BASE_TS = 1_770_000_000_000  # fixed ms timestamp so the suite is deterministic
 
 
@@ -53,6 +53,7 @@ async def run_migration_chain_tests() -> bool:
     await _test_full_chain_from_base(results)
     await _test_v18_conversation_rekey(results)
     await _test_v22_signal_via_column(results)
+    await _test_v23_frozen_cache_scrub(results)
 
     for label, ok in results:
         print(f"    {'✅ PASS' if ok else '❌ FAIL'} | {label}")
@@ -68,7 +69,7 @@ async def _schema_version(storage: Any) -> int | None:
 
 
 async def _test_full_chain_from_base(results: list[tuple[str, bool]]) -> None:
-    """Build a pre-migration (v0/base) DB, run the whole v2→v21 chain, assert v4 ACK collapse."""
+    """Build a pre-migration (v0/base) DB, run the whole v2→HEAD chain, assert v4 ACK collapse."""
     with tempfile.TemporaryDirectory() as tmp_dir:
         db_path = Path(tmp_dir) / "migration_chain_base.db"
 
@@ -136,15 +137,15 @@ async def _test_full_chain_from_base(results: list[tuple[str, bool]]) -> None:
         except Exception:
             logger.exception("full-chain migration from base schema raised")
             chain_ran = False
-            results.append(("full chain v0→v21: migrator runs end-to-end without error", False))
+            results.append(("full chain v0→HEAD: migrator runs end-to-end without error", False))
             return
 
-        results.append(("full chain v0→v21: migrator runs end-to-end without error", chain_ran))
+        results.append(("full chain v0→HEAD: migrator runs end-to-end without error", chain_ran))
         try:
             version = await _schema_version(storage)
             results.append(
                 (
-                    "full chain v0→v21: final schema_version marker is 21",
+                    f"full chain v0→HEAD: final schema_version marker is {FINAL_SCHEMA_VERSION}",
                     version == FINAL_SCHEMA_VERSION,
                 )
             )
@@ -245,15 +246,15 @@ async def _test_v18_conversation_rekey(results: list[tuple[str, bool]]) -> None:
             storage = await create_sqlite_storage(db_path)
         except Exception:
             logger.exception("v18 re-key migration raised")
-            results.append(("v18 re-key: migrator runs v17→v21 without error", False))
+            results.append(("v18 re-key: migrator runs v17→HEAD without error", False))
             return
 
-        results.append(("v18 re-key: migrator runs v17→v21 without error", True))
+        results.append(("v18 re-key: migrator runs v17→HEAD without error", True))
         try:
             version = await _schema_version(storage)
             results.append(
                 (
-                    "v18 re-key: final schema_version marker is 21",
+                    f"v18 re-key: final schema_version marker is {FINAL_SCHEMA_VERSION}",
                     version == FINAL_SCHEMA_VERSION,
                 )
             )
@@ -334,15 +335,15 @@ async def _test_v22_signal_via_column(results: list[tuple[str, bool]]) -> None:
             storage = await create_sqlite_storage(db_path)
         except Exception:
             logger.exception("v22 signal_via migration raised")
-            results.append(("v22 signal_via: migrator runs v21→v22 without error", False))
+            results.append(("v22 signal_via: migrator runs v21→HEAD without error", False))
             return
 
-        results.append(("v22 signal_via: migrator runs v21→v22 without error", True))
+        results.append(("v22 signal_via: migrator runs v21→HEAD without error", True))
         try:
             version = await _schema_version(storage)
             results.append(
                 (
-                    "v22 signal_via: final schema_version marker is 22",
+                    f"v22 signal_via: final schema_version marker is {FINAL_SCHEMA_VERSION}",
                     version == FINAL_SCHEMA_VERSION,
                 )
             )
@@ -364,6 +365,207 @@ async def _test_v22_signal_via_column(results: list[tuple[str, bool]]) -> None:
                     and row[0]["lon"] == existing_lon
                     and row[0]["rssi"] == existing_rssi
                     and row[0]["snr"] == existing_snr,
+                )
+            )
+        finally:
+            await storage.close()
+
+
+# The v4 step creates the telemetry table AND adds the weather columns to
+# station_positions; CREATE_SCHEMA_V2_SQL carries neither. A fixture that starts at
+# v22 therefore has to bring both itself — at v22 the v4 block is skipped, so a
+# fixture built from the constants alone would fail on the very first INSERT.
+# Mirrors `_migrate_v3_to_v4` sections 2 and 3.
+_TELEMETRY_DDL = """
+CREATE TABLE IF NOT EXISTS telemetry (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    callsign TEXT NOT NULL,
+    timestamp INTEGER NOT NULL,
+    temp1 REAL, temp2 REAL, hum REAL, hum2 REAL,
+    qfe REAL, qnh REAL, gas INTEGER, co2 INTEGER,
+    alt REAL, batt INTEGER, extras TEXT
+);
+"""
+
+_STATION_POSITIONS_TELEMETRY_COLUMNS = (
+    ("temp1", "REAL"),
+    ("temp2", "REAL"),
+    ("hum", "REAL"),
+    ("hum2", "REAL"),
+    ("qfe", "REAL"),
+    ("qnh", "REAL"),
+    ("gas", "INTEGER"),
+    ("co2", "INTEGER"),
+    ("batt", "INTEGER"),
+    ("telemetry_ts", "INTEGER"),
+)
+
+
+# (1) sensor-less node: every weather column is a wire sentinel, batt is real.
+_V23_SENSORLESS = "OE1SNS-1"
+# (2) real weather station reporting a GENUINE 0.0 °C, with non-zero temp1 elsewhere
+#     in its history — the V6 case the scrub must not touch.
+_V23_GENUINE_ZERO = "OE1WXG-1"
+# (3) real pressure sensor, sentinel `/O=` second temperature (no non-zero temp2
+#     anywhere in history) — caught by the history check, not by the row.
+_V23_SENTINEL_TEMP2 = "OE1DUA-2"
+
+
+def _seed_v23_fixture(db_path: Path) -> None:
+    """Build the v22 DB the frozen-cache scrub runs against.
+
+    Seeds the station_positions cache with the three interesting shapes and the
+    telemetry history that decides the temperature cases.
+    """
+    with db_write(db_path) as conn:
+        conn.executescript(CREATE_SCHEMA_SQL)
+        conn.executescript(CREATE_SCHEMA_V2_SQL)
+        conn.executescript(_TELEMETRY_DDL)
+        existing = {row[1] for row in conn.execute("PRAGMA table_info(station_positions)")}
+        for col, typedef in _STATION_POSITIONS_TELEMETRY_COLUMNS:
+            if col not in existing:
+                conn.execute(f"ALTER TABLE station_positions ADD COLUMN {col} {typedef}")
+        conn.execute("DELETE FROM schema_version")
+        conn.execute("INSERT INTO schema_version (version) VALUES (22)")
+
+        cache_sql = (
+            "INSERT INTO station_positions"
+            " (callsign, lat, lon, temp1, temp2, hum, hum2, qfe, qnh, gas, co2,"
+            "  batt, last_seen, telemetry_ts)"
+            " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+        )
+        conn.execute(
+            cache_sql,
+            (_V23_SENSORLESS, 48.1, 16.2, 0.0, 0.0, 0.0, None, 0.0, 1013.2, 0, 0,
+             88, BASE_TS, BASE_TS),
+        )  # fmt: skip
+        conn.execute(
+            cache_sql,
+            (_V23_GENUINE_ZERO, 48.2, 16.3, 0.0, 4.5, 71.0, None, 968.4, 998.0, 220, None,
+             75, BASE_TS, BASE_TS),
+        )  # fmt: skip
+        conn.execute(
+            cache_sql,
+            (_V23_SENTINEL_TEMP2, 48.3, 16.4, 25.0, 0.0, 44.5, None, 978.7, None, 0, 0,
+             100, BASE_TS, BASE_TS),
+        )  # fmt: skip
+
+        tele_sql = (
+            "INSERT INTO telemetry"
+            " (callsign, timestamp, temp1, temp2, hum, qfe, gas, co2, batt)"
+            " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)"
+        )
+        # The sensor-less node's history: battery only, exactly as the current ingest
+        # path stores it — so no non-zero temp1/temp2 exists for it anywhere.
+        conn.execute(tele_sql, (_V23_SENSORLESS, BASE_TS, None, None, None, None, None, None, 88))
+        # The weather station HAS non-zero temperatures in history, which is what earns
+        # its cached 0.0 °C the benefit of the doubt.
+        conn.execute(
+            tele_sql,
+            (_V23_GENUINE_ZERO, BASE_TS - 3600_000, 3.5, 4.9, 70.0, 968.0, 219, None, 75),
+        )
+        conn.execute(tele_sql, (_V23_GENUINE_ZERO, BASE_TS, 0.0, 4.5, 71.0, 968.4, 220, None, 75))
+        # Real temp1, never a non-zero temp2 — /O= was always the 0 sentinel.
+        conn.execute(
+            tele_sql, (_V23_SENTINEL_TEMP2, BASE_TS, 25.0, None, 44.5, 978.7, None, None, 100)
+        )
+        conn.commit()
+
+
+async def _test_v23_frozen_cache_scrub(results: list[tuple[str, bool]]) -> None:
+    """Seed a v22 DB whose station_positions cache holds the two classes of frozen
+    value (unreachable `qnh`, wire-sentinel zeros) and assert v23 clears exactly those
+    — while a GENUINE 0.0 °C reading and every real value survive.
+
+    The frozen values are what a production box actually served: a sensor-less node
+    advertising 0 °C / 0 % / 0 hPa, and a QNH frozen since February that no ingest
+    path could overwrite because nothing writes that column any more.
+    """
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        db_path = Path(tmp_dir) / "migration_chain_v23.db"
+        sensorless = _V23_SENSORLESS
+        genuine_zero = _V23_GENUINE_ZERO
+        sentinel_temp2 = _V23_SENTINEL_TEMP2
+
+        await asyncio.to_thread(_seed_v23_fixture, db_path)
+
+        try:
+            storage = await create_sqlite_storage(db_path)
+        except Exception:
+            logger.exception("v23 frozen-cache scrub raised")
+            results.append(("v23 scrub: migrator runs v22→HEAD without error", False))
+            return
+
+        results.append(("v23 scrub: migrator runs v22→HEAD without error", True))
+        try:
+            version = await _schema_version(storage)
+            results.append(
+                (
+                    f"v23 scrub: final schema_version marker is {FINAL_SCHEMA_VERSION}",
+                    version == FINAL_SCHEMA_VERSION,
+                )
+            )
+
+            rows = await storage._query("SELECT * FROM station_positions")
+            by_cs = {r["callsign"]: r for r in rows}
+
+            sns = by_cs.get(sensorless, {})
+            results.append(
+                (
+                    "v23 scrub: sensor-less node loses every sentinel-zero reading",
+                    all(
+                        sns.get(col) is None
+                        for col in ("temp1", "temp2", "hum", "qfe", "gas", "co2")
+                    ),
+                )
+            )
+            results.append(
+                (
+                    "v23 scrub: sensor-less node keeps its real batt/position",
+                    sns.get("batt") == 88 and sns.get("lat") == 48.1,
+                )
+            )
+
+            wxg = by_cs.get(genuine_zero, {})
+            results.append(
+                (
+                    "v23 scrub: a GENUINE 0.0 °C survives (station has non-zero temp1 history)",
+                    wxg.get("temp1") == 0.0,
+                )
+            )
+            results.append(
+                (
+                    "v23 scrub: real hum/qfe/gas/temp2 readings survive untouched",
+                    wxg.get("hum") == 71.0
+                    and wxg.get("qfe") == 968.4
+                    and wxg.get("gas") == 220
+                    and wxg.get("temp2") == 4.5,
+                )
+            )
+
+            dua = by_cs.get(sentinel_temp2, {})
+            results.append(
+                (
+                    "v23 scrub: sentinel temp2 next to a REAL pressure is cleared",
+                    dua.get("temp2") is None and dua.get("temp1") == 25.0,
+                )
+            )
+
+            results.append(
+                (
+                    "v23 scrub: qnh is cleared on every row (no writer can ever set it)",
+                    all(r["qnh"] is None for r in rows),
+                )
+            )
+
+            # The scrub must not have touched the history table it reads.
+            tele = await storage._query(
+                "SELECT COUNT(*) n FROM telemetry WHERE temp1 = 0 OR gas = 0 OR co2 = 0"
+            )
+            results.append(
+                (
+                    "v23 scrub: telemetry history is left alone (cache-only fix)",
+                    tele[0]["n"] == 1,  # genuine_zero's 0.0 °C row
                 )
             )
         finally:

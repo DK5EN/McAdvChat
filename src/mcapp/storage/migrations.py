@@ -397,10 +397,14 @@ class MigrationsMixin(StorageBase):
                         " (existing rows left as '' — unknown, not backfilled)",
                         current_version,
                     )
+                    _set_schema_version(conn, 22)
+
+                if current_version < 23:  # noqa: PLR2004 - schema migration step
+                    self._scrub_frozen_station_cache(conn)
                     # Adding a step after this one? Bump LATEST_SCHEMA_VERSION in
                     # storage/constants.py in the same commit — the startup suite
                     # asserts every migration chain terminates there.
-                    _set_schema_version(conn, 22)
+                    _set_schema_version(conn, 23)
 
         await asyncio.to_thread(_init_db)
 
@@ -773,3 +777,98 @@ class MigrationsMixin(StorageBase):
             conn.execute("ALTER TABLE telemetry ADD COLUMN alt REAL")
         except sqlite3.OperationalError:
             logger.debug("Column alt already exists in telemetry, skipping")
+
+    @staticmethod
+    def _scrub_frozen_station_cache(conn: sqlite3.Connection) -> None:
+        """V22 → V23: clear frozen sensor values from the station_positions cache.
+
+        `station_positions`' weather columns are a "last known reading per column"
+        cache of the `telemetry` table, written by `_upsert_station_position`'s
+        telemetry branch as `COALESCE(excluded.x, station_positions.x)`. That
+        COALESCE is deliberate — an incoming frame carrying no reading for a column
+        must not erase the last real one — but it also means a value written ONCE
+        can never be corrected or cleared by ingestion, only overwritten by a newer
+        non-NULL reading. Two classes of value therefore froze permanently:
+
+        `qnh` — no writer exists. Both the telemetry INSERTs and this upsert bind a
+        literal None (node QNH is unreliable; the frontend derives QNH from qfe+alt,
+        see `ingest.py`'s "Node QNH is unreliable" note), so every stored value
+        predates that policy and is unreachable by any later frame. 5 rows on the
+        production DB still served a QNH frozen since February.
+
+        Wire sentinels — Extern-UDP `tele` emits every sensor key unconditionally
+        from zero-initialised firmware fields, so 0 there means "no sensor fitted".
+        Sentinel decoding (`store_telemetry`'s `_wire_reading`) only landed in the
+        telemetry-reconcile campaign; rows cached before it kept the raw 0. A
+        sensor-less node consequently advertised 0 °C / 0 % / 0 hPa / 0 gas / 0 CO2
+        as real readings, and because a station with no sensor never sends a
+        non-NULL replacement, the COALESCE kept them alive forever.
+
+        The scrub is one-way and self-healing: any station that really does report
+        a value rewrites its cache row on the next beacon.
+
+        Every target is probed before it is touched. The weather columns and the
+        `telemetry` table are both artifacts of the v4 step, 19 versions back, and a
+        DB can legitimately arrive here without them (the migration-chain fixtures
+        do exactly that: they seed the minimum their own step needs). A data scrub
+        must not be the thing that stops the service from starting, so a missing
+        column or table downgrades that one statement to a logged skip.
+        """
+        present = {row[1] for row in conn.execute("PRAGMA table_info(station_positions)")}
+        cleared: dict[str, int] = {}
+        skipped: list[str] = []
+
+        def _clear(col: str, extra_predicate: str = "") -> None:
+            if col not in present:
+                skipped.append(col)
+                return
+            conn.execute(
+                f"UPDATE station_positions SET {col} = NULL WHERE {col} = 0{extra_predicate}"  # noqa: S608 - col and predicate are literals in this module, never input
+            )
+            cleared[col] = conn.execute("SELECT changes()").fetchone()[0]
+
+        # `qnh`: unconditional — every non-NULL value is by definition legacy.
+        if "qnh" in present:
+            conn.execute("UPDATE station_positions SET qnh = NULL WHERE qnh IS NOT NULL")
+            cleared["qnh"] = conn.execute("SELECT changes()").fetchone()[0]
+        else:
+            skipped.append("qnh")
+
+        # Physically impossible as readings, so 0 is ALWAYS a wire sentinel: 0 %RH,
+        # 0 hPa station pressure, 0 Ω gas resistance, 0 ppm CO2. Temperatures are
+        # excluded here — 0.0 °C is a genuine reading (that is finding V6) and gets
+        # the history check below instead.
+        for col in ("hum", "hum2", "qfe", "gas", "co2"):
+            _clear(col)
+
+        # Temperatures: clear a cached 0.0 only for a station whose telemetry history
+        # has never once held a non-zero value in that column. A real weather station
+        # reporting a genuine 0.0 °C keeps it (its history carries other, non-zero
+        # readings); a sensor-less node whose only "temperature" ever was the 0
+        # sentinel loses it. Anchored on the history table rather than on the row's
+        # own other columns so that a station with a real pressure but a sentinel
+        # `/O=` (temp2) is also caught — which is also why this step needs `telemetry`
+        # and is skipped wholesale when that table does not exist.
+        has_telemetry = bool(
+            conn.execute(
+                "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'telemetry'"
+            ).fetchone()
+        )
+        for col in ("temp1", "temp2"):
+            if not has_telemetry:
+                skipped.append(col)
+                continue
+            _clear(
+                col,
+                "  AND NOT EXISTS ("  # noqa: S608 - col comes from the literal tuple above
+                "    SELECT 1 FROM telemetry t"
+                "    WHERE t.callsign = station_positions.callsign"
+                f"      AND t.{col} IS NOT NULL AND t.{col} != 0"
+                "  )",
+            )
+
+        logger.info(
+            "Migration v22 → v23: scrubbed frozen station_positions readings (%s)%s",
+            ", ".join(f"{col}={n}" for col, n in cleared.items()) or "nothing to clear",
+            f" — skipped, not present on this DB: {', '.join(skipped)}" if skipped else "",
+        )
