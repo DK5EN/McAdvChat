@@ -52,6 +52,7 @@ from mcapp.storage.conversation_key_tests import run_conversation_key_tests
 from mcapp.storage.migration_chain_tests import run_migration_chain_tests
 from mcapp.storage.query_tests import run_query_tests
 from mcapp.storage.signal_via_tests import run_signal_via_tests
+from mcapp.storage.telemetry_reconcile_tests import run_telemetry_reconcile_tests
 from mcapp.udp_handler import run_startup_tests as run_udp_handler_tests
 from mcapp.udp_parsing_tests import run_udp_parsing_tests
 
@@ -88,6 +89,9 @@ async def main() -> int:  # noqa: PLR0915 - flat suite registry; one visible lin
 
     storage_ok = await run_storage_tests()
     print(f"storage: {'PASS' if storage_ok else 'FAIL'}")
+
+    telemetry_reconcile_ok = run_telemetry_reconcile_tests()
+    print(f"telemetry_reconcile: {'PASS' if telemetry_reconcile_ok else 'FAIL'}")
 
     sse_ok = await run_sse_tests()
     print(f"sse: {'PASS' if sse_ok else 'FAIL'}")
@@ -173,6 +177,7 @@ async def main() -> int:  # noqa: PLR0915 - flat suite registry; one visible lin
         and udp_ok
         and udp_parsing_ok
         and storage_ok
+        and telemetry_reconcile_ok
         and sse_ok
         and classifier_ok
         and parsing_ok
