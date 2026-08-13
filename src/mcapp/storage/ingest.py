@@ -43,6 +43,19 @@ from .constants import (
     BucketTuple,
     compute_conversation_key,
 )
+from .telemetry_reconcile import (
+    ALL_FIELDS,
+    Action,
+    Provenance,
+    Reading,
+    absent,
+    derived,
+    measured,
+    merge_extras,
+    readings,
+    reconcile,
+    values_for,
+)
 
 _MAX_FORENSIC_HOPS = 4  # log raw data for messages routed over more hops
 _MIN_PLAUSIBLE_HPA = 850  # pressure below this is a firmware mapping error
@@ -702,8 +715,12 @@ class IngestMixin(StorageBase):
         if lat and lon and lat != 0 and lon != 0:
             await self._upsert_station_position(callsign, pos_data, "position")
 
-        # Weather station beacons carry telemetry in APRS extensions
-        if any(pos_data.get(f) for f in _WEATHER_BEACON_FIELDS):
+        # Weather station beacons carry telemetry in APRS extensions. Presence,
+        # not truthiness: a genuine 0.0 reading is falsy but real, and this gate
+        # used to drop an all-genuine-zero beacon before store_telemetry's own
+        # (transport-aware) sentinel decoding ever saw it — V6's sibling, one
+        # level up (verdict, telemetry reconcile campaign).
+        if any(pos_data.get(f) is not None for f in _WEATHER_BEACON_FIELDS):
             await self.store_telemetry(callsign, pos_data)
 
     async def _store_mheard(self, src: str, rssi: Any, snr: Any, timestamp: int, raw: str) -> bool:
@@ -917,7 +934,12 @@ class IngestMixin(StorageBase):
                 (msg_id, timestamp - DEDUP_WINDOW_MS, callsign.upper()),
             )
             if existing:
-                if msg_type == "pos" and any(message.get(f) for f in _WEATHER_BEACON_FIELDS):
+                # Presence, not truthiness — see the identical note in
+                # `_store_position`; a genuine all-zero beacon must still reach
+                # `store_telemetry`'s own transport-aware sentinel decoding.
+                if msg_type == "pos" and any(
+                    message.get(f) is not None for f in _WEATHER_BEACON_FIELDS
+                ):
                     await self.store_telemetry(callsign, {**message, "via": relay_via})
                 return
 
@@ -1085,21 +1107,40 @@ class IngestMixin(StorageBase):
         }
     )
 
-    async def store_telemetry(self, callsign: str, data: dict[str, Any]) -> None:  # noqa: PLR0912, PLR0915 - complex handler kept intact
-        """Store telemetry in dedicated table and update station_positions."""
+    async def store_telemetry(  # noqa: PLR0912, PLR0915 - dispatch on Action, kept as one method
+        self, callsign: str, data: dict[str, Any]
+    ) -> None:
+        """Store telemetry in dedicated table and update station_positions.
+
+        Dedup/merge policy for a second observation of the same station inside
+        the dedup window is delegated entirely to `telemetry_reconcile.reconcile()`
+        — see that module's docstring for the defects (V1/V2/V3/V6) this
+        replaces. This method's only remaining jobs are: decode wire sentinels
+        into `Reading`s (transport-dependent — see `_wire_reading` below),
+        resolve `qfe` (implausibility filter + barometric derivation), compute
+        `incoming_is_newer` from the two stored timestamps (never from arrival
+        order — that assumption IS V1), and dispatch on the returned `Action`.
+        """
         if not callsign:
             return
 
         timestamp = data.get("timestamp", now_ms())
-        temp1 = data.get("temp1")
-        temp2 = data.get("temp2")
-        hum = data.get("hum")
-        hum2 = data.get("hum2")
-        qfe = data.get("qfe")
-        gas = data.get("gas")
-        co2 = data.get("co2")
-        alt = data.get("alt")
-        batt = data.get("batt")
+        src_type = data.get("src_type", "")
+        # Sentinel decoding is transport-dependent (see `Reading`'s docstring):
+        # the BLE APRS-text path emits a `/KEY=` only for a real sensor, so a
+        # parsed 0.0 there is genuine; Extern-UDP `tele` JSON emits every key
+        # unconditionally from zero-initialised firmware fields, so 0 there
+        # means "no sensor fitted". `parse_aprs_position` (ble_protocol.py)
+        # and BLE-remote relays both stamp one of these three src_type values.
+        is_ble_transport = src_type in ("ble", "ble_remote", "BLE")
+
+        def _wire_reading(key: str) -> Reading:
+            val = data.get(key)
+            if val is None:
+                return absent()
+            if val == 0 and not is_ble_transport:
+                return absent()
+            return measured(val)
 
         # Collect unknown sensor keys into extras JSON
         extras_dict: dict[str, Any] = {}
@@ -1110,11 +1151,15 @@ class IngestMixin(StorageBase):
         extras_dict.update(
             {k: v for k, v in data.items() if k not in all_known and v is not None and v != 0}
         )
-        extras_json = json.dumps(extras_dict) if extras_dict else None
+        incoming_extras_json = json.dumps(extras_dict) if extras_dict else None
 
-        # QFE < 850 hPa is unrealistic (firmware mapping error in UDP LoRa telemetry)
-        if qfe is not None and qfe < _MIN_PLAUSIBLE_HPA:
-            qfe = None
+        # QFE < 850 hPa is unrealistic (firmware mapping error in UDP LoRa telemetry —
+        # the `lora`-variant tele's `qfe` key is fed from `/F=`, a barometric altitude
+        # in metres, not a pressure). By src_type+key, not magnitude, is wave 3's fix
+        # (verdict V4/V4a); this filter is unchanged from before this refactor.
+        raw_qfe = data.get("qfe")
+        if raw_qfe is not None and raw_qfe < _MIN_PLAUSIBLE_HPA:
+            raw_qfe = None
 
         # Altitude for frames that carry none of their own — APRS `T#` telemetry and,
         # far more often, the Extern-UDP `tele` datagram, whose field set
@@ -1123,180 +1168,235 @@ class IngestMixin(StorageBase):
         # that fallback needs it: while this lookup sat after the fallback, every
         # `/Q=`-sending station reaching us over UDP kept `alt=None` at decision time,
         # so `qnh and alt` was never true and the QNH→QFE derivation never once fired.
+        alt = data.get("alt")
         if alt is None:
             rows_result = await self._query(
                 "SELECT alt FROM station_positions WHERE callsign = ?",
                 (callsign,),
             )
-            rows = rows_result
-            if rows:
-                alt = rows[0].get("alt")
+            if rows_result:
+                alt = rows_result[0].get("alt")
 
-        # If QFE missing but QNH + altitude available, calculate QFE (barometric formula).
-        # `qfe_derived` is what the dedup/merge below needs to prefer a MEASURED `/P=`
-        # over this estimate: a station sending both `/Q=` and `/P=` delivers them on
-        # different transports one second apart, and the two disagree by several hPa.
-        qnh = data.get("qnh")
-        qfe_derived = False
-        # Only use plausible QNH values
-        if (qfe is None or qfe == 0) and qnh and alt and qnh > _MIN_PLAUSIBLE_HPA:
-            qfe = round(
-                qnh * (1 - BARO_LAPSE_RATE_K_PER_M * alt / BARO_STD_TEMP_K) ** BARO_EXPONENT, 1
+        # If QFE missing but QNH + altitude available, calculate QFE (barometric
+        # formula) as a DERIVED reading — never MEASURED — so a real `/P=` sensor
+        # reading always outranks it in `reconcile()`, regardless of arrival order.
+        qnh_raw = data.get("qnh")
+        qfe_reading: Reading
+        if raw_qfe is not None:
+            qfe_reading = measured(raw_qfe)
+        elif qnh_raw and alt and qnh_raw > _MIN_PLAUSIBLE_HPA:
+            qfe_reading = derived(
+                round(
+                    qnh_raw
+                    * (1 - BARO_LAPSE_RATE_K_PER_M * alt / BARO_STD_TEMP_K) ** BARO_EXPONENT,
+                    1,
+                )
             )
-            qfe_derived = True
+        else:
+            qfe_reading = absent()
 
-        qnh = None  # Node QNH is unreliable; frontend calculates from QFE + alt
+        # Node QNH is unreliable; frontend calculates QNH from qfe + alt. The
+        # `telemetry`/`station_positions` qnh column is therefore always NULL —
+        # `qnh_raw` above only ever feeds the qfe derivation.
 
-        # Skip all-zero readings (node without sensors)
-        # Check ONLY sensor values — altitude comes from position beacons, not sensors
-        sensor_values = (temp1, temp2, hum, hum2, qfe, gas, co2)
-        if all(v is None or v == 0 for v in sensor_values):
+        incoming = readings(
+            temp1=_wire_reading("temp1"),
+            temp2=_wire_reading("temp2"),
+            hum=_wire_reading("hum"),
+            hum2=_wire_reading("hum2"),
+            qfe=qfe_reading,
+            gas=_wire_reading("gas"),
+            co2=_wire_reading("co2"),
+            batt=_wire_reading("batt"),
+        )
+
+        # Skip a frame with no sensor reading at all (node without sensors, or an
+        # all-absent tele datagram). `0.0` is a value (see `Reading`), so this is
+        # provenance-based, not a truthiness check on the raw wire values.
+        if all(r.prov is Provenance.ABSENT for r in incoming.values()):
             return
 
-        # Dedup: if telemetry for same callsign exists within 60s, merge & keep best
+        # Dedup window is symmetric: a frame replayed with an OLD timestamp (every
+        # mcapp restart flushes ble_service's buffered notifications carrying their
+        # original timestamps) must not match a live row that is now far outside
+        # this window — that would silently swallow the replayed observation
+        # instead of recording it as history (verdict V1 prerequisite 3).
         recent = await self._query(
-            "SELECT id, temp1, temp2, hum, hum2, qfe, gas, co2, batt, extras"
-            " FROM telemetry WHERE callsign = ? AND timestamp > ?",
-            (callsign, timestamp - TELEMETRY_DEDUP_WINDOW_MS),
-        )
-        recent_list = recent
-        if recent_list:
-            existing = recent_list[0]
-            existing_qfe = existing.get("qfe", 0) or 0
-            new_has_qfe = qfe is not None and qfe != 0
-            # A `/P=` reading off the sensor beats an estimate the barometric formula
-            # produced from `/Q=` + altitude, and it is what decides replace-vs-merge
-            # below. Without this distinction the pair (existing has QFE, new has QFE)
-            # matched NEITHER branch and fell through to the INSERT — two rows a second
-            # apart, several hPa apart, and a chart that zigzags between them.
-            new_qfe_measured = new_has_qfe and not qfe_derived
-
-            if existing_qfe != 0 and not new_qfe_measured:
-                # Existing record's QFE is at least as good; merge new non-null values in
-                merge_sets = []
-                merge_vals = []
-                for col, val in [("temp2", temp2), ("hum2", hum2)]:
-                    if val is not None and val != 0 and not (existing.get(col) or 0):
-                        merge_sets.append(f"{col} = ?")
-                        merge_vals.append(val)
-                if extras_json and not existing.get("extras"):
-                    merge_sets.append("extras = ?")
-                    merge_vals.append(extras_json)
-                if merge_sets:
-                    merge_vals.append(existing["id"])
-                    await self._mutate(
-                        f"UPDATE telemetry SET {', '.join(merge_sets)} WHERE id = ?",  # noqa: S608 - identifiers from fixed set; values parameterized
-                        tuple(merge_vals),
-                    )
-                return  # keep existing record with real QFE
-
-            if new_has_qfe:
-                # Reached only when the new frame wins: either the existing row had no
-                # QFE at all, or the new one measured it while the existing was derived.
-                # Replace it — but carry over EVERY reading the winner does not itself
-                # carry first, because the two frames are not supersets of each other.
-                # The row being replaced came from the Extern-UDP `tele` datagram, whose
-                # JSON has real `gas`/`co2`/`batt` keys; the winner is the BLE copy of
-                # the same beacon, which carries the pressure but leaves those NULL. While
-                # this merge only covered temp2/hum2/extras, every BME680 station traded
-                # its gas resistance for the pressure the moment the salvage path started
-                # working — DL2JA-2 went from 42 rows with gas and none with QFE to 14
-                # with QFE and none with gas. Both readings belong on the same row.
-                carried = {
-                    "temp1": temp1,
-                    "temp2": temp2,
-                    "hum": hum,
-                    "hum2": hum2,
-                    "gas": gas,
-                    "co2": co2,
-                    "batt": batt,
-                }
-                for col, val in carried.items():
-                    if not val:  # None and 0 both mean "this frame has no reading"
-                        carried[col] = existing.get(col) or val
-                temp1 = carried["temp1"]
-                temp2 = carried["temp2"]
-                hum = carried["hum"]
-                hum2 = carried["hum2"]
-                gas = carried["gas"]
-                co2 = carried["co2"]
-                batt = carried["batt"]
-                if not extras_json and existing.get("extras"):
-                    extras_json = existing["extras"]
-                await self._mutate(
-                    "DELETE FROM telemetry WHERE callsign = ? AND timestamp > ?",
-                    (callsign, timestamp - TELEMETRY_DEDUP_WINDOW_MS),
-                )
-
-        logger.debug(
-            "Telemetry from %s: temp1=%s temp2=%s hum=%s qfe=%s alt=%s batt=%s",
-            callsign,
-            temp1,
-            temp2,
-            hum,
-            qfe,
-            alt,
-            batt,
-        )
-
-        await self._mutate(
-            "INSERT INTO telemetry"
-            " (callsign, timestamp, temp1, temp2, hum, hum2,"
-            "  qfe, qnh, gas, co2, alt, batt, extras)"
-            " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "SELECT id, timestamp, temp1, temp2, hum, hum2, qfe, gas, co2, batt, extras"
+            " FROM telemetry WHERE callsign = ? AND timestamp > ? AND timestamp < ?"
+            " ORDER BY timestamp DESC LIMIT 1",
             (
                 callsign,
-                timestamp,
-                temp1,
-                temp2,
-                hum,
-                hum2,
-                qfe,
-                qnh,
-                gas,
-                co2,
-                alt,
-                batt,
-                extras_json,
+                timestamp - TELEMETRY_DEDUP_WINDOW_MS,
+                timestamp + TELEMETRY_DEDUP_WINDOW_MS,
             ),
         )
+        existing_row = recent[0] if recent else None
 
-        # Update station_positions with latest telemetry values
-        # Use NULLIF(x, 0) so zero values don't overwrite real data from other paths
+        existing: dict[str, Reading] | None = None
+        existing_ts = timestamp
+        existing_extras_json: str | None = None
+        if existing_row is not None:
+            existing_ts = existing_row["timestamp"]
+            existing_extras_json = existing_row.get("extras")
+            # Values read back from the table are labelled MEASURED — labelling
+            # them DERIVED would rebuild V1 in this caller (see `Reading`'s
+            # docstring for why "can't prove it was measured" is the wrong call).
+            existing = readings(
+                **{
+                    field: measured(existing_row[field])
+                    if existing_row.get(field) is not None
+                    else absent()
+                    for field in ALL_FIELDS
+                }
+            )
+
+        # Equal timestamps count as NOT newer (reconcile()'s documented rule).
+        # Derived from the two STORED timestamps, never from which frame arrived
+        # second — that assumption is the whole of V1.
+        incoming_is_newer = existing_row is None or timestamp > existing_ts
+
+        action, merged = reconcile(existing, incoming, incoming_is_newer=incoming_is_newer)
+        merged_extras_json = merge_extras(existing_extras_json, incoming_extras_json)
+        vals = dict(zip(ALL_FIELDS, values_for(merged), strict=True))
+
+        logger.debug(
+            "Telemetry from %s: action=%s temp1=%s temp2=%s hum=%s qfe=%s alt=%s batt=%s",
+            callsign,
+            action,
+            vals["temp1"],
+            vals["temp2"],
+            vals["hum"],
+            vals["qfe"],
+            alt,
+            vals["batt"],
+        )
+
+        if action is Action.INSERT:
+            await self._mutate(
+                "INSERT INTO telemetry"
+                " (callsign, timestamp, temp1, temp2, hum, hum2,"
+                "  qfe, qnh, gas, co2, alt, batt, extras)"
+                " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    callsign,
+                    timestamp,
+                    vals["temp1"],
+                    vals["temp2"],
+                    vals["hum"],
+                    vals["hum2"],
+                    vals["qfe"],
+                    None,
+                    vals["gas"],
+                    vals["co2"],
+                    alt,
+                    vals["batt"],
+                    merged_extras_json,
+                ),
+            )
+        elif action is Action.UPDATE_EXISTING:
+            assert existing_row is not None  # noqa: S101 - reconcile() guarantees this
+            await self._mutate(
+                "UPDATE telemetry SET temp1 = ?, temp2 = ?, hum = ?, hum2 = ?,"
+                " qfe = ?, gas = ?, co2 = ?, batt = ?, extras = ? WHERE id = ?",
+                (
+                    vals["temp1"],
+                    vals["temp2"],
+                    vals["hum"],
+                    vals["hum2"],
+                    vals["qfe"],
+                    vals["gas"],
+                    vals["co2"],
+                    vals["batt"],
+                    merged_extras_json,
+                    existing_row["id"],
+                ),
+            )
+        elif action is Action.REPLACE_EXISTING:
+            assert existing_row is not None  # noqa: S101 - reconcile() guarantees this
+            # Delete by explicit row id, NEVER by an open-ended time predicate — the
+            # unbounded `timestamp > ?` DELETE this replaces destroyed every row a
+            # replayed frame's original timestamp fell behind (verdict V1, reproduced
+            # 6 rows → 1).
+            await self._mutate("DELETE FROM telemetry WHERE id = ?", (existing_row["id"],))
+            await self._mutate(
+                "INSERT INTO telemetry"
+                " (callsign, timestamp, temp1, temp2, hum, hum2,"
+                "  qfe, qnh, gas, co2, alt, batt, extras)"
+                " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    callsign,
+                    timestamp,  # re-stamped under the incoming frame's timestamp
+                    vals["temp1"],
+                    vals["temp2"],
+                    vals["hum"],
+                    vals["hum2"],
+                    vals["qfe"],
+                    None,
+                    vals["gas"],
+                    vals["co2"],
+                    alt,
+                    vals["batt"],
+                    merged_extras_json,
+                ),
+            )
+        # Action.SKIP: no telemetry ROW write — see Action.SKIP's docstring. The
+        # station_positions upsert below still runs, per Action's class docstring.
+
+        # Update station_positions with latest telemetry values. Bind the RECONCILED
+        # values, never the raw incoming frame's — station_positions fills via
+        # COALESCE(excluded.x, ...), so binding raw values would let a replayed
+        # frame's stale readings overwrite current ones on the very path that just
+        # decided they must not win the telemetry row (V1's mechanism one level out).
+        #
+        # No `NULLIF(excluded.x, 0)` guard: sentinel decoding already happened above,
+        # so a merged value of 0 here is always a genuine reading, never a wire
+        # sentinel — NULLIF would otherwise silently discard it (V6's sibling on this
+        # cache leg).
+        #
+        # telemetry_ts additionally gets a MAX() guard, like last_seen already has:
+        # unlike last_seen, it previously had none, so an honest INSERT of a
+        # once-outside-window replayed frame (this station has no row in THIS
+        # dedup window, so `existing_ts` defaults to the incoming timestamp) could
+        # still walk station_positions.telemetry_ts backwards relative to a newer
+        # row already cached there. Python-side `max(existing_ts, timestamp)` handles
+        # the in-window case; the SQL-side MAX() covers the no-existing-row case too.
+        telemetry_ts = max(existing_ts, timestamp)
         await self._mutate(
             """INSERT INTO station_positions
                    (callsign, temp1, temp2, hum, hum2, qfe, qnh, gas, co2, batt,
                     telemetry_ts, last_seen, extras)
                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                ON CONFLICT(callsign) DO UPDATE SET
-                   temp1 = COALESCE(NULLIF(excluded.temp1, 0), station_positions.temp1),
-                   temp2 = COALESCE(NULLIF(excluded.temp2, 0), station_positions.temp2),
-                   hum = COALESCE(NULLIF(excluded.hum, 0), station_positions.hum),
-                   hum2 = COALESCE(NULLIF(excluded.hum2, 0), station_positions.hum2),
-                   qfe = COALESCE(NULLIF(excluded.qfe, 0), station_positions.qfe),
-                   qnh = COALESCE(NULLIF(excluded.qnh, 0), station_positions.qnh),
-                   gas = COALESCE(NULLIF(excluded.gas, 0), station_positions.gas),
-                   co2 = COALESCE(NULLIF(excluded.co2, 0), station_positions.co2),
-                   batt = COALESCE(NULLIF(excluded.batt, 0), station_positions.batt),
-                   telemetry_ts = excluded.telemetry_ts,
+                   temp1 = COALESCE(excluded.temp1, station_positions.temp1),
+                   temp2 = COALESCE(excluded.temp2, station_positions.temp2),
+                   hum = COALESCE(excluded.hum, station_positions.hum),
+                   hum2 = COALESCE(excluded.hum2, station_positions.hum2),
+                   qfe = COALESCE(excluded.qfe, station_positions.qfe),
+                   qnh = COALESCE(excluded.qnh, station_positions.qnh),
+                   gas = COALESCE(excluded.gas, station_positions.gas),
+                   co2 = COALESCE(excluded.co2, station_positions.co2),
+                   batt = COALESCE(excluded.batt, station_positions.batt),
+                   telemetry_ts = MAX(COALESCE(station_positions.telemetry_ts, 0),
+                                      excluded.telemetry_ts),
                    last_seen = MAX(COALESCE(station_positions.last_seen, 0),
                                    COALESCE(excluded.last_seen, 0)),
                    extras = COALESCE(excluded.extras, station_positions.extras)
             """,
             (
                 callsign,
-                temp1,
-                temp2,
-                hum,
-                hum2,
-                qfe,
-                qnh,
-                gas,
-                co2,
-                batt,
+                vals["temp1"],
+                vals["temp2"],
+                vals["hum"],
+                vals["hum2"],
+                vals["qfe"],
+                None,
+                vals["gas"],
+                vals["co2"],
+                vals["batt"],
+                telemetry_ts,
                 timestamp,
-                timestamp,
-                extras_json,
+                merged_extras_json,
             ),
         )
 

@@ -34,6 +34,7 @@ from .storage.constants import (
     CREATE_SCHEMA_SQL,
     CREATE_SCHEMA_V2_SQL,
     LATEST_SCHEMA_VERSION,
+    TELEMETRY_DEDUP_WINDOW_MS,
     db_read,
     db_write,
 )
@@ -958,6 +959,113 @@ async def run_startup_tests() -> bool:  # noqa: PLR0915 - test suite lists one c
                 (
                     "BME680: co2 and batt survive the replacement too",
                     _approx(r13.get("co2"), 412) and _approx(r13.get("batt"), 61),
+                )
+            )
+
+            # 14. V1 regression: a frame replayed with an OLD timestamp must never
+            # delete rows newer than the row it actually dedups against. `ble_service`
+            # buffers up to 1000 BLE notifications whenever mcapp's SSE consumer is
+            # away (every restart) and replays them carrying their ORIGINAL
+            # timestamps. The pre-fix `DELETE FROM telemetry WHERE callsign = ? AND
+            # timestamp > ?` was unbounded above and keyed off the replayed frame's
+            # own (old) timestamp — reproduced live as 6 rows -> 1. Seed 4 rows, each
+            # > TELEMETRY_DEDUP_WINDOW_MS apart so none dedups against another, then
+            # replay the FIRST beacon's exact timestamp carrying a measured `/P=`
+            # that its own row lacks. The other 3 rows — all newer than the replay's
+            # timestamp — must survive untouched.
+            cs14 = "OE1XYZ-34"
+            seed_count14 = 4
+            gap14 = TELEMETRY_DEDUP_WINDOW_MS * 3
+            ts14 = [base_ts + 100 + i * gap14 for i in range(seed_count14)]
+            temp14 = [11.0, 12.0, 13.0, 14.0]
+            for i in range(seed_count14):
+                tele14 = {
+                    "src": cs14,
+                    "type": "tele",
+                    "src_type": "lora",
+                    "timestamp": ts14[i],
+                    "temp1": temp14[i],
+                }
+                await storage.store_message(tele14, json.dumps(tele14))
+            rows14_before = await _telemetry_rows(cs14)
+            results.append(
+                (
+                    "V1 seed: 4 rows > dedup-window apart each land as their own row",
+                    len(rows14_before) == seed_count14
+                    and [r.get("temp1") for r in rows14_before] == temp14,
+                )
+            )
+            replay14 = {
+                "src": cs14,
+                "type": "pos",
+                "src_type": "ble_remote",
+                "timestamp": ts14[0],  # the FIRST beacon's original timestamp, replayed
+                "msg": f"!4812.34N/01143.56E-/P=955.0/T={temp14[0]}",
+                "temp1": temp14[0],
+                "qfe": 955.0,
+            }
+            await storage.store_message(replay14, json.dumps(replay14))
+            rows14_after = await _telemetry_rows(cs14)
+            results.append(
+                (
+                    (
+                        "V1: replayed old frame does not delete newer rows"
+                        f" ({seed_count14} rows before and after, got {len(rows14_after)})"
+                    ),
+                    len(rows14_after) == seed_count14,
+                )
+            )
+            results.append(
+                (
+                    "V1: rows 2-4 (all newer than the replay) are untouched",
+                    [r.get("temp1") for r in rows14_after[1:]] == temp14[1:],
+                )
+            )
+            results.append(
+                (
+                    "V1: the replayed measured qfe lands on row 1 (the one it dedups against)",
+                    _approx(rows14_after[0].get("qfe"), 955.0)
+                    and _approx(rows14_after[0].get("temp1"), temp14[0]),
+                )
+            )
+
+            # 15. V3 regression: a station with no pressure sensor must not get a
+            # duplicate row every beacon. `(existing has no qfe, incoming has no
+            # qfe)` used to match neither the merge nor the replace branch and fell
+            # through to a bare INSERT — every beacon, not just once every 60s.
+            cs15 = "OE1XYZ-35"
+            tele15 = {
+                "src": cs15,
+                "type": "tele",
+                "src_type": "lora",
+                "timestamp": base_ts + 200,
+                "temp1": 18.4,
+                "hum": 55.0,
+            }
+            await storage.store_message(tele15, json.dumps(tele15))
+            ble15 = {
+                "src": cs15,
+                "type": "pos",
+                "src_type": "ble_remote",
+                "timestamp": base_ts + 200 + 200,
+                "msg": "!4812.34N/01143.56E-/T=18.4/H=55.0/H2=12.5",
+                "temp1": 18.4,
+                "hum": 55.0,
+                "temp2": 12.5,
+            }
+            await storage.store_message(ble15, json.dumps(ble15))
+            rows15 = await _telemetry_rows(cs15)
+            r15 = rows15[0] if rows15 else {}
+            results.append(
+                (
+                    (
+                        "V3: a pressure-less station gets ONE merged row, not a"
+                        f" duplicate (got {len(rows15)} rows)"
+                    ),
+                    len(rows15) == 1
+                    and _approx(r15.get("temp1"), 18.4)
+                    and _approx(r15.get("temp2"), 12.5)
+                    and not r15.get("qfe"),
                 )
             )
 
