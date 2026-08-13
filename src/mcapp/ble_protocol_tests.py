@@ -116,6 +116,30 @@ APRS_BME680_GAS = 236.8
 APRS_BME680_CO2 = 412.0
 APRS_BME680_F = 453.0
 
+# --- V5/V7 regression fixtures: free-text comment injection, unpadded /B= --
+# A German site-description comment naturally contains "/H=" ("Höhe" = height)
+# ahead of the real weather extensions the firmware appends after the comment
+# (loop_functions.cpp:3772). Each fixture below plants a plausible fake reading
+# in the comment ahead of the genuine one, so a first-match parser reports the
+# fake value while the real one is stranded.
+APRS_HUM_INJECTION = "!4812.34N/01143.56E#Standort/H=520m Dach/T=22.6/H=42.5/P=940.3"
+APRS_HUM_INJECTION_REAL = 42.5
+APRS_TEMP1_INJECTION = "!4812.34N/01143.56E#Route/T=99.9 km entfernt/H=41.0/T=23.4/P=940.3"
+APRS_TEMP1_INJECTION_REAL = 23.4
+APRS_GAS_INJECTION = "!4825.38N/01147.20E-Garage/G=999.9 Bereich/T=22.0/H=40.0/G=236.8/P=950.0"
+APRS_GAS_INJECTION_REAL = 236.8
+
+# Unpadded /B= (INA226 branch, loop_functions.cpp:3619 `/B=%i`) vs the padded
+# /B=%3i BATT_LEVEL branch. "B" is skip-listed from `extras`, so a missed match
+# loses the reading outright rather than merely miscategorizing it.
+APRS_BATT_UNPADDED = "!4812.34N/01143.56E#/B=85"
+APRS_BATT_UNPADDED_VALUE = 85
+APRS_BATT_PADDED = "!4812.34N/01143.56E#/B=100"
+APRS_BATT_PADDED_VALUE = 100
+APRS_BATT_OUT_OF_RANGE = "!4812.34N/01143.56E#/B=150"
+APRS_BATT_INJECTION = "!4812.34N/01143.56E#Gebäude/B=12 Etage/B=77"
+APRS_BATT_INJECTION_REAL = 77
+
 # --- APRS symbol table id: '/', '\', or an overlay (0-9 A-Z) ---------------
 # Built from chr(92) rather than a backslash literal, for the same reason
 # `udp_parsing_tests.py` mandates it: in Python source the correct value is
@@ -440,6 +464,111 @@ def _test_aprs_position(results: list[tuple[str, bool]]) -> None:
     )
 
 
+def _test_aprs_comment_injection(results: list[tuple[str, bool]]) -> None:
+    """V5/V7 regressions: free-text comment injection, unpadded /B=.
+
+    Each check's comment names the specific wrong implementation it kills.
+    """
+    hum = parse_aprs_position(APRS_HUM_INJECTION)
+    if hum is None:
+        _check(results, "German-comment /H= injection still parses", False)
+    else:
+        # Kills: re.search (first match, the pre-fix behavior) -> hum would be
+        # 520.0 (the comment's "/H=520m"), not the real 42.5.
+        _check(
+            results,
+            "comment '/H=520m' ahead of real /H=42.5: last match wins",
+            _close(hum.get("hum", 0.0), APRS_HUM_INJECTION_REAL),
+        )
+        # Kills: matched_spans recording only the winning span -> the earlier
+        # injected /H=520 would leak into extras under "H", a key that looks
+        # exactly like a genuine reading rather than obvious junk.
+        _check(
+            results,
+            "the injected /H=520 does not leak into extras under 'H'",
+            "H" not in hum.get("extras", {}),
+        )
+
+    temp1 = parse_aprs_position(APRS_TEMP1_INJECTION)
+    if temp1 is None:
+        _check(results, "German-comment /T= injection still parses", False)
+    else:
+        # Kills: first-match /T= scan -> temp1 would be 99.9 (the comment's).
+        _check(
+            results,
+            "comment '/T=99.9 km entfernt' ahead of real /T=23.4: last match wins",
+            _close(temp1.get("temp1", 0.0), APRS_TEMP1_INJECTION_REAL),
+        )
+        _check(
+            results,
+            "the injected /T=99.9 does not leak into extras under 'T'",
+            "T" not in temp1.get("extras", {}),
+        )
+
+    gas = parse_aprs_position(APRS_GAS_INJECTION)
+    if gas is None:
+        _check(results, "German-comment /G= injection still parses", False)
+    else:
+        # Kills: first-match /G= scan -> gas would be 999.9 (the comment's),
+        # the same defect class that historically stranded /O= /G= /C= readings.
+        _check(
+            results,
+            "comment '/G=999.9' ahead of real /G=236.8: last match wins",
+            _close(gas.get("gas", 0.0), APRS_GAS_INJECTION_REAL),
+        )
+        _check(
+            results,
+            "the injected /G=999.9 does not leak into extras under 'G'",
+            "G" not in gas.get("extras", {}),
+        )
+
+    unpadded = parse_aprs_position(APRS_BATT_UNPADDED)
+    # Kills: the pre-fix fixed \d{3} width -> unpadded '/B=85' fails to match at
+    # all, and "batt" (skip-listed from extras) would be lost outright.
+    _check(
+        results,
+        "unpadded /B=85 (INA226 branch) is parsed, not lost",
+        unpadded is not None and unpadded.get("batt") == APRS_BATT_UNPADDED_VALUE,
+    )
+
+    padded = parse_aprs_position(APRS_BATT_PADDED)
+    # Kills: a digit-count regression (e.g. \d{1,2}) that would fail to match a
+    # 3-digit value or truncate it.
+    _check(
+        results,
+        "3-digit /B=100 (the old padded shape) still works",
+        padded is not None and padded.get("batt") == APRS_BATT_PADDED_VALUE,
+    )
+
+    out_of_range = parse_aprs_position(APRS_BATT_OUT_OF_RANGE)
+    # Kills: accepting 1-3 digits with no upper bound -> '/B=150' would be
+    # stored as a 150% battery reading instead of being rejected.
+    _check(
+        results,
+        "/B=150 (out of 0-100 range) is rejected, not stored",
+        out_of_range is not None and "batt" not in out_of_range,
+    )
+    # "B" is unconditionally skip-listed from extras (altitude/battery/groups
+    # are handled explicitly before the weather-fields loop), so a rejected
+    # reading must not resurface there either.
+    _check(
+        results,
+        "the rejected /B=150 does not resurface in extras under 'B'",
+        out_of_range is not None and "B" not in out_of_range.get("extras", {}),
+    )
+
+    batt_injection = parse_aprs_position(APRS_BATT_INJECTION)
+    # Kills: /B='s own first-match scan. /B= has a separate code path from the
+    # weather_fields loop, so the V5 last-match fix there does not automatically
+    # cover it — this is the case that would slip through if only the loop were
+    # fixed.
+    _check(
+        results,
+        "German comment '/B=12' ahead of real /B=77: last match wins",
+        batt_injection is not None and batt_injection.get("batt") == APRS_BATT_INJECTION_REAL,
+    )
+
+
 def _test_aprs_symbol_table_ids(results: list[tuple[str, bool]]) -> None:
     """The symbol table id: '/', a single backslash, or an overlay (0-9 A-Z).
 
@@ -541,6 +670,7 @@ def run_ble_protocol_tests() -> bool:
     _test_fcs(results)
     _test_ack(results)
     _test_aprs_position(results)
+    _test_aprs_comment_injection(results)
     _test_aprs_symbol_table_ids(results)
     _test_timestamp(results)
 

@@ -330,16 +330,30 @@ def parse_aprs_position(message: str) -> dict[str, Any] | None:  # noqa: PLR0912
     if symbol:
         result["aprs_symbol"] = symbol
 
-    # Altitude in feet: /A=001526
+    # Altitude in feet: /A=001526. Left as first-match (unlike /B= and the weather
+    # fields below): the fixed 6-digit, zero-padded width is a much narrower target
+    # for accidental comment injection than a bounded-width value like /B=, and the
+    # firmware only ever emits this exact shape, so widening the accepted digit
+    # count — the change that made /B= need a last-match fix — does not apply here.
     alt_match = re.search(r"/A=(\d{6})", message)
     if alt_match:
         altitude_ft = int(alt_match.group(1))
         result["alt"] = round(altitude_ft * FEET_TO_METERS)
 
-    # Battery level: /B=085
-    battery_match = re.search(r"/B=(\d{3})", message)
-    if battery_match:
-        result["batt"] = int(battery_match.group(1))
+    # Battery level: /B=085 (BATT_LEVEL branch, %3i-padded). The INA226 branch
+    # emits it unpadded instead (`/B=%i`, loop_functions.cpp:3619), so a fixed
+    # \d{3} count misses e.g. `/B=85` outright — and because "B" is skip-listed
+    # from `extras` below, that reading isn't merely miscategorized, it is lost.
+    # Accept 1-3 digits and bound the parsed value to the valid percent range;
+    # an out-of-range capture (garbage or injected) is rejected, not stored.
+    # Last-match, same rationale as the weather fields below: a real reading is
+    # appended by the firmware after the free-text comment, so if the comment
+    # happens to contain its own `/B=...`, the later occurrence wins.
+    battery_matches = list(re.finditer(r"/B=(\d{1,3})", message))
+    if battery_matches:
+        batt = int(battery_matches[-1].group(1))
+        if 0 <= batt <= 100:  # noqa: PLR2004 - percent range is self-documenting
+            result["batt"] = batt
 
     # Groups: /R=...;...;...
     group_match = re.search(r"/R=((?:\d{1,5};?){1,6})", message)
@@ -386,17 +400,33 @@ def parse_aprs_position(message: str) -> dict[str, Any] | None:  # noqa: PLR0912
         "gas": r"/G=([\d.]+)",
         "co2": r"/C=([\d.]+)",
     }
+    # V5: `re.search` (first match) is exploitable by the operator's own free-text
+    # comment, which precedes the extensions on the wire and is unfiltered beyond a
+    # 39-char truncation (command_functions.cpp:3211-3230) — `Standort/H=520m Dach`
+    # ahead of a real `/H=42.5` used to yield hum=520.0, stranding the genuine
+    # reading in `extras`. The firmware's own parser has the identical weakness
+    # (aprs_functions.cpp:606 treats everything from the first `/` as extension
+    # space), so mirroring it fixes nothing; anchoring to an "extension region" is
+    # not possible because there is no boundary between comment and extensions.
+    #
+    # What DOES work: genuine extensions are appended AFTER the comment
+    # (loop_functions.cpp:3772 — `catxt` then `strconcat`), so when a key's pattern
+    # matches more than once, the LAST match is the real sensor reading. On a
+    # well-formed beacon there is exactly one match, so last == first and nothing
+    # changes. Every occurrence (not just the winning one) is still recorded in
+    # matched_spans, so an earlier injected occurrence is excluded from `extras`
+    # too, rather than merely losing the tie-break and reappearing there under a
+    # key that looks like a reading.
     matched_spans: list[tuple[int, int]] = []
     for field, pattern in weather_fields.items():
-        m = re.search(pattern, message)
-        if m:
-            try:
-                # `/O=` wins over the legacy `/T2=` alias: dict order puts temp2 first,
-                # so setdefault leaves an already-parsed real value alone.
-                result.setdefault(field.removesuffix("_legacy"), float(m.group(1)))
-                matched_spans.append(m.span())
-            except ValueError:
-                pass
+        matches = list(re.finditer(pattern, message))
+        if not matches:
+            continue
+        matched_spans.extend(m.span() for m in matches)
+        # `/O=` wins over the legacy `/T2=` alias: dict order puts temp2 first,
+        # so setdefault leaves an already-parsed real value alone.
+        with contextlib.suppress(ValueError):
+            result.setdefault(field.removesuffix("_legacy"), float(matches[-1].group(1)))
 
     # Capture any remaining /KEY=VALUE extensions into extras
     extras: dict[str, float] = {}
