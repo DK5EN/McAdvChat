@@ -1132,13 +1132,18 @@ class IngestMixin(StorageBase):
             if rows:
                 alt = rows[0].get("alt")
 
-        # If QFE missing but QNH + altitude available, calculate QFE (barometric formula)
+        # If QFE missing but QNH + altitude available, calculate QFE (barometric formula).
+        # `qfe_derived` is what the dedup/merge below needs to prefer a MEASURED `/P=`
+        # over this estimate: a station sending both `/Q=` and `/P=` delivers them on
+        # different transports one second apart, and the two disagree by several hPa.
         qnh = data.get("qnh")
+        qfe_derived = False
         # Only use plausible QNH values
         if (qfe is None or qfe == 0) and qnh and alt and qnh > _MIN_PLAUSIBLE_HPA:
             qfe = round(
                 qnh * (1 - BARO_LAPSE_RATE_K_PER_M * alt / BARO_STD_TEMP_K) ** BARO_EXPONENT, 1
             )
+            qfe_derived = True
 
         qnh = None  # Node QNH is unreliable; frontend calculates from QFE + alt
 
@@ -1159,9 +1164,15 @@ class IngestMixin(StorageBase):
             existing = recent_list[0]
             existing_qfe = existing.get("qfe", 0) or 0
             new_has_qfe = qfe is not None and qfe != 0
+            # A `/P=` reading off the sensor beats an estimate the barometric formula
+            # produced from `/Q=` + altitude, and it is what decides replace-vs-merge
+            # below. Without this distinction the pair (existing has QFE, new has QFE)
+            # matched NEITHER branch and fell through to the INSERT — two rows a second
+            # apart, several hPa apart, and a chart that zigzags between them.
+            new_qfe_measured = new_has_qfe and not qfe_derived
 
-            if existing_qfe != 0 and not new_has_qfe:
-                # Existing record has real QFE; merge new non-null sensor values into it
+            if existing_qfe != 0 and not new_qfe_measured:
+                # Existing record's QFE is at least as good; merge new non-null values in
                 merge_sets = []
                 merge_vals = []
                 for col, val in [("temp2", temp2), ("hum2", hum2)]:
@@ -1179,8 +1190,10 @@ class IngestMixin(StorageBase):
                     )
                 return  # keep existing record with real QFE
 
-            if existing_qfe == 0 and new_has_qfe:
-                # New record is better — merge non-null values from old, then replace
+            if new_has_qfe:
+                # Reached only when the new frame wins: either the existing row had no
+                # QFE at all, or the new one measured it while the existing was derived.
+                # Merge non-null values from old, then replace it (never insert alongside).
                 if not (temp2 and temp2 != 0):
                     old_t2 = existing.get("temp2")
                     if old_t2 and old_t2 != 0:

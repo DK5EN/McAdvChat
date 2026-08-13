@@ -786,6 +786,99 @@ async def run_startup_tests() -> bool:  # noqa: PLR0915 - test suite lists one c
                 )
             )
 
+            # 12. Measured `/P=` must REPLACE a derived QFE, not land beside it. A station
+            # sending both `/Q=` and `/P=` (DF8RD-1, DM6CS-12) delivers them on different
+            # transports ~1 s apart: the UDP `tele` frame first, from which the barometric
+            # fallback estimates a QFE, then the BLE copy with the real sensor reading.
+            # Both are non-zero, so the pair (existing has QFE, new has QFE) matched
+            # NEITHER dedup branch and fell through to the INSERT — observed live on
+            # mcapp.local as two rows a second apart, 962.6 vs 966.5 hPa, which charts as
+            # a zigzag. The measured value wins and the derived row is replaced.
+            cs12 = "OE1XYZ-32"
+            alt12 = 542
+            pos12 = {
+                "msg_id": "CCCC0003",
+                "src": cs12,
+                "dst": "*",
+                "msg": "",
+                "type": "pos",
+                "src_type": "lora",
+                "timestamp": base_ts + 40,
+                "rssi": -101,
+                "snr": 4,
+                "lat": 48.22,
+                "lon": 11.68,
+                "alt": alt12,
+            }
+            await storage.store_message(pos12, json.dumps(pos12))
+            # UDP tele: only QNH → QFE gets derived
+            tele12 = {
+                "src": cs12,
+                "type": "tele",
+                "src_type": "lora",
+                "timestamp": base_ts + 41,
+                "temp1": 33.0,
+                "qfe": 0,
+                "qnh": 1026.8,
+            }
+            await storage.store_message(tele12, json.dumps(tele12))
+            derived12 = round(
+                tele12["qnh"]
+                * (1 - BARO_LAPSE_RATE_K_PER_M * alt12 / BARO_STD_TEMP_K) ** BARO_EXPONENT,
+                1,
+            )
+            rows12_before = await _telemetry_rows(cs12)
+            results.append(
+                (
+                    "derived-then-measured: the udp tele frame lands one derived row",
+                    len(rows12_before) == 1 and _approx(rows12_before[0].get("qfe"), derived12),
+                )
+            )
+            # BLE copy of the SAME beacon, 1 s later, carrying the measured `/P=`
+            measured12 = 966.5
+            ble12 = {
+                **pos12,
+                "src_type": "ble_remote",
+                "timestamp": base_ts + 40 + 1000,
+                "msg": f"!4813.45N/01140.98E-/A=001778/P={measured12}/T=33.0/Q=1026.8",
+                "temp1": 33.0,
+                "qfe": measured12,
+                "qnh": 1026.8,
+            }
+            await storage.store_message(ble12, json.dumps(ble12))
+            rows12 = await _telemetry_rows(cs12)
+            results.append(
+                (
+                    (
+                        "derived-then-measured: measured `/P=` REPLACES the derived row"
+                        f" (one row at {measured12}, not two)"
+                    ),
+                    len(rows12) == 1 and _approx(rows12[0].get("qfe"), measured12),
+                )
+            )
+            # ...and the reverse order must not regress: a derived value arriving after a
+            # measured one must not overwrite it (BLE wins the race often enough).
+            tele12b = {
+                "src": cs12,
+                "type": "tele",
+                "src_type": "lora",
+                "timestamp": base_ts + 40 + 2000,
+                "temp1": 33.0,
+                "qfe": 0,
+                "qnh": 1026.8,
+            }
+            await storage.store_message(tele12b, json.dumps(tele12b))
+            rows12b = await _telemetry_rows(cs12)
+            results.append(
+                (
+                    (
+                        "measured-then-derived: a later derived QFE neither replaces nor"
+                        " duplicates the measured row"
+                    ),
+                    len(rows12b) == 1 and _approx(rows12b[0].get("qfe"), measured12),
+                )
+            )
+
             # D4(a): store_message()'s inline classifier-annotation path with a REAL
             # Classifier — every classifier column on the stored row must be populated.
             from .classifier.classify import Classifier  # noqa: PLC0415 - local subtree import
