@@ -23,6 +23,7 @@ from collections.abc import Sequence
 from pathlib import Path
 from typing import Any
 
+from .ble_protocol import parse_aprs_position
 from .logging_setup import get_logger
 from .storage._base import StorageBase
 from .storage.classifier_api import ClassifierApiMixin
@@ -38,7 +39,7 @@ from .storage.constants import (
     db_read,
     db_write,
 )
-from .storage.ingest import _MIN_PLAUSIBLE_HPA, IngestMixin
+from .storage.ingest import _QFE_PLAUSIBLE_HPA_RANGE, IngestMixin
 from .storage.migrations import MigrationsMixin
 from .storage.prefs import PrefsMixin
 from .storage.query import QueryMixin
@@ -651,6 +652,38 @@ async def run_startup_tests() -> bool:  # noqa: PLR0915 - test suite lists one c
                     (callsign,),
                 )
 
+            def _ble_frame_from_aprs(
+                src: str, timestamp: int, msg: str, msg_id: str | None = None, **extra: Any
+            ) -> dict[str, Any]:
+                """Build a store_message()-ready frame from a RAW APRS string via the
+                real `parse_aprs_position()` parser (verdict V8), instead of a
+                hand-typed dict of qfe/gas/temp1/... — every telemetry case above
+                built its frame that way, so the parser -> storage seam was never
+                exercised by any storage test. That is exactly where the `/G=` gas
+                regression lived: the parser filed it into `extras`, storage never
+                looked for a `gas` key, and both suites stayed green. `msg_id`, when
+                given, lets a case ride the dedup-salvage path the same way the
+                hand-built ble11/ble13 fixtures do (matching a preceding `pos`
+                frame's msg_id within the dedup window).
+                """
+                parsed = parse_aprs_position(msg)
+                assert parsed is not None, (  # noqa: S101 - white-box startup test
+                    f"parse_aprs_position rejected fixture APRS string: {msg!r}"
+                )
+                frame: dict[str, Any] = {
+                    "src": src,
+                    "dst": "*",
+                    "msg": msg,
+                    "type": "pos",
+                    "src_type": "ble_remote",
+                    "timestamp": timestamp,
+                    **parsed,
+                }
+                if msg_id is not None:
+                    frame["msg_id"] = msg_id
+                frame.update(extra)
+                return frame
+
             # 10. Extern-UDP `tele` datagram: QNH → QFE derivation must fire even though
             # the datagram carries no altitude of its own. The firmware's tele document
             # (`extudp_functions.cpp:471-481`) is batt/temp1/temp2/hum/qfe/qnh/gas/co2
@@ -686,7 +719,7 @@ async def run_startup_tests() -> bool:  # noqa: PLR0915 - test suite lists one c
                 "temp1": 33.5,
                 "temp2": 22.4,
                 "hum": 0,
-                "qfe": 0,  # the `/F=` integer, discarded by _MIN_PLAUSIBLE_HPA
+                "qfe": 0,  # the `/F=` altitude; discarded by src_type == "lora", not magnitude
                 "qnh": 1026.8,
                 "gas": 0,
                 "co2": 0,
@@ -710,8 +743,9 @@ async def run_startup_tests() -> bool:  # noqa: PLR0915 - test suite lists one c
             )
             results.append(
                 (
-                    "udp tele: the implausible `/F=`-sourced qfe is not stored raw",
-                    (t10_qfe := t10.get("qfe")) is not None and t10_qfe >= _MIN_PLAUSIBLE_HPA,
+                    "udp tele: the `/F=`-sourced qfe is not stored raw (0)",
+                    (t10_qfe := t10.get("qfe")) is not None
+                    and t10_qfe >= _QFE_PLAUSIBLE_HPA_RANGE[0],
                 )
             )
 
@@ -906,7 +940,9 @@ async def run_startup_tests() -> bool:  # noqa: PLR0915 - test suite lists one c
             }
             await storage.store_message(pos13, json.dumps(pos13))
             # UDP tele: gas + temp2 + co2, no usable QFE (BME680 stations send no `/Q=`,
-            # and the `qfe` key here is the `/F=` integer, discarded as implausible).
+            # and the `qfe` key here is the `/F=` altitude, discarded by src_type ==
+            # "lora" — note 453 m would have passed the old >850 magnitude floor's
+            # sibling case, but not this one; see verdict V4).
             tele13 = {
                 "src": cs13,
                 "type": "tele",
@@ -1130,6 +1166,202 @@ async def run_startup_tests() -> bool:  # noqa: PLR0915 - test suite lists one c
                     and _approx(r15.get("temp1"), 18.4)
                     and _approx(r15.get("temp2"), 12.5)
                     and not r15.get("qfe"),
+                )
+            )
+
+            # 16. V4: the `lora`-variant tele's `qfe` key is fed from `/F=`, a
+            # barometric ALTITUDE in metres, never a pressure at any magnitude. 1043
+            # is chosen because it clears the OLD `_MIN_PLAUSIBLE_HPA = 850` floor
+            # (1043 >= 850), so this case would have PASSED under that magnitude
+            # heuristic — DO9ALM-5-class stations above 850 m altitude used to store
+            # their altitude as their station pressure. Kills: any `qfe` handling
+            # that goes back to `raw_qfe < N` instead of `src_type == "lora"`.
+            cs16 = "OE1XYZ-42"
+            tele16 = {
+                "src": cs16,
+                "type": "tele",
+                "src_type": "lora",
+                "timestamp": base_ts + 400,
+                "batt": 70,
+                "temp1": 12.0,
+                "qfe": 1043,  # `/F=`: a 1043 m barometric altitude, not a pressure
+                "qnh": 0,
+            }
+            await storage.store_message(tele16, json.dumps(tele16))
+            rows16 = await _telemetry_rows(cs16)
+            r16 = rows16[0] if rows16 else {}
+            results.append(
+                (
+                    (
+                        "V4: a lora tele's /F=-sourced qfe=1043 (a 1043 m altitude) is"
+                        " NOT stored as a pressure, even though 1043 clears the old"
+                        " >850 magnitude floor"
+                    ),
+                    len(rows16) == 1 and r16.get("qfe") is None,
+                )
+            )
+
+            # 17. V4a (node variant): the `node`-variant tele's `qfe` key is fed from
+            # `node_press` — a genuine hPa reading, unlike the `lora` variant's `/F=`
+            # altitude (verdict V2a table). Kills a "fix" that discards `qfe` for
+            # every tele frame regardless of src_type, which would silently blind
+            # every own-node pressure reading while still passing case 16.
+            cs17 = "OE1XYZ-43"
+            tele17 = {
+                "src": cs17,
+                "type": "tele",
+                "src_type": "node",
+                "timestamp": base_ts + 420,
+                "temp1": 18.5,
+                "qfe": 968.4,  # node_press: a real hPa reading
+                "qnh": 0,
+                # The node variant has no `batt` key on the wire and emits gas/co2
+                # unconditionally (verdict V2a) — deliberately not mirrored here
+                # since this case's target is qfe discrimination, not those fields.
+            }
+            await storage.store_message(tele17, json.dumps(tele17))
+            rows17 = await _telemetry_rows(cs17)
+            r17 = rows17[0] if rows17 else {}
+            results.append(
+                (
+                    (
+                        "V4a: a node tele's real qfe (968.4 hPa, node_press) is stored,"
+                        " not discarded"
+                    ),
+                    len(rows17) == 1 and _approx(r17.get("qfe"), 968.4),
+                )
+            )
+
+            # 18. V4a (Alpine altitude): a genuine sub-850 hPa station pressure must
+            # survive. DO9ALM-5 sits at ~1746 m (`/A=005727` feet round-trips to
+            # 1746 m), where true QFE runs ~820 hPa — the OLD `_MIN_PLAUSIBLE_HPA =
+            # 850` floor discarded exactly this reading as "a firmware mapping
+            # error". Built via the real APRS parser (also exercises Task 2's seam
+            # for the BLE `/P=` path). Kills: any residual `raw_qfe < N` lower bound
+            # that still rejects genuine Alpine pressure.
+            cs18 = "DO9ALM-5"
+            msg18 = "!4703.00N/01123.00E-/A=005727/B=070/P=820.0/T=5.0/H=60.0"
+            pos18 = _ble_frame_from_aprs(cs18, base_ts + 440, msg18)
+            await storage.store_message(pos18, json.dumps(pos18))
+            rows18 = await _telemetry_rows(cs18)
+            r18 = rows18[0] if rows18 else {}
+            results.append(
+                (
+                    (
+                        "V4a: a genuine sub-850 hPa Alpine QFE (DO9ALM-5, ~1746 m,"
+                        " 820.0 hPa via /P= on BLE) is stored, not discarded"
+                    ),
+                    len(rows18) == 1 and _approx(r18.get("qfe"), 820.0),
+                )
+            )
+
+            # 19. Task 2 / V8 seam, dual-transport sibling of case 11: the UDP `pos`
+            # datagram lands first with no telemetry, then a BLE copy — built from a
+            # RAW APRS string through the real `parse_aprs_position()`, not a
+            # hand-typed dict — carries `/P=` and `/G=` on the dedup-salvage path.
+            # Kills a parser/storage key-name mismatch (the exact shape of the `/G=`
+            # gas regression) that a hand-built fixture cannot detect.
+            cs19 = "OE1XYZ-44"
+            udp19 = {
+                "msg_id": "CCCC0019",
+                "src": cs19,
+                "dst": "*",
+                "msg": "",
+                "type": "pos",
+                "src_type": "lora",
+                "timestamp": base_ts + 460,
+                "rssi": -110,
+                "snr": -10,
+                "lat": 48.2,
+                "lon": 11.6,
+                "alt": 0,
+                "batt": 55,
+            }
+            await storage.store_message(udp19, json.dumps(udp19))
+            msg19 = "!4812.00N/01136.00E-/B=055/P=955.5/H=33.2/T=21.4/G=210.0/V=3"
+            ble19 = _ble_frame_from_aprs(cs19, base_ts + 460 + 200, msg19, msg_id="CCCC0019")
+            await storage.store_message(ble19, json.dumps(ble19))
+            rows19 = await _telemetry_rows(cs19)
+            r19 = rows19[0] if rows19 else {}
+            results.append(
+                (
+                    (
+                        "parser-driven dual-transport: /P= pressure, parsed via the real"
+                        " parse_aprs_position(), is stored (955.5 hPa)"
+                    ),
+                    len(rows19) == 1 and _approx(r19.get("qfe"), 955.5),
+                )
+            )
+            results.append(
+                (
+                    (
+                        "parser-driven dual-transport: /G= gas resistance, parsed via"
+                        " the real parser, is stored too (210.0)"
+                    ),
+                    _approx(r19.get("gas"), 210.0),
+                )
+            )
+
+            # 20. Task 2 / V8 seam, BME680 sibling of case 13: gas/co2 arrive on the
+            # UDP tele frame, the pressure arrives ~200 ms later on a BLE copy built
+            # from a raw APRS string via the real parser and carrying NO gas/co2 of
+            # its own — the merge must carry the earlier gas/co2 forward onto the
+            # measured-pressure row rather than dropping them (V2's failure mode),
+            # and this time the BLE side's absence of `/G=`/`/C=` is enforced by the
+            # parser's own output, not by a hand-typed dict omission.
+            cs20 = "OE1XYZ-45"
+            pos20 = {
+                "msg_id": "CCCC0020",
+                "src": cs20,
+                "dst": "*",
+                "msg": "",
+                "type": "pos",
+                "src_type": "lora",
+                "timestamp": base_ts + 480,
+                "rssi": -112,
+                "snr": -9,
+                "lat": 48.423,
+                "lon": 11.7866,
+                "alt": 0,
+                "batt": 58,
+            }
+            await storage.store_message(pos20, json.dumps(pos20))
+            tele20 = {
+                "src": cs20,
+                "type": "tele",
+                "src_type": "lora",
+                "timestamp": base_ts + 481,
+                "batt": 58,
+                "temp1": 30.1,
+                "temp2": 16.5,
+                "hum": 22.0,
+                "qfe": 410,  # `/F=` altitude, discarded by src_type == "lora"
+                "qnh": 0,
+                "gas": 240.3,
+                "co2": 398,
+            }
+            await storage.store_message(tele20, json.dumps(tele20))
+            msg20 = "!4825.38N\\01147.20E-/B=058/P=958.2/H=22.0/T=30.1/O=16.5/V=3"
+            ble20 = _ble_frame_from_aprs(cs20, base_ts + 480 + 200, msg20, msg_id="CCCC0020")
+            await storage.store_message(ble20, json.dumps(ble20))
+            rows20 = await _telemetry_rows(cs20)
+            r20 = rows20[0] if rows20 else {}
+            results.append(
+                (
+                    (
+                        "parser-driven BME680: the parser-built measured /P= (958.2)"
+                        " replaces the derived-absent qfe in one row"
+                    ),
+                    len(rows20) == 1 and _approx(r20.get("qfe"), 958.2),
+                )
+            )
+            results.append(
+                (
+                    (
+                        "parser-driven BME680: gas/co2 from the earlier tele frame"
+                        " survive onto that same row (240.3 / 398)"
+                    ),
+                    _approx(r20.get("gas"), 240.3) and _approx(r20.get("co2"), 398),
                 )
             )
 

@@ -373,10 +373,13 @@ def parse_aprs_position(message: str) -> dict[str, Any] | None:  # noqa: PLR0912
     # Two traps live here. `/F=` is the firmware's `qfe` VARIABLE but is not a pressure at
     # all: it carries `node_press_alt`, the BME680's barometric altitude in METRES
     # (`bme680.cpp:139`, printed as `ALT:%5im / %5im` at `loop_functions.cpp:1452`). It
-    # must stay OUT of this table; the real station pressure is `/P=`. Note the magnitude
-    # heuristic downstream (`_MIN_PLAUSIBLE_HPA`) does NOT reliably separate the two — an
-    # altitude above 850 m reads as a plausible pressure — so the exclusion has to happen
-    # here, by key, not there by value.
+    # must stay OUT of this table; the real station pressure is `/P=`. The exclusion has
+    # to happen here, by key: no magnitude test can separate the two, because an altitude
+    # above 850 m reads as a perfectly plausible pressure. `store_telemetry` makes the
+    # same distinction by key for the Extern-UDP path (it discards the `lora`-variant
+    # tele `qfe`, which is `/F=`-fed, on `src_type`), and its
+    # `_QFE_PLAUSIBLE_HPA_RANGE` is only a garbage-value sanity check — not a
+    # pressure/altitude discriminator. See verdict findings V4/V4a.
     #
     # And temp2/gas/co2 arrive as `/O=`, `/G=`, `/C=`: while they were missing from this
     # table they fell through to `extras` as opaque single letters, so the columns stayed

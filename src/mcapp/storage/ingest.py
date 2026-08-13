@@ -58,7 +58,21 @@ from .telemetry_reconcile import (
 )
 
 _MAX_FORENSIC_HOPS = 4  # log raw data for messages routed over more hops
-_MIN_PLAUSIBLE_HPA = 850  # pressure below this is a firmware mapping error
+
+# Physical sanity range (hPa) for a GENUINE qfe reading — src_type == "node" tele's
+# `node_press`, or BLE `/P=` via `parse_aprs_position`. This is a garbage-value floor
+# and ceiling only; it plays NO role in telling a real pressure from the `lora`-variant
+# tele's `/F=`-sourced barometric ALTITUDE (see the src_type dispatch in
+# store_telemetry — verdict V4/V4a: magnitude cannot do that job in either direction,
+# because an altitude above 850 m passes a >850 floor and a genuine high-altitude QFE
+# fails it). Bounds: recorded sea-level pressure extremes run ~870-1085 hPa (deepest
+# cyclone to strongest anticyclone); station-level QFE drops further before any
+# sea-level correction, and this mesh already has stations as high as ~1750 m
+# (DO9ALM-5, true QFE ~820 hPa; DB0HOB-12 1543 m, ~841 hPa) that a tighter floor would
+# discard. 300 hPa corresponds to roughly 9000 m — no station on this network is
+# remotely close, so it is a plausibility check, not an active constraint on real
+# traffic; 1100 hPa gives the same margin above the recorded high.
+_QFE_PLAUSIBLE_HPA_RANGE = (300, 1100)
 
 # A `pos` frame is a weather beacon if it carries any sensor reading. Every APRS
 # weather extension the firmware emits is listed, not just the `/P=`+`/T=`+`/H=`
@@ -919,10 +933,13 @@ class IngestMixin(StorageBase):
         # only lat/lon/alt/batt — while the BLE copy carries the full APRS string with
         # its `/P=` station pressure. UDP is the faster path, so it lands first and the
         # BLE copy hits this gate; returning outright dropped the ONLY carrier of `/P=`
-        # in the system. (The `tele` datagram that rides along with the UDP `pos` cannot
-        # substitute: its `qfe` key is fed from the firmware's `/F=` field — a small
-        # integer, not a pressure — so `_MIN_PLAUSIBLE_HPA` correctly discards it, and
-        # the document has no `press` key at all. `extudp_functions.cpp:471-481`.)
+        # in the system. (The `lora`-variant `tele` datagram that rides along with the
+        # UDP `pos` cannot substitute: its `qfe` key is fed from the firmware's `/F=`
+        # field — a barometric ALTITUDE IN METRES, not a pressure at any magnitude — so
+        # `store_telemetry` discards it by `src_type == "lora"`, not by size, and the
+        # document has no `press` key at all. `extudp_functions.cpp:470-480`. The
+        # `node`-variant tele, by contrast, DOES carry a real hPa in `qfe`
+        # (`node_press`, `extudp_functions.cpp:459`) — see verdict V4/V4a.)
         # Salvaging telemetry here is safe against a genuine double-delivered datagram:
         # `store_telemetry` has its own 60 s window that merges rather than duplicates.
         if msg_id is not None:
@@ -1153,12 +1170,32 @@ class IngestMixin(StorageBase):
         )
         incoming_extras_json = json.dumps(extras_dict) if extras_dict else None
 
-        # QFE < 850 hPa is unrealistic (firmware mapping error in UDP LoRa telemetry —
-        # the `lora`-variant tele's `qfe` key is fed from `/F=`, a barometric altitude
-        # in metres, not a pressure). By src_type+key, not magnitude, is wave 3's fix
-        # (verdict V4/V4a); this filter is unchanged from before this refactor.
+        # QFE is discriminated by (src_type, key) — the exact firmware wiring — never
+        # by magnitude, which fails in BOTH directions (verdict V4/V4a: an `/F=`
+        # altitude above 850 m used to pass a >850 floor as a plausible pressure, and a
+        # genuine high-altitude QFE below 850 hPa used to be discarded as implausible):
+        #
+        #   src_type == "lora"  Extern-UDP `tele`, relayed-node variant. `qfe` is fed
+        #                       from `aprspos.qfe`, filled ONLY from the APRS `/F=`
+        #                       field — the BME680's barometric ALTITUDE in metres
+        #                       (`bme680.cpp:139`, `extudp_functions.cpp:477`,
+        #                       `aprs_functions.cpp:800-807`). Never a pressure, at any
+        #                       magnitude. Must never reach the qfe column.
+        #   src_type == "node"  Extern-UDP `tele`, own-node variant. `qfe` is fed from
+        #                       `node_press` (`extudp_functions.cpp:459`) — a real hPa
+        #                       reading.
+        #   src_type in         BLE APRS text via `parse_aprs_position`'s `/P=` match —
+        #   ("ble","ble_remote", a real station pressure.
+        #    "BLE")
+        #
+        # `_QFE_PLAUSIBLE_HPA_RANGE` below is applied ONLY to the two genuine sources,
+        # as a garbage-value sanity check, not as the pressure/altitude discriminator —
+        # that job is done above, by key, not by size.
         raw_qfe = data.get("qfe")
-        if raw_qfe is not None and raw_qfe < _MIN_PLAUSIBLE_HPA:
+        qfe_out_of_range = raw_qfe is not None and not (
+            _QFE_PLAUSIBLE_HPA_RANGE[0] <= raw_qfe <= _QFE_PLAUSIBLE_HPA_RANGE[1]
+        )
+        if src_type == "lora" or qfe_out_of_range:
             raw_qfe = None
 
         # Altitude for frames that carry none of their own — APRS `T#` telemetry and,
@@ -1184,7 +1221,7 @@ class IngestMixin(StorageBase):
         qfe_reading: Reading
         if raw_qfe is not None:
             qfe_reading = measured(raw_qfe)
-        elif qnh_raw and alt and qnh_raw > _MIN_PLAUSIBLE_HPA:
+        elif qnh_raw and alt and qnh_raw > _QFE_PLAUSIBLE_HPA_RANGE[0]:
             qfe_reading = derived(
                 round(
                     qnh_raw
