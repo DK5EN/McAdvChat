@@ -1155,7 +1155,7 @@ class IngestMixin(StorageBase):
 
         # Dedup: if telemetry for same callsign exists within 60s, merge & keep best
         recent = await self._query(
-            "SELECT id, temp2, hum2, qfe, extras"
+            "SELECT id, temp1, temp2, hum, hum2, qfe, gas, co2, batt, extras"
             " FROM telemetry WHERE callsign = ? AND timestamp > ?",
             (callsign, timestamp - TELEMETRY_DEDUP_WINDOW_MS),
         )
@@ -1193,15 +1193,34 @@ class IngestMixin(StorageBase):
             if new_has_qfe:
                 # Reached only when the new frame wins: either the existing row had no
                 # QFE at all, or the new one measured it while the existing was derived.
-                # Merge non-null values from old, then replace it (never insert alongside).
-                if not (temp2 and temp2 != 0):
-                    old_t2 = existing.get("temp2")
-                    if old_t2 and old_t2 != 0:
-                        temp2 = old_t2
-                if not (hum2 and hum2 != 0):
-                    old_h2 = existing.get("hum2")
-                    if old_h2 and old_h2 != 0:
-                        hum2 = old_h2
+                # Replace it — but carry over EVERY reading the winner does not itself
+                # carry first, because the two frames are not supersets of each other.
+                # The row being replaced came from the Extern-UDP `tele` datagram, whose
+                # JSON has real `gas`/`co2`/`batt` keys; the winner is the BLE copy of
+                # the same beacon, which carries the pressure but leaves those NULL. While
+                # this merge only covered temp2/hum2/extras, every BME680 station traded
+                # its gas resistance for the pressure the moment the salvage path started
+                # working — DL2JA-2 went from 42 rows with gas and none with QFE to 14
+                # with QFE and none with gas. Both readings belong on the same row.
+                carried = {
+                    "temp1": temp1,
+                    "temp2": temp2,
+                    "hum": hum,
+                    "hum2": hum2,
+                    "gas": gas,
+                    "co2": co2,
+                    "batt": batt,
+                }
+                for col, val in carried.items():
+                    if not val:  # None and 0 both mean "this frame has no reading"
+                        carried[col] = existing.get(col) or val
+                temp1 = carried["temp1"]
+                temp2 = carried["temp2"]
+                hum = carried["hum"]
+                hum2 = carried["hum2"]
+                gas = carried["gas"]
+                co2 = carried["co2"]
+                batt = carried["batt"]
                 if not extras_json and existing.get("extras"):
                     extras_json = existing["extras"]
                 await self._mutate(

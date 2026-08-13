@@ -105,6 +105,17 @@ APRS_HUM = 42.1
 APRS_QFE = 940.3
 APRS_QNH = 956.9
 
+# A real BME680 beacon as DL2JA-2 sends it. The firmware emits temp2/gas/co2 as
+# /O= /G= /C= (loop_functions.cpp 3667/3690/3699) — never /T2=, which no firmware
+# has ever written — and /F= is its integer `qfe` variable, NOT a pressure. While
+# /O= /G= /C= were absent from the parser's table they fell through to `extras` as
+# opaque letters, so the columns stayed NULL and the gas chart had nothing to draw.
+APRS_BME680 = "!4825.38N/01147.20E-/B=060/P=960.0/H=28.5/T=31.1/O=17.8/F=453/G=236.8/C=412/V=3"
+APRS_BME680_TEMP2 = 17.8
+APRS_BME680_GAS = 236.8
+APRS_BME680_CO2 = 412.0
+APRS_BME680_F = 453.0
+
 # --- APRS symbol table id: '/', '\', or an overlay (0-9 A-Z) ---------------
 # Built from chr(92) rather than a backslash literal, for the same reason
 # `udp_parsing_tests.py` mandates it: in Python source the correct value is
@@ -383,6 +394,44 @@ def _test_aprs_position(results: list[tuple[str, bool]]) -> None:
         _check(results, "APRS /H= humidity", _close(full["hum"], APRS_HUM))
         _check(results, "APRS /P= QFE", _close(full["qfe"], APRS_QFE))
         _check(results, "APRS /Q= QNH", _close(full["qnh"], APRS_QNH))
+
+    bme = parse_aprs_position(APRS_BME680)
+    if bme is None:
+        _check(results, "parse_aprs_position on a BME680 beacon returns a dict", False)
+    else:
+        _check(
+            results,
+            "APRS /O= -> temp2 (not extras)",
+            _close(bme.get("temp2", 0.0), APRS_BME680_TEMP2),
+        )
+        _check(
+            results, "APRS /G= -> gas (not extras)", _close(bme.get("gas", 0.0), APRS_BME680_GAS)
+        )
+        _check(
+            results, "APRS /C= -> co2 (not extras)", _close(bme.get("co2", 0.0), APRS_BME680_CO2)
+        )
+        _check(
+            results,
+            "APRS /P= still the pressure on a BME680 beacon",
+            _close(bme.get("qfe", 0.0), 960.0),
+        )
+        # /F= is the firmware's integer `qfe` variable and is NOT a pressure: it must
+        # never reach the qfe field, and stays an opaque extra.
+        _check(
+            results,
+            "APRS /F= never lands in qfe",
+            not _close(bme.get("qfe", 0.0), APRS_BME680_F),
+        )
+        _check(
+            results,
+            "APRS /F= stays in extras",
+            _close(bme.get("extras", {}).get("F", 0.0), APRS_BME680_F),
+        )
+        _check(
+            results,
+            "APRS /O= /G= /C= no longer leak into extras",
+            not ({"O", "G", "C"} & set(bme.get("extras", {}))),
+        )
 
     _check(
         results,

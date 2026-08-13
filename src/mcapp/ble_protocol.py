@@ -349,23 +349,51 @@ def parse_aprs_position(message: str) -> dict[str, Any] | None:  # noqa: PLR0912
             if g.isdigit():
                 result[f"group_{i}"] = int(g)
 
-    # Weather fields from weather stations (e.g. DK5EN-12)
-    # /P=940.3 (QFE), /H=42.1 (humidity), /T=22.6 (temp), /Q=956.9 (QNH)
-    # /T2=... (temp2), /H2=... (hum2) for dual-sensor stations
+    # Weather fields from weather stations (e.g. DK5EN-12). The key→quantity mapping is
+    # the firmware's, not APRS convention — see `PositionToAPRS` (loop_functions.cpp
+    # 3646-3699), which is the only thing that emits these:
+    #
+    #   /P= press (station pressure, i.e. QFE)   /Q= qnh      /T= temp1
+    #   /O= temp2   /H= hum   /G= gasres   /C= co2   /V= sensor generation
+    #
+    # Two traps live here. `/F=` is the firmware's `qfe` VARIABLE but is not a pressure at
+    # all: it carries `node_press_alt`, the BME680's barometric altitude in METRES
+    # (`bme680.cpp:139`, printed as `ALT:%5im / %5im` at `loop_functions.cpp:1452`). It
+    # must stay OUT of this table; the real station pressure is `/P=`. Note the magnitude
+    # heuristic downstream (`_MIN_PLAUSIBLE_HPA`) does NOT reliably separate the two — an
+    # altitude above 850 m reads as a plausible pressure — so the exclusion has to happen
+    # here, by key, not there by value.
+    #
+    # And temp2/gas/co2 arrive as `/O=`, `/G=`, `/C=`: while they were missing from this
+    # table they fell through to `extras` as opaque single letters, so the columns stayed
+    # NULL and the gas-resistance chart had nothing to draw even though every beacon
+    # carried the reading.
+    #
+    # `/T2=`/`/H2=` were mapped here historically and no firmware has ever emitted them
+    # (empty `git log --all -S` across the firmware history). `/T2=` is kept as a harmless
+    # legacy alias for temp2 only because `/T=` cannot match it. `hum2` has NO source
+    # anywhere: no `/H2=` on the wire, and neither Extern-UDP `tele` variant carries a
+    # `hum2` key (`extudp_functions.cpp:450-459` and `:470-480`). It is dead and only
+    # still listed so the column's absence is explained rather than rediscovered.
     weather_fields = {
         "temp1": r"/T=(-?[\d.]+)",
-        "temp2": r"/T2=(-?[\d.]+)",
+        "temp2": r"/O=(-?[\d.]+)",
+        "temp2_legacy": r"/T2=(-?[\d.]+)",
         "hum": r"/H=([\d.]+)",
         "hum2": r"/H2=([\d.]+)",
         "qfe": r"/P=([\d.]+)",
         "qnh": r"/Q=([\d.]+)",
+        "gas": r"/G=([\d.]+)",
+        "co2": r"/C=([\d.]+)",
     }
     matched_spans: list[tuple[int, int]] = []
     for field, pattern in weather_fields.items():
         m = re.search(pattern, message)
         if m:
             try:
-                result[field] = float(m.group(1))
+                # `/O=` wins over the legacy `/T2=` alias: dict order puts temp2 first,
+                # so setdefault leaves an already-parsed real value alone.
+                result.setdefault(field.removesuffix("_legacy"), float(m.group(1)))
                 matched_spans.append(m.span())
             except ValueError:
                 pass

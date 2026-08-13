@@ -645,7 +645,7 @@ async def run_startup_tests() -> bool:  # noqa: PLR0915 - test suite lists one c
 
             async def _telemetry_rows(callsign: str) -> list[dict[str, Any]]:
                 return await storage._query(  # noqa: SLF001 - white-box startup test
-                    "SELECT temp1, hum, qfe, gas, alt FROM telemetry"
+                    "SELECT temp1, temp2, hum, qfe, gas, co2, batt, alt FROM telemetry"
                     " WHERE callsign = ? ORDER BY timestamp",
                     (callsign,),
                 )
@@ -876,6 +876,88 @@ async def run_startup_tests() -> bool:  # noqa: PLR0915 - test suite lists one c
                         " duplicates the measured row"
                     ),
                     len(rows12b) == 1 and _approx(rows12b[0].get("qfe"), measured12),
+                )
+            )
+
+            # 13. A BME680 station (DL2JA-2) puts gas resistance on the UDP `tele`
+            # datagram and the pressure only on the BLE copy, and the two frames are NOT
+            # supersets of each other. When the measured `/P=` replaces the tele row it
+            # must CARRY the gas over, not drop it: while the merge covered only
+            # temp2/hum2/extras, every BME680 station traded its gas for the pressure the
+            # moment the salvage path started working — observed on mcapp.local as
+            # DL2JA-2 going from 42 rows with gas and none with QFE, to 14 with QFE and
+            # none with gas. One row, both readings.
+            cs13 = "OE1XYZ-33"
+            pos13 = {
+                "msg_id": "CCCC0004",
+                "src": cs13,
+                "dst": "*",
+                "msg": "",
+                "type": "pos",
+                "src_type": "lora",
+                "timestamp": base_ts + 60,
+                "rssi": -117,
+                "snr": -7,
+                "lat": 48.423,
+                "lon": 11.7866,
+                "alt": 0,
+                "batt": 61,
+            }
+            await storage.store_message(pos13, json.dumps(pos13))
+            # UDP tele: gas + temp2 + co2, no usable QFE (BME680 stations send no `/Q=`,
+            # and the `qfe` key here is the `/F=` integer, discarded as implausible).
+            tele13 = {
+                "src": cs13,
+                "type": "tele",
+                "src_type": "lora",
+                "timestamp": base_ts + 61,
+                "batt": 61,
+                "temp1": 32.3,
+                "temp2": 17.8,
+                "hum": 24.2,
+                "qfe": 453,
+                "qnh": 0,
+                "gas": 251.7,
+                "co2": 412,
+            }
+            await storage.store_message(tele13, json.dumps(tele13))
+            rows13_before = await _telemetry_rows(cs13)
+            results.append(
+                (
+                    "BME680: udp tele row carries gas but no QFE",
+                    len(rows13_before) == 1
+                    and _approx(rows13_before[0].get("gas"), 251.7)
+                    and not rows13_before[0].get("qfe"),
+                )
+            )
+            # The BLE copy of the same beacon: pressure on `/P=`, gas on `/G=`.
+            ble13 = {
+                **pos13,
+                "src_type": "ble_remote",
+                "timestamp": base_ts + 60 + 200,
+                "msg": "!4825.38N\\01147.20E-/B=060/P=960.0/H=24.2/T=32.3/O=17.8/F=453/G=236.8/V=3",
+                "temp1": 32.3,
+                "hum": 24.2,
+                "qfe": 960.0,
+                # Deliberately NO gas/co2/batt: this frame stands for a BLE copy that
+                # carries only the pressure, so the assertion below tests the MERGE
+                # rather than the parser mapping (covered in ble_protocol_tests).
+            }
+            await storage.store_message(ble13, json.dumps(ble13))
+            rows13 = await _telemetry_rows(cs13)
+            r13 = rows13[0] if rows13 else {}
+            results.append(
+                (
+                    "BME680: one row carrying BOTH the measured pressure and the gas",
+                    len(rows13) == 1
+                    and _approx(r13.get("qfe"), 960.0)
+                    and _approx(r13.get("gas"), 251.7),
+                )
+            )
+            results.append(
+                (
+                    "BME680: co2 and batt survive the replacement too",
+                    _approx(r13.get("co2"), 412) and _approx(r13.get("batt"), 61),
                 )
             )
 
