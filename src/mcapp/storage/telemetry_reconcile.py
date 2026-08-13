@@ -127,9 +127,35 @@ class Reading:
     `__post_init__` so the `0.0`-is-not-absence bug (V6) cannot be
     reintroduced by a future caller passing `None` alongside a non-ABSENT
     provenance, or a falsy-but-real value alongside `ABSENT`.
+
+    DECODING SENTINELS IS THE CALLER'S JOB, AND IT IS TRANSPORT-DEPENDENT.
+    This module refuses to guess: it has no truthiness check anywhere, so it
+    cannot tell a real 0.0 from a wire sentinel, and mapping one rule over
+    both transports is wrong in both directions:
+
+    * Extern-UDP `tele` JSON emits EVERY key unconditionally from
+      zero-initialised fields (`extudp_functions.cpp:450-459` and
+      `:470-480`), so there `0` means "no sensor fitted" and must become
+      `absent()`. Mapping it to `measured(0.0)` makes a sensorless node's
+      zeros tie with, and on newer timestamps beat, a real reading from the
+      other transport — reproducing the gas/CO2 destruction of verdict
+      V2a case (b) through fully contract-compliant wiring.
+    * The BLE APRS text path emits a `/KEY=` only when the sensor is real
+      (`loop_functions.cpp:3646-3699`), so there a parsed `0.0` is genuine
+      and must become `measured(0.0)`. Mapping it to `absent()` is V6
+      verbatim.
+
+    Provenance of values read back from the `telemetry` table: label
+    non-NULL columns `MEASURED`. Provenance is not persisted, and the
+    plausible-looking alternative — "we cannot prove it was measured, call
+    it DERIVED" — hands every replayed stale frame a `prov >` win that
+    bypasses the chronology gate entirely, rebuilding V1 in the caller while
+    this module works exactly as designed. Accepted limitation of labelling
+    MEASURED: an older replayed measured `/P=` will not displace a newer
+    derived qfe. That costs a few hPa on one row and is the safe direction.
     """
 
-    value: float | int | str | None
+    value: float | int | None
     prov: Provenance
 
     def __post_init__(self) -> None:
@@ -146,14 +172,14 @@ def absent() -> Reading:
     return Reading(None, Provenance.ABSENT)
 
 
-def measured(value: float | int | str) -> Reading:
+def measured(value: float | int) -> Reading:
     """A real sensor/parsed reading. `0.0`, negative values, and empty
     strings are all legitimate — only `None` means absence, and the type
     signature already excludes it here."""
     return Reading(value, Provenance.MEASURED)
 
 
-def derived(value: float | int | str) -> Reading:
+def derived(value: float | int) -> Reading:
     """An estimate computed from other measured fields (e.g. QFE from
     QNH + altitude via the barometric formula), never a direct sensor read."""
     return Reading(value, Provenance.DERIVED)
@@ -190,6 +216,23 @@ class Action(Enum):
     upsert is the only writer of those values, and the old MERGE branch's
     early `return` before it (part of V2) is exactly the bug this note
     exists to prevent from recurring.
+
+    Two binding rules for that upsert, because "run it on every action" on
+    its own steers a caller straight back into V1:
+
+    * Bind the MERGED values (`values_for()`), never the raw incoming
+      frame's. `station_positions` fills via `COALESCE(NULLIF(excluded.x,
+      0), …)`, so binding a replayed frame's raw values lets stale readings
+      overwrite current ones on the very path that just decided they must
+      not win the `telemetry` row.
+    * Bind `max(existing_ts, incoming_ts)` for `telemetry_ts`, not the
+      incoming frame's timestamp. Unlike `last_seen`, `telemetry_ts` has no
+      `MAX()` guard in the upsert (`ingest.py`, `telemetry_ts =
+      excluded.telemetry_ts`), so a replayed frame — every deploy flushes up
+      to 1000 of them from ble_service's buffer, carrying original
+      timestamps — would walk the station's freshness backwards by up to the
+      dedup window. That is V1's mechanism relocated one level out, which is
+      how it would survive this refactor.
     """
 
     #: No row existed in the dedup window. Insert a new row from the
@@ -379,7 +422,7 @@ def column_names() -> tuple[str, ...]:
     return ALL_FIELDS
 
 
-def values_for(merged: Mapping[str, Reading]) -> tuple[float | int | str | None, ...]:
+def values_for(merged: Mapping[str, Reading]) -> tuple[float | int | None, ...]:
     """Unwrap a merged `ALL_FIELDS`-keyed reading map (as returned by
     `reconcile()`) into a plain value tuple in `column_names()` order,
     ready to bind positionally into an INSERT or UPDATE. Raises
