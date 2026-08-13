@@ -646,7 +646,7 @@ async def run_startup_tests() -> bool:  # noqa: PLR0915 - test suite lists one c
 
             async def _telemetry_rows(callsign: str) -> list[dict[str, Any]]:
                 return await storage._query(  # noqa: SLF001 - white-box startup test
-                    "SELECT temp1, temp2, hum, qfe, gas, co2, batt, alt FROM telemetry"
+                    "SELECT timestamp, temp1, temp2, hum, qfe, gas, co2, batt, alt FROM telemetry"
                     " WHERE callsign = ? ORDER BY timestamp",
                     (callsign,),
                 )
@@ -995,11 +995,20 @@ async def run_startup_tests() -> bool:  # noqa: PLR0915 - test suite lists one c
                     and [r.get("temp1") for r in rows14_before] == temp14,
                 )
             )
+            # The replay must be marginally NEWER than the row it dedups against, which
+            # is what a real ble_service replay looks like: the buffered BLE copy of a
+            # beacon lands ~200 ms after the UDP `tele` row for the same beacon, so
+            # `incoming_is_newer` is True and the REPLACE path — the one that runs the
+            # DELETE — actually fires. Pinning it to `ts14[0]` exactly (as this case
+            # first did) yields UPDATE_EXISTING instead, so the DELETE never executed in
+            # any test and reverting the V1 fix to the old unbounded predicate left the
+            # whole gated suite green. The frame is still OLD in absolute terms: three
+            # seeded rows sit far past it and must survive.
             replay14 = {
                 "src": cs14,
                 "type": "pos",
                 "src_type": "ble_remote",
-                "timestamp": ts14[0],  # the FIRST beacon's original timestamp, replayed
+                "timestamp": ts14[0] + 200,  # the first beacon's BLE copy, replayed late
                 "msg": f"!4812.34N/01143.56E-/P=955.0/T={temp14[0]}",
                 "temp1": temp14[0],
                 "qfe": 955.0,
@@ -1026,6 +1035,61 @@ async def run_startup_tests() -> bool:  # noqa: PLR0915 - test suite lists one c
                     "V1: the replayed measured qfe lands on row 1 (the one it dedups against)",
                     _approx(rows14_after[0].get("qfe"), 955.0)
                     and _approx(rows14_after[0].get("temp1"), temp14[0]),
+                )
+            )
+
+            # 14b. An EQUAL-timestamp redelivery must not win. `incoming_is_newer` is
+            # derived as `incoming_ts > existing_ts`, so equal means not-newer and the
+            # existing value stands. Kills a `>=` derivation, which is otherwise
+            # invisible: identical redeliveries SKIP either way because no value
+            # changes, so only a differing value at an equal timestamp exposes it.
+            equal_ts14 = {
+                "src": cs14,
+                "type": "pos",
+                "src_type": "ble_remote",
+                "timestamp": rows14_after[0]["timestamp"],
+                "msg": "!4812.34N/01143.56E-/P=999.9/T=99.9",
+                "temp1": 99.9,
+                "qfe": 999.9,
+            }
+            await storage.store_message(equal_ts14, json.dumps(equal_ts14))
+            rows14_eq = await _telemetry_rows(cs14)
+            results.append(
+                (
+                    "V1: an equal-timestamp redelivery neither wins nor duplicates",
+                    len(rows14_eq) == seed_count14
+                    and _approx(rows14_eq[0].get("qfe"), 955.0)
+                    and _approx(rows14_eq[0].get("temp1"), temp14[0]),
+                )
+            )
+
+            # 14c. The upstream presence gates. `_store_position` and the dedup-salvage
+            # branch used `any(msg.get(f) for f in _WEATHER_BEACON_FIELDS)`, so a beacon
+            # whose only reading is a genuine 0.0 was falsy throughout and never reached
+            # store_telemetry at all — V6 one level up, and invisible to every case that
+            # tests store_telemetry directly. 0.0 C is an ordinary winter reading here.
+            # Kills: reverting either gate to truthiness.
+            cs14c = "OE1XYZ-36"
+            pos14c = {
+                "msg_id": "CCCC0014",
+                "src": cs14c,
+                "dst": "*",
+                "msg": "!4812.34N/01143.56E-/T=0.0",
+                "type": "pos",
+                "src_type": "ble_remote",
+                "timestamp": base_ts + 5000,
+                "rssi": -100,
+                "snr": 5,
+                "lat": 48.2,
+                "lon": 11.6,
+                "temp1": 0.0,
+            }
+            await storage.store_message(pos14c, json.dumps(pos14c))
+            rows14c = await _telemetry_rows(cs14c)
+            results.append(
+                (
+                    "V6 upstream: a beacon whose only reading is a genuine 0.0 is stored",
+                    len(rows14c) == 1 and rows14c[0].get("temp1") == 0.0,
                 )
             )
 
