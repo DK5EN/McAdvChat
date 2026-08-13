@@ -54,8 +54,16 @@ changes too, not just code.
 
 Each repo commits independently (`[type] description`). Stage explicit paths.
 
-**Push before releasing.** `gh release create` pushes only the _tag_; it never pushes the branch. A
-tag pointing at commits that exist nowhere else on the remote is a mess to unpick later.
+**Push before releasing.** `gh release create` pushes NOTHING — not the branch, and not the tag
+either. If the tag is absent on the remote it silently creates one server-side at the default
+branch's HEAD, which then diverges from your identically-named local tag; that is how 55 dev tags
+drifted on this repo before `release.sh` was fixed to push tags itself and pass `--verify-tag`. So
+push the branch first, and after a release confirm the tag actually matches:
+
+```bash
+[ "$(git rev-parse <tag>)" = "$(git ls-remote origin refs/tags/<tag> | awk '{print $1}')" ] \
+  && echo "tag parity ok"
+```
 
 **Expect the push to be rejected.** Dependabot opens PRs against this repo and they land on
 `development` while you work. Then:
@@ -82,7 +90,8 @@ The next tag comes from `pyproject.toml`'s version plus the highest **local** `v
 so `git fetch --tags` in both repos first, or a release cut elsewhere gets a number reused.
 
 What it does, in order: build webapp → tag both repos (lightweight) → build combined tarball →
-sha256 → `gh release create --prerelease` (which pushes the MCProxy tag) → push the webapp tag →
+sha256 → push BOTH repos' tags (`push_tags_both_repos`, which must run before the release exists) →
+`gh release create --prerelease --verify-tag`, which now aborts rather than inventing a tag →
 clean up local artefacts. On any failure a trap rolls back tags, the GitHub release, and artefacts.
 
 ## Step 4 — The `curl: (56)` trap
