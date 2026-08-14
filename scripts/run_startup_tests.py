@@ -41,6 +41,7 @@ from mcapp.commands.routing_tests import run_routing_tests
 from mcapp.contract_parity_tests import run_contract_parity_tests
 from mcapp.dedup_contract_tests import run_dedup_contract_tests
 from mcapp.identity_tests import run_identity_tests
+from mcapp.linkcheck_tests import run_linkcheck_tests
 from mcapp.main import MessageRouter
 from mcapp.meteo_tests import run_meteo_tests
 from mcapp.push_tests import run_push_tests
@@ -71,6 +72,9 @@ async def main() -> int:  # noqa: PLR0915 - flat suite registry; one visible lin
 
     dedup_contract_ok = run_dedup_contract_tests()
     print(f"dedup_contract: {'PASS' if dedup_contract_ok else 'FAIL'}")
+
+    linkcheck_ok = run_linkcheck_tests()
+    print(f"linkcheck: {'PASS' if linkcheck_ok else 'FAIL'}")
 
     aprs_symbol_ok = await run_aprs_symbol_tests()
     print(f"aprs_symbol: {'PASS' if aprs_symbol_ok else 'FAIL'}")
@@ -171,6 +175,7 @@ async def main() -> int:  # noqa: PLR0915 - flat suite registry; one visible lin
         and send_path_ok
         and contract_parity_ok
         and dedup_contract_ok
+        and linkcheck_ok
         and aprs_symbol_ok
         and identity_ok
         and ble_service_ok

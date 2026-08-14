@@ -31,6 +31,10 @@ All four are enforced by CI (`.github/workflows/tests.yml`, Python 3.11) and mus
 ## Code Quality
 
 - `uvx ruff check` and `uvx ruff format --check .` are mandatory — zero tolerance for errors and warnings
+- **`ruff format` also formats ` ```python ` blocks inside `.md` files.** A docs-only commit can and
+  did turn CI red (twice, 2026-08-14) because a fenced example in `doc/` had non-ruff spacing.
+  Run `uvx ruff format --check .` — not just on `*.py` — before committing **any** file, docs
+  included. Note prettier and ruff both touch markdown, so run prettier first, then ruff-format check.
 - **Ruff config** lives in `pyproject.toml` — see `[tool.ruff]` / `[tool.ruff.lint]` for line length, target version, the full rule set and documented ignores
 - **Keep all `[tool.ruff*]` sections identical** across `pyproject.toml`, `ble_service/pyproject.toml` and mc-chat's `pyproject.toml` — the classifier subtree must lint clean under the same rules in both repos
 - New `# noqa` markers need a trailing reason comment and should stay rare — prefer a real fix
