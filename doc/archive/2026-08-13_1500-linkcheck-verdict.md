@@ -1,8 +1,16 @@
 # Link Check — Fable Verdict
 
+> **ARCHIVED 2026-08-14.** All 18 findings were folded into the implementation plan and the ADR
+> before any code was written, and the feature has since shipped in `v1.6.14-dev.35`. Kept as the
+> record of what the first draft got wrong and why, so the same ground is not re-litigated —
+> particularly the "Refuted / verified-safe" section at the end.
+>
+> The two blockers (Findings 1 and 2 — the hex/decimal `msg_id` split and negative pong ids) were
+> both later confirmed against real traffic; see ADR §1.5.1.
+
 Date: 2026-08-13
 Reviewed: `doc/2026-08-13_1500-linkcheck-ping-pong-ADR.md` and
-`doc/2026-08-13_1500-linkcheck-implementation-plan.md`, first drafts.
+`doc/archive/2026-08-13_1500-linkcheck-implementation-plan.md`, first drafts.
 Method: 7 independent finders (protocol, codebase accuracy, concurrency, security, test
 strategy, architectural fit, completeness), then per-claim verification against source by the
 orchestrator. Every finding below was re-derived from the cited file before being recorded;

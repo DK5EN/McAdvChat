@@ -2,7 +2,7 @@
 `linkcheck.py`.
 
 See `doc/2026-08-13_1500-linkcheck-ping-pong-ADR.md` §1.2/§1.3/§1.5 and
-`doc/2026-08-13_1500-linkcheck-implementation-plan.md` §1.3 for the protocol
+`doc/archive/2026-08-13_1500-linkcheck-implementation-plan.md` §1.3 for the protocol
 this suite pins. In particular:
 
 * the hex-echo/decimal-pong correlation split (ADR §1.3a), including the real

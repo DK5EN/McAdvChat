@@ -1,9 +1,17 @@
 # Link Check (`{ping}` / `{pong}`) — implementation plan
 
+> **ARCHIVED 2026-08-14.** Fully implemented, released as `v1.6.14-dev.35` and verified live on
+> `mcapp.local`. Kept for the reasoning, not as a live work item — the current description of the
+> feature is `doc/2026-08-13_1500-linkcheck-ping-pong-ADR.md` (see its §6 for the post-deploy
+> verification) and the gotchas are summarised in `CLAUDE.md` § Link Check.
+>
+> Shipped: backend `9313857` (parser), `8cb52e8` (ingest guard + non-str `msg` fix), `bc596d5`
+> (session engine, REST, SSE); webapp `cead0fd` (UI). Waves 1-7 all complete.
+
 Status: **IMPLEMENTED AND DEPLOYED 2026-08-14** — backend `9313857`/`8cb52e8`/`bc596d5`, webapp `cead0fd`, released as `v1.6.14-dev.35` and verified live on `mcapp.local` (ADR §6).
 Date: 2026-08-13
 ADR: `doc/2026-08-13_1500-linkcheck-ping-pong-ADR.md`
-Review: `doc/2026-08-13_1500-linkcheck-verdict.md` — 18 findings against the first draft of this
+Review: `doc/archive/2026-08-13_1500-linkcheck-verdict.md` — 18 findings against the first draft of this
 plan, all folded in below. Read it before questioning a design choice here; several obvious-looking
 alternatives were tried and rejected with evidence.
 Scope: `storage/ingest.py`, `commands/linkcheck.py` (new), `commands/handler.py`,

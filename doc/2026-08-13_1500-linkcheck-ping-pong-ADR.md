@@ -3,8 +3,8 @@
 **Date:** 2026-08-13
 **Status:** **Implemented and deployed** 2026-08-14 in `v1.6.14-dev.35` (`mcapp.local`). Protocol validated on air (§1.5); the deployed stack re-verified end to end after release (§6).
 **Affects:** `storage/ingest.py`, `commands/linkcheck.py` (new), `sse_routes/linkcheck.py` (new), `main.py`, frontend `webapp`
-**Implementation plan:** `doc/2026-08-13_1500-linkcheck-implementation-plan.md`
-**Review:** `doc/2026-08-13_1500-linkcheck-verdict.md` — this ADR's first draft contained two
+**Implementation plan:** `doc/archive/2026-08-13_1500-linkcheck-implementation-plan.md`
+**Review:** `doc/archive/2026-08-13_1500-linkcheck-verdict.md` — this ADR's first draft contained two
 design-breaking protocol errors; both are corrected here and recorded there.
 **Source:** <https://icssw.org/2026/07/24/ping-check/>, firmware `v4.35p.07.24.2`+
 

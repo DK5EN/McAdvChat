@@ -2,7 +2,7 @@
 
 See `doc/2026-08-13_1500-linkcheck-ping-pong-ADR.md` §1.2 (wire format), §1.3
 (the correlation token) and §1.5 (measured on air) for the protocol this
-module decodes, and `doc/2026-08-13_1500-linkcheck-implementation-plan.md`
+module decodes, and `doc/archive/2026-08-13_1500-linkcheck-implementation-plan.md`
 §1 and §2.3 for how it is used. Do not re-derive the protocol here — read
 those sections first.
 
