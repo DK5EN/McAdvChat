@@ -395,4 +395,51 @@ API surface on the box: `GET /api/linkcheck/sessions` → `{"sessions":[]}`; sel
 firmware-level reason; `count=500` → 422. Note the API is on port **2981** (lighttpd proxies it at
 8082); 8081 is the BLE service.
 
-Still not exercised: the browser itself. The SSE path is proven, the click is not.
+### 6.1 Browser verification (2026-08-14)
+
+Driven in Chrome against `http://mcapp.local/webapp/positions`. Footer read `v1.6.14-dev.35`, so
+the browser was running the new bundle and not a stale service-worker copy.
+
+**Verified working:**
+
+- the **Link check** button renders on every station card
+- clicking it starts a real session — the box logged
+  `_udp_message_handler: src_type='linkcheck' src=None dst=DL2JA-2 msg={ping}`
+- the card flips to **Stop** / _"Checking…"_ while in flight
+- the timeout renders as **"No direct-RF answer"**, not "station down"
+- the action's accessible name is the intended honest wording verbatim:
+  `Link check DL2JA-2 — transmits on air: about 4 transmissions over up to two minutes`
+
+**NOT verified: the success render.** Both browser attempts timed out. That was checked rather
+than assumed — no pong reached the box at all, so these were genuine no-answers rather than a UI
+fault, and the timeout came from the backend's 90 s timer (`LinkCheckStore` contains no
+`setTimeout`; it is purely event-driven off `proxy:linkcheck_timeout`). The success **data** path
+is proven at API and SSE level (§6, `response_ms 21410, rssi -118, hops 0`), but no successful
+result has been seen rendered in the DOM.
+
+**The link degraded during the session**, which is itself worth recording: `DL2JA-2` answered 4 of
+5 attempts earlier in the day and 0 of 2 an hour later, with its beacon signal drifting from
+`-117 dBm / SNR -4` to `-127 dBm / SNR -16`. A marginal link is not a stable test fixture. Anyone
+re-verifying this should pick a strong neighbour (`DB0ED-99`, `DB0ISM-1`) rather than `DL2JA-2`.
+
+---
+
+## 7. Current state (2026-08-14)
+
+**Shipped and live** in `v1.6.14-dev.35` on `mcapp.local`: parser and correlation, ingest guard,
+session engine, REST API, SSE events, and the station-list UI. CI green on every commit in both
+repos. Working docs archived under `doc/archive/`.
+
+Known gaps, none blocking:
+
+| Gap                                       | Note                                                                                                                                                      |
+| ----------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Success render unseen in the DOM          | §6.1 — data path proven, pixels not                                                                                                                       |
+| No `count > 1` in the UI                  | API accepts 1-5; the button always sends 1                                                                                                                |
+| No feature toggle                         | Fine behind the LAN; genuinely open if the box is ever exposed, since an unauthenticated transmit endpoint could not then be disabled short of a redeploy |
+| 13 historical `{ping}`/`{pong}` chat rows | Pre-date the guard, deliberately left in place                                                                                                            |
+
+Worth doing in the firmware fork, independently of McApp: add `{ping}` to the
+`{CET}`/`{MCP}`/`{SET}` no-retransmit exclusion list at `loop_functions.cpp:3468`. That cuts a
+proxy-originated ping from ~4 keyings to 1 and removes the 40 s quantisation from the measured
+time (§1.4 point 7, §1.5.4).
