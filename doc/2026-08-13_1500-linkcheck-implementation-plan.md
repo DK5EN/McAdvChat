@@ -1,6 +1,6 @@
 # Link Check (`{ping}` / `{pong}`) — implementation plan
 
-Status: **IMPLEMENTED 2026-08-14** (backend `9313857`/`8cb52e8`/`bc596d5`, webapp `cead0fd`)
+Status: **IMPLEMENTED AND DEPLOYED 2026-08-14** — backend `9313857`/`8cb52e8`/`bc596d5`, webapp `cead0fd`, released as `v1.6.14-dev.35` and verified live on `mcapp.local` (ADR §6).
 Date: 2026-08-13
 ADR: `doc/2026-08-13_1500-linkcheck-ping-pong-ADR.md`
 Review: `doc/2026-08-13_1500-linkcheck-verdict.md` — 18 findings against the first draft of this
@@ -16,15 +16,18 @@ This plan assumes both.
 
 ## Wave status log
 
-| Wave | Contents                | Status              |
-| ---- | ----------------------- | ------------------- |
-| 0    | Pre-flight              | **DONE 2026-08-14** |
-| 1    | Stage 0 + pure parser   | not started         |
-| 2    | Stage 1 signal ingest   | not started         |
-| 3    | Stage 2 session engine  | not started         |
-| 4    | Stage 2 routes + wiring | not started         |
-| 5    | Stage 3 webapp          | not started         |
-| 6    | Documentation           | not started         |
+All waves complete 2026-08-14; released as `v1.6.14-dev.35` and verified live (ADR §6).
+
+| Wave | Contents                | Status                                         |
+| ---- | ----------------------- | ---------------------------------------------- |
+| 0    | Pre-flight              | **done** — captured on air instead of stubbed  |
+| 1    | Stage 0 + pure parser   | **done** `9313857`                             |
+| 2    | Stage 1 signal ingest   | **done** — no code needed, already worked (§2) |
+| 3    | Stage 2 session engine  | **done** `bc596d5`                             |
+| 4    | Stage 2 routes + wiring | **done** `bc596d5`                             |
+| 5    | Stage 3 webapp          | **done** webapp `cead0fd`                      |
+| 6    | Documentation           | **done** `9b2ca09` + this pass                 |
+| 7    | Release + deploy        | **done** `v1.6.14-dev.35` on `mcapp.local`     |
 
 ---
 
@@ -395,8 +398,12 @@ exposes the new methods rather than assuming registration happened.
 
 ## 7. Decisions still open
 
-1. **Shared session base vs. shared idioms** between `LinkCheckMixin` and `CTCPingMixin` (§3.1).
-   Decide in Wave 3, record the reasoning here.
+1. ~~**Shared session base vs. shared idioms**~~ — **ANSWERED: shared idioms, no base class.**
+   `LinkCheckMixin` mirrors `CTCPingMixin`'s structure (state dataclasses, injectable timeout,
+   tracked task set, reject-don't-clamp validation) without extracting a common parent. The two
+   correlate on different tokens — ctcping on a 3-digit ACK/echo suffix, link check on a 32-bit id
+   in two representations — so a shared base would have to be parameterised over exactly the part
+   that differs. `ctcping.py` was not touched beyond adding the missing `stop_ctcping()`.
 2. ~~**`src_type` preservation through the echo**~~ — **ANSWERED: no** (ADR §1.5.5). `getExtern()`
    reads only `dst` and `msg` from our datagram (`extudp_functions.cpp:260-261`); `src_type` on the
    echo is set by the firmware. **No marker we control survives the round trip**, so §3.2's plan to
@@ -404,9 +411,11 @@ exposes the new methods rather than assuming registration happened.
    echo-claim can only be narrowed, never closed: match on `dst` + `{ping}` prefix + a pending
    attempt within a short window, and document the residual ambiguity with a human-typed `{ping}`.
    No longer blocking for Wave 3, but Wave 3 must implement the narrowed form, not the tagged one.
-3. **Feature toggle.** No kill switch is planned. The only precedent is the coarse `BLE_MODE`
-   config. Decide whether an on-air-transmitting feature on an unauthenticated endpoint needs one;
-   the caps in §3.3 are the current answer.
+3. **Feature toggle** — shipped WITHOUT one, deliberately. The server-side caps (≤5 attempts,
+   one session per target, ≤3 concurrent, 60 s cooldown, self-ping and blocklist refused) bound the
+   on-air cost, and the endpoint is only reachable from the LAN behind Caddy/lighttpd. **Still
+   genuinely open** if the box is ever exposed beyond the LAN: there is then no way to disable an
+   unauthenticated transmit endpoint short of a redeploy. Revisit before any remote-access change.
 
 Resolved during review, recorded so they are not reopened: whether we can self-ping (no — ADR
 §1.4.8); whether a pong can precede its echo (no — ADR §1.4.5); whether foreign traffic needs a
@@ -438,6 +447,11 @@ What the plan did not predict, found only by building and measuring:
 5. **Stage 1 needed no code**, as §2 predicted after the live-data check — pong signal was
    already flowing into `signal_log`.
 
-Not done, deliberately: no `count > 1` UI (the API supports up to 5; the button sends 1), and no
-on-air verification of the GUI path end to end. The backend path was verified on air three times
-(ADR §1.5); the webapp was verified against the real contract in unit tests only.
+6. **Post-deploy, the SSE path WAS verified on air** (ADR §6): a live link check on
+   `mcapp.local` emitted `proxy:linkcheck_sent` / `_result` / `_done` with `rssi -118, hops 0`,
+   and the live DB confirmed zero `{ping}`/`{pong}` chat rows alongside the pong's `signal_log`
+   row. The earlier note that this was unverified is superseded.
+
+Not done, deliberately: no `count > 1` UI (the API supports up to 5; the button sends 1), and the
+browser click itself is still unexercised — the SSE contract the UI consumes is proven, the DOM
+path is not.

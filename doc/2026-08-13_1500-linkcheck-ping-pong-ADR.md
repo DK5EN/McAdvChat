@@ -1,7 +1,7 @@
 # ADR: Link Check (firmware `{ping}` / `{pong}`) in McApp
 
 **Date:** 2026-08-13
-**Status:** Accepted, not implemented — protocol **validated on air 2026-08-14** (§1.5)
+**Status:** **Implemented and deployed** 2026-08-14 in `v1.6.14-dev.35` (`mcapp.local`). Protocol validated on air (§1.5); the deployed stack re-verified end to end after release (§6).
 **Affects:** `storage/ingest.py`, `commands/linkcheck.py` (new), `sse_routes/linkcheck.py` (new), `main.py`, frontend `webapp`
 **Implementation plan:** `doc/2026-08-13_1500-linkcheck-implementation-plan.md`
 **Review:** `doc/2026-08-13_1500-linkcheck-verdict.md` — this ADR's first draft contained two
@@ -362,8 +362,37 @@ delivers strictly more for less.
 
 ## 5. Firmware sync note
 
-Before implementing Stage 2, re-verify against the firmware actually running on the target node
-that `loop_functions.cpp:3103/3184/3395/3466`, `lora_functions.cpp:701/756/773` and
+**Done 2026-08-14** — the three on-air exchanges in §1.5 were run against the firmware actually on
+`DK5EN-98`, which is the re-verification this section asked for. Repeat it after any node firmware
+update: re-verify against the firmware actually running on the target node that `loop_functions.cpp:3103/3184/3395/3466`, `lora_functions.cpp:701/756/773` and
 `extudp_functions.cpp:365` are unchanged — the correlation scheme and the airtime estimate depend
 on all of them, and §1.4 point 7 in particular is local-fork code. New upstream tags at time of
 writing: `v4.35p.08.03`, `v4.35p.08.06`, `v4.35p.08.10.2`.
+
+---
+
+## 6. Post-deploy verification (2026-08-14, `v1.6.14-dev.35`)
+
+Re-run against the deployed stack on `mcapp.local`, not a test harness. The SSE stream is the one
+the webapp consumes:
+
+```
+event: proxy:linkcheck_sent    {"target": "DL2JA-2", "seq": 1}
+event: proxy:linkcheck_result  {"seq": 1, "response_ms": 21410, "rssi": -118, "snr": -7.0, "hops": 0, "late": false}
+event: proxy:linkcheck_done    {"sent": 1, "received": 1, "status": "completed"}
+```
+
+`-118 dBm` sits with the pre-release `-117/-127/-119`, and `21.4 s` with `23.8/42.6/29.3` — the
+deployed behaviour matches what §1.5 measured. `hops: 0`, so the signal is attributable to
+`DL2JA-2` itself.
+
+Both ingest behaviours confirmed on the live DB: **zero** `{ping}`/`{pong}` rows in `messages`
+since deploy (13 historical rows predate the fix and were deliberately left), and the pong's signal
+reached `signal_log` as `source='lora', rssi=-118, snr=-7.0`. That pair is exactly what the guard
+placement in the implementation plan §1.1 exists to preserve.
+
+API surface on the box: `GET /api/linkcheck/sessions` → `{"sessions":[]}`; self-ping → 400 with the
+firmware-level reason; `count=500` → 422. Note the API is on port **2981** (lighttpd proxies it at
+8082); 8081 is the BLE service.
+
+Still not exercised: the browser itself. The SSE path is proven, the click is not.

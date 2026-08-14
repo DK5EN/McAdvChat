@@ -94,6 +94,36 @@ Add columns/tables via a `current_version < N` block in the chain in `storage/mi
 
 System-level machine state (packages, firewall, web front door) is versioned by `SYSTEM_EPOCH` in `bootstrap/mcapp.sh` and mirrored by `REQUIRED_SYSTEM_EPOCH` in `src/mcapp/system_converge.py` — bump both together, a startup test enforces parity. Installed state is marked at `/var/lib/mcapp/system-epoch`; `mcapp.sh --converge` runs `setup_system` + `install_packages` idempotently to bring a box up to date. The update runner converges the newly deployed slot after every successful update, and the app's converge watchdog self-heals boxes whose update was driven by a pre-epoch runner.
 
+## Link Check (`{ping}` / `{pong}`)
+
+Probes whether a station answers on **direct RF**, using the firmware's `v4.35p.07.24.2` ping
+feature. Design and the on-air measurements: `doc/2026-08-13_1500-linkcheck-ping-pong-ADR.md`.
+
+- **Correlation has two representations and both are load-bearing.** The Extern-UDP `msg_id` field
+  is an 8-digit **hex string** (`"1AE1E057"`); the pong payload embeds the same 32-bit value in
+  **decimal**, and roughly half the fleet emits it **negative** (`{pong}{-427408969}` — real
+  traffic, `SendPong()` formats an `unsigned int` with the signed `%i`). Normalise both with
+  `& 0xFFFFFFFF` — `linkcheck.normalise_id()`. A `\d+` pattern silently never matches half the
+  stations.
+- **Prefix-match the ping, never equality.** `sendMessage()` appends an unterminated ACK suffix, so
+  ours reads `{ping}{087` on the wire.
+- **The routing hook must come BEFORE the echo/ACK branches** in `commands/routing.py`. ctcping's
+  `_ECHO_SUFFIX_RE` (`\{\d{3}$`) also matches `{ping}{087`; wired after it, ctcping swallows every
+  echo, the session never learns its `msg_id`, and every attempt times out with no visible cause.
+- **The ingest guard sits before `_insert_message_row`, NOT in `_should_filter_message`.** The
+  latter returns before `_ingest_signal`, so a guard there deletes the pong's signal ingestion,
+  which already works. `linkcheck_ingest_tests.py` case 1 pins exactly that pair.
+- **It does not measure a round-trip time.** Measured 21-43 s on air, dominated by the node's TX
+  queue and the firmware's 40 s retransmit steps. Report reachability + reply RSSI/SNR; never label
+  a number RTT. Attempt timeout is 90 s for that reason, and attempts are sequential.
+- **RSSI/SNR belongs to the target only when the pong arrives with no via-path** (`hops == 0`);
+  relayed pongs are the observed norm and carry the last hop's signal.
+- **Nothing we send survives the round trip** — `getExtern()` reads only `dst` and `msg`, so our
+  own echo cannot be tagged and the echo-claim can only be narrowed, never closed.
+- A proxy-originated ping is **~4 keyings over 2 minutes** (retransmission is armed for any DM not
+  starting `{CET}`/`{MCP}`/`{SET}`). Caps are enforced server-side; the endpoint has no auth.
+- **We cannot ping ourselves** — the firmware refuses a DM to its own callsign.
+
 ## Web Push
 
 Web Push to browser / iOS-PWA clients, sharing one wire contract with mc-chat so both backends behave identically.
