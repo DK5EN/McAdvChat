@@ -1,6 +1,6 @@
 # Link Check (`{ping}` / `{pong}`) — implementation plan
 
-Status: **not started**
+Status: **IMPLEMENTED 2026-08-14** (backend `9313857`/`8cb52e8`/`bc596d5`, webapp `cead0fd`)
 Date: 2026-08-13
 ADR: `doc/2026-08-13_1500-linkcheck-ping-pong-ADR.md`
 Review: `doc/2026-08-13_1500-linkcheck-verdict.md` — 18 findings against the first draft of this
@@ -411,3 +411,33 @@ exposes the new methods rather than assuming registration happened.
 Resolved during review, recorded so they are not reopened: whether we can self-ping (no — ADR
 §1.4.8); whether a pong can precede its echo (no — ADR §1.4.5); whether foreign traffic needs a
 retention policy (moot — Stage 0 drops it, §1.1).
+
+---
+
+## 8. Implementation notes (2026-08-14)
+
+What the plan did not predict, found only by building and measuring:
+
+1. **ctcping's echo regex collides with our ping.** `_ECHO_SUFFIX_RE` is
+   `\{\d{3}$`, which matches our own echoed `{ping}{087`. The link-check hook in
+   `commands/routing.py` therefore had to go **before** the echo/ACK branches. Wired after,
+   ctcping swallows every echo, the session never learns its `msg_id`, and every attempt times
+   out with nothing in the logs pointing at the cause.
+2. **Attempt timeout is 90 s, not 30 s**, and attempts are **sequential rather than
+   interval-driven**. Both follow from the measured 23.8/42.6/29.3 s responses and the firmware's
+   40 s retransmit step (ADR §1.5.4).
+3. **Two pre-existing bugs surfaced during verification**, neither related to link check:
+   - `store_message` raised `AttributeError` on any frame whose `msg` was not a string,
+     losing the whole frame. Reachable from unauthenticated port 1799 via the telemetry branch,
+     which publishes without `udp_handler`'s `isinstance` guard. Fixed in `8cb52e8`.
+   - `ctcping`'s `_ping_bg_tasks` was populated at four sites and cancelled nowhere.
+     `stop_ctcping()` added and wired into `_shutdown_services` in `bc596d5`.
+4. **The webapp's station card had to be restructured after all.** Adding a button inside a
+   `role="button"` card reproduced an accessibility regression this repo had already fixed once
+   and pinned with a test. The card now matches `MheardListPanel`/`WxListPanel`.
+5. **Stage 1 needed no code**, as §2 predicted after the live-data check — pong signal was
+   already flowing into `signal_log`.
+
+Not done, deliberately: no `count > 1` UI (the API supports up to 5; the button sends 1), and no
+on-air verification of the GUI path end to end. The backend path was verified on air three times
+(ADR §1.5); the webapp was verified against the real contract in unit tests only.
