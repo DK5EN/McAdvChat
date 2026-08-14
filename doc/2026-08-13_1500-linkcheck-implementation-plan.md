@@ -65,184 +65,81 @@ Not delegable. Record answers in this file before dispatching.
 **Why first:** this is live today. Foreign ping/pong exchanges in our RF range are already stored
 and rendered as chat (ADR §2a). Everything else here is new capability; this is a fix.
 
-### 1.1 The change
+### 1.1 The change — NOT in `_should_filter_message`
 
-`storage/ingest.py`, `_should_filter_message()` at `:1463`, alongside the existing `{CET}` drop at
-`:1469`:
+**Corrected 2026-08-14 after checking live data. The first version of this section was a
+regression waiting to happen.**
+
+`_should_filter_message()` returns at `ingest.py:819`, which is _before_ `_ingest_signal()` at
+`:982`. Dropping ping/pong there would delete signal ingestion that is **already working today**
+(§2). Do not put the drop there.
+
+Put the guard immediately before the messages-table insert at `ingest.py:1054`:
 
 ```python
-if msg_content.startswith("{ping}") or msg_content.startswith("{pong}"):
-    return True
+# {ping}/{pong} are protocol frames, not chat. Their signal has already been
+# ingested by _ingest_signal() above; only the messages-table row is suppressed.
+if not linkcheck.is_link_check_payload(msg):
+    await self._insert_message_row(params, msg_id, dst)
 ```
 
-Prefix matching is mandatory, not stylistic: a ping we originate carries an unterminated ACK
-suffix and reads `{ping}{042` on the wire (ADR §1.2).
+Everything upstream — dedup bookkeeping, `_ingest_signal`, classification — still runs. Only the
+chat row is suppressed.
 
-**Rejected:** classifier rules, as the first draft proposed. `src/mcapp/classifier/` is a mc-chat
-subtree; that route means edit-upstream → split → pull → bump `classifier_ver` → backfill →
+Prefix matching is mandatory, not stylistic: a ping we originate carries an unterminated ACK suffix
+and reads `{ping}{087` on the wire (ADR §1.2, confirmed on air in §1.5).
+
+**Rejected:** classifier rules, as the very first draft proposed. `src/mcapp/classifier/` is a
+mc-chat subtree; that route means edit-upstream → split → pull → bump `classifier_ver` → backfill →
 re-run a parity corpus, across two repos, to categorise frames that are protocol rather than chat.
-See verdict Finding 9. It also created a message-hiding vector (verdict, lower-severity list) that
-the hard-drop does not.
+See verdict Finding 9.
 
-### 1.2 The ordering trap — read before touching §2
+### 1.2 Why the placement matters — verified, not theoretical
 
-`_should_filter_message()` is called at `ingest.py:818` and its `True` return exits `store_message`
-at `:819`. `_ingest_signal()` runs at `:982`, **after** it.
+Measured on the live box after the three on-air pings: every pong's signal is already in
+`signal_log` with `source='lora'` and the exact RSSI/SNR of the reply.
 
-So a naive Stage 0 drop silently kills Stage 1: pong signal would never reach `signal_log`, and
-nothing would fail — the tests would pass and the data would simply never appear. §2.2 places the
-link-check branch **before** the filter for exactly this reason.
+```
+pong ts=1786687960805 -> ('DL2JA-2', -117, -7.0, 'lora')
+pong ts=1786688214767 -> ('DL2JA-2', -127, -19.0, 'lora')
+pong ts=1786688301509 -> ('DL2JA-2', -119, -9.0, 'lora')
+```
 
-Whoever implements Stage 0 alone must know this is coming; whoever implements Stage 1 must verify
-the ordering holds after both changes land.
-
-Filtering suppresses **persistence only**. `message_router` still publishes the frame, which is
-what Stage 2 subscribes to.
+A drop in `_should_filter_message` removes all three rows and nothing fails loudly.
 
 ### 1.3 Tests
 
-New suite `src/mcapp/linkcheck_tests.py` (shared with §2.3), registered per §6.2:
+New suite `src/mcapp/linkcheck_tests.py`, registered per §6.2:
 
-- `{ping}` and `{pong}{123}` are filtered — assert the row is **absent from `messages`** after
-  `store_message`, not merely that the helper returned `True`
-- `{ping}{042` (real on-air form, unterminated suffix) is filtered
-- `{pong}{-1234567890}` (negative id, ADR §1.3b) is filtered
-- a normal message mentioning `{ping}` mid-text is **not** filtered
-- **regression test for the live bug** (CLAUDE.md requires one): store a foreign
-  `{pong}` exchange, assert it does not appear in the message query the webapp uses
+- `{ping}`, `{pong}{123}`, `{ping}{087` (unterminated suffix) and `{pong}{-427408969}` (real
+  negative id from live traffic) are all recognised as link-check payloads
+- a normal message merely containing `{ping}` mid-text is **not**
+- **regression, the whole point of the placement:** store a pong with rssi/snr, assert the
+  `messages` row is absent **and** a `signal_log` row with `source='lora'` is present. This test
+  fails against the naive `_should_filter_message` implementation, which is exactly why it exists.
 
 ---
 
-## 2. Stage 1 — pong signal into the existing signal architecture
+## 2. Stage 1 — pong signal into `signal_log`: ALREADY IMPLEMENTED, NO CODE
 
-**No new table, no migration.** A pong's `rssi`/`snr` is the same physical measurement
-`signal_log` already models, and it has a `source TEXT` column added for this kind of distinction
-(`migrations.py:322-325`, values `'mheard'`/`'lora'`). Verdict Findings 10 and 11 cover why the
-first draft's `link_checks` table was wrong; do not reintroduce it.
+**Verified on the live box 2026-08-14 — this stage needs no implementation at all.**
 
-### 2.1 Observed wire shapes
+`_ingest_signal()` classifies any `src_type == "lora"` frame with `msg_type in ("pos", "msg")` and
+valid rssi/snr as a signal observation (`ingest.py:381`). A pong is exactly that, so its signal
+already flows into `signal_log`, `signal_buckets` and `station_positions` today. Evidence in §1.2.
 
-**Real capture, 2026-08-14** (run 1 of three; ADR §1.5 has all three and the analysis).
+Relay attribution is **also already handled**, and better than earlier drafts of this plan assumed.
+`ingest.py:864` derives `signal_via = msg_via.rsplit(",", 1)[-1]` — the last path component, i.e.
+the station that actually delivered the transmission — and `_ingest_signal` keys `signal_buckets`
+and `station_positions.signal_via` by it, while deliberately keeping `signal_log` originator-keyed
+(see that method's docstring).
 
-Echo of our own outgoing ping — `msg_id` is an 8-digit **hex string**, and the payload carries the
-unterminated ACK suffix:
+**Therefore: do not add a via-path gate.** An earlier revision of this plan instructed exactly that,
+which would have contradicted a documented, working design. `source='linkcheck'` is likewise
+unnecessary — `source='lora'` is already correct and already written.
 
-```json
-{
-  "src_type": "node",
-  "type": "msg",
-  "src": "DK5EN-98",
-  "dst": "DL2JA-2",
-  "msg": "{ping}{087",
-  "msg_id": "1AE1E057",
-  "firmware": "4.35",
-  "rssi": 0,
-  "snr": 0
-}
-```
-
-Inbound pong — `msg_id` is this frame's own id; the correlation token is inside `msg`, in decimal.
-`int("1AE1E057", 16) == 451010647`:
-
-```json
-{
-  "src_type": "lora",
-  "type": "msg",
-  "src": "DL2JA-2",
-  "dst": "DK5EN-98",
-  "msg": "{pong}{451010647}",
-  "msg_id": "E9FB720A",
-  "firmware": "35",
-  "rssi": -117,
-  "snr": -7.0
-}
-```
-
-Note `firmware` differs between the two (`"4.35"` on our own node's echo, `"35"` on a remote LoRa
-frame) — do not assume a single format.
-
-`rssi`/`snr` are a `0/0` sentinel on `src_type:"node"` and must be excluded by an explicit
-`src_type` check, per the existing project rule — never by a range check.
-
-### 2.2 Ingest branch
-
-In `store_message()`, **before** the `_should_filter_message()` call at `:818` (see §1.2):
-
-1. `linkcheck.parse()` the frame.
-2. On a pong with `src_type == "lora"`, real signal, **and an empty via-path**, call the existing
-   `_ingest_signal()` with `source='linkcheck'`.
-3. Fall through to the normal path; `_should_filter_message` then drops the message row.
-
-**The empty-path condition is not optional.** Relayed pongs are the observed norm (ADR §1.4
-point 2 — all seven historical pongs arrived `hops=1`), and a relayed pong's `rssi`/`snr` measures
-the **last hop**, not the station named in `src`. Writing those into `signal_log` under the
-originator's callsign would corrupt the existing map and mHeard views with wrong signal for the
-wrong station — a data-integrity bug worse than the chat noise Stage 0 fixes. Reject when `src`
-contains a comma.
-
-**Read the field values from the `message` dict directly, not from the locals.** `store_message`
-extracts `src`/`msg`/`rssi`/`snr`/`timestamp` into locals at `:821-841`, which is _after_ the
-filter call this branch must precede. `_ingest_signal()`'s parameters (`callsign`, `message`,
-`src_type`, `msg_type`, `msg_id`, `rssi`, `snr`, `timestamp`, `signal_via`) are all derivable from
-`message.get(...)`, so the branch is self-sufficient — but an implementer who reaches for the
-locals will get `NameError`, and one who "fixes" that by moving the filter call below the
-extraction changes ordering for every message type in the system. Do neither.
-
-Hard requirements:
-
-- **Must never block or fail ingestion.** Mirror the classifier's defensive wrap at
-  `ingest.py:1002-1054` — its comment states the invariant: "a misbehaving classifier must not drop
-  the message". Verdict Finding 7: an unwrapped parse loses the entire message row on a crafted
-  id, not just the link-check data. Reproduced: 20 digits → `OverflowError` on the SQLite bind,
-  5000 digits → `ValueError` from CPython's 4300-digit cap.
-- `source='linkcheck'` needs no migration — the column exists. Confirm the value is not constrained
-  by a CHECK before assuming it.
-
-### 2.3 Pure parser — `src/mcapp/linkcheck.py`
-
-Storage-free, no I/O, no state. Built and tested first (Wave 1) so everything downstream imports a
-tested module.
-
-```python
-PING_PREFIX = "{ping}"          # prefix, never equality — ACK suffix, ADR §1.2
-_PONG_RE = re.compile(r"^\{pong\}\{(-?[0-9]{1,10})\}")
-
-def parse(message: dict) -> LinkCheckFrame | None: ...
-def normalise_id(value: int | str) -> int | None: ...   # -> unsigned 32-bit
-```
-
-Requirements, each traceable to a verdict finding:
-
-- **`normalise_id` is the heart of this feature.** Echo ids arrive as 8-digit hex strings, pong ids
-  as signed decimals (ADR §1.3). Normalise both with `& 0xFFFFFFFF`. Python's `&` on a negative
-  yields two's complement, so this is exact for both signs. Getting this wrong means every attempt
-  times out with no diagnostic.
-- `[0-9]`, **not** `\d` — Python's `\d` matches any Unicode Nd digit, which the firmware never
-  emits. `ctcping.py:28` already does this deliberately; follow it.
-- Bounded digit count (`{1,10}`) — verdict Finding 7.
-- `parse()` returns `None` for non-link-check frames and **never raises**.
-- An unparseable pong id yields `correlates_to=None` and is still recognised as a pong.
-- Port 1799 is unauthenticated; treat `src`, `dst`, `msg`, `msg_id` as attacker-shaped. No
-  assumption that `msg_id` is present or hex-valid.
-- Via-routed `dst` (`A,B,C`) resolves to the **last** comma-component. The helper is
-  `push_delivery._resolve_target()` (`:99`) — private, so either promote it or duplicate
-  deliberately with a comment. It is **not** `matches()`, as the first draft said.
-
-### 2.4 Tests
-
-Extend `src/mcapp/linkcheck_tests.py`:
-
-- `normalise_id`: hex string ↔ negative decimal round-trip for a known pair; assert
-  `int("B66FD32E", 16) & 0xFFFFFFFF == -1234567890 & 0xFFFFFFFF`
-- pong ids: positive, negative, zero, 10-digit max, 11-digit (reject), 20-digit, 5000-digit,
-  Arabic-Indic digits (reject), empty, unterminated
-- **assert no exception escapes `store_message` for every hostile id above, and that the
-  surrounding message row is still written when the frame is not a link-check frame** — the
-  Finding 7 regression
-- `{ping}{042` parses as a ping
-- via-routed `dst` resolves to the last component
-- `src_type:"node"` echo does **not** feed `signal_log` (0/0 sentinel)
-- `src_type:"lora"` pong **does**, with `source='linkcheck'`
+The only work here is the regression test in §1.3 that pins the behaviour so Stage 0 cannot break
+it.
 
 ---
 

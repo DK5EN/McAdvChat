@@ -215,6 +215,20 @@ factor of ten, and users would compare the numbers between stations as if they m
 The node's own OLED `D: x.xxx s` is not affected by the retransmit half of this, since
 `sendPing()` does not retransmit — but it still measures from queueing.
 
+### 1.5.6 Path ordering — how `hops` is read
+
+`src` on an Extern-UDP frame is `msg_source_path` (`extudp_functions.cpp:502`). On relay the
+firmware builds it as originator-first with each relay appended
+(`lora_functions.cpp:1193-1201`: `msg_source_path = msg_source_call + "," + node_call`, then
+`concat(',' + node_call)` for each further hop).
+
+So for `src = "DB0HOB-12,DB0ED-99"`: **DB0HOB-12 originated**, DB0ED-99 relayed, and **DB0ED-99 is
+the station we actually heard on RF**. Our own DL2JA-2 pongs carried a bare `src = "DL2JA-2"` with
+no comma — direct, which is why their RSSI is attributable.
+
+Practical rule for the implementation: `hops = src.count(",")`, and signal is attributable to
+`src` only when `hops == 0`. This is the fact §1.4 point 2's gate rests on.
+
 ### 1.5.5 Nothing we send survives the round trip
 
 `getExtern()` reads **only** `dst` and `msg` from the inbound JSON
