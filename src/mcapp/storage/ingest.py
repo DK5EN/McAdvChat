@@ -16,6 +16,7 @@ from datetime import UTC, datetime
 from statistics import mean
 from typing import Any
 
+from .. import linkcheck
 from ..logging_setup import get_logger
 from ..util import (
     APRS_ALTERNATE_TABLE,
@@ -821,7 +822,17 @@ class IngestMixin(StorageBase):
         msg_id = message.get("msg_id")
         src = message.get("src", "")
         dst = message.get("dst", "")
-        msg = message.get("msg", "")
+        # Coerce once, here: `msg` is used downstream by the echo_id regex
+        # (`re.search(..., msg)`), the `":ack" in msg` prefilter, the classifier
+        # and the link-check guard, every one of which assumes `str`. Port 1799 is
+        # unauthenticated and `udp_handler` only type-checks `msg` on the chat
+        # branch (`:493`) — the telemetry branch publishes at `:484` WITHOUT that
+        # check, so a crafted `{"type":"tele","msg":123}` reached here and raised
+        # `AttributeError`, losing the frame entirely. A non-str `msg` is not a
+        # chat payload; treat it as empty and let the frame's signal/position data
+        # ingest normally.
+        raw_msg = message.get("msg", "")
+        msg = raw_msg if isinstance(raw_msg, str) else ""
         msg_type = message.get("type", "msg")
         timestamp = message.get("timestamp", now_ms())
         rssi = message.get("rssi")
@@ -1051,7 +1062,15 @@ class IngestMixin(StorageBase):
             conversation_key,
             *cls_cols,
         )
-        await self._insert_message_row(params, msg_id, dst)
+        # {ping}/{pong} are protocol frames (linkcheck ADR §1.2), not chat: suppress
+        # only the messages-table row, here and not in `_should_filter_message`.
+        # `_should_filter_message` returns before `_ingest_signal` runs above, so a
+        # guard placed there would also delete the pong's already-working signal
+        # ingestion into signal_log/station_positions (implementation plan §1.1/§1.2).
+        # Everything upstream of this point — dedup, `_ingest_signal`, classification —
+        # must run unchanged for these frames; only this final INSERT is skipped.
+        if not linkcheck.is_link_check_payload(msg):
+            await self._insert_message_row(params, msg_id, dst)
 
     @staticmethod
     def _build_message_dict(row: dict[str, Any]) -> dict[str, Any]:
@@ -1462,7 +1481,11 @@ class IngestMixin(StorageBase):
 
     def _should_filter_message(self, message: dict[str, Any]) -> bool:  # noqa: PLR0911 - complex handler kept intact
         """Check if message should be filtered out."""
-        msg_content = message.get("msg", "")
+        raw_msg_content = message.get("msg", "")
+        # Same unauthenticated-input coercion as `store_message` — this runs FIRST
+        # (`store_message:819`), so an un-guarded `.startswith` here crashed before
+        # the coercion there could help.
+        msg_content = raw_msg_content if isinstance(raw_msg_content, str) else ""
         src_type = message.get("src_type", "")
         src = message.get("src", "")
 

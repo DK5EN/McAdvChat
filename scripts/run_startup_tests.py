@@ -50,6 +50,7 @@ from mcapp.sqlite_storage import run_startup_tests as run_storage_tests
 from mcapp.sse_handler import run_startup_tests as run_sse_tests
 from mcapp.storage.connection_lifecycle_tests import run_connection_lifecycle_tests
 from mcapp.storage.conversation_key_tests import run_conversation_key_tests
+from mcapp.storage.linkcheck_ingest_tests import run_linkcheck_ingest_tests
 from mcapp.storage.migration_chain_tests import run_migration_chain_tests
 from mcapp.storage.query_tests import run_query_tests
 from mcapp.storage.signal_via_tests import run_signal_via_tests
@@ -121,6 +122,9 @@ async def main() -> int:  # noqa: PLR0915 - flat suite registry; one visible lin
     migration_chain_ok = await run_migration_chain_tests()
     print(f"migration_chain: {'PASS' if migration_chain_ok else 'FAIL'}")
 
+    linkcheck_ingest_ok = await run_linkcheck_ingest_tests()
+    print(f"linkcheck_ingest: {'PASS' if linkcheck_ingest_ok else 'FAIL'}")
+
     signal_via_ok = await run_signal_via_tests()
     print(f"signal_via: {'PASS' if signal_via_ok else 'FAIL'}")
 
@@ -176,6 +180,7 @@ async def main() -> int:  # noqa: PLR0915 - flat suite registry; one visible lin
         and contract_parity_ok
         and dedup_contract_ok
         and linkcheck_ok
+        and linkcheck_ingest_ok
         and aprs_symbol_ok
         and identity_ok
         and ble_service_ok
