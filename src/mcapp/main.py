@@ -2336,6 +2336,12 @@ async def _shutdown_services(ctx: AppContext) -> None:
 
     await ctx.command_handler.stop_dedup_cleanup()
     await ctx.command_handler.stop_pending_responses()
+    # Link-check sessions hold a driver task per target plus per-attempt waits,
+    # and each can sit for the full 90 s attempt timeout. Reap them here, with
+    # the other command-handler background work, before the transports below
+    # are torn down under them.
+    await ctx.command_handler.stop_linkcheck()
+    await ctx.command_handler.stop_ctcping()
 
     # A hydration sweep can sit for ~12 s in its burst-clearing sleep and then
     # spend ~9 s issuing register commands, so it must be reaped BEFORE the BLE

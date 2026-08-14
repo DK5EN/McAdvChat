@@ -36,6 +36,7 @@ from mcapp.ble_protocol_tests import run_ble_protocol_tests
 from mcapp.classifier.tests import run_all_tests as run_classifier_tests
 from mcapp.commands.dedup_tests import run_dedup_tests
 from mcapp.commands.handler import create_command_handler
+from mcapp.commands.linkcheck_session_tests import run_linkcheck_session_tests
 from mcapp.commands.parsing_tests import run_parsing_tests
 from mcapp.commands.routing_tests import run_routing_tests
 from mcapp.contract_parity_tests import run_contract_parity_tests
@@ -76,6 +77,9 @@ async def main() -> int:  # noqa: PLR0915 - flat suite registry; one visible lin
 
     linkcheck_ok = run_linkcheck_tests()
     print(f"linkcheck: {'PASS' if linkcheck_ok else 'FAIL'}")
+
+    linkcheck_session_ok = await run_linkcheck_session_tests()
+    print(f"linkcheck_session: {'PASS' if linkcheck_session_ok else 'FAIL'}")
 
     aprs_symbol_ok = await run_aprs_symbol_tests()
     print(f"aprs_symbol: {'PASS' if aprs_symbol_ok else 'FAIL'}")
@@ -180,6 +184,7 @@ async def main() -> int:  # noqa: PLR0915 - flat suite registry; one visible lin
         and contract_parity_ok
         and dedup_contract_ok
         and linkcheck_ok
+        and linkcheck_session_ok
         and linkcheck_ingest_ok
         and aprs_symbol_ok
         and identity_ok

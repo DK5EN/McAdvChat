@@ -13,6 +13,7 @@ from typing import TYPE_CHECKING, Any, Protocol
 if TYPE_CHECKING:
     from ..sqlite_storage import SQLiteStorage
     from .ctcping import ActivePing, PingTest
+    from .linkcheck import LinkCheckSession
 
 
 class CommandHandlerBase(Protocol):
@@ -40,6 +41,10 @@ class CommandHandlerBase(Protocol):
     ping_tests: dict[str, PingTest]
     ping_timeout: float
     _completing_test_ids: set[str]
+
+    # ── LinkCheckMixin attributes ─────────────────────────────────────────────
+    link_sessions: dict[str, LinkCheckSession]
+    linkcheck_timeout: float
 
     # ── TopicBeaconMixin attributes ──────────────────────────────────────────
     active_topics: dict[str, Any]
@@ -124,4 +129,8 @@ class CommandHandlerBase(Protocol):
         raise NotImplementedError
 
     async def _handle_ack_message(self, message_data: dict[str, Any]) -> None:
+        raise NotImplementedError
+
+    # LinkCheckMixin → called by RoutingMixin
+    async def handle_link_check_frame(self, message_data: dict[str, Any]) -> None:
         raise NotImplementedError

@@ -81,6 +81,7 @@ try:
 
     from .sse_routes.classifier import build_classifier_router
     from .sse_routes.deploy import build_deploy_router
+    from .sse_routes.linkcheck import build_linkcheck_router
     from .sse_routes.prefs import build_prefs_router
     from .sse_routes.push import build_push_router
     from .sse_routes.stream import build_stream_router
@@ -165,6 +166,7 @@ class SSEManager:
             message_router.subscribe("ble_notification", self._broadcast_handler)
             message_router.subscribe("ble_status", self._broadcast_handler)
             message_router.subscribe("msg_status", self._status_handler)
+            message_router.subscribe("linkcheck_event", self._linkcheck_handler)
             # Note: websocket_direct not supported for SSE (no individual connection reference)
 
         logger.info("SSEManager initialized for %s:%d", host, port)
@@ -441,6 +443,7 @@ class SSEManager:
         app.include_router(build_weather_router(self))
         app.include_router(build_deploy_router(self))
         app.include_router(build_push_router(self))
+        app.include_router(build_linkcheck_router(self))
 
         return app
 
@@ -653,6 +656,22 @@ class SSEManager:
                 routed_message["source"],
                 truncated,
             )
+
+    async def _linkcheck_handler(self, routed_message: dict[str, Any]) -> None:
+        """Forward LinkCheckMixin session events to SSE clients.
+
+        The mixin publishes `{"event": "linkcheck_result", ...}` on the
+        "linkcheck_event" topic; the webapp subscribes to `proxy:linkcheck_*`.
+        Deliberately NOT routed through `_broadcast_handler`: these are our own
+        session events, not mesh payloads, so they carry no `src` for
+        `blocklist_decision()` to judge and must not be filtered as if they did.
+        """
+        payload = routed_message["data"]
+        event = payload.get("event")
+        if not isinstance(event, str) or not event:
+            logger.warning("linkcheck_event without a usable 'event' key: %r", payload)
+            return
+        await self.broadcast_event(f"proxy:{event}", payload)
 
     async def _status_handler(self, routed_message: dict[str, Any]) -> None:
         """Forward message status updates (ACK) to SSE clients."""

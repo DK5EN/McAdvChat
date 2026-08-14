@@ -2,6 +2,7 @@
 
 from typing import Any
 
+from .. import linkcheck
 from ..logging_setup import get_logger
 from ._base import CommandHandlerBase
 from .parsing import extract_target_callsign, is_group, normalize_unified, parse_command
@@ -40,6 +41,15 @@ class RoutingMixin(CommandHandlerBase):
             return
 
         msg_text = message_data.get("msg", "")
+
+        # Link-check protocol frames ({ping}/{pong}) are not chat and not
+        # commands: they drive the LinkCheckMixin session engine and stop here.
+        # Checked BEFORE the echo/ACK branches because our own outbound ping is
+        # echoed back as "{ping}{NNN" (unterminated ACK suffix, ADR §1.2), which
+        # `_is_echo_message` would otherwise claim as a ctcping echo.
+        if linkcheck.is_link_check_payload(msg_text):
+            await self.handle_link_check_frame(message_data)
+            return
 
         if self._is_echo_message(msg_text):
             await self._handle_echo_message(message_data)

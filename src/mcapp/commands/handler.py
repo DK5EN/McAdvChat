@@ -12,6 +12,7 @@ from .admin_commands import AdminCommandsMixin
 from .ctcping import CTCPingMixin
 from .data_commands import DataCommandsMixin
 from .dedup import DedupMixin
+from .linkcheck import LinkCheckMixin
 from .response import ResponseMixin
 from .routing import RoutingMixin
 from .simple_commands import SimpleCommandsMixin
@@ -151,6 +152,7 @@ class CommandHandler(
     WeatherCommandMixin,
     AdminCommandsMixin,
     CTCPingMixin,
+    LinkCheckMixin,
     TopicBeaconMixin,
 ):
     def __init__(  # noqa: PLR0913 - signature fixed by call sites
@@ -185,6 +187,7 @@ class CommandHandler(
         # Initialize subsystems
         self._init_topic_beacon()
         self._init_ctcping()
+        self._init_linkcheck()
         self._init_dedup()
         self._init_weather()
         self._init_response()

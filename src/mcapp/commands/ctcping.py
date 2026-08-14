@@ -104,6 +104,28 @@ class CTCPingMixin(CommandHandlerBase):
         self._completing_test_ids: set[str] = set()
         self._ping_bg_tasks: set[asyncio.Task[Any]] = set()
 
+    async def stop_ctcping(self) -> None:
+        """Cancel every in-flight ping task. Called from `_shutdown_services`.
+
+        `_ping_bg_tasks` is populated at four sites in this module (the per-ping
+        timeout, the completion cleanup, the test driver and the monitor) and
+        each entry removes itself via `add_done_callback`, but until this method
+        existed nothing ever CANCELLED them: shutdown tore the transports down
+        while a `_ping_timeout_task` was still sleeping its 30 s, and a
+        `_monitor_test_completion` could sit for `PING_TEST_MAX_WAIT_SECONDS`
+        (300 s). Found while adding the equivalent for `LinkCheckMixin`, which
+        would otherwise have reproduced the same leak.
+        """
+        tasks = [task for task in self._ping_bg_tasks if not task.done()]
+        for task in tasks:
+            task.cancel()
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+        self._ping_bg_tasks.clear()
+        self.active_pings.clear()
+        self.ping_tests.clear()
+        self._completing_test_ids.clear()
+
     def _is_ack_message(self, msg: str) -> bool:
         """Check if message is an ACK with :ackXXX pattern"""
         if not msg:
