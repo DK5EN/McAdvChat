@@ -16,15 +16,15 @@ This plan assumes both.
 
 ## Wave status log
 
-| Wave | Contents                | Status      |
-| ---- | ----------------------- | ----------- |
-| 0    | Pre-flight              | not started |
-| 1    | Stage 0 + pure parser   | not started |
-| 2    | Stage 1 signal ingest   | not started |
-| 3    | Stage 2 session engine  | not started |
-| 4    | Stage 2 routes + wiring | not started |
-| 5    | Stage 3 webapp          | not started |
-| 6    | Documentation           | not started |
+| Wave | Contents                | Status              |
+| ---- | ----------------------- | ------------------- |
+| 0    | Pre-flight              | **DONE 2026-08-14** |
+| 1    | Stage 0 + pure parser   | not started         |
+| 2    | Stage 1 signal ingest   | not started         |
+| 3    | Stage 2 session engine  | not started         |
+| 4    | Stage 2 routes + wiring | not started         |
+| 5    | Stage 3 webapp          | not started         |
+| 6    | Documentation           | not started         |
 
 ---
 
@@ -47,9 +47,16 @@ Not delegable. Record answers in this file before dispatching.
    while ingest sees SSID-qualified `dst` (`DK5EN-98`). Establish which is authoritative at the
    comparison point; the own-vs-foreign classification in §2 depends on it.
 
-Answers:
+**Answers (completed 2026-08-14 — pre-flight is DONE, Waves may start):**
 
-> _(fill in during pre-flight)_
+1. Node `DK5EN-98` reports `firmware=4.35`, `fw_sub=p`. The wire carries no date-level version, so
+   the build date is not observable from either side — for us or for any target. Confirmed by
+   three successful live exchanges instead (ADR §1.5).
+2. **Captured on air, 2026-08-14** — three pings to `DL2JA-2`, all answered and correlated. Full
+   results in ADR §1.5; the real frames are in §2.1 below. The loopback responder is still needed
+   for the test suite, but it is no longer blocking.
+3. Ingest sees the SSID-qualified form: our node is `DK5EN-98` and the pong's `dst` is `DK5EN-98`.
+   Compare SSID-qualified at the ingest boundary.
 
 ---
 
@@ -115,38 +122,44 @@ first draft's `link_checks` table was wrong; do not reintroduce it.
 
 ### 2.1 Observed wire shapes
 
-> **FILL FROM PRE-FLIGHT §0.2.** Derived from `extudp_functions.cpp:491-520`; not yet a capture.
+**Real capture, 2026-08-14** (run 1 of three; ADR §1.5 has all three and the analysis).
 
-Echo of our own outgoing ping — note `msg_id` is a **hex string**:
+Echo of our own outgoing ping — `msg_id` is an 8-digit **hex string**, and the payload carries the
+unterminated ACK suffix:
 
 ```json
 {
   "src_type": "node",
   "type": "msg",
   "src": "DK5EN-98",
-  "dst": "OE1XYZ-12",
-  "msg": "{ping}{042",
-  "msg_id": "1AE1E0C4",
-  "firmware": "4.35p",
+  "dst": "DL2JA-2",
+  "msg": "{ping}{087",
+  "msg_id": "1AE1E057",
+  "firmware": "4.35",
   "rssi": 0,
   "snr": 0
 }
 ```
 
-Inbound pong — `msg_id` is this frame's own id; the correlation token is inside `msg`, in decimal:
+Inbound pong — `msg_id` is this frame's own id; the correlation token is inside `msg`, in decimal.
+`int("1AE1E057", 16) == 451010647`:
 
 ```json
 {
   "src_type": "lora",
   "type": "msg",
-  "src": "OE1XYZ-12",
+  "src": "DL2JA-2",
   "dst": "DK5EN-98",
-  "msg": "{pong}{450125508}",
-  "msg_id": "3AF10C21",
-  "rssi": -95,
-  "snr": 6
+  "msg": "{pong}{451010647}",
+  "msg_id": "E9FB720A",
+  "firmware": "35",
+  "rssi": -117,
+  "snr": -7.0
 }
 ```
+
+Note `firmware` differs between the two (`"4.35"` on our own node's echo, `"35"` on a remote LoRa
+frame) — do not assume a single format.
 
 `rssi`/`snr` are a `0/0` sentinel on `src_type:"node"` and must be excluded by an explicit
 `src_type` check, per the existing project rule — never by a range check.
@@ -156,9 +169,16 @@ Inbound pong — `msg_id` is this frame's own id; the correlation token is insid
 In `store_message()`, **before** the `_should_filter_message()` call at `:818` (see §1.2):
 
 1. `linkcheck.parse()` the frame.
-2. On a pong with `src_type == "lora"` and real signal, call the existing `_ingest_signal()` with
-   `source='linkcheck'`.
+2. On a pong with `src_type == "lora"`, real signal, **and an empty via-path**, call the existing
+   `_ingest_signal()` with `source='linkcheck'`.
 3. Fall through to the normal path; `_should_filter_message` then drops the message row.
+
+**The empty-path condition is not optional.** Relayed pongs are the observed norm (ADR §1.4
+point 2 — all seven historical pongs arrived `hops=1`), and a relayed pong's `rssi`/`snr` measures
+the **last hop**, not the station named in `src`. Writing those into `signal_log` under the
+originator's callsign would corrupt the existing map and mHeard views with wrong signal for the
+wrong station — a data-integrity bug worse than the chat noise Stage 0 fixes. Reject when `src`
+contains a comma.
 
 **Read the field values from the `message` dict directly, not from the locals.** `store_message`
 extracts `src`/`msg`/`rssi`/`snr`/`timestamp` into locals at `:821-841`, which is _after_ the
@@ -249,7 +269,8 @@ as part of this work.
 ### 3.2 Correlation
 
 1. `POST /api/linkcheck` → validate → create session, keyed by target, status RUNNING.
-2. Send `{"type": "msg", "dst": target, "msg": "{ping}", "src_type": "linkcheck"}` via
+2. Send `{"type": "msg", "dst": target, "msg": "{ping}"}` — the firmware reads only `dst` and
+   `msg` (ADR §1.5.5), so any extra key is discarded. Publish via
    `await self.message_router.publish("linkcheck", "udp_message", message_data)` — the idiom every
    existing caller uses (`ctcping.py:602`). **Not** `_send_via_udp`, which is private and called by
    nobody.
@@ -260,15 +281,27 @@ as part of this work.
 5. An inbound pong whose `normalise_id(correlates_to)` matches a pending attempt resolves it:
    `rtt_ms = now - sent_ms`, plus the pong frame's `rssi`/`snr`.
 
-**Echo-claim ambiguity (verdict Finding, concurrency #2):** matching on `dst` + `{ping}` prefix
-alone cannot distinguish our session's ping from a human typing `{ping}` into chat to the same
-station. Mitigate by tagging our own sends (`src_type: "linkcheck"`) and requiring that tag on the
-claimed echo. If the echo does not preserve `src_type`, fall back to claiming only while an
-attempt is pending **and** within a short window, and document the residual ambiguity.
+**Echo-claim ambiguity (verdict, concurrency #2 — cannot be fully closed).** Matching on `dst` +
+`{ping}` prefix alone cannot distinguish our session's ping from a human typing `{ping}` into chat
+to the same station. The first draft proposed tagging our sends with `src_type: "linkcheck"`;
+**that does not work** — nothing we put in the datagram survives (ADR §1.5.5). Claim an echo only
+while an attempt to that `dst` is pending and within a short window, and document the residual
+ambiguity rather than pretending it is solved.
 
-**Retransmission (ADR §1.4 point 7):** our ping keys ~4 times and can elicit up to 4 pongs sharing
-one id. Duplicate pongs are the **normal** case. First pong wins; later ones for a resolved
-attempt are counted and discarded, never a second result.
+**Retransmission (ADR §1.4 point 7):** our ping keys up to 4 times over 2 minutes (40 s per retry,
+`MAX_RETRANSMIT 3`). It does **not** produce duplicate pongs — measured 1 pong per ping on 3/3 live
+runs, because retransmits reuse the `msg_id` and the responder's `is_new_packet()` drops them
+(ADR §1.5.2). Still handle a duplicate defensively (first wins), but do not design around it.
+
+**Do not report a round-trip time (ADR §1.5.4).** Measured 23.8 s / 42.6 s / 29.3 s on air —
+dominated by TX queueing and 40 s retransmit quantisation, not propagation. The result object
+should carry `reachable`, `rssi`, `snr` and `response_ms`; the UI must not label `response_ms` as
+RTT or invite comparison between stations.
+
+**Only attribute signal when the pong path is empty (ADR §1.4 point 2).** Relayed pongs are the
+observed norm in today's fleet, and their `rssi`/`snr` belongs to the last hop, not the target.
+Set `signal_attributable = (hops == 0)` and gate both the UI and the `signal_log` write on it —
+otherwise Stage 1 poisons `signal_log` with relay measurements attributed to the wrong station.
 
 ### 3.3 Caps — server-side, not UI
 
@@ -467,9 +500,13 @@ exposes the new methods rather than assuming registration happened.
 
 1. **Shared session base vs. shared idioms** between `LinkCheckMixin` and `CTCPingMixin` (§3.1).
    Decide in Wave 3, record the reasoning here.
-2. **`src_type` preservation through the echo** (§3.2). Determines whether the echo-claim
-   ambiguity is fully closed or only narrowed. **Answerable from the pre-flight capture (§0.2) and
-   blocking for Wave 3** — do not start Wave 3 without it.
+2. ~~**`src_type` preservation through the echo**~~ — **ANSWERED: no** (ADR §1.5.5). `getExtern()`
+   reads only `dst` and `msg` from our datagram (`extudp_functions.cpp:260-261`); `src_type` on the
+   echo is set by the firmware. **No marker we control survives the round trip**, so §3.2's plan to
+   tag our own sends with `src_type: "linkcheck"` does not work — delete that mitigation. The
+   echo-claim can only be narrowed, never closed: match on `dst` + `{ping}` prefix + a pending
+   attempt within a short window, and document the residual ambiguity with a human-typed `{ping}`.
+   No longer blocking for Wave 3, but Wave 3 must implement the narrowed form, not the tagged one.
 3. **Feature toggle.** No kill switch is planned. The only precedent is the coarse `BLE_MODE`
    config. Decide whether an on-air-transmitting feature on an unauthenticated endpoint needs one;
    the caps in §3.3 are the current answer.

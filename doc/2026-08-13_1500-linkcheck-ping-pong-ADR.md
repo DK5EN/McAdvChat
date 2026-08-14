@@ -1,7 +1,7 @@
 # ADR: Link Check (firmware `{ping}` / `{pong}`) in McApp
 
 **Date:** 2026-08-13
-**Status:** Accepted, not implemented
+**Status:** Accepted, not implemented — protocol **validated on air 2026-08-14** (§1.5)
 **Affects:** `storage/ingest.py`, `commands/linkcheck.py` (new), `sse_routes/linkcheck.py` (new), `main.py`, frontend `webapp`
 **Implementation plan:** `doc/2026-08-13_1500-linkcheck-implementation-plan.md`
 **Review:** `doc/2026-08-13_1500-linkcheck-verdict.md` — this ADR's first draft contained two
@@ -70,7 +70,7 @@ feature that silently never correlates.
 **(a) The Extern-UDP `msg_id` field is hex; the pong payload is decimal.**
 `extudp_functions.cpp:365` formats it as `snprintf(_msgId, sizeof(_msgId), "%08X", …)` and assigns
 it at `:505`, so every Extern-UDP frame carries an **8-digit uppercase hex string**
-(`"1AE1E0C4"`). The pong embeds the same 32-bit value in **decimal**. McApp already reflects this
+(`"1AE1E057"`, a real capture). The pong embeds the same 32-bit value in **decimal**. McApp already reflects this
 elsewhere — `messages.msg_id` is `TEXT` (`migrations.py:557`).
 
 **(b) About half of all nodes emit a negative pong id.** `SendPong(String, unsigned int msg_id)`
@@ -99,10 +99,20 @@ Python's `&` on a negative int yields the two's-complement value, so this is exa
    (`loop_functions.cpp:3163-3165`), a one-button toggle (`onebutton_functions.cpp:219`). A node in
    track mode never answers — and those are exactly the mobile stations a link test is most
    interesting for.
-2. **RF-direct only.** Foreign ping/pong set `bMeshDestination = false` and
-   `bSendAckGateway = false` (`lora_functions.cpp:883/889`), and `:1137` additionally suppresses
-   meshing for a `{ping}` to the telemetry group `100001`. Nothing is forwarded into the mesh and
-   nothing reaches the MeshCom server. Group, `*` and `100001` destinations are never answered.
+2. **RF-direct by design, but NOT in the current fleet.** Foreign ping/pong set
+   `bMeshDestination = false` and `bSendAckGateway = false` (`lora_functions.cpp:883/889`), and
+   `:1137` additionally suppresses meshing for a `{ping}` to the telemetry group `100001`. Nothing
+   reaches the MeshCom server, and group, `*` and `100001` destinations are never answered.
+
+   **Contradicted on air (§1.5.3):** all seven historical pongs in our database arrived with
+   `hops=1` — relayed one hop before reaching us. A node running this build will not relay a pong,
+   so the relays doing it must run a pre-ping build. The feature is three weeks old and the fleet
+   updates slowly, so **assume pongs propagate multi-hop for the foreseeable future.**
+
+   Consequence for the design: a pong's `rssi`/`snr` describes **the last hop**, not the pinged
+   station. Signal may only be attributed to the target when the pong arrives with an empty path.
+   A pong with a via-path proves reachability but says nothing about the target's signal.
+
 3. **`queueExtern()` runs before any ping/pong filtering.** `lora_functions.cpp:701` queues
    received frames to Extern-UDP, behind three gates: `bEXTUDP`, `is_new_packet()`, and a
    TEXT/POS/HEY type check. Ping and pong therefore arrive at McApp as ordinary `type:"msg"`
@@ -122,13 +132,98 @@ Python's `&` on a negative int yields the two's-complement value, so this is exa
 7. **A ping we originate is retransmitted three further times.** `sendMessage()` arms
    retransmission for any text DM whose payload does not start with `{CET}`, `{MCP}` or `{SET}`
    (`loop_functions.cpp:3466-3472`); `{ping}` is not in that list. Retransmission is cancelled by a
-   DM-ACK, and a responder answers with a pong, never an ACK — so nothing cancels it. **One attempt
-   is about four keyings over two minutes, and can elicit up to four pongs sharing one correlation
-   id.** The node's own `sendPing()` sets `0xFF` (no retransmission) and does not do this; only our
-   path does. This block is local-fork code and may differ upstream.
+   DM-ACK, and a responder answers with a pong, never an ACK — so nothing cancels it. The schedule
+   is fixed at **40 s per retry, `MAX_RETRANSMIT 3`** (`lora_functions.cpp:1911/1932`), so one
+   attempt costs **up to four keyings over two minutes**. The node's own `sendPing()` sets `0xFF`
+   (no retransmission) and does not do this; only our path does. This block is local-fork code and
+   may differ upstream.
+
+   **Corrected by measurement (§1.5.2):** the first draft said this "can elicit up to four pongs
+   sharing one correlation id". It does not — three live exchanges produced **exactly one pong
+   each**. Retransmissions reuse the same `msg_id`, so the responder's `is_new_packet()` duplicate
+   filter drops them. The airtime cost is real; the duplicate-pong problem is not.
+
+   **This is worth a one-line firmware fix in our own fork:** adding `{ping}` to the
+   `{CET}`/`{MCP}`/`{SET}` exclusion list at `loop_functions.cpp:3468` would make a proxy-originated
+   ping behave like the node's own — one keying instead of four, and no 40 s quantisation in the
+   measured time.
+
 8. **We cannot ping ourselves.** `sendMessage()` hard-refuses a DM to our own callsign
    (`loop_functions.cpp:3366-3372`, `[ERROR]...DM to own-all not allowed`). A self-test produces no
    transmission at all.
+
+---
+
+## 1.5 Measured on air, 2026-08-14
+
+Three pings sent from `DK5EN-98` to `DL2JA-2` by writing
+`{"type":"msg","dst":"DL2JA-2","msg":"{ping}"}` to the node's Extern-UDP port 1799. All three
+answered. This section replaces guesswork with capture; where it contradicts §1.1-§1.4, it wins.
+
+| #   | echo `msg_id` | as decimal  | pong token  | match | echo→pong | RSSI / SNR |
+| --- | ------------- | ----------- | ----------- | ----- | --------- | ---------- |
+| 1   | `1AE1E057`    | 451 010 647 | 451 010 647 | yes   | 23.8 s    | −117 / −4  |
+| 2   | `1AE1E059`    | 451 010 649 | 451 010 649 | yes   | 42.6 s    | −127 / −19 |
+| 3   | `1AE1E05A`    | 451 010 650 | 451 010 650 | yes   | 29.3 s    | −119 / −9  |
+
+Real frames (run 1), verbatim from `messages`:
+
+```
+src=DK5EN-98  dst=DL2JA-2   src_type=node  msg_id=1AE1E057  rssi=0     snr=0.0   msg='{ping}{087'
+src=DL2JA-2   dst=DK5EN-98  src_type=lora  msg_id=E9FB720A  rssi=-117  snr=-7.0  msg='{pong}{451010647}'
+```
+
+### 1.5.1 Confirmed exactly as designed
+
+- **The hex/decimal split (§1.3a).** `int("1AE1E057", 16) == 451010647`, the pong's token, on all
+  three runs. The correlation scheme works.
+- **The unterminated ACK suffix (§1.2).** On air the ping reads `{ping}{087`, `{ping}{089`,
+  `{ping}{090` — no closing brace, exactly as predicted. Prefix matching is mandatory.
+- **The `0/0` sentinel** on `src_type:"node"`; real signal only on `src_type:"lora"`.
+- **Echo always precedes pong** (§1.4 point 5), all three runs.
+- **Negative pong ids are real (§1.3b).** Not in our own runs, but all seven historical pongs in
+  the database (DB0HOB-12 → DK1TCP-77) carry them: `{pong}{-427408969}`, `{pong}{-427409018}`, …
+  A `\d+` pattern would have silently failed against that station forever.
+
+### 1.5.2 One pong per ping
+
+No duplicates in any run, over a 150 s and two 80 s observation windows. See §1.4 point 7.
+
+### 1.5.3 Pongs are being relayed
+
+All seven historical pongs arrived `hops=1`. See §1.4 point 2 — this changes what `rssi` means.
+
+### 1.5.4 The measured time is not a round-trip time
+
+23.8 s, 42.6 s, 29.3 s — an order of magnitude too slow for LoRa propagation, and too variable to
+be a link metric. Two causes, both structural:
+
+- **The echo timestamps queueing, not transmission.** `sendMessage()` calls `sendExtern()` when it
+  puts the frame in the ring buffer, not when the radio keys. On a busy relay node the gap is
+  seconds to tens of seconds, and both ends queue.
+- **Retransmission quantises it to 40 s steps.** Run 2 at 42.6 s is almost certainly the first
+  retransmit (+40 s) being answered ~2.6 s later.
+
+**Design consequence — this is the finding that changes the feature.** McApp cannot measure a
+round-trip time this way, and must not display one. What this exchange genuinely delivers is:
+
+1. **reachability** — did the station answer at all, and
+2. **RSSI/SNR of the reply**, when the pong arrives with an empty path (§1.4 point 2).
+
+Label the time "response time (includes queueing)" or omit it. Calling it RTT would be wrong by a
+factor of ten, and users would compare the numbers between stations as if they meant something.
+The node's own OLED `D: x.xxx s` is not affected by the retransmit half of this, since
+`sendPing()` does not retransmit — but it still measures from queueing.
+
+### 1.5.5 Nothing we send survives the round trip
+
+`getExtern()` reads **only** `dst` and `msg` from the inbound JSON
+(`extudp_functions.cpp:260-261`); `src_type:"node"` on the echo is set by the firmware. Any tag we
+add to the outbound datagram is discarded. Correlating our own echo therefore cannot rely on a
+marker we control — only on `dst` + payload prefix + timing.
+
+This answers implementation-plan open question 2 with a **no**, and it is load-bearing for the
+echo-claim ambiguity in that plan's §3.2.
 
 ---
 
@@ -211,7 +306,8 @@ delivers strictly more for less.
 
 ### 4.1 Positive
 
-- Works with the firmware already deployed on both ends, with no firmware change.
+- **Verified working end to end on air** (§1.5): 3/3 pings answered and correlated, against a
+  marginal −117…−127 dBm link, with the firmware already deployed on both ends.
 - The responder side needs no configuration.
 - We get RSSI/SNR of the reply, a better link metric than "message delivered".
 - Removes existing chat noise (§2a) as a side effect of Stage 0.
@@ -220,8 +316,13 @@ delivers strictly more for less.
 
 ### 4.2 Negative / accepted limitations
 
+- **No usable round-trip time** (§1.5.4). Measured 23.8-42.6 s, dominated by TX queueing and
+  40 s retransmit quantisation. The feature delivers reachability and reply signal, not latency.
+  Do not display a number labelled RTT.
 - **Four keyings per attempt, not one** (§1.4 point 7). Airtime caps must be set against the real
-  multiplier, and duplicate pongs are the normal case.
+  multiplier. A one-line firmware change in our fork would remove this.
+- **Reply signal is only attributable when the pong has no via-path** (§1.4 point 2) — and in
+  today's fleet, relayed pongs are the observed norm.
 - **UDP mode only.** BLE clients cannot see pongs (§1.4 point 4). Note that UDP is always on and
   BLE is additive, so this is not a mode the box is "in" — the constraint is that a BLE-only client
   view cannot show this data, not that the endpoint should be refused.
