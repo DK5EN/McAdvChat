@@ -86,6 +86,11 @@ class LinkCheckAttempt:
     response_ms: int | None = None
     hops: int | None = None
     late: bool = False
+    # Set when a src_type:"udp" (internet-path) pong matches this attempt's
+    # id — ADR §1.5.1: real signal only on src_type:"lora". Never itself
+    # resolves the attempt; a later "lora" copy still overwrites rssi/snr/hops
+    # normally and reports this as True.
+    internet_reply: bool = False
 
 
 @dataclass
@@ -230,6 +235,7 @@ class LinkCheckMixin(CommandHandlerBase):
                             "response_ms": attempt.response_ms,
                             "hops": attempt.hops,
                             "late": attempt.late,
+                            "internet_reply": attempt.internet_reply,
                         }
                         for attempt in session.attempts
                     ],
@@ -309,6 +315,31 @@ class LinkCheckMixin(CommandHandlerBase):
                     # in case of a genuine (if unlikely) id collision.
                     continue
 
+                # Real signal only on src_type:"lora" (ADR §1.5.1); "udp"/"node"
+                # carry a 0/0 sentinel. A "udp" pong is a genuine reply, but an
+                # internet-path one, not RF — record that the target answered
+                # without resolving the attempt, so it keeps waiting for a
+                # "lora" copy until the driver timeout. "node" is our own
+                # node's echo sentinel; "ble" is the BLE-service copy whose
+                # signal provenance is ambiguous — the Extern-UDP "lora" copy
+                # of the same pong arrives within ~1 s and resolves then.
+                if frame.src_type == "udp":
+                    attempt.internet_reply = True
+                    logger.debug(
+                        "Internet-path (udp) pong for %s seq=%d, still waiting for an RF copy",
+                        target,
+                        attempt.seq,
+                    )
+                    return
+                if frame.src_type != "lora":
+                    logger.debug(
+                        "Ignoring pong with src_type=%r for %s seq=%d",
+                        frame.src_type,
+                        target,
+                        attempt.seq,
+                    )
+                    return
+
                 if attempt.resolved:
                     logger.debug(
                         "Duplicate link check pong for %s seq=%d, ignoring",
@@ -337,6 +368,7 @@ class LinkCheckMixin(CommandHandlerBase):
                     snr=attempt.snr,
                     hops=attempt.hops,
                     late=attempt.late,
+                    internet_reply=attempt.internet_reply,
                 )
                 return
         # No attempt anywhere carries this id: unknown/foreign pong, ignored.
@@ -398,7 +430,12 @@ class LinkCheckMixin(CommandHandlerBase):
                     received += 1
                 else:
                     attempt.timed_out = True
-                    await self._emit_linkcheck_event("linkcheck_timeout", target=target, seq=seq)
+                    await self._emit_linkcheck_event(
+                        "linkcheck_timeout",
+                        target=target,
+                        seq=seq,
+                        internet_reply=attempt.internet_reply,
+                    )
 
             if session.status == LinkCheckStatus.RUNNING:
                 session.status = (

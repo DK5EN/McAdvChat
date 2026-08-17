@@ -108,6 +108,7 @@ def _pong(  # noqa: PLR0913 - test fixture builder, all but src/token are kw-onl
     rssi: int = -117,
     snr: float = -7.0,
     msg_id: str = "E9FB720A",
+    src_type: str = "lora",
 ) -> dict[str, Any]:
     return {
         "type": "msg",
@@ -115,7 +116,7 @@ def _pong(  # noqa: PLR0913 - test fixture builder, all but src/token are kw-onl
         "dst": dst,
         "msg": f"{{pong}}{{{token}}}",
         "msg_id": msg_id,
-        "src_type": "lora",
+        "src_type": src_type,
         "rssi": rssi,
         "snr": snr,
     }
@@ -397,6 +398,149 @@ async def _test_relayed_pong_reports_hops() -> list[tuple[str, bool]]:
     return out
 
 
+async def _test_udp_pong_does_not_resolve() -> list[tuple[str, bool]]:
+    """An internet-path (`src_type:"udp"`) pong must never count as RF success.
+
+    ADR §1.5.1: real signal only on `src_type:"lora"`; `udp`/`node` carry the
+    `0/0` sentinel. Live evidence 2026-08-17 (mcapp.local): internet-connected
+    stations answered in 2-3 s via `src_type:"udp"` before this gate existed,
+    and the session wrongly resolved as RF success with sentinel rssi/snr.
+    """
+    out: list[tuple[str, bool]] = []
+    h = _make_harness()
+    h.linkcheck_timeout = 0.05
+
+    ok, _msg = await h.start_link_check("DL2JA-2", 1, "DK5EN-98")
+    out.append(("udp pong: start accepted", ok))
+    await asyncio.sleep(0)
+    await asyncio.sleep(0)
+
+    await h.handle_link_check_frame(_echo("DL2JA-2", _REAL_ECHO_MSG_ID))
+    await h.handle_link_check_frame(
+        _pong("DL2JA-2", _REAL_PONG_TOKEN, src_type="udp", rssi=0, snr=0.0)
+    )
+
+    session = h.link_sessions.get("DL2JA-2")
+    attempt = session.attempts[-1] if session and session.attempts else None
+    out.append(("udp pong: attempt not resolved", attempt is not None and not attempt.resolved))
+    out.append(("udp pong: no result event yet", len(h.message_router.results_for("DL2JA-2")) == 0))
+    if attempt is not None:
+        out.append(("udp pong: rssi stays None", attempt.rssi is None))
+        out.append(("udp pong: snr stays None", attempt.snr is None))
+
+    await _await_driver(h, "DL2JA-2", max_wait=2.0)
+
+    out.append(
+        (
+            "udp pong: still no result event after timeout",
+            len(h.message_router.results_for("DL2JA-2")) == 0,
+        )
+    )
+    if attempt is not None:
+        out.append(("udp pong: attempt timed_out after driver finishes", attempt.timed_out))
+        out.append(("udp pong: attempt internet_reply True", attempt.internet_reply))
+
+    done = h.message_router.done_for("DL2JA-2")
+    out.append(
+        ("udp pong: done status == timeout", done is not None and done["status"] == "timeout")
+    )
+
+    timeout_events = [
+        e
+        for e in h.message_router.events
+        if e["event"] == "linkcheck_timeout" and e["target"] == "DL2JA-2"
+    ]
+    out.append(("udp pong: exactly one timeout event", len(timeout_events) == 1))
+    if timeout_events:
+        out.append(
+            (
+                "udp pong: timeout event carries internet_reply=True",
+                timeout_events[0]["internet_reply"] is True,
+            )
+        )
+    return out
+
+
+async def _test_udp_pong_then_lora_pong_resolves_with_rf_signal() -> list[tuple[str, bool]]:
+    """A later `lora` pong for the same attempt still resolves with real RF signal."""
+    out: list[tuple[str, bool]] = []
+    h = _make_harness()
+    h.linkcheck_timeout = 5.0
+
+    ok, _msg = await h.start_link_check("DL2JA-2", 1, "DK5EN-98")
+    out.append(("udp then lora: start accepted", ok))
+    await asyncio.sleep(0)
+    await asyncio.sleep(0)
+
+    await h.handle_link_check_frame(_echo("DL2JA-2", _REAL_ECHO_MSG_ID))
+    await h.handle_link_check_frame(
+        _pong("DL2JA-2", _REAL_PONG_TOKEN, src_type="udp", rssi=0, snr=0.0)
+    )
+    out.append(
+        (
+            "udp then lora: no result event after udp pong",
+            len(h.message_router.results_for("DL2JA-2")) == 0,
+        )
+    )
+
+    await h.handle_link_check_frame(
+        _pong("DL2JA-2", _REAL_PONG_TOKEN, rssi=_REAL_RSSI, snr=_REAL_SNR)
+    )
+    await _await_driver(h, "DL2JA-2")
+
+    results = h.message_router.results_for("DL2JA-2")
+    out.append(("udp then lora: exactly one result event", len(results) == 1))
+    if results:
+        r = results[0]
+        out.append(("udp then lora: rssi from lora frame", r["rssi"] == _REAL_RSSI))
+        out.append(("udp then lora: snr from lora frame", r["snr"] == _REAL_SNR))
+        out.append(("udp then lora: hops == 0", r["hops"] == 0))
+        out.append(
+            ("udp then lora: internet_reply True in result event", r["internet_reply"] is True)
+        )
+
+    done = h.message_router.done_for("DL2JA-2")
+    out.append(
+        (
+            "udp then lora: done status == completed",
+            done is not None and done["status"] == "completed",
+        )
+    )
+    return out
+
+
+async def _test_ble_pong_ignored() -> list[tuple[str, bool]]:
+    """A `src_type:"ble"` pong causes no state change: the "lora" copy resolves it later."""
+    out: list[tuple[str, bool]] = []
+    h = _make_harness()
+    h.linkcheck_timeout = 0.05
+
+    ok, _msg = await h.start_link_check("DL2JA-2", 1, "DK5EN-98")
+    out.append(("ble pong: start accepted", ok))
+    await asyncio.sleep(0)
+    await asyncio.sleep(0)
+
+    await h.handle_link_check_frame(_echo("DL2JA-2", _REAL_ECHO_MSG_ID))
+    await h.handle_link_check_frame(
+        _pong("DL2JA-2", _REAL_PONG_TOKEN, src_type="ble", rssi=_REAL_RSSI, snr=_REAL_SNR)
+    )
+
+    session = h.link_sessions.get("DL2JA-2")
+    attempt = session.attempts[-1] if session and session.attempts else None
+    out.append(("ble pong: attempt not resolved", attempt is not None and not attempt.resolved))
+    out.append(
+        ("ble pong: internet_reply stays False", attempt is not None and not attempt.internet_reply)
+    )
+    out.append(("ble pong: no result event", len(h.message_router.results_for("DL2JA-2")) == 0))
+
+    await _await_driver(h, "DL2JA-2", max_wait=2.0)
+    done = h.message_router.done_for("DL2JA-2")
+    out.append(
+        ("ble pong: done status == timeout", done is not None and done["status"] == "timeout")
+    )
+    return out
+
+
 async def _collect_all() -> list[tuple[str, bool]]:
     results: list[tuple[str, bool]] = []
     for test_fn in (
@@ -413,6 +557,9 @@ async def _collect_all() -> list[tuple[str, bool]]:
         _test_oserror_releases_target,
         _test_stop_mid_session_allows_restart,
         _test_relayed_pong_reports_hops,
+        _test_udp_pong_does_not_resolve,
+        _test_udp_pong_then_lora_pong_resolves_with_rf_signal,
+        _test_ble_pong_ignored,
     ):
         try:
             results.extend(await test_fn())
