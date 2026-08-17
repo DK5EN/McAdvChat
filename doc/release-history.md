@@ -27,6 +27,14 @@
 
 - **[fix]** Piped installs (`curl | sudo bash`) now pin bootstrap libs, templates, and the app to one resolved release tag for the whole run, instead of always pulling libs from the `development` branch tip regardless of the app version being installed. `--tag` is now a real time machine for libs+templates+app (previously app-only); a new `--ref`/`MCAPP_BOOTSTRAP_REF` forces just the bootstrap tree ref, independently of the app version, for developing bootstrap changes without cutting a release and as a one-line field rollback. A skew guard aborts cleanly if a pinned tag's libs predate a function the running script needs, instead of installing a mismatched pair. See `doc/2026-08-09_1600-bootstrap-tag-pinning-plan.md`.
 
+- **[chore]** Push contract raised to **v6**. `endpoints.subscribe.semantics` now states normatively
+  that a subscribe POST replaces the stored filter wholesale rather than patching it, and puts the
+  resulting ordering obligation on the client: resolve stored preferences first, POST second. It
+  also forbids the tempting server-side workaround — a backend that ignored or merged a
+  default-looking filter would break clearing groups on purpose and would diverge the two
+  implementations. Backend behaviour is unchanged; both backends already satisfied v6 the day it was
+  written.
+
 ### Frontend (webapp)
 
 - **[fix]** Push notification settings no longer wipe themselves. Opening Settings on a cold boot —
