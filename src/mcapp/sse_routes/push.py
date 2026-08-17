@@ -1,5 +1,11 @@
-"""Web Push REST endpoints (Wave 5, PWA campaign, contract v2): VAPID public
+"""Web Push REST endpoints (Wave 5, PWA campaign, contract v6): VAPID public
 key, subscribe (upsert-by-endpoint), unsubscribe.
+
+Subscribe overwrites the stored filter WHOLESALE — there is no partial update
+and no merge. Contract v6 pins the consequence: ordering is the client's
+obligation, and a server MUST NOT try to guess whether a default-looking filter
+was deliberate. Do not add such a heuristic here; it would break clearing groups
+on purpose and diverge this backend from mc-chat.
 
 Wires `PushDispatcher` (`push_delivery.py`) into the mesh-message ingest
 pipeline WITHOUT the ingest handler ever awaiting push delivery — see

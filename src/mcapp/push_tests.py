@@ -1,4 +1,4 @@
-"""Startup regression suite for Web Push (Wave 5, PWA campaign, contract v3).
+"""Startup regression suite for Web Push (Wave 5, PWA campaign, contract v6).
 
 Implements every vector in `contract/push_contract.json` (a byte-verbatim copy
 of the shared wire contract; the mc-chat sibling implements the SAME vectors
@@ -77,7 +77,12 @@ _CONTRACT_PATH = pathlib.Path(__file__).parent / "contract" / "push_contract.jso
 # push-eligible.
 # v5 (2026-08-17): adds eligibility clause (d) — firmware {ping}/{pong}
 # link-check protocol frames are not push-eligible.
-_EXPECTED_SHA256 = "525b5ffef16a1a08ad9be8d0f5d891f37fddae7d500b53d7495b8bcc0dce6501"
+# v6 (2026-08-18): adds a client-side ordering clause to subscribe semantics —
+# a subscribe POST replaces the stored filter wholesale, so a client must not
+# send a filter its own preference store has not yet supplied, and servers must
+# not try to detect that case heuristically. Normative text only; no vectors and
+# no backend behavior change, so this suite is unchanged apart from the pin.
+_EXPECTED_SHA256 = "04706a94843a129c09c5fddbf097121c20fa6a51458278235a883f032c9972e5"
 
 # The VAPID keyfile holds a raw P-256 private scalar, so load_or_create_vapid chmods it
 # owner-only. At the default 0644 any local account could forge VAPID JWTs as this node.
