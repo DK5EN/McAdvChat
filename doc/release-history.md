@@ -27,6 +27,22 @@
 
 - **[fix]** Piped installs (`curl | sudo bash`) now pin bootstrap libs, templates, and the app to one resolved release tag for the whole run, instead of always pulling libs from the `development` branch tip regardless of the app version being installed. `--tag` is now a real time machine for libs+templates+app (previously app-only); a new `--ref`/`MCAPP_BOOTSTRAP_REF` forces just the bootstrap tree ref, independently of the app version, for developing bootstrap changes without cutting a release and as a one-line field rollback. A skew guard aborts cleanly if a pinned tag's libs predate a function the running script needs, instead of installing a mismatched pair. See `doc/2026-08-09_1600-bootstrap-tag-pinning-plan.md`.
 
+### Frontend (webapp)
+
+- **[fix]** Push notification settings no longer wipe themselves. Opening Settings on a cold boot —
+  which is what a service-worker update reload produces — re-POSTed the push subscription with the
+  built-in defaults before the settings store had finished loading from IndexedDB. A subscribe POST
+  replaces the **whole** server-side filter, so the user's group list was silently cleared on the
+  backend and group notifications stopped. Observed in the field after the 2026-08-17 update, with
+  the subscription itself provably intact the whole time.
+- **[fix]** Push status is no longer reported from the outcome of a network round trip. An intact
+  subscription rendered as "not enabled yet" — hiding the DM / groups / broadcast fields, which
+  reads as data loss — for as long as the VAPID fetch and subscribe POST took, worst right after a
+  deploy while the backend is still restarting. It is now committed from `getSubscription()` alone,
+  before any network call, with a distinct "checking" state for the pre-resolution unknown.
+- **[fix]** User settings can no longer be persisted before they were loaded, which would have
+  written an empty callsign, proxy host and coordinates over the stored record.
+
 ## v1.6.13 (2026-06-20)
 
 Maintenance release: reduces journal log noise and rolls up dependency updates. No functional changes.
