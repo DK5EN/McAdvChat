@@ -75,7 +75,9 @@ _CONTRACT_PATH = pathlib.Path(__file__).parent / "contract" / "push_contract.jso
 # v4 (2026-07-26): file moved inside mc-chat's subtree'd `contract/` prefix;
 # adds eligibility clause (c) — text ACKs and {CET} broadcasts are not
 # push-eligible.
-_EXPECTED_SHA256 = "2ccd2e0657ac0d797152c65f255f04e942d54acf8182451beeeb026b0760c44b"
+# v5 (2026-08-17): adds eligibility clause (d) — firmware {ping}/{pong}
+# link-check protocol frames are not push-eligible.
+_EXPECTED_SHA256 = "525b5ffef16a1a08ad9be8d0f5d891f37fddae7d500b53d7495b8bcc0dce6501"
 
 # The VAPID keyfile holds a raw P-256 private scalar, so load_or_create_vapid chmods it
 # owner-only. At the default 0644 any local account could forge VAPID JWTs as this node.

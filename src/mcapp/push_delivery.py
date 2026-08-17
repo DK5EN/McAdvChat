@@ -41,6 +41,7 @@ from typing import Any, cast
 from pywebpush import WebPushException
 from pywebpush import webpush as _real_webpush
 
+from .linkcheck import is_link_check_payload
 from .logging_setup import get_logger
 from .storage.constants import DEDUP_WINDOW_MS
 
@@ -194,10 +195,20 @@ def is_eligible(payload: dict[str, Any], own_callsign: str) -> bool:
     (c) must not be node-local noise — a text ACK or a `{CET}` time
         broadcast. This lived at the router wiring seam until contract v4
         made the exclusion universal; see `_is_node_local_noise`.
+    (d) must not be a `{ping}`/`{pong}` link-check protocol frame
+        (contract v5, `eligibility_linkcheck_semantics`). The SAME
+        predicate the storage guard in front of `_insert_message_row`
+        uses (`linkcheck.is_link_check_payload`), so push and message
+        history agree by construction — the push dispatcher subscribes to
+        the router topics, not to storage, so without this clause it
+        announced raw `{pong}{451010884}` frames that no conversation
+        view will ever show.
     """
     if payload.get("type") != "msg" or not _push_text(payload):
         return False
     if _is_node_local_noise(payload):
+        return False
+    if is_link_check_payload(_push_text(payload)):
         return False
     resolved_src = _resolve_source(str(payload.get("src") or ""))
     return resolved_src != own_callsign
