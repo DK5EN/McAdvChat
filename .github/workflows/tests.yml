@@ -20,8 +20,13 @@ jobs:
 
       - name: Install uv
         # setup-uv stopped publishing moving major/minor tags at v8 (supply-chain
-        # hardening) — @v9 does not exist; pin the exact release.
-        uses: astral-sh/setup-uv@v9.0.0
+        # hardening) — @v10 does not exist; pin the exact release.
+        #
+        # v10's breaking change only affects `enable-cache: auto`, which it now
+        # turns off for pull_request_target / workflow_run / release (cache
+        # poisoning). The cache is enabled explicitly below and this workflow
+        # triggers on none of those events, so the bump is a no-op for us.
+        uses: astral-sh/setup-uv@v10.0.1
         with:
           enable-cache: true
 
