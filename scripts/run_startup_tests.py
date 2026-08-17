@@ -42,6 +42,7 @@ from mcapp.commands.routing_tests import run_routing_tests
 from mcapp.contract_parity_tests import run_contract_parity_tests
 from mcapp.dedup_contract_tests import run_dedup_contract_tests
 from mcapp.identity_tests import run_identity_tests
+from mcapp.linkcheck_sse_tests import run_linkcheck_sse_tests
 from mcapp.linkcheck_tests import run_linkcheck_tests
 from mcapp.main import MessageRouter
 from mcapp.meteo_tests import run_meteo_tests
@@ -129,6 +130,9 @@ async def main() -> int:  # noqa: PLR0915 - flat suite registry; one visible lin
     linkcheck_ingest_ok = await run_linkcheck_ingest_tests()
     print(f"linkcheck_ingest: {'PASS' if linkcheck_ingest_ok else 'FAIL'}")
 
+    linkcheck_sse_ok = await run_linkcheck_sse_tests()
+    print(f"linkcheck_sse: {'PASS' if linkcheck_sse_ok else 'FAIL'}")
+
     signal_via_ok = await run_signal_via_tests()
     print(f"signal_via: {'PASS' if signal_via_ok else 'FAIL'}")
 
@@ -186,6 +190,7 @@ async def main() -> int:  # noqa: PLR0915 - flat suite registry; one visible lin
         and linkcheck_ok
         and linkcheck_session_ok
         and linkcheck_ingest_ok
+        and linkcheck_sse_ok
         and aprs_symbol_ok
         and identity_ok
         and ble_service_ok

@@ -29,6 +29,7 @@ from . import __version__
 from .ble_client import ConnectionState
 from .classifier import Classifier
 from .commands.parsing import SPAM_GROUP
+from .linkcheck import is_link_check_payload
 from .logging_setup import get_logger
 from .schemas import DeleteMessagesRequest
 from .sqlite_storage import SQLiteStorage, create_sqlite_storage
@@ -640,6 +641,15 @@ class SSEManager:
         storage/command subscribers of the same message are unaffected.
         """
         message_data = routed_message["data"]
+        # {ping}/{pong} are protocol frames, not chat (linkcheck ADR §1.2):
+        # storage refuses to persist them and push eligibility clause (d)
+        # refuses to announce them, so the live stream must not show them
+        # either — the SAME shared predicate, so all three user-visible
+        # surfaces (history, push, SSE) agree by construction. The webapp's
+        # link-check UI is fed by _linkcheck_handler's `proxy:linkcheck_*`
+        # events, which carry everything these raw frames do and more.
+        if is_link_check_payload(message_data.get("msg", "")):
+            return
         router = self.message_router
         decision = router.blocklist_decision(message_data) if router is not None else "pass"
         if decision == "drop":
