@@ -30,7 +30,13 @@ _ACK_SUFFIX_RE = re.compile(r"\s*:ack[0-9]{3}$")  # _is_ack_message: boolean che
 # ack-request suffix. Shared definition (util.ACK_SUFFIX_FIXED_RE) -- both of
 # ctcping's copies used to spell it `\d`, which in Python also matches every
 # Unicode Nd digit the firmware cannot emit.
-_PING_TEST_SEQUENCE_RE = re.compile(r"ping test \d+/\d+")  # _is_ping_message: boolean check
+# _is_ping_message: boolean check. This sequence is the only part of the probe
+# text that's guaranteed to survive on the wire -- at the minimum 25-byte
+# payload, _start_ping_test truncates "[CTC] Ping test 1/3 to measure
+# roundtrip" down to "[CTC] Ping test 1/3 to me", so anything past "test N/M"
+# (the "mea"/"measure"/"roundtrip" tail this predicate used to also require)
+# is padding/truncation territory and must not be load-bearing here.
+_PING_TEST_SEQUENCE_RE = re.compile(r"ping test \d+/\d+")
 _PING_TEST_SEQUENCE_CAPTURE_RE = re.compile(r"ping test (\d+)/(\d+)")  # _extract_sequence_info
 _ACK_ID_RE = re.compile(r"\s*:ack([0-9]{3})$")  # _handle_ack_message: extracts ack id
 
@@ -141,23 +147,20 @@ class CTCPingMixin(CommandHandlerBase):
         return "[CTC]" in msg and match_ack_suffix(msg) is not None
 
     def _is_ping_message(self, msg: str) -> bool:
-        """Check if message looks like a ping test message (not the 'started' message)"""
+        """Check if message looks like a ping test message (not the 'started' message).
+
+        Recognition rests solely on the `ping test N/M` sequence -- the text
+        after it ("to measure roundtrip...") is padding/truncation territory:
+        at the minimum 25-byte payload the wire text is truncated to "[CTC]
+        Ping test 1/3 to me", so a measurement-term requirement on that tail
+        would never match the most common on-air probe. The `N/M` sequence is
+        already specific enough to keep this from matching the non-sequence
+        "🏓 Ping test to X started: N ping(s) with NN bytes payload..." notice.
+        """
         if not msg:
             return False
 
-        msg_lower = msg.lower()
-
-        has_sequence = bool(_PING_TEST_SEQUENCE_RE.search(msg_lower))
-        has_measurement = any(
-            term in msg_lower
-            for term in [
-                "mea",
-                "measure",
-                "roundtrip",
-            ]
-        )
-
-        return has_sequence and has_measurement
+        return bool(_PING_TEST_SEQUENCE_RE.search(msg.lower()))
 
     def _extract_sequence_info(self, msg: str) -> str | None:
         """Extract sequence info from ping message"""

@@ -2024,6 +2024,17 @@ async def test_ctcping_logic(handler: Any) -> bool:  # noqa: PLR0912, PLR0915 - 
         ("DK5EN-1  :ack75", False, "Invalid ACK (2 digits)"),
         ("DK5EN-1  :ack7534", False, "Invalid ACK (4 digits)"),
         ("Random message", False, "Normal message ignored"),
+        # B7: the minimum 25-byte payload truncates the wire probe to
+        # "[CTC] Ping test N/M to me" -- the "measure"/"roundtrip" tail never
+        # survives, so _is_ping_message must not require it.
+        ("[CTC] Ping test 1/3 to me", True, "Truncated 25-byte ping message recognised"),
+        # Negative: the "started" notice has no "N/M" sequence and must never
+        # be mistaken for an echoed ping test message.
+        (
+            "🏓 Ping test to DL3NCU-1 started: 3 ping(s) with 25 bytes payload...",
+            False,
+            "Start notice not treated as ping message",
+        ),
     ]
 
     for message, expected_result, description in pattern_tests:
@@ -2169,6 +2180,76 @@ async def _test_simulated_ping_flows(handler: Any, results: list[Any]) -> None: 
         results.append((status, "Simulated ping flow", False))
         if has_console:
             print(f"{status} | Simulated ping flow - Exception: {e}")
+
+    # Test 1b: Truncated 25-byte payload (B7). Without the fix, the "measure"/
+    # "roundtrip" tail this echo used to require is truncated away on the wire
+    # ("[CTC] Ping test 1/3 to me{223"), so _is_ping_message returned False,
+    # _handle_echo_message bailed before registering an ActivePing, and the
+    # ACK below would find "no matching ping found" -- the test could only
+    # ever end via the 300 s timeout fallback. Registers a real RUNNING
+    # PingTest (like the A5 timeout test below) so the ACK path resolves a
+    # test_id and records an actual "success" result, not just clears
+    # active_pings.
+    try:
+        import time as _time
+
+        from .ctcping import PingTest as _PingTest
+
+        b7_test_id = "b7-truncated-payload-test"
+        b7_dst = "W2TRUNC-1"
+        b7_echo_id = "223"
+
+        handler.ping_tests[b7_test_id] = _PingTest(
+            test_id=b7_test_id,
+            target=b7_dst,
+            requester=handler.my_callsign,
+            total_pings=1,
+            payload_size=25,
+            start_time=_time.time(),
+        )
+
+        echo_data = {
+            "src": handler.my_callsign,
+            "dst": b7_dst,
+            "msg": "[CTC] Ping test 1/3 to me{" + b7_echo_id,
+        }
+
+        await handler._handle_echo_message(echo_data)
+
+        ping_tracked = b7_echo_id in handler.active_pings
+        status = "✅ PASS" if ping_tracked else "❌ FAIL"
+        results.append((status, "Truncated 25-byte echo tracked", ping_tracked))
+
+        if has_console:
+            print(f"{status} | Truncated 25-byte echo tracked")
+
+        await asyncio.sleep(0.1)
+
+        ack_data = {
+            "src": b7_dst,
+            "dst": handler.my_callsign,
+            "msg": f"{handler.my_callsign}  :ack{b7_echo_id}",
+        }
+
+        await handler._handle_ack_message(ack_data)
+
+        ping_completed = b7_echo_id not in handler.active_pings
+        b7_test_summary = handler.ping_tests.get(b7_test_id)
+        recorded_success = b7_test_summary is not None and any(
+            r.get("status") == "success" for r in b7_test_summary.results
+        )
+        ok = ping_completed and recorded_success
+        status = "✅ PASS" if ok else "❌ FAIL"
+        results.append((status, "Truncated 25-byte echo: ACK processed and success recorded", ok))
+
+        if has_console:
+            print(f"{status} | Truncated 25-byte echo: ACK processed and success recorded")
+
+    except Exception as e:
+        status = "❌ ERROR"
+        results.append((status, "Truncated 25-byte echo flow", False))
+        if has_console:
+            print(f"{status} | Truncated 25-byte echo flow - Exception: {e}")
 
     # Test 2: Timeout Scenario
     try:
