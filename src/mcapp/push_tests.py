@@ -41,6 +41,7 @@ from pywebpush import WebPushException
 
 from .commands.constants import has_console
 from .push_delivery import (
+    COALESCE_WINDOW_SECONDS,
     DEDUP_WINDOW_SECONDS,
     PushCoalescer,
     PushDedup,
@@ -82,7 +83,14 @@ _CONTRACT_PATH = pathlib.Path(__file__).parent / "contract" / "push_contract.jso
 # send a filter its own preference store has not yet supplied, and servers must
 # not try to detect that case heuristically. Normative text only; no vectors and
 # no backend behavior change, so this suite is unchanged apart from the pin.
-_EXPECTED_SHA256 = "04706a94843a129c09c5fddbf097121c20fa6a51458278235a883f032c9972e5"
+# v7 (2026-08-19): adds `payload_ack_suffix_semantics` — the firmware's
+# ack-request suffix ('{NNN', no closing brace) is stripped from the
+# delivered payload text, BEFORE the 120-char truncation, but the
+# eligibility/blocklist/dedup gates must see the UNSTRIPPED text. Adds 5
+# payload_vectors (replayed automatically by the existing payload_vectors
+# loop) plus a dedicated ordering regression here
+# (`_test_ack_suffix_stripped_after_gates`).
+_EXPECTED_SHA256 = "e74d3a6138279f440c8f1925c532221d17d73a84490da9c4e7c97a64413334f3"
 
 # The VAPID keyfile holds a raw P-256 private scalar, so load_or_create_vapid chmods it
 # owner-only. At the default 0644 any local account could forge VAPID JWTs as this node.
@@ -261,6 +269,11 @@ async def run_push_tests() -> bool:
     # 4e. The subscription cache must be invalidated by every write path, or a new
     #     subscriber silently gets no pushes until the next restart.
     await _test_push_subscription_cache_invalidation(_record)
+
+    # 4f. contract `payload_ack_suffix_semantics` (rule 2): the gates must see
+    #     the UNSTRIPPED text — pinned via the one gate the strip can actually
+    #     perturb, PushDedup's msg_id-less fallback triple.
+    await _test_ack_suffix_stripped_after_gates(_record)
 
     # 5. VAPID persistence (injected fake generator — never real crypto).
     _test_vapid_persistence(_record)
@@ -983,6 +996,115 @@ async def _test_push_subscription_cache_invalidation(record: _RecordFn) -> None:
                 "subs cache: a caller mutating the returned list cannot empty the cache",
                 len(await storage.list_push_subscriptions()) == 1,
             )
+        finally:
+            await storage.close()
+
+
+async def _test_ack_suffix_stripped_after_gates(record: _RecordFn) -> None:
+    """Contract `payload_ack_suffix_semantics` (rule 2): the ack-suffix strip
+    must run AFTER the eligibility/blocklist/dedup gates, not before.
+
+    A link-check vector does NOT discriminate this ordering: with the strict
+    unbraced pattern, '{pong}{451010884}' ends in '}' and is never stripped,
+    and a stripped '{ping}{087' -> '{ping}' is still caught by clause (d)'s
+    PREFIX check regardless of ordering. The only gate the strip can actually
+    perturb is PushDedup's msg_id-less (resolved-src, resolved-dst, text)
+    fallback key, so this drives that path specifically: two DMs to the
+    node's own callsign with a FALSY msg_id, same src/dst, texts 'ok{001' and
+    'ok{002' — two DISTINCT messages on the wire that collapse to the same
+    stripped text 'ok'.
+
+    Gate-first (correct): dedup sees two distinct keys, so the first message
+    delivers immediately and the second is buffered by the coalescer's
+    already-open window; closing that window emits one summary (count=1).
+    Strip-first (the bug this pins): dedup sees ONE key, so the second
+    message is swallowed as a duplicate before it ever reaches the
+    coalescer, and no summary ever fires.
+
+    Drives the REAL dispatcher end to end (handle_mesh_message -> queue ->
+    background drain -> stub webpush_fn -> background sweep for the coalesce
+    close), mirroring the idiom in `_drive_one_delivery_and_check_prune` /
+    `_test_blocklist_gate_suppresses_delivery`.
+    """
+    deliveries: list[dict[str, Any]] = []
+
+    def _stub_webpush(**kwargs: Any) -> None:
+        deliveries.append(json.loads(kwargs["data"]))
+
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        storage = await create_sqlite_storage(pathlib.Path(tmp_dir) / "push_ack_suffix.db")
+        try:
+            endpoint = "https://push.example/ack-suffix-ordering"
+            await storage.upsert_push_subscription(
+                endpoint,
+                {"endpoint": endpoint, "keys": {"p256dh": "p", "auth": "a"}},
+                {"dm": True, "groups": [], "broadcast": False},
+            )
+            clock = {"t": 0.0}
+            dispatcher = PushDispatcher(
+                storage=storage,
+                vapid=_FAKE_VAPID,
+                webpush_fn=_stub_webpush,
+                now=lambda: clock["t"],
+            )
+            dispatcher.start()
+            try:
+                own = "DK5EN-99"
+                first = {
+                    "src": "OE1ABC-1",
+                    "dst": own,
+                    "type": "msg",
+                    "msg": "ok{001",
+                    "msg_id": None,
+                    "timestamp": 0,
+                }
+                second = {
+                    "src": "OE1ABC-1",
+                    "dst": own,
+                    "type": "msg",
+                    "msg": "ok{002",
+                    "msg_id": None,
+                    "timestamp": 0,
+                }
+
+                await dispatcher.handle_mesh_message(first, own)
+                for _ in range(100):
+                    if deliveries:
+                        break
+                    await asyncio.sleep(0.02)
+                record(
+                    "ack-suffix ordering: the immediate push's text is stripped ('ok{001' -> 'ok')",
+                    bool(deliveries) and deliveries[0].get("text") == "ok",
+                )
+
+                await dispatcher.handle_mesh_message(second, own)
+
+                # Close the coalesce window: advance the fake clock past it and
+                # poll for the background sweep loop (real-time driven) to act.
+                clock["t"] += COALESCE_WINDOW_SECONDS + 1
+                for _ in range(150):
+                    if len(deliveries) >= 2:
+                        break
+                    await asyncio.sleep(0.02)
+
+                record(
+                    "ack-suffix ordering: the second message reached the coalescer "
+                    "(summary delivered), so dedup saw the UNSTRIPPED text",
+                    len(deliveries) >= 2,
+                )
+                summary = deliveries[1] if len(deliveries) >= 2 else {}
+                record(
+                    "ack-suffix ordering: the summary counts the second message "
+                    "(count == 1, not 0)",
+                    summary.get("count") == 1,
+                )
+                latest = summary.get("latest") or {}
+                record(
+                    "ack-suffix ordering: summary.latest.text is 'ok' (stripped)",
+                    latest.get("text") == "ok",
+                )
+            finally:
+                await dispatcher.stop()
         finally:
             await storage.close()
 

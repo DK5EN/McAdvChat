@@ -31,6 +31,7 @@ import base64
 import contextlib
 import json
 import os
+import re
 import stat
 import time
 from collections import OrderedDict
@@ -113,20 +114,44 @@ def _resolve_source(src: str) -> str:
 
 # ── Pure payload builder + eligibility + matcher ────────────────────────────
 
+# contract `payload_ack_suffix_semantics`: the firmware appends an ack-request
+# suffix, an opening brace plus the sender's message counter with NO closing
+# brace ('{NNN'), to every DM it SENDS (commands/parsing.py's inline strip and
+# mc-chat's append_ack_request both emit/expect exactly that shape). Group and
+# broadcast sends never carry it. Deliberately STRICT in two ways: (i) no
+# optional closing brace — there is no '{NNN}' form on the wire and there
+# never will be, so a trailing '{NNN}' is ordinary chat text; (ii) `[0-9]`,
+# not `\d`, because `\d` matches every Unicode Nd digit and the firmware never
+# emits one (the same choice `linkcheck.py` / `commands/ctcping.py` make).
+_ACK_SUFFIX_RE = re.compile(r"\{[0-9]+$")
 
-def build_push_payload(raw_message: dict[str, Any]) -> dict[str, Any]:
-    """Translate a raw mesh-ingest message (src/dst/msg-or-text/type/msg_id/
-    timestamp) into the contract's push payload shape (type/src/dst/text/
-    msg_id/ts) — contract `payload_schema`.
 
-    `src`/`dst` are carried through RAW (not resolved) per payload_schema —
-    resolution happens at eligibility/match time, not in the stored payload.
-    `text` is `str(msg.get('msg') or msg.get('text') or '')`, truncated to
-    MAX_TEXT_LEN chars. `ts` is converted from epoch milliseconds to epoch
-    SECONDS when `timestamp` is numeric; a non-numeric value passes through
-    unchanged.
+def _strip_ack_suffix(text: str) -> str:
+    """Strip the firmware's ack-request suffix and trim whitespace,
+    UNCONDITIONALLY — even when the pattern matched nothing (' hi ' -> 'hi',
+    'Hello {042' -> 'Hello', not 'Hello ') — contract
+    `payload_ack_suffix_semantics`.
+
+    NOT the same helper as `commands/parsing.py`'s inline `\\{\\d+$` strip —
+    that one is a routing-side concern (target/suppression extraction) and
+    stays separate from this push-payload concern. NOT mc-chat's looser
+    `strip_ack_request` (`\\{\\d+\\}?$`, optional closing brace) either — that
+    helper exists there only for optimistic-send echo matching; reusing it
+    here would strip a genuine '{pong}{451010884}' link-check frame down to
+    '{pong}', which eligibility clause (d) does not recognise, silently
+    reopening the v5 `{ping}`/`{pong}` eligibility bug.
     """
-    text = str(raw_message.get("msg") or raw_message.get("text") or "")
+    return _ACK_SUFFIX_RE.sub("", text).strip()
+
+
+def _payload_fields(raw_message: dict[str, Any], text: str) -> dict[str, Any]:
+    """Shared field assembly for `build_push_payload` and `_build_gate_view`:
+    defaulted type, raw (unresolved) src/dst, the given `text` truncated to
+    MAX_TEXT_LEN, msg_id, and timestamp converted from epoch ms to epoch s
+    when numeric. The only difference between the two callers is whether
+    `text` was run through `_strip_ack_suffix` first — factored out so that
+    difference can never accidentally drift into a second one.
+    """
     ts = raw_message.get("timestamp")
     if isinstance(ts, (int, float)) and not isinstance(ts, bool):
         ts = ts / 1000
@@ -138,6 +163,56 @@ def build_push_payload(raw_message: dict[str, Any]) -> dict[str, Any]:
         "msg_id": raw_message.get("msg_id"),
         "ts": ts,
     }
+
+
+def build_push_payload(raw_message: dict[str, Any]) -> dict[str, Any]:
+    """Translate a raw mesh-ingest message (src/dst/msg-or-text/type/msg_id/
+    timestamp) into the contract's push payload shape (type/src/dst/text/
+    msg_id/ts) — contract `payload_schema`.
+
+    `src`/`dst` are carried through RAW (not resolved) per payload_schema —
+    resolution happens at eligibility/match time, not in the stored payload.
+    `text` is `str(msg.get('msg') or msg.get('text') or '')`, with the
+    firmware's ack-request suffix stripped (`_strip_ack_suffix`, contract
+    `payload_ack_suffix_semantics`) BEFORE truncation to MAX_TEXT_LEN chars —
+    stripping first means the cap always carries 120 chars of real text and
+    truncation can never split the suffix into a bare '{'. `ts` is converted
+    from epoch milliseconds to epoch SECONDS when `timestamp` is numeric; a
+    non-numeric value passes through unchanged.
+
+    This builds the DELIVERED payload only. `PushDispatcher.handle_mesh_message`
+    must gate (eligibility/blocklist/dedup) on the UNSTRIPPED text first — see
+    `_build_gate_view` — and call this function only after every gate passes.
+    """
+    text = str(raw_message.get("msg") or raw_message.get("text") or "")
+    return _payload_fields(raw_message, _strip_ack_suffix(text))
+
+
+def _build_gate_view(raw_message: dict[str, Any]) -> dict[str, Any]:
+    """Gate-only payload view for eligibility/blocklist/dedup (contract
+    `payload_ack_suffix_semantics`, rule 2): reproduces `build_push_payload`'s
+    extraction/defaulting/ts-conversion/truncation exactly, via the same
+    shared `_payload_fields`, but does NOT strip the firmware ack-request
+    suffix — the gates must see the message as it arrived on the wire.
+
+    Three reasons this view is separate from the delivered payload, in order
+    of how quietly each one bites: a stripped '{ping}{087' collapses to
+    '{ping}', which eligibility clause (d) would then only catch because ping
+    recognition happens to be a prefix check rather than equality — an
+    implementation-detail dependency, not a design one. Stripping before the
+    blocklist gate changes nothing (the gate keys on `src`, never `text`) but
+    is kept unstripped anyway for uniformity with the other two gates.
+    Stripping before dedup would widen its msg_id-less (resolved-src,
+    resolved-dst, text) fallback key, silently collapsing two distinct
+    messages that differed only in their ack counter into one.
+
+    Used ONLY by `PushDispatcher.handle_mesh_message` to build the
+    eligibility/blocklist/dedup gate view; the delivered payload is built
+    separately, strictly AFTER every gate has passed, via `build_push_payload`
+    (which DOES strip).
+    """
+    text = str(raw_message.get("msg") or raw_message.get("text") or "")
+    return _payload_fields(raw_message, text)
 
 
 def _push_text(payload: dict[str, Any]) -> str:
@@ -601,20 +676,28 @@ class PushDispatcher:
         once, then per-subscription match+coalesce — an ineligible, blocked,
         or duplicate message never opens/feeds ANY subscription's coalesce
         window.
+
+        contract `payload_ack_suffix_semantics` (rule 2): the gates run on
+        `_build_gate_view` (UNSTRIPPED text) and `build_push_payload` (the
+        STRIPPED, delivered payload) is only constructed after every gate has
+        passed — do not reorder this: stripping first would widen dedup's
+        msg_id-less fallback key. See `_build_gate_view`'s docstring.
         """
         if not own_callsign:
             return
-        payload = build_push_payload(raw_message)
-        if not is_eligible(payload, own_callsign):
+        gate_view = _build_gate_view(raw_message)
+        if not is_eligible(gate_view, own_callsign):
             return
         # contract `blocklist`: gate on the node's GLOBAL blocked_callsigns set
         # together with eligibility and BEFORE dedup/matching — a blocked
         # sender's message produces zero pushes, consumes no dedup slot, and
         # opens no coalesce window (return before touching either).
-        if is_sender_blocked(payload, blocked_callsigns or set()):
+        if is_sender_blocked(gate_view, blocked_callsigns or set()):
             return
-        if self.dedup.is_duplicate(payload):
+        if self.dedup.is_duplicate(gate_view):
             return
+        # Gates passed: NOW build the delivered (ack-suffix-stripped) payload.
+        payload = build_push_payload(raw_message)
         subs = await self._storage.list_push_subscriptions()
         for sub in subs:
             if not matches(payload, own_callsign, sub["filter"]):
