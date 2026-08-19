@@ -686,14 +686,26 @@ class IngestMixin(StorageBase):
                 ack_for_msg_id,
                 nearby,
             )
-        # Notify frontend via SSE
+        # Notify frontend via SSE. This is a TRANSPORT fact only — "my own node" or
+        # "a gateway" took the frame off the air, not "the addressee answered" — so
+        # it must never publish `acked`, which is the field meaning peer delivery
+        # everywhere else (see the inline-ACK path below). ack_type is 0x00=Node,
+        # 0x01=Gateway per ble_protocol.py; anything else is reported rather than
+        # silently folded into "node".
+        if ack_type == 0x00:
+            ack_kind = "node"
+        elif ack_type == 0x01:
+            ack_kind = "gateway"
+        else:
+            ack_kind = f"unknown({ack_type!r})"
         if self._message_router:
             await self._message_router.publish(
                 "storage",
                 "msg_status",
                 {
                     "msg_id": ack_for_msg_id,
-                    "acked": True,
+                    "sent": True,
+                    "ack_kind": ack_kind,
                 },
             )
 
@@ -929,13 +941,39 @@ class IngestMixin(StorageBase):
             ack_match = re.search(r":ack([0-9]+)", msg)
             if ack_match:
                 ack_num = ack_match.group(1)
-                await self._mutate(
-                    "UPDATE messages SET acked = 1 WHERE id = ("
-                    "  SELECT id FROM messages WHERE echo_id = ? AND type = 'msg'"
-                    "  ORDER BY timestamp DESC LIMIT 1"
-                    ")",
+                # Resolve the original outbound row's own msg_id in the SAME lookup
+                # the UPDATE uses, so the published event names the message the
+                # frontend actually rendered, not the echo suffix.
+                original_rows = await self._query(
+                    "SELECT id, msg_id FROM messages WHERE echo_id = ? AND type = 'msg'"
+                    " ORDER BY timestamp DESC LIMIT 1",
                     (ack_num,),
                 )
+                if original_rows:
+                    original = original_rows[0]
+                    rows_updated = await self._mutate(
+                        "UPDATE messages SET acked = 1 WHERE id = ?",
+                        (original["id"],),
+                    )
+                    # Publish only on an actual match — an unmatched :ackNNN from
+                    # foreign traffic must never claim a delivery. Never let a
+                    # publish failure break ingestion (hot path).
+                    if rows_updated and self._message_router:
+                        try:
+                            await self._message_router.publish(
+                                "storage",
+                                "msg_status",
+                                {
+                                    "msg_id": original["msg_id"],
+                                    "acked": True,
+                                    "ack_kind": "peer",
+                                },
+                            )
+                        except Exception:
+                            logger.exception(
+                                "Failed to publish msg_status for inline ACK of msg_id=%s",
+                                original["msg_id"],
+                            )
 
         # Time-windowed dedup: reject only if the SAME SENDER's same msg_id was seen
         # within DEDUP_WINDOW_MS. MHeard beacons (msg_id=None) skip this check — they

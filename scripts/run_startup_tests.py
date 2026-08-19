@@ -50,6 +50,7 @@ from mcapp.push_tests import run_push_tests
 from mcapp.send_path_tests import run_send_path_tests
 from mcapp.sqlite_storage import run_startup_tests as run_storage_tests
 from mcapp.sse_handler import run_startup_tests as run_sse_tests
+from mcapp.storage.ack_status_tests import run_ack_status_tests
 from mcapp.storage.connection_lifecycle_tests import run_connection_lifecycle_tests
 from mcapp.storage.conversation_key_tests import run_conversation_key_tests
 from mcapp.storage.linkcheck_ingest_tests import run_linkcheck_ingest_tests
@@ -130,6 +131,9 @@ async def main() -> int:  # noqa: PLR0915 - flat suite registry; one visible lin
     linkcheck_ingest_ok = await run_linkcheck_ingest_tests()
     print(f"linkcheck_ingest: {'PASS' if linkcheck_ingest_ok else 'FAIL'}")
 
+    ack_status_ok = await run_ack_status_tests()
+    print(f"ack_status: {'PASS' if ack_status_ok else 'FAIL'}")
+
     linkcheck_sse_ok = await run_linkcheck_sse_tests()
     print(f"linkcheck_sse: {'PASS' if linkcheck_sse_ok else 'FAIL'}")
 
@@ -190,6 +194,7 @@ async def main() -> int:  # noqa: PLR0915 - flat suite registry; one visible lin
         and linkcheck_ok
         and linkcheck_session_ok
         and linkcheck_ingest_ok
+        and ack_status_ok
         and linkcheck_sse_ok
         and aprs_symbol_ok
         and identity_ok
