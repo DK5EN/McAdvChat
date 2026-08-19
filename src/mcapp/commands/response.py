@@ -100,12 +100,28 @@ class ResponseMixin(CommandHandlerBase):
                 del self._response_locks[key]
 
     async def _transmit_chunks(self, chunks: list[str], recipient: str, src_type: str) -> None:
-        """Send response chunks in order, preserving the 12 s LoRa airtime spacing."""
+        """Send response chunks in order, preserving the 12 s LoRa airtime spacing.
+
+        Bug A: a broadcast-shaped recipient ("*"/"ALL"/empty) is treated as
+        local-only, same as our own callsign. This is safe without threading an
+        extra flag through send_response/_send_chunks (both cross-mixin-called
+        from routing.py against the CommandHandlerBase Protocol in _base.py, so
+        widening either signature would require touching that shared stub too):
+        `_should_execute_command`'s broadcast branch denies execution outright
+        for anyone else's traffic on "*"/"ALL"/"", so `response_target` — and
+        therefore `recipient` here — can only take that shape as the reply to
+        one of OUR OWN commands. suppression.should_suppress_outbound already
+        keeps the ORIGINAL "!command" text off the air for that same case (dst
+        fails is_valid_destination); the reply is plain text, not a command, so
+        without this it went out as a real broadcast instead of staying local.
+        """
+        recipient_upper = recipient.upper()
+        is_local_only = recipient_upper == self.my_callsign or recipient_upper in ("*", "ALL", "")
         logger.debug(
-            "send_response: recipient='%s', my_callsign='%s', equal=%s",
+            "send_response: recipient='%s', my_callsign='%s', local_only=%s",
             recipient,
             self.my_callsign,
-            recipient.upper() == self.my_callsign,
+            is_local_only,
         )
 
         for i, raw_chunk in enumerate(chunks[:MAX_CHUNKS]):
@@ -114,9 +130,7 @@ class ResponseMixin(CommandHandlerBase):
                 chunk_header = f"({i + 1}/{min(len(chunks), MAX_CHUNKS)}) "
                 chunk = chunk_header + raw_chunk
 
-            if recipient.upper() == self.my_callsign:
-                logger.debug("Self-response, sending directly to WebSocket")
-
+            if is_local_only:
                 # Send directly via WebSocket, bypass BLE routing
                 if self.message_router:
                     msg_id = f"{int(time.time()):08X}_{i}"

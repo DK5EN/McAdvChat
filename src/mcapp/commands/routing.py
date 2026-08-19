@@ -62,10 +62,25 @@ class RoutingMixin(CommandHandlerBase):
         if not msg_text or not msg_text.startswith("!"):
             return
 
+        # msg_id dedup: mark as processed IMMEDIATELY after the check passes,
+        # before any `await` that could yield the event loop. A command can
+        # genuinely reach the proxy twice (BLE notification + Extern-UDP; both
+        # topics are subscribed in handler.py) and slow handlers like
+        # handle_weather (asyncio.to_thread) suspend here — a second copy that
+        # arrives while the first is still awaiting must see the mark. Marking
+        # used to happen only after execute_command() returned (in
+        # _parse_and_execute), so a duplicate that raced in during that await
+        # slipped past the check and executed again; the throttle branch below
+        # never marked it at all, so every throttled duplicate replied too.
+        # Guarded on a truthy msg_id: an unguarded mark would insert a falsy
+        # id (None/"") into processed_msg_ids and then block every later
+        # command that also lacks a msg_id for MSG_ID_TIMEOUT_SECONDS.
         msg_id = message_data.get("msg_id")
-        if self._is_duplicate_msg_id(msg_id):
+        if msg_id and self._is_duplicate_msg_id(msg_id):
             logger.debug("Duplicate msg_id %s, ignoring", msg_id)
             return
+        if msg_id:
+            self._mark_msg_id_processed(msg_id)
 
         normalized = self.normalize_command_data(message_data)
         src = normalized["src"]
@@ -90,6 +105,18 @@ class RoutingMixin(CommandHandlerBase):
             self.group_responses_enabled,
         )
 
+        # Bug A: an own command sent to a broadcast destination (*/ALL/empty)
+        # never leaves as a raw "!command" — suppression.should_suppress_outbound
+        # already keeps that off the air (dst fails is_valid_destination). The
+        # REPLY is plain text though, not a command, and used to go out as a real
+        # broadcast: _resolve_response_target's group branch returns dst (= "*"),
+        # and _transmit_chunks only kept a reply local when the recipient equalled
+        # our own callsign. Fixed downstream in _transmit_chunks (response.py),
+        # which now also treats a broadcast-shaped recipient as local-only —
+        # response_target can only take that shape as the reply to one of OUR OWN
+        # commands (_should_execute_command's broadcast branch above denies
+        # execution outright for anyone else's traffic on */ALL/""), so no flag
+        # needs to be threaded through send_response for this.
         response_target = self._resolve_response_target(src, dst, target_type)
 
         # Content-level throttle. The window is per-command (COMMAND_THROTTLING, in
@@ -131,12 +158,20 @@ class RoutingMixin(CommandHandlerBase):
         src: str,
         src_type: str,
     ) -> None:
-        """Parse a !command, check per-command throttle, execute, and send response."""
+        """Parse a !command, check per-command throttle, execute, and send response.
+
+        msg_id is no longer marked here — the caller (_message_handler) marks it
+        immediately after the duplicate check passes, before the first `await`
+        that could yield, so a second copy of the same inbound message can never
+        race past the check while this call is still awaiting a slow handler
+        (e.g. handle_weather's asyncio.to_thread). Kept as a parameter purely for
+        the log line below / signature parity with callers.
+        """
+        logger.debug("_parse_and_execute: msg_id=%s (already marked processed by caller)", msg_id)
         try:
             cmd_result = parse_command(msg_text)
 
             if not cmd_result:
-                self._mark_msg_id_processed(msg_id)
                 logger.debug("Unknown command '%s' from %s (discarded)", msg_text, src)
                 return
 
@@ -150,13 +185,11 @@ class RoutingMixin(CommandHandlerBase):
             # branch was unreachable, and its message mixed units (COMMAND_THROTTLING
             # values are SECONDS, rendered as "min").
             response = await self.execute_command(cmd, kwargs, src)
-            self._mark_msg_id_processed(msg_id)
             self._mark_content_processed(content_hash, cmd)
             await self.send_response(response, response_target, src_type)
 
         except Exception as e:
             logger.warning("Command error (%s): %s", type(e).__name__, e)
-            self._mark_msg_id_processed(msg_id)
             await self.send_response(
                 self._error_response_text(e),
                 response_target,
