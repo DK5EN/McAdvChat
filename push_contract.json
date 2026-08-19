@@ -1,6 +1,6 @@
 {
-  "version": 6,
-  "description": "MeshCom Web Push wire contract. Shared by mc-chat and MCProxy via the `contract/` git subtree (mc-chat is upstream); each repo's test suite implements these vectors. Frontend mirrors match_vectors + eligibility for its foreground-sound predicate. Edit in mc-chat and re-sync — never edit MCProxy's copy in place. v2 (2026-07-17) adds via-routed dst resolution, push eligibility, dedup, and payload_vectors after a cross-backend parity audit found the two backends diverging on all four. v3 (2026-07-17) adds a blocklist push-path gate: a message whose resolved source is on the node's GLOBAL blocked_callsigns set produces zero pushes (checked together with eligibility, BEFORE dedup/matching) — closing a bug where the push dispatcher bypassed the blocklist every other path enforces. v4 (2026-07-26) moves to the subtree (this file previously lived outside it at mc-chat's tests/fixtures/, kept byte-identical by hand) and adds eligibility clause (c): text ACKs and {CET} time broadcasts are not push-eligible, closing a bug where every message the operator sent produced an ':ackNNN' notification. v5 (2026-08-17) adds eligibility clause (d): firmware link-check protocol frames ({ping} prefix / {pong}{token}) are not push-eligible — closing a bug where MCProxy's link-check feature pushed raw '{pong}{...}' notifications for frames its storage guard keeps out of message history. v6 (2026-08-18) adds a normative client-side ordering clause to endpoints.subscribe.semantics: a subscribe POST replaces the stored filter wholesale, so a client MUST NOT send a filter its own preference store has not yet supplied — closing a bug where a re-POST issued before local prefs finished loading silently wiped a live subscription's group list, and pinning that servers MUST NOT try to detect that case heuristically.",
+  "version": 7,
+  "description": "MeshCom Web Push wire contract. Shared by mc-chat and MCProxy via the `contract/` git subtree (mc-chat is upstream); each repo's test suite implements these vectors. Frontend mirrors match_vectors + eligibility for its foreground-sound predicate. Edit in mc-chat and re-sync — never edit MCProxy's copy in place. v2 (2026-07-17) adds via-routed dst resolution, push eligibility, dedup, and payload_vectors after a cross-backend parity audit found the two backends diverging on all four. v3 (2026-07-17) adds a blocklist push-path gate: a message whose resolved source is on the node's GLOBAL blocked_callsigns set produces zero pushes (checked together with eligibility, BEFORE dedup/matching) — closing a bug where the push dispatcher bypassed the blocklist every other path enforces. v4 (2026-07-26) moves to the subtree (this file previously lived outside it at mc-chat's tests/fixtures/, kept byte-identical by hand) and adds eligibility clause (c): text ACKs and {CET} time broadcasts are not push-eligible, closing a bug where every message the operator sent produced an ':ackNNN' notification. v5 (2026-08-17) adds eligibility clause (d): firmware link-check protocol frames ({ping} prefix / {pong}{token}) are not push-eligible — closing a bug where MCProxy's link-check feature pushed raw '{pong}{...}' notifications for frames its storage guard keeps out of message history. v6 (2026-08-18) adds a normative client-side ordering clause to endpoints.subscribe.semantics: a subscribe POST replaces the stored filter wholesale, so a client MUST NOT send a filter its own preference store has not yet supplied — closing a bug where a re-POST issued before local prefs finished loading silently wiped a live subscription's group list, and pinning that servers MUST NOT try to detect that case heuristically. v7 (2026-08-19) strips the firmware's trailing ack-request suffix from `payload_schema.text` (see payload_ack_suffix_semantics) — closing a bug where every DM notification ended in a raw '{461', text that every conversation view has always hidden.",
   "endpoints": {
     "vapid_public_key": {
       "method": "GET",
@@ -82,10 +82,11 @@
     "type": "message type string, e.g. 'msg'",
     "src": "sender callsign string, as received (raw, may carry the relay path)",
     "dst": "destination string as received (raw, may carry the relay path) — NOT resolved in the payload",
-    "text": "chat text: str(msg.get('msg') or msg.get('text') or ''), truncated to <= 120 chars",
+    "text": "chat text: the msg-or-text extraction str(msg.get('msg') or msg.get('text') or '') with the firmware's trailing ack-request suffix stripped (payload_ack_suffix_semantics), THEN truncated to <= 120 chars",
     "msg_id": "number or string",
     "ts": "epoch SECONDS (number). If the source timestamp is epoch milliseconds it MUST be divided by 1000; a non-numeric value passes through unchanged."
   },
+  "payload_ack_suffix_semantics": "The firmware appends an ack-request suffix to every DM it SENDS: an opening brace plus the sender's message counter, '{NNN', with NO closing brace (MCProxy commands/parsing.py and mc-chat's append_ack_request both emit and expect exactly that shape). Group and broadcast sends never carry it. It is a transport artifact, not chat content — the message's identity already travels in `msg_id` — and every conversation view already hides it, so a push must not be the one surface that shows it. Strip the $-anchored pattern `\\{[0-9]+$`, then trim leading/trailing whitespace UNCONDITIONALLY, even when nothing matched (a suffix preceded by a space, 'Hello {042', must leave 'Hello', not 'Hello '). The pattern is deliberately STRICT in two ways. (i) No optional closing brace: there is no '{NNN}' variant on the wire and there never will be, so a trailing '{NNN}' is ordinary chat text and is left untouched. A looser `\\{\\d+\\}?$` helper exists in mc-chat (strip_ack_request) and the webapp (stripAckRequestSuffix) for optimistic-send echo matching; it is deliberately NOT reused here. (ii) `[0-9]`, not `\\d` — Python's `\\d` matches every Unicode Nd digit, which the firmware never emits (the same choice linkcheck.py and commands/ctcping.py already make). Two ordering rules are load-bearing. (1) Strip BEFORE the 120-char truncation, so the cap carries 120 chars of real text and a truncation can never split the suffix into a bare '{'. (2) Strip ONLY for the delivered payload text: eligibility (clauses c and d), the blocklist gate and dedup MUST all be evaluated on the UNSTRIPPED text. Three reasons, in order of how quietly they bite. A stripped '{ping}{087' becomes '{ping}', which clause (d) still catches ONLY because ping recognition is a prefix check and not an equality test — the gate would then depend on an implementation detail of a different clause. The strict pattern above leaves a bracketed '{pong}{451010884}' alone, but the looser `\\{\\d+\\}?$` helper named earlier does NOT: substituting it here — an easy 'reuse the shared helper' refactor — turns that frame into '{pong}', which clause (d) does not recognise (eligibility_linkcheck_semantics requires the bracketed token), silently re-opening the v5 bug. Neither backend's eligibility_vectors can see any of this, because both suites drive is_eligible on the RAW vector dict while production drives it on whatever the dispatcher hands it. And stripping before dedup widens the msg_id-less dedup triple (src, dst, text) into a key that collapses two distinct messages whose only difference was the ack counter. mc-chat satisfies (2) by construction (its dispatcher gates on the raw message and builds the payload last); MCProxy must build a gate-only view first and the delivered payload after the gates.",
   "payload_vectors": [
     {
       "name": "ms timestamp converts to epoch seconds; text from msg field",
@@ -101,6 +102,31 @@
       "name": "null msg coerces to empty string, not the literal 'None'",
       "raw": { "type": "msg", "src": "A-1", "dst": "DK5EN-99", "msg": null, "msg_id": 9, "timestamp": 0 },
       "expected_payload": { "type": "msg", "src": "A-1", "dst": "DK5EN-99", "text": "", "msg_id": 9, "ts": 0.0 }
+    },
+    {
+      "name": "the firmware ack-request suffix is stripped from the payload text",
+      "raw": { "type": "msg", "src": "DJ8MEH-8", "dst": "DK5EN-99", "msg": "Schade - neugierig wie ich bin{455", "msg_id": 11, "timestamp": 1700000000000 },
+      "expected_payload": { "type": "msg", "src": "DJ8MEH-8", "dst": "DK5EN-99", "text": "Schade - neugierig wie ich bin", "msg_id": 11, "ts": 1700000000.0 }
+    },
+    {
+      "name": "a space before the suffix is trimmed away with it",
+      "raw": { "type": "msg", "src": "A-1", "dst": "DK5EN-99", "msg": "Hello {042", "msg_id": 12, "timestamp": 0 },
+      "expected_payload": { "type": "msg", "src": "A-1", "dst": "DK5EN-99", "text": "Hello", "msg_id": 12, "ts": 0.0 }
+    },
+    {
+      "name": "a trailing BRACED group is not a firmware suffix and is left untouched",
+      "raw": { "type": "msg", "src": "A-1", "dst": "DK5EN-99", "msg": "set filter {42}", "msg_id": 13, "timestamp": 0 },
+      "expected_payload": { "type": "msg", "src": "A-1", "dst": "DK5EN-99", "text": "set filter {42}", "msg_id": 13, "ts": 0.0 }
+    },
+    {
+      "name": "a mid-text brace-digit run is left untouched (the pattern is $-anchored)",
+      "raw": { "type": "msg", "src": "A-1", "dst": "DK5EN-99", "msg": "hallo {12 welt", "msg_id": 14, "timestamp": 0 },
+      "expected_payload": { "type": "msg", "src": "A-1", "dst": "DK5EN-99", "text": "hallo {12 welt", "msg_id": 14, "ts": 0.0 }
+    },
+    {
+      "name": "the suffix is stripped BEFORE the 120-char truncation, so no truncation can split it",
+      "raw": { "type": "msg", "src": "A-1", "dst": "DK5EN-99", "msg": "0123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890123456789012345678901234567{461", "msg_id": 15, "timestamp": 0 },
+      "expected_payload": { "type": "msg", "src": "A-1", "dst": "DK5EN-99", "text": "0123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890123456789012345678901234567", "msg_id": 15, "ts": 0.0 }
     }
   ],
   "coalesce": {
