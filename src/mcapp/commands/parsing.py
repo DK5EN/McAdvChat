@@ -7,6 +7,7 @@ import re
 from collections.abc import Callable
 from typing import Any
 
+from ..util import strip_ack_suffix
 from .constants import CALLSIGN_TARGET_RE
 
 _MAX_GROUP_NUM = 99999
@@ -304,8 +305,10 @@ def normalize_unified(message_data: dict[str, Any], context: str = "command") ->
     src = strip_relay_path(src_raw)
     dst = message_data.get("dst", "").strip().upper()
     msg = message_data.get("msg", "").strip()
-    # Strip MeshCom message ID suffix ({NNN) before any routing decisions
-    msg = re.sub(r"\{\d+$", "", msg).strip()
+    # Strip MeshCom message ID suffix ({NNN) before any routing decisions.
+    # Shared definition (util.strip_ack_suffix) -- this used to carry its own
+    # `\d`-spelled literal, which also matched non-ASCII Unicode digits.
+    msg = strip_ack_suffix(msg)
 
     result = message_data.copy()
     result.update({"src": src, "dst": dst, "msg": msg})

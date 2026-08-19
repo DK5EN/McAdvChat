@@ -10,7 +10,7 @@ from enum import StrEnum
 from typing import Any
 
 from ..logging_setup import get_logger
-from ..util import now_ms
+from ..util import match_ack_suffix, now_ms
 from ._base import CommandHandlerBase
 from .constants import CALLSIGN_STRICT_RE
 from .parsing import strip_relay_path
@@ -26,10 +26,12 @@ PING_TEST_MAX_WAIT_SECONDS = 300
 # Ack patterns use [0-9], not \d (ack_predicate_vectors.json v2): Python's \d
 # matches any Unicode Nd digit, which the firmware ('%-9.9s:ack%03i') never emits.
 _ACK_SUFFIX_RE = re.compile(r"\s*:ack[0-9]{3}$")  # _is_ack_message: boolean check
-_ECHO_SUFFIX_RE = re.compile(r"\{\d{3}$")  # _is_echo_message: boolean check
+# _is_echo_message / _handle_echo_message: the firmware's fixed-width `{NNN`
+# ack-request suffix. Shared definition (util.ACK_SUFFIX_FIXED_RE) -- both of
+# ctcping's copies used to spell it `\d`, which in Python also matches every
+# Unicode Nd digit the firmware cannot emit.
 _PING_TEST_SEQUENCE_RE = re.compile(r"ping test \d+/\d+")  # _is_ping_message: boolean check
 _PING_TEST_SEQUENCE_CAPTURE_RE = re.compile(r"ping test (\d+)/(\d+)")  # _extract_sequence_info
-_ECHO_ID_RE = re.compile(r"\{(\d{3})$")  # _handle_echo_message: extracts message id
 _ACK_ID_RE = re.compile(r"\s*:ack([0-9]{3})$")  # _handle_ack_message: extracts ack id
 
 logger = get_logger(__name__)
@@ -136,7 +138,7 @@ class CTCPingMixin(CommandHandlerBase):
         """Check if message is a CTC ping echo with [CTC] signature and {xxx} suffix"""
         if not msg:
             return False
-        return "[CTC]" in msg and bool(_ECHO_SUFFIX_RE.search(msg))
+        return "[CTC]" in msg and match_ack_suffix(msg) is not None
 
     def _is_ping_message(self, msg: str) -> bool:
         """Check if message looks like a ping test message (not the 'started' message)"""
@@ -188,13 +190,15 @@ class CTCPingMixin(CommandHandlerBase):
 
             logger.debug("Echo processing: src=%s, dst=%s, msg='%s...'", src, dst, msg[:30])
 
-            match = _ECHO_ID_RE.search(msg)
+            match = match_ack_suffix(msg)
             if not match:
                 logger.debug("No message ID found in echo")
                 return
 
             message_id = match.group(1)
-            original_msg = msg[:-4]
+            # Split at the match rather than a hardcoded [:-4], so the slice
+            # cannot drift from the suffix width the shared pattern defines.
+            original_msg = msg[: match.start()]
 
             logger.debug("Echo ID: %s, Original: '%s'", message_id, original_msg)
 

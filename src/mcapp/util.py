@@ -4,10 +4,69 @@
 Not used by ble_service (a separate process/deployment) — it keeps its own copies.
 """
 
+import re
 import time
 from typing import Any
 
 FEET_TO_METERS = 0.3048
+
+
+# --- MeshCom ack-request suffix ({NNN) -------------------------------------
+# The firmware appends an ack-request suffix to every DM it sends: an opening
+# brace plus the sender's message counter, formatted `%03i` -- so `{087`, with
+# NO closing brace. There is no `{NNN}` form on the wire and there never will
+# be (assuming one caused a real bug once); a trailing `{NNN}` is ordinary chat
+# text. Group and broadcast sends never carry the suffix at all.
+#
+# `[0-9]`, never `\d`: Python's `\d` matches every Unicode Nd digit (Arabic-Indic
+# ٠-٩ and friends), which the firmware cannot emit. The same choice is already
+# made for the `:ackNNN` patterns in commands/ctcping.py and in linkcheck.py.
+#
+# TWO widths, deliberately, because the call sites want different things:
+#
+#   ACK_SUFFIX_RE        one-or-more digits. The lenient reader used wherever we
+#                        only want the suffix GONE (command routing, push payload
+#                        text). Being lenient costs nothing there.
+#   ACK_SUFFIX_FIXED_RE  exactly three, the firmware's literal `%03i` width, and
+#                        capturing. Used where the digits are DATA rather than
+#                        noise -- ctcping's echo correlation reads the id back
+#                        out and splits the message on the match, so a
+#                        variable-width match would change what it extracts.
+#
+# Keep both here rather than inline at the call sites: before this module owned
+# them there were four separate literals across parsing.py, ctcping.py (x2) and
+# push_delivery.py, three of which still spelled `\d` after the strict-pattern
+# correction landed in the fourth.
+ACK_SUFFIX_RE = re.compile(r"\{([0-9]+)$")
+ACK_SUFFIX_FIXED_RE = re.compile(r"\{([0-9]{3})$")
+
+
+def strip_ack_suffix(text: str) -> str:
+    """Remove a trailing `{NNN` ack-request suffix, then trim whitespace.
+
+    The trim is UNCONDITIONAL -- it applies even when no suffix matched, so
+    `' hi '` -> `'hi'` and `'Hello {042'` -> `'Hello'` rather than `'Hello '`.
+    That matches mc-chat's `strip_ack_request` and the webapp's
+    `stripAckRequestSuffix`, which compare stripped text on both sides of
+    optimistic-send echo matching; a leftover trailing space there breaks the
+    comparison.
+
+    Only a TRAILING run is removed -- mid-text `'hello {12 world'` is untouched
+    -- and a braced `'set filter {42}'` is left alone, because that is chat
+    text, not a firmware suffix.
+    """
+    return ACK_SUFFIX_RE.sub("", text).strip()
+
+
+def match_ack_suffix(text: str) -> re.Match[str] | None:
+    """Match a trailing FIXED-WIDTH `{NNN` suffix (the firmware's `%03i`).
+
+    Returns the match rather than just the id so callers can also use
+    `match.start()` to split the message at the suffix without hardcoding its
+    length. `group(1)` is the three-digit id.
+    """
+    return ACK_SUFFIX_FIXED_RE.search(text)
+
 
 # --- APRS symbol double-escape (firmware bug) ------------------------------
 # The MeshCom firmware hand-escapes a backslash in `sendExtern()`'s JSON builder

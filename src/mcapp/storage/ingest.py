@@ -19,6 +19,7 @@ from typing import Any
 from .. import linkcheck
 from ..logging_setup import get_logger
 from ..util import (
+    ACK_SUFFIX_RE,
     APRS_ALTERNATE_TABLE,
     FEET_TO_METERS,
     FIRMWARE_DOUBLED_BACKSLASH,
@@ -912,7 +913,7 @@ class IngestMixin(StorageBase):
         # Compute echo_id (extract {NNN from end of message text)
         echo_id = None
         if msg_type == "msg" and msg:
-            echo_match = re.search(r"\{(\d+)$", msg)
+            echo_match = ACK_SUFFIX_RE.search(msg)
             if echo_match:
                 echo_id = echo_match.group(1)
 

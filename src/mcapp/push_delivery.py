@@ -31,7 +31,6 @@ import base64
 import contextlib
 import json
 import os
-import re
 import stat
 import time
 from collections import OrderedDict
@@ -45,6 +44,7 @@ from pywebpush import webpush as _real_webpush
 from .linkcheck import is_link_check_payload
 from .logging_setup import get_logger
 from .storage.constants import DEDUP_WINDOW_MS
+from .util import strip_ack_suffix
 
 logger = get_logger(__name__)
 
@@ -114,34 +114,12 @@ def _resolve_source(src: str) -> str:
 
 # ── Pure payload builder + eligibility + matcher ────────────────────────────
 
-# contract `payload_ack_suffix_semantics`: the firmware appends an ack-request
-# suffix, an opening brace plus the sender's message counter with NO closing
-# brace ('{NNN'), to every DM it SENDS (commands/parsing.py's inline strip and
-# mc-chat's append_ack_request both emit/expect exactly that shape). Group and
-# broadcast sends never carry it. Deliberately STRICT in two ways: (i) no
-# optional closing brace — there is no '{NNN}' form on the wire and there
-# never will be, so a trailing '{NNN}' is ordinary chat text; (ii) `[0-9]`,
-# not `\d`, because `\d` matches every Unicode Nd digit and the firmware never
-# emits one (the same choice `linkcheck.py` / `commands/ctcping.py` make).
-_ACK_SUFFIX_RE = re.compile(r"\{[0-9]+$")
-
-
-def _strip_ack_suffix(text: str) -> str:
-    """Strip the firmware's ack-request suffix and trim whitespace,
-    UNCONDITIONALLY — even when the pattern matched nothing (' hi ' -> 'hi',
-    'Hello {042' -> 'Hello', not 'Hello ') — contract
-    `payload_ack_suffix_semantics`.
-
-    NOT the same helper as `commands/parsing.py`'s inline `\\{\\d+$` strip —
-    that one is a routing-side concern (target/suppression extraction) and
-    stays separate from this push-payload concern. NOT mc-chat's looser
-    `strip_ack_request` (`\\{\\d+\\}?$`, optional closing brace) either — that
-    helper exists there only for optimistic-send echo matching; reusing it
-    here would strip a genuine '{pong}{451010884}' link-check frame down to
-    '{pong}', which eligibility clause (d) does not recognise, silently
-    reopening the v5 `{ping}`/`{pong}` eligibility bug.
-    """
-    return _ACK_SUFFIX_RE.sub("", text).strip()
+# contract `payload_ack_suffix_semantics`: strip the firmware's trailing
+# ack-request suffix (`{NNN`, no closing brace) and trim, via the shared
+# definition in util. STRICT by contract: a trailing `{NNN}` is ordinary chat
+# text, and mc-chat's looser `strip_ack_request` must NOT be substituted here --
+# it would reduce a `{pong}{451010884}` link-check frame to `{pong}`, which
+# eligibility clause (d) does not recognise, reopening the v5 bug.
 
 
 def _payload_fields(raw_message: dict[str, Any], text: str) -> dict[str, Any]:
@@ -149,7 +127,7 @@ def _payload_fields(raw_message: dict[str, Any], text: str) -> dict[str, Any]:
     defaulted type, raw (unresolved) src/dst, the given `text` truncated to
     MAX_TEXT_LEN, msg_id, and timestamp converted from epoch ms to epoch s
     when numeric. The only difference between the two callers is whether
-    `text` was run through `_strip_ack_suffix` first — factored out so that
+    `text` was run through `strip_ack_suffix` first — factored out so that
     difference can never accidentally drift into a second one.
     """
     ts = raw_message.get("timestamp")
@@ -173,7 +151,7 @@ def build_push_payload(raw_message: dict[str, Any]) -> dict[str, Any]:
     `src`/`dst` are carried through RAW (not resolved) per payload_schema —
     resolution happens at eligibility/match time, not in the stored payload.
     `text` is `str(msg.get('msg') or msg.get('text') or '')`, with the
-    firmware's ack-request suffix stripped (`_strip_ack_suffix`, contract
+    firmware's ack-request suffix stripped (`strip_ack_suffix`, contract
     `payload_ack_suffix_semantics`) BEFORE truncation to MAX_TEXT_LEN chars —
     stripping first means the cap always carries 120 chars of real text and
     truncation can never split the suffix into a bare '{'. `ts` is converted
@@ -185,7 +163,7 @@ def build_push_payload(raw_message: dict[str, Any]) -> dict[str, Any]:
     `_build_gate_view` — and call this function only after every gate passes.
     """
     text = str(raw_message.get("msg") or raw_message.get("text") or "")
-    return _payload_fields(raw_message, _strip_ack_suffix(text))
+    return _payload_fields(raw_message, strip_ack_suffix(text))
 
 
 def _build_gate_view(raw_message: dict[str, Any]) -> dict[str, Any]:

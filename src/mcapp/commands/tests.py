@@ -2,13 +2,12 @@
 
 import asyncio
 import json
-import re
 import tempfile
 from datetime import datetime
 from pathlib import Path
 from typing import Any
 
-from ..util import now_ms
+from ..util import now_ms, strip_ack_suffix
 from .constants import has_console
 from .parsing import is_group, parse_command
 
@@ -2033,7 +2032,7 @@ async def test_ctcping_logic(handler: Any) -> bool:  # noqa: PLR0912, PLR0915 - 
 
         if "echo" in description.lower():
             if "Non-ping echo ignored" in description:
-                clean_msg = re.sub(r"\{\d{3}$", "", message)
+                clean_msg = strip_ack_suffix(message)
                 actual_result = handler._is_ping_message(clean_msg)
             else:
                 actual_result = echo_result

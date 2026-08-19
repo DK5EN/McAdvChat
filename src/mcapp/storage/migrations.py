@@ -5,10 +5,10 @@ is historical record and must never be rewritten, only relocated.
 """
 
 import asyncio
-import re
 import sqlite3
 
 from ..logging_setup import get_logger
+from ..util import ACK_SUFFIX_RE
 from ._base import StorageBase
 from .constants import (
     BUCKET_SECONDS,
@@ -685,7 +685,7 @@ class MigrationsMixin(StorageBase):
             "SELECT id, msg FROM messages WHERE type = 'msg' AND msg LIKE '%{%'"
         ).fetchall()
         for row_id, msg in rows:
-            match = re.search(r"\{(\d+)$", msg or "")
+            match = ACK_SUFFIX_RE.search(msg or "")
             if match:
                 conn.execute(
                     "UPDATE messages SET echo_id = ? WHERE id = ?",
