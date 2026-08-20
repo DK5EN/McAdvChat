@@ -68,6 +68,7 @@ import binascii
 import hashlib
 import inspect
 import json
+import logging
 import pathlib
 import random
 import sys
@@ -260,6 +261,44 @@ def _snapshot_side_effects() -> Callable[[], None]:
             ble_main.state.notification_event.clear()
 
     return _restore
+
+
+class _LogCapture(logging.Handler):
+    """Collects emitted `LogRecord`s for a `_capture_logs` scope, without
+    touching any real handler (stdout, journald, ...)."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.records: list[logging.LogRecord] = []
+
+    def emit(self, record: logging.LogRecord) -> None:
+        self.records.append(record)
+
+
+def _capture_logs(target: logging.Logger) -> tuple[_LogCapture, Callable[[], None]]:
+    """Attach a `_LogCapture` to `target` for the duration of a test and
+    return `(capture, restore)`.
+
+    Also lowers `target`'s own effective level to DEBUG for the duration --
+    a `logging.Handler.setLevel` alone is not enough, the LOGGER itself
+    (`logging.basicConfig(level=logging.INFO, ...)` in both
+    `ble_service/src/main.py` and everywhere else) would otherwise filter
+    out anything below INFO before it ever reaches this handler. Both the
+    handler and the logger's own level are restored in `restore`, so a test
+    never leaves the ambient logging configuration changed for whatever
+    runs after it.
+    """
+    handler = _LogCapture()
+    handler.setLevel(logging.DEBUG)
+    original_level = target.level
+    target.addHandler(handler)
+    target.setLevel(logging.DEBUG)
+
+    def _restore() -> None:
+        target.removeHandler(handler)
+        target.setLevel(original_level)
+
+    return handler, _restore
 
 
 def _test_resolved_device_name(record: Any) -> None:
@@ -493,6 +532,143 @@ def _test_crc16_ccitt_vectors(record: Any) -> None:
         f"-- {len(mismatches)} mismatch(es)",
         not mismatches,
     )
+
+
+def _test_json_frame_looks_truncated_helper(record: Any) -> None:
+    """Direct unit coverage of the truncation heuristic, isolated from
+    logging/queueing: unbalanced or unclosed braces => truncated; balanced
+    and closed => not, even when the content is otherwise invalid JSON (that
+    is the malformed-vs-truncated distinction the whole fix depends on)."""
+    for label, json_str, expected in (
+        ("missing closing brace", '{"a":"b"', True),
+        ("cut mid-value, no closing brace", '{"a":"b","c":"d', True),
+        ("nested object still open", '{"a":{"b":"c"', True),
+        ("nested object closed, outer missing", '{"a":{"b":"c"}', True),
+        ("balanced but trailing comma (malformed, not truncated)", '{"a":"b",}', False),
+        ("balanced and actually valid", '{"a":"b"}', False),
+        ("empty object", "{}", False),
+    ):
+        record(
+            f"_json_frame_looks_truncated({json_str!r} [{label}]) == {expected}",
+            ble_main._json_frame_looks_truncated(json_str) is expected,
+        )
+
+
+def _test_notification_callback_register_json_happy_path(record: Any) -> None:
+    """A well-formed, complete `D{...}` register frame must still parse
+    exactly as before -- the new truncation/malformed diagnosis must not
+    regress the common case."""
+    restore_side_effects = _snapshot_side_effects()
+    try:
+        data = b'D{"typ":"I","callsign":"DK5EN-98"}\x00\x00'
+        ble_main.notification_callback(data)
+        queued = ble_main.state.notification_queue[-1]
+        record(
+            "notification_callback: a complete D{ frame still parses as json (no regression)",
+            queued.get("format") == "json"
+            and queued.get("parsed") == {"typ": "I", "callsign": "DK5EN-98"},
+        )
+    finally:
+        restore_side_effects()
+
+
+def _test_notification_callback_truncated_frame_is_loud_not_silent(record: Any) -> None:
+    """REGRESSION target (the defect this brief closes): a `D{` register-
+    update frame cut off by an ATT MTU overflow -- exactly what MeshCom FW
+    4.36's proposed filter-list register field risks -- must not vanish
+    behind only a DEBUG-level trace. It must:
+      (a) still be queued, not dropped with no trace at all;
+      (b) never be reported as a successful 'json' parse (no silent partial
+          apply of a half-arrived register update);
+      (c) be logged at a level that is actually seen (WARNING or higher,
+          never DEBUG);
+      (d) name BOTH that it looks truncated AND that the update was
+          dropped, so the failure is diagnosable, not just noted.
+
+    Proved discriminating: reverting `_decode_register_frame` to the old
+    bare `json.loads(json_str)` (no try/except, no `_json_frame_looks_
+    truncated` call) makes this raise straight out of `notification_
+    callback`'s inner try into its own generic `except Exception as e:
+    logger.warning("Notification decode error: %s", e)` fallback -- which
+    still logs at WARNING but with no truncation/MTU diagnosis and no
+    length information, failing assertion (d) below. Verified by hand during
+    development (edit in place, run, revert) per the no-git-stash brief
+    constraint; not left as a permanent mutant in this file.
+    """
+    handler, restore_logs = _capture_logs(ble_main.logger)
+    restore_side_effects = _snapshot_side_effects()
+    try:
+        # Missing closing brace and a dangling key/value -- exactly what an
+        # ATT MTU cutting a JSON payload mid-field looks like on the wire.
+        truncated = b'D{"typ":"I","callsign":"DK5EN-98","firmware":"4.35p.07.2'
+
+        before = len(ble_main.state.notification_queue)
+        ble_main.notification_callback(truncated)
+
+        record(
+            "notification_callback: a truncated D{ frame is still queued, not dropped with "
+            "no trace at all",
+            len(ble_main.state.notification_queue) == before + 1,
+        )
+        queued = ble_main.state.notification_queue[-1]
+        record(
+            "notification_callback: a truncated D{ frame is NOT reported as a successful "
+            "'json' parse (the register update did not silently apply)",
+            queued.get("format") != "json" and "parsed" not in queued,
+        )
+        record(
+            "notification_callback: the drop is logged at WARNING or higher, never DEBUG",
+            any(r.levelno >= logging.WARNING for r in handler.records),
+        )
+        record(
+            "notification_callback: the log names both the likely cause (MTU/truncation) "
+            "and that the register update was dropped",
+            any(
+                "mtu" in r.getMessage().lower()
+                and "trunc" in r.getMessage().lower()
+                and "dropped" in r.getMessage().lower()
+                for r in handler.records
+            ),
+        )
+    finally:
+        restore_logs()
+        restore_side_effects()
+
+
+def _test_notification_callback_malformed_frame_distinguished_from_truncation(
+    record: Any,
+) -> None:
+    """A frame that arrived intact but is not valid JSON (a firmware/encoding
+    bug, not an MTU sizing problem) must be reported as malformed, not as a
+    truncation -- conflating the two would point at the wrong fix."""
+    handler, restore_logs = _capture_logs(ble_main.logger)
+    restore_side_effects = _snapshot_side_effects()
+    try:
+        # Balanced braces, ends with '}' -- not a truncation shape -- but a
+        # trailing comma makes it invalid JSON.
+        malformed = b'D{"typ":"I","callsign":"DK5EN-98",}'
+
+        ble_main.notification_callback(malformed)
+
+        record(
+            "notification_callback: a malformed-but-closed D{ frame is NOT reported as a "
+            "truncation",
+            not any("trunc" in r.getMessage().lower() for r in handler.records),
+        )
+        record(
+            "notification_callback: a malformed-but-closed D{ frame is still logged loudly "
+            "(WARNING or higher), not silently",
+            any(r.levelno >= logging.WARNING for r in handler.records),
+        )
+        queued = ble_main.state.notification_queue[-1]
+        record(
+            "notification_callback: a malformed D{ frame is not reported as a successful "
+            "'json' parse either",
+            queued.get("format") != "json",
+        )
+    finally:
+        restore_logs()
+        restore_side_effects()
 
 
 def _load_state_safe() -> tuple[str | None, str | None]:
@@ -1683,6 +1859,157 @@ def _takes_operation_lock(source: str) -> bool:
         ):
             return True
     return False
+
+
+async def _test_send_command_oversized_raises_clear_error(record: Any) -> None:
+    """`send_command`'s frame uses `_frame()`'s ONE-byte length prefix
+    (length = len(payload) + 2), so the payload cap is 253 bytes -- a
+    different, smaller boundary than `_BLE_MTU_LIMIT` (247), which only
+    gates `set_callsign`/`set_wifi`. Before the pre-check, a command at or
+    past that boundary raised a bare `OverflowError` deep inside
+    `int.to_bytes()`, with nothing at the call site explaining what went
+    wrong.
+
+    Proved discriminating: reverting `send_command` to its old one-line body
+    (`return await self.write(_frame(MsgType.TEXT_COMMAND, cmd.encode("utf-8")))`,
+    no pre-check) turns the 254-byte case's `ValueError` into a bare
+    `OverflowError: int too big to convert`, failing the assertions below.
+    Verified by hand during development (edited in place, ran this suite,
+    reverted) per the no-git-stash brief constraint.
+    """
+    # Not connected -- the pre-check must fire before any connection-state
+    # check, so no fake D-Bus/BlueZ is needed at all.
+    adapter = ble_adapter.BLEAdapter()
+
+    # Exactly at the boundary: a 253-byte payload -> frame length == 255,
+    # must NOT be rejected by the pre-check. It still fails afterwards on
+    # "not connected" -- proving the check does not reject a legitimately
+    # sized command.
+    boundary_cmd = "x" * 253
+    try:
+        await adapter.send_command(boundary_cmd)
+        boundary_error: Exception | None = None
+    except Exception as e:
+        boundary_error = e
+    record(
+        "send_command: a 253-byte command (frame length exactly 255) passes the length "
+        f"pre-check, fails later only on 'not connected' -- got {boundary_error!r}",
+        isinstance(boundary_error, RuntimeError) and "not connected" in str(boundary_error).lower(),
+    )
+
+    # One byte over: frame length 256 cannot fit in _frame()'s one-byte
+    # length prefix.
+    oversized_cmd = "x" * 254
+    try:
+        await adapter.send_command(oversized_cmd)
+        oversized_error: Exception | None = None
+    except Exception as e:
+        oversized_error = e
+    record(
+        "send_command: a 254-byte command (frame length 256) raises a clear ValueError, "
+        f"not a bare OverflowError -- got {oversized_error!r}",
+        isinstance(oversized_error, ValueError),
+    )
+    record(
+        "send_command: the ValueError names the actual and max size, not just 'invalid'",
+        oversized_error is not None
+        and "256" in str(oversized_error)
+        and "253" in str(oversized_error),
+    )
+
+
+def _adapter_with_fake_read_props(
+    *, mtu: Any = None, has_mtu: bool = True, raises: BaseException | None = None
+) -> tuple[BLEAdapter, _FakeIface]:
+    """A bare `BLEAdapter` with `read_props_iface` wired to a `_FakeIface`,
+    for testing `_log_negotiated_mtu` in isolation -- no bus, no connect()
+    plumbing needed, since the method only ever touches `read_props_iface`.
+    """
+    adapter = BLEAdapter()
+    read_props = _FakeIface()
+    if raises is not None:
+        read_props.raises["call_get"] = raises
+    elif has_mtu:
+        read_props.properties = {"MTU": mtu}
+    # Otherwise `properties` is left empty on purpose: the Properties.Get
+    # fake then succeeds but yields None, modelling a BlueZ that answers
+    # without error yet never actually populated this optional property.
+    adapter.read_props_iface = cast("Any", read_props)
+    return adapter, read_props
+
+
+async def _test_log_negotiated_mtu(record: Any) -> None:
+    """`_log_negotiated_mtu` must never fabricate a value: BlueZ's
+    `GattCharacteristic1.MTU` is an optional property whose availability on
+    this adapter's WriteValue/StartNotify (never AcquireWrite/AcquireNotify)
+    usage pattern is unverified -- see the method's docstring. Pins both
+    outcomes (present vs. genuinely unreachable) and that neither one ever
+    raises into the connect path that calls it.
+    """
+    handler, restore_logs = _capture_logs(ble_adapter.logger)
+    try:
+        # --- BlueZ reports a real MTU: logged verbatim, not invented ---
+        adapter, _read_props = _adapter_with_fake_read_props(mtu=247)
+        await adapter._log_negotiated_mtu()
+        record(
+            "_log_negotiated_mtu: a BlueZ-reported MTU is logged, at INFO",
+            any(r.levelno == logging.INFO and "247" in r.getMessage() for r in handler.records),
+        )
+        handler.records.clear()
+
+        # --- BlueZ's D-Bus call itself fails (property genuinely absent on
+        # this stack/version) -- must be reported plainly, never invented,
+        # and must not raise. ---
+        adapter2, _read_props2 = _adapter_with_fake_read_props(
+            raises=DBusError("org.bluez.Error.Failed", "No such property 'MTU'")
+        )
+        try:
+            await adapter2._log_negotiated_mtu()
+            raised = False
+        except Exception:
+            raised = True
+        record(
+            "_log_negotiated_mtu: an unreadable MTU property does not raise into the connect path",
+            not raised,
+        )
+        record(
+            "_log_negotiated_mtu: an unreadable MTU property is reported as unavailable, "
+            "not invented as a number",
+            any("not available" in r.getMessage().lower() for r in handler.records)
+            and not any("247" in r.getMessage() for r in handler.records),
+        )
+        handler.records.clear()
+
+        # --- read_props_iface not set at all (never connected) -- a no-op,
+        # not a crash. ---
+        adapter3 = BLEAdapter()
+        try:
+            await adapter3._log_negotiated_mtu()
+            raised3 = False
+        except Exception:
+            raised3 = True
+        record(
+            "_log_negotiated_mtu: no-op (does not raise) when there is no read_props_iface "
+            "yet (before any connect)",
+            not raised3,
+        )
+    finally:
+        restore_logs()
+
+
+def _test_finalize_connection_logs_mtu(record: Any) -> None:
+    """`_finalize_successful_connection` -- the ONE place both `connect()`'s
+    retry ladder and `ensure_connected()`'s composite converge on success --
+    must call `_log_negotiated_mtu` so every successful connect logs it
+    exactly once, from either path.
+    """
+    source = inspect.getsource(ble_adapter.BLEAdapter._finalize_successful_connection)
+    called = _self_call_names(source)
+    record(
+        "_finalize_successful_connection calls _log_negotiated_mtu on every successful "
+        "connect (both connect() and ensure_connected() share this method)",
+        "_log_negotiated_mtu" in called,
+    )
 
 
 def _test_ensure_connected_result_shape(record: Any) -> None:
@@ -4741,6 +5068,10 @@ async def run_ble_service_tests() -> bool:
     _test_api_key_valid(_record)
     _test_auth_boundary_via_testclient(_record)
     _test_crc16_ccitt_vectors(_record)
+    _test_json_frame_looks_truncated_helper(_record)
+    _test_notification_callback_register_json_happy_path(_record)
+    _test_notification_callback_truncated_frame_is_loud_not_silent(_record)
+    _test_notification_callback_malformed_frame_distinguished_from_truncation(_record)
     _test_ble_state_missing_corrupt_and_nondict(_record)
     _test_ble_pin_persistence(_record)
     _test_status_payload_shape(_record)
@@ -4762,6 +5093,9 @@ async def run_ble_service_tests() -> bool:
     _test_ensure_connected_never_calls_locking_public_methods(_record)
     _test_fail_connect_wraps_and_chains(_record)
     _test_stale_bond_signature_and_timeout_helpers(_record)
+    _test_finalize_connection_logs_mtu(_record)
+    await _test_send_command_oversized_raises_clear_error(_record)
+    await _test_log_negotiated_mtu(_record)
     for case in (
         _test_connect_with_scan_retry,
         _test_ensure_connected_already_connected_is_noop,

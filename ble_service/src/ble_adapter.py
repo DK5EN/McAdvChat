@@ -87,6 +87,15 @@ _MAX_CALLSIGN_LEN = 15
 _BLE_MTU_LIMIT = 247
 _MAX_SSID_LEN = 32
 _MAX_WIFI_PASSWORD_LEN = 63
+# `_frame()`'s length prefix is a SINGLE byte: length = len(payload) + 2 must
+# fit in it, i.e. the largest value `int.to_bytes(1, "big")` can represent.
+# This is a different, larger boundary than `_BLE_MTU_LIMIT` (247) -- that one
+# is a real ATT-MTU-derived cap enforced only for set_callsign/set_wifi; this
+# one is the hard ceiling the wire framing itself cannot exceed no matter what
+# the negotiated MTU is. Exceeding it used to raise a bare `OverflowError`
+# from deep inside `int.to_bytes()`, with no indication at the call site of
+# what went wrong -- see `BLEAdapter.send_command`'s length pre-check.
+_FRAME_LENGTH_PREFIX_MAX = 255
 
 # Timing constants (seconds)
 CONNECT_TIMEOUT_S = 10.0
@@ -901,7 +910,45 @@ class BLEAdapter:
         self._start_keepalive()
         self._start_dst_check()
 
+        # Best-effort, once per connect: see _log_negotiated_mtu's docstring
+        # for why this is never fabricated and may legitimately report
+        # "not available".
+        await self._log_negotiated_mtu()
+
         logger.info("Connected to %s", mac)
+
+    async def _log_negotiated_mtu(self) -> None:
+        """Log the ATT MTU BlueZ negotiated for this GATT connection, once
+        per connect -- best effort, and NEVER a guess.
+
+        BlueZ's `org.bluez.GattCharacteristic1` documents an optional,
+        readonly `MTU` property carrying the negotiated ATT MTU. Whether it
+        is actually populated for THIS adapter's usage pattern is
+        unverified: the property is primarily documented against the
+        `AcquireWrite`/`AcquireNotify` raw-socket path, and this adapter
+        instead talks to bluetoothd via the ordinary `WriteValue`/
+        `StartNotify` D-Bus calls (see `write()`/`start_notify()`) -- there
+        was no live BlueZ/hardware available to confirm the property is
+        populated on that path too. So this reads it defensively: on ANY
+        failure (property absent, wrong D-Bus type, bluetoothd version that
+        doesn't expose it at all) it logs that plainly and returns -- it
+        never invents a number, and it never raises into the connect path
+        that calls it.
+        """
+        if self.read_props_iface is None:
+            return
+        try:
+            mtu_variant = await self.read_props_iface.call_get(GATT_CHARACTERISTIC_INTERFACE, "MTU")
+            mtu = mtu_variant.value
+        except Exception as e:
+            logger.info(
+                "Negotiated ATT MTU not available from BlueZ for this connection (%s: %s) -- "
+                "not measured, not assumed",
+                type(e).__name__,
+                e,
+            )
+            return
+        logger.info("Negotiated ATT MTU for this BLE connection: %s bytes", mtu)
 
     async def _attempt_connection(self, _mac: str, path: str) -> None:
         """Single connection attempt with stale BlueZ state handling"""
@@ -1323,9 +1370,23 @@ class BLEAdapter:
 
         Returns:
             True if send successful
+
+        Raises:
+            ValueError: the framed message is too long for `_frame()`'s one-byte
+                length prefix. Same defect and same cap as `send_command` above --
+                this path builds a TEXT_COMMAND frame the identical way, so it
+                inherited the identical bare `OverflowError` from `int.to_bytes()`.
         """
         message = "{" + group + "}" + msg
-        return await self.write(_frame(MsgType.TEXT_COMMAND, message.encode("utf-8")))
+        message_bytes = message.encode("utf-8")
+        length = len(message_bytes) + 2
+        if length > _FRAME_LENGTH_PREFIX_MAX:
+            raise ValueError(
+                f"Message too long: {length} bytes (max {_FRAME_LENGTH_PREFIX_MAX}) -- "
+                f"the GATT write frame's length prefix is a single byte and cannot "
+                f"encode it."
+            )
+        return await self.write(_frame(MsgType.TEXT_COMMAND, message_bytes))
 
     async def send_hello(self) -> bool:
         """Send hello/wakeup command to device"""
@@ -1342,8 +1403,23 @@ class BLEAdapter:
 
         Returns:
             True if send successful
+
+        Raises:
+            ValueError: `cmd` is too long for `_frame()`'s one-byte length
+                prefix (payload cap 253 bytes -- see `_FRAME_LENGTH_PREFIX_MAX`).
+                Without this check the overflow surfaced as a bare
+                `OverflowError` raised deep inside `int.to_bytes()`, with
+                nothing at this boundary explaining what went wrong.
         """
-        return await self.write(_frame(MsgType.TEXT_COMMAND, cmd.encode("utf-8")))
+        cmd_bytes = cmd.encode("utf-8")
+        length = len(cmd_bytes) + 2
+        if length > _FRAME_LENGTH_PREFIX_MAX:
+            raise ValueError(
+                f"Command too long: {length} bytes (max {_FRAME_LENGTH_PREFIX_MAX}) -- "
+                f"the GATT write frame's length prefix is a single byte and cannot "
+                f"represent more than {_FRAME_LENGTH_PREFIX_MAX - 2} bytes of payload"
+            )
+        return await self.write(_frame(MsgType.TEXT_COMMAND, cmd_bytes))
 
     async def set_time(self) -> bool:
         """Set current time and UTC offset on device.

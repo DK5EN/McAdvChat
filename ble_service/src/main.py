@@ -235,6 +235,97 @@ def crc16_ccitt(data: bytes) -> int:
     return crc
 
 
+def _json_frame_looks_truncated(json_str: str) -> bool:
+    """Heuristic: does `json_str` (a `D{...}` register-update frame's JSON
+    payload, already stripped of the leading 'D' and any zero-byte padding)
+    look like it was cut off mid-object rather than being genuinely
+    malformed?
+
+    A frame chopped by a GATT-layer ATT MTU overflow loses only its TAIL --
+    it never gains stray bytes in the middle -- so the two failure shapes
+    are distinguishable without a full parser: truncation leaves the braces
+    unbalanced and/or the string not ending in '}'; a malformed-but-intact
+    frame (bad value, a stray character, a trailing comma...) still closes
+    cleanly. Not proof either way, just the best signal available from a
+    bare `json.JSONDecodeError` -- see `_decode_register_frame`.
+    """
+    stripped = json_str.rstrip()
+    if not stripped.endswith("}"):
+        return True
+    return stripped.count("{") != stripped.count("}")
+
+
+def _decode_register_frame(data: bytes, notification: dict[str, Any]) -> None:
+    """Decode a `D{...}` register-update notification into `notification`,
+    in place. Never raises.
+
+    A `D{` frame carries a full register snapshot (callsign, firmware
+    version, group config, ...) as one JSON object; there is no
+    multi-notification reassembly anywhere in this codebase (and adding one
+    is a firmware-agreement protocol change, out of scope here -- see the
+    module's "Multi-Part Responses" docstring for the one place the
+    firmware DOES already split a response across notifications, by design
+    and on a fixed schedule, not as an MTU workaround). So a truncated or
+    malformed frame here means the ENTIRE register update is discarded, not
+    just one field -- that used to surface as a DEBUG-adjacent one-line
+    warning indistinguishable from routine noise. This logs loudly instead,
+    and distinguishes two causes that have different fixes:
+
+      - a truncated frame (`_json_frame_looks_truncated`) -- almost
+        certainly the ATT MTU cutting off a payload the firmware tried to
+        send whole (the concern for MeshCom FW 4.36's proposed filter-list
+        register field). Logged at ERROR with the byte/char lengths, so an
+        operator can correlate against the negotiated MTU
+        `BLEAdapter._log_negotiated_mtu` logs once per connect.
+      - a genuinely malformed frame -- balanced/closed but not valid JSON,
+        or not valid UTF-8 at all. Logged at WARNING: this is a
+        firmware/decoding bug, not an MTU sizing problem.
+
+    Either way `notification["format"]` is set to "raw" (never "json") and
+    no partial/best-effort value is applied -- there is nothing here that
+    silently accepts a half-decoded register update.
+    """
+    raw_len = len(data)
+    try:
+        json_str = data.rstrip(b"\x00").decode("utf-8")[1:]
+    except UnicodeDecodeError:
+        # A byte sequence cut off mid multi-byte UTF-8 codepoint is itself
+        # strong truncation evidence -- ATT MTU truncation is byte-exact, it
+        # does not respect codepoint boundaries.
+        notification["format"] = "raw"
+        logger.exception(
+            "Dropped BLE register update: D{ frame (%d bytes) is not valid UTF-8 -- looks "
+            "truncated (cut mid-character), most likely the ATT MTU cutting off a register "
+            "JSON payload. The whole register update was discarded, not partially applied.",
+            raw_len,
+        )
+        return
+
+    try:
+        notification["parsed"] = json.loads(json_str)
+        notification["format"] = "json"
+    except json.JSONDecodeError as e:
+        notification["format"] = "raw"
+        if _json_frame_looks_truncated(json_str):
+            logger.exception(
+                "Dropped BLE register update: D{ frame (%d bytes, %d chars decoded) looks "
+                "truncated (unbalanced or unclosed JSON) -- most likely exceeds the "
+                "negotiated BLE MTU. The whole register update was discarded, not partially "
+                "applied.",
+                raw_len,
+                len(json_str),
+            )
+        else:
+            logger.warning(
+                "Dropped BLE register update: malformed JSON in D{ frame (%d bytes) -- the "
+                "frame arrived intact (braces balanced, properly closed), so this is a "
+                "firmware/decoding bug, not an MTU sizing problem; json error: %s. The "
+                "register update was discarded.",
+                raw_len,
+                e,
+            )
+
+
 def notification_callback(data: bytes) -> None:
     """Called when BLE notification received"""
     timestamp = _now_ms()
@@ -249,10 +340,7 @@ def notification_callback(data: bytes) -> None:
     # Attempt to decode
     try:
         if data.startswith(b"D{"):
-            # JSON message
-            json_str = data.rstrip(b"\x00").decode("utf-8")[1:]
-            notification["parsed"] = json.loads(json_str)
-            notification["format"] = "json"
+            _decode_register_frame(data, notification)
         elif data.startswith(b"@"):
             # Binary mesh message
             notification["format"] = "binary"
