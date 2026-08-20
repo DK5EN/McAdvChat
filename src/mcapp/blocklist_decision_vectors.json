@@ -1,5 +1,5 @@
 {
-  "description": "Canonical vectors for the callsign-blocklist gate, shared between MCProxy's MessageRouter.blocklist_decision (src/mcapp/main.py) and the webapp's mirror of it in processDataElement (src/services/messageProcessor.ts). Both sides classify an inbound payload from a blocked src as pass/redirect/drop using the same rules: strip the via-relay path off src before matching (first comma component), resolve dst to its effective target (last comma component of a via-routed 'VIA,TARGET'), and treat numeric groups plus '*'/'ALL'/'TEST' as group-like (redirect to the spam group) while everything else drops. `blocklist` entries are matched by EXACT string (no SSID normalization) against src, both sides upper-cased before comparison.\n\nEach vector's `decision` is MCProxy's actual output (verified live against MessageRouter.blocklist_decision — see MCProxy/src/mcapp/send_path_tests.py). This file is vendored byte-for-byte (parsed-equal, not literal-byte-equal — Prettier reformats the webapp copy) at webapp/src/services/__tests__/blocklist_decision_vectors.json; a spec there diffs the two copies when both repos are checked out side by side.\n\nRESOLVED DIVERGENCE (2026-07-27 drift-resolution campaign, webapp docs/code-simpl-v2.md): earlier versions of this file documented that the webapp's isGroupDst was a bare /^\\d+$/ test while MCProxy's is_group() enforced 1..99999, so an out-of-range numeric dst ('0', '100000') from a blocked src redirected on the webapp but dropped on MCProxy. The group predicate is now unified across all three repos (see group_dst_vectors.json, canonical at MCProxy/src/mcapp/commands/group_dst_vectors.json) and BOTH sides drop: the former divergence vectors below carry a single `decision` like every other vector, and the per-side `webapp_decision`/`note` escape hatch is gone from this file.",
+  "description": "Canonical vectors for the callsign-blocklist gate, shared between MCProxy's MessageRouter.blocklist_decision (src/mcapp/main.py) and the webapp's mirror of it in processDataElement (src/services/messageProcessor.ts). Both sides classify an inbound payload from a blocked src as pass/redirect/drop using the same rules: strip the via-relay path off src before matching (first comma component), resolve dst to its effective target (last comma component of a via-routed 'VIA,TARGET'), and treat numeric groups plus '*'/'ALL'/'TEST' as group-like (redirect to the spam group) while everything else drops. `blocklist` entries are matched by EXACT string (no SSID normalization) against src, both sides upper-cased before comparison.\n\nEach vector's `decision` is MCProxy's actual output (verified live against MessageRouter.blocklist_decision — see MCProxy/src/mcapp/send_path_tests.py). This file is vendored byte-for-byte (parsed-equal, not literal-byte-equal — Prettier reformats the webapp copy) at webapp/src/services/__tests__/blocklist_decision_vectors.json; a spec there diffs the two copies when both repos are checked out side by side.\n\nRESOLVED DIVERGENCE (2026-07-27 drift-resolution campaign, webapp docs/code-simpl-v2.md): earlier versions of this file documented that the webapp's isGroupDst was a bare /^\\d+$/ test while MCProxy's is_group() enforced 1..99999, so an out-of-range numeric dst ('0', '100000') from a blocked src redirected on the webapp but dropped on MCProxy. The group predicate is now unified across all three repos (see group_dst_vectors.json, canonical at MCProxy/src/mcapp/commands/group_dst_vectors.json) and BOTH sides drop: the former divergence vectors below carry a single `decision` like every other vector, and the per-side `webapp_decision`/`note` escape hatch is gone from this file. v2: hashtag destinations are group-like for quarantine purposes -- blocked-sender traffic to a '#TAG' is redirected to SPAM_GROUP and stays inspectable, matching numeric-group behaviour, instead of being dropped outright. A malformed '#' destination is still dropped.",
   "canonical": "MCProxy/src/mcapp/blocklist_decision_vectors.json",
   "vectors": [
     {
@@ -152,6 +152,43 @@
       "src": "OE9BAD-1",
       "dst": "100000",
       "decision": "drop"
+    },
+    {
+      "name": "blocked src to a hashtag is quarantined, not dropped",
+      "blocklist": [
+        "OE9BAD-1"
+      ],
+      "src": "OE9BAD-1",
+      "dst": "#OE-SOTA",
+      "decision": "redirect"
+    },
+    {
+      "name": "blocked src to a via-routed hashtag is quarantined",
+      "blocklist": [
+        "OE9BAD-1"
+      ],
+      "src": "OE9BAD-1",
+      "dst": "R1-1,#EMCOM",
+      "decision": "redirect"
+    },
+    {
+      "name": "blocked src to a MALFORMED hashtag is dropped (addresses nobody)",
+      "blocklist": [
+        "OE9BAD-1"
+      ],
+      "src": "OE9BAD-1",
+      "dst": "#OE_SOTA",
+      "decision": "drop"
+    },
+    {
+      "name": "unblocked src to a hashtag passes through",
+      "blocklist": [
+        "OE9BAD-1"
+      ],
+      "src": "OE1GOOD-1",
+      "dst": "#OE-SOTA",
+      "decision": "pass"
     }
-  ]
+  ],
+  "version": 2
 }

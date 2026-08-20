@@ -1,14 +1,38 @@
 {
-  "description": "Canonical vectors for the unified group-destination predicate, shared by three independent implementations: MCProxy is_group (src/mcapp/commands/parsing.py, the authoritative origin of the semantics), mc-chat is_group (meshcom_mock/commands.py) and the webapp isGroupDst (src/utils/callsignUtils.ts). Unified semantics (drift-resolution campaign 2026-07-27, webapp docs/code-simpl-v2.md): dst is a group iff it equals 'TEST' case-insensitively, OR it is a non-empty all-ASCII-digit string whose integer value is in 1..99999 (leading zeros allowed: '00232' is group 232). Everything else is NOT a group: empty, '*', 'Time', 'ALL' (broadcast-like dsts are OR'd in explicitly by call sites that want them, e.g. the blocklist gate), callsigns, signed/spaced/scientific numerics, via-routed strings (callers resolve the effective target BEFORE asking this predicate), and any non-ASCII digit. Non-ASCII digits are the trap this fixture exists to pin: Python str.isdigit() accepts '٣', '２' and '²' while JS /^\\d+$/ rejects them all; int('٣') == 3 and int('１２３') == 123 (a naive backend accepts non-ASCII group ids the webapp rejects) and int('²') raises ValueError (a guard-less backend crashes -- mc-chat's pre-campaign is_group did exactly that). Backends therefore gate on dst.isascii() before isdigit(). SYNC RULE: canonical source is THIS file in MCProxy; parse-equal vendored copies live at mc-chat/tests/fixtures/group_dst_vectors.json and webapp/src/utils/__tests__/group_dst_vectors.json (Prettier may reformat the webapp copy; only content drift is a failure). Every repo replays every vector against its own implementation, and sibling drift-checks self-skip when the sibling checkout is absent.",
+  "description": "Canonical vectors for the unified group-destination predicate, shared by three independent implementations: MCProxy is_group (src/mcapp/commands/parsing.py, the authoritative origin of the semantics), mc-chat is_group (meshcom_mock/commands.py) and the webapp isGroupDst (src/utils/callsignUtils.ts). Unified semantics (drift-resolution campaign 2026-07-27, webapp docs/code-simpl-v2.md): dst is a group iff it equals 'TEST' case-insensitively, OR it is a non-empty all-ASCII-digit string whose integer value is in 1..99999 (leading zeros allowed: '00232' is group 232). Everything else is NOT a group: empty, '*', 'Time', 'ALL' (broadcast-like dsts are OR'd in explicitly by call sites that want them, e.g. the blocklist gate), callsigns, signed/spaced/scientific numerics, via-routed strings (callers resolve the effective target BEFORE asking this predicate), and any non-ASCII digit. Non-ASCII digits are the trap this fixture exists to pin: Python str.isdigit() accepts '٣', '２' and '²' while JS /^\\d+$/ rejects them all; int('٣') == 3 and int('１２３') == 123 (a naive backend accepts non-ASCII group ids the webapp rejects) and int('²') raises ValueError (a guard-less backend crashes -- mc-chat's pre-campaign is_group did exactly that). Backends therefore gate on dst.isascii() before isdigit(). SYNC RULE: canonical source is THIS file in MCProxy; parse-equal vendored copies live at mc-chat/tests/fixtures/group_dst_vectors.json and webapp/src/utils/__tests__/group_dst_vectors.json (Prettier may reformat the webapp copy; only content drift is a failure). Every repo replays every vector against its own implementation, and sibling drift-checks self-skip when the sibling checkout is absent. v2 pins that is_group() stays NUMERIC-ONLY: a '#'-prefixed destination is NOT a group. Hashtag classification lives in the sibling predicate is_hashtag() -- see hashtag_dst_vectors.json. Widening is_group() would have changed the meaning of a predicate mirrored in three repos; a sibling was chosen instead.",
   "canonical": "MCProxy/src/mcapp/commands/group_dst_vectors.json",
-  "version": 1,
+  "version": 2,
   "vectors": [
-    { "name": "empty string", "dst": "", "is_group": false },
-    { "name": "minimum group id 1", "dst": "1", "is_group": true },
-    { "name": "typical group 232", "dst": "232", "is_group": true },
-    { "name": "maximum group id 99999", "dst": "99999", "is_group": true },
-    { "name": "zero is below the range", "dst": "0", "is_group": false },
-    { "name": "100000 is above the range", "dst": "100000", "is_group": false },
+    {
+      "name": "empty string",
+      "dst": "",
+      "is_group": false
+    },
+    {
+      "name": "minimum group id 1",
+      "dst": "1",
+      "is_group": true
+    },
+    {
+      "name": "typical group 232",
+      "dst": "232",
+      "is_group": true
+    },
+    {
+      "name": "maximum group id 99999",
+      "dst": "99999",
+      "is_group": true
+    },
+    {
+      "name": "zero is below the range",
+      "dst": "0",
+      "is_group": false
+    },
+    {
+      "name": "100000 is above the range",
+      "dst": "100000",
+      "is_group": false
+    },
     {
       "name": "leading zeros parse as their integer value",
       "dst": "00232",
@@ -19,27 +43,71 @@
       "dst": "00000",
       "is_group": false
     },
-    { "name": "zero-padded maximum", "dst": "099999", "is_group": true },
-    { "name": "TEST uppercase", "dst": "TEST", "is_group": true },
-    { "name": "TEST lowercase", "dst": "test", "is_group": true },
-    { "name": "TEST mixed case", "dst": "Test", "is_group": true },
-    { "name": "broadcast star is not a group", "dst": "*", "is_group": false },
-    { "name": "Time channel is not a group", "dst": "Time", "is_group": false },
+    {
+      "name": "zero-padded maximum",
+      "dst": "099999",
+      "is_group": true
+    },
+    {
+      "name": "TEST uppercase",
+      "dst": "TEST",
+      "is_group": true
+    },
+    {
+      "name": "TEST lowercase",
+      "dst": "test",
+      "is_group": true
+    },
+    {
+      "name": "TEST mixed case",
+      "dst": "Test",
+      "is_group": true
+    },
+    {
+      "name": "broadcast star is not a group",
+      "dst": "*",
+      "is_group": false
+    },
+    {
+      "name": "Time channel is not a group",
+      "dst": "Time",
+      "is_group": false
+    },
     {
       "name": "ALL broadcast alias is not a group (call sites OR it in where wanted)",
       "dst": "ALL",
       "is_group": false
     },
-    { "name": "personal callsign", "dst": "DK5EN-12", "is_group": false },
+    {
+      "name": "personal callsign",
+      "dst": "DK5EN-12",
+      "is_group": false
+    },
     {
       "name": "scientific notation is not a group id",
       "dst": "1e3",
       "is_group": false
     },
-    { "name": "leading space", "dst": " 12", "is_group": false },
-    { "name": "trailing space", "dst": "12 ", "is_group": false },
-    { "name": "negative number", "dst": "-1", "is_group": false },
-    { "name": "plus-signed number", "dst": "+1", "is_group": false },
+    {
+      "name": "leading space",
+      "dst": " 12",
+      "is_group": false
+    },
+    {
+      "name": "trailing space",
+      "dst": "12 ",
+      "is_group": false
+    },
+    {
+      "name": "negative number",
+      "dst": "-1",
+      "is_group": false
+    },
+    {
+      "name": "plus-signed number",
+      "dst": "+1",
+      "is_group": false
+    },
     {
       "name": "arabic-indic digit three: int() accepts it, the predicate must not",
       "dst": "٣",
@@ -58,6 +126,31 @@
     {
       "name": "via-routed dst is NOT resolved by this predicate (callers resolve first)",
       "dst": "RELAY-1,232",
+      "is_group": false
+    },
+    {
+      "name": "hashtag is not a group (see hashtag_dst_vectors.json)",
+      "dst": "#OE-SOTA",
+      "is_group": false
+    },
+    {
+      "name": "hashtag prefix is not a group",
+      "dst": "#OE",
+      "is_group": false
+    },
+    {
+      "name": "bare hash is not a group",
+      "dst": "#",
+      "is_group": false
+    },
+    {
+      "name": "hashtag of digits is not a group",
+      "dst": "#232",
+      "is_group": false
+    },
+    {
+      "name": "via-routed hashtag is not a group",
+      "dst": "RELAY-1,#OE-SOTA",
       "is_group": false
     }
   ]

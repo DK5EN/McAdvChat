@@ -133,6 +133,69 @@ def is_group(dst: str) -> bool:
     return False
 
 
+# A hashtag destination is the MeshCom FW 4.36 RfC's "#TAG" addressing token
+# carried in the destination field. Contract: ./hashtag_dst_vectors.json —
+# canonical HERE, vendored and replayed by mc-chat and the webapp.
+#
+# Deliberately NOT length-bounded, and deliberately case-insensitive. Both are
+# load-bearing: the defect this predicate exists to fix is a "#"-prefixed dst
+# falling through to the personal-DM branch, where compute_conversation_key
+# split it on its first hyphen. An over-long or lowercase tag that failed this
+# test would fall back into exactly that branch. The RfC's 9-char cap and its
+# uppercase-on-send rule are SEND-side grammar, enforced at the API boundary —
+# never here, where the only job is "do not mistake this for a callsign".
+_HASHTAG_DST_RE = re.compile(r"^#[A-Za-z0-9-]+$")
+
+
+def resolve_dst_target(dst: str) -> str:
+    """Resolve a via-routed destination to its real target.
+
+    Wire form is 'VIA[,VIA2],TARGET' — the real target is the LAST comma
+    component (the src field carries the relay path the other way round, first
+    component = sender). Safe for hashtags specifically because the RfC forbids
+    ',' inside a tag, so there is no ambiguity.
+
+    Single definition. This idiom was hand-rolled in four places before
+    (storage/constants.py, classifier/types.py's regex anchor, push_delivery.py
+    and implicitly in storage/query.py); a fifth copy is how they drift.
+    """
+    return dst.rsplit(",", maxsplit=1)[-1].strip()
+
+
+def is_hashtag(dst: str) -> bool:
+    """Check if destination is a hashtag channel (RfC FW 4.36 '#TAG')."""
+    if not dst:
+        return False
+    return _HASHTAG_DST_RE.match(resolve_dst_target(dst)) is not None
+
+
+def dst_kind(dst: str) -> str:
+    """Classify a destination: broadcast | group | hashtag | direct | unknown.
+
+    Rules apply IN ORDER; see hashtag_dst_vectors.json for the pinned corpus.
+    The '#'-but-malformed -> 'unknown' rule at step 5 is load-bearing: such a
+    destination addresses nobody and must not fall through to 'direct', because
+    treating it as a personal DM is the original defect and a malformed tag is
+    the case most likely to arrive from a buggy or hostile sender. 'unknown'
+    means do not deliver, do not key a conversation, do not ack.
+    """
+    target = resolve_dst_target(dst)
+    if not target:
+        return "unknown"
+    if target.upper() in ("*", "ALL"):
+        return "broadcast"
+    if is_group(target):
+        return "group"
+    if is_hashtag(target):
+        return "hashtag"
+    # Both of these address nobody, and neither may fall through to "direct":
+    # a "#"-prefixed value that failed the tag charset, and an all-ASCII-digit
+    # value outside the 1..99999 group range.
+    if target.startswith("#") or (target.isascii() and target.isdigit()):
+        return "unknown"
+    return "direct"
+
+
 # ---------------------------------------------------------------------------
 # Dispatch-based command parser
 # ---------------------------------------------------------------------------

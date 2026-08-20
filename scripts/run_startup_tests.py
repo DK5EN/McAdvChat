@@ -36,6 +36,7 @@ from mcapp.ble_protocol_tests import run_ble_protocol_tests
 from mcapp.classifier.tests import run_all_tests as run_classifier_tests
 from mcapp.commands.dedup_tests import run_dedup_tests
 from mcapp.commands.handler import create_command_handler
+from mcapp.commands.hashtag_dst_tests import run_hashtag_dst_tests
 from mcapp.commands.linkcheck_session_tests import run_linkcheck_session_tests
 from mcapp.commands.parsing_tests import run_parsing_tests
 from mcapp.commands.routing_tests import run_routing_tests
@@ -112,6 +113,9 @@ async def main() -> int:  # noqa: PLR0915 - flat suite registry; one visible lin
 
     parsing_ok = run_parsing_tests()
     print(f"parsing: {'PASS' if parsing_ok else 'FAIL'}")
+
+    hashtag_dst_ok = run_hashtag_dst_tests()
+    print(f"hashtag_dst: {'PASS' if hashtag_dst_ok else 'FAIL'}")
 
     dedup_ok = run_dedup_tests()
     print(f"dedup: {'PASS' if dedup_ok else 'FAIL'}")
@@ -206,6 +210,7 @@ async def main() -> int:  # noqa: PLR0915 - flat suite registry; one visible lin
         and sse_ok
         and classifier_ok
         and parsing_ok
+        and hashtag_dst_ok
         and dedup_ok
         and routing_ok
         and conversation_key_ok

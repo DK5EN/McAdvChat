@@ -19,7 +19,7 @@ from typing import Any
 from .ble_client import BLEMode, ConnectionState, create_ble_client
 from .commands import create_command_handler
 from .commands.constants import CALLSIGN_STRICT_RE
-from .commands.parsing import is_group, normalize_unified, strip_relay_path
+from .commands.parsing import dst_kind, is_group, normalize_unified, strip_relay_path
 from .config_loader import (
     BLE_SERVICE_URL,
     MESHCOM_UDP_PORT,
@@ -349,28 +349,29 @@ class MessageRouter:
         the webapp live and trigger command responses. Returns:
 
             "pass"     — src not blocked; handle normally.
-            "redirect" — blocked group/broadcast traffic; the broadcast path
-                         quarantines it to SPAM_GROUP (9999) for live viewing,
-                         while storage still drops it (live-only, never
-                         persisted, so it never lands in mHeard/history).
-            "drop"     — blocked personal/position/telemetry; suppressed on
-                         every path.
+            "redirect" — blocked group/broadcast/hashtag traffic; the broadcast
+                         path quarantines it to SPAM_GROUP (9999) for live
+                         viewing, while storage still drops it (live-only,
+                         never persisted, so it never lands in mHeard/history).
+            "drop"     — blocked personal/position/telemetry (or a malformed
+                         '#' destination, which addresses nobody); suppressed
+                         on every path.
 
-        `src` and `dst` are both normalized before use — the raw inbound payload is
-        not pre-normalized on this path. `src` goes through the same
+        `src` is normalized before use — the raw inbound payload is not
+        pre-normalized on this path. `src` goes through the same
         `strip_relay_path` the command path applies three lines after this guard, so
         a stray-whitespace `src` can no longer slip past the blocklist and then
-        normalize cleanly into command execution. `dst` is resolved to its real
-        target (last comma-component of a via-routed 'VIA,TARGET') and stripped +
-        upper-cased before the group test, so a relayed group post from a blocked
-        station is quarantined to SPAM_GROUP instead of being dropped outright, and
-        `is_group` no longer misclassifies e.g. " 20" as a non-group.
+        normalize cleanly into command execution. `dst` classification is
+        delegated to `dst_kind`, which resolves a via-routed 'VIA,TARGET' to its
+        real target before deciding — so a relayed group/hashtag post from a
+        blocked station is quarantined to SPAM_GROUP instead of being dropped
+        outright, and a hashtag is treated as group-like for quarantine (a
+        malformed '#' destination classifies as "unknown" and still drops).
         """
         src = strip_relay_path(data.get("src") or "")
         if not self._is_callsign_blocked(src):
             return "pass"
-        dst = (data.get("dst") or "").rsplit(",", maxsplit=1)[-1].strip().upper()
-        if is_group(dst) or dst in ("*", "ALL"):
+        if dst_kind(data.get("dst") or "") in ("group", "broadcast", "hashtag"):
             return "redirect"
         return "drop"
 

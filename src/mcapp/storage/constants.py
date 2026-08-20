@@ -8,7 +8,7 @@ from contextlib import closing, contextmanager
 from pathlib import Path
 from typing import NamedTuple
 
-from ..commands.parsing import is_group
+from ..commands.parsing import is_group, is_hashtag, resolve_dst_target
 
 # The schema version a fresh install lands on, and the version every migration
 # chain must terminate at. BUMP THIS in the same commit as any new `if
@@ -129,17 +129,32 @@ def compute_conversation_key(src: str, dst: str) -> str | None:
     yields None — no bucket at all. Callers fall back to
     COALESCE(conversation_key, dst), so client-visible partitioning for such
     traffic is unchanged.
+
+    v4 adds the hashtag branch (commands/parsing.py:is_hashtag; contracts
+    ../commands/hashtag_dst_vectors.json and ./conversation_key_vectors.json
+    v4): a '#TAG' destination keys on the resolved tag VERBATIM — string-
+    preserving exactly like the group branch, case included — and this check
+    runs AFTER is_group/'*' but BEFORE the all-ASCII-digit branch, so a
+    hashtag never reaches the DM fallback below. Before this fix a '#'-
+    prefixed dst fell into the DM branch, which split it on its first hyphen
+    ('#OE-SOTA' → conversation key '#OE<>DK5EN'), fragmenting one tag per
+    sender and colliding distinct tags that share a prefix. A '#'-prefixed
+    dst that fails the tag charset (bare '#', '#OE_SOTA') yields None — no
+    bucket at all, NOT a degenerate DM pair — mirroring dst_kind's 'unknown'
+    classification for the same input.
     """
     if not dst:
         return None
-    target = dst.rsplit(",", maxsplit=1)[-1].strip()
-    if is_group(target):
+    target = resolve_dst_target(dst)
+    if is_group(target) or target == "*":
         return target
-    if target == "*":
-        return "*"
-    if target.isascii() and target.isdigit():
-        # All-ASCII digits but outside the 1..99999 group range: no bucket
-        # (conversation_key_vectors.json v2), NOT a degenerate DM pair.
+    if is_hashtag(target):
+        return target
+    if target.startswith("#") or (target.isascii() and target.isdigit()):
+        # Malformed hashtag ('#OE_SOTA', bare '#') or an all-ASCII-digit
+        # target outside the 1..99999 group range ('0', '100000'): no
+        # bucket at all (dst_kind's 'unknown' rule / conversation_key_vectors
+        # v2), NOT a degenerate DM pair.
         return None
     # DM: strip SSIDs, sort alphabetically
     base_src = src.split(",", maxsplit=1)[0].split("-", maxsplit=1)[0]

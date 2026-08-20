@@ -9,7 +9,7 @@ import json
 import sqlite3
 from typing import Any, cast
 
-from ..commands.parsing import is_group
+from ..commands.parsing import is_group, is_hashtag
 from ..logging_setup import get_logger
 from ._base import StorageBase
 from .constants import compute_conversation_key, db_write, escape_like
@@ -79,13 +79,17 @@ class PrefsMixin(StorageBase):
         """Delete a whole conversation, mirroring the webapp's client-side
         removal semantics.
 
-        Groups ('232', 'TEST') and broadcast ('*'): match via
-        conversation_key so via-routed rows (dst 'VIA,232' → key '232')
-        are included, like get_messages_page. 'Time' is the webapp's
-        virtual chat of {CET}-prefixed broadcasts — those rows live under
-        dst '*' in the DB and are split out of the '*' delete. New {CET}
-        messages are dropped by _should_filter_message, so the Time
-        branch only removes pre-filter legacy rows.
+        Groups ('232', 'TEST'), hashtags ('#OE-SOTA') and broadcast ('*'):
+        match via conversation_key so via-routed rows (dst 'VIA,232' →
+        key '232', dst 'VIA,#OE-SOTA' → key '#OE-SOTA') are included,
+        like get_messages_page. A hashtag dst takes this same group-style
+        arm — routing it into the personal branch below would compute a
+        corrupted conversation key (compute_conversation_key's DM fallback
+        splits on the first hyphen: '#OE-SOTA' → '#OE<>DK5EN'). 'Time' is
+        the webapp's virtual chat of {CET}-prefixed broadcasts — those rows
+        live under dst '*' in the DB and are split out of the '*' delete.
+        New {CET} messages are dropped by _should_filter_message, so the
+        Time branch only removes pre-filter legacy rows.
         Personal (callsign): delete bidirectional using conversation_key.
         Matching only conversation_key is complete: type='ack' rows no
         longer exist (the v4 migration removed them and store_message
@@ -137,13 +141,15 @@ class PrefsMixin(StorageBase):
                         " AND type IN ('msg', 'ack')"
                         " AND (msg IS NULL OR msg NOT LIKE '{CET}%')"
                     )
-                elif is_group(dst):
-                    # Unified predicate (group_dst_vectors.json). An
-                    # out-of-range digit dst ('0') falls to the personal arm,
-                    # whose conversation key is None post-v2 and matches
-                    # nothing — consistent with "no bucket". Legacy rows
-                    # keyed verbatim pre-v2 are no longer deletable here;
-                    # the app no longer surfaces such buckets at all.
+                elif is_group(dst) or is_hashtag(dst):
+                    # Unified predicates (group_dst_vectors.json,
+                    # hashtag_dst_vectors.json). An out-of-range digit dst
+                    # ('0') or a malformed hashtag ('#OE_SOTA') falls to the
+                    # personal arm, whose conversation key is None post-v2/v4
+                    # and matches nothing — consistent with "no bucket".
+                    # Legacy rows keyed verbatim pre-v2 are no longer
+                    # deletable here; the app no longer surfaces such
+                    # buckets at all.
                     cursor = conn.execute(
                         "DELETE FROM messages WHERE conversation_key = ?"
                         " AND type IN ('msg', 'ack')",

@@ -41,8 +41,8 @@ def _load_conversation_key_vectors() -> list[dict[str, str | None]]:
     parse-equal to this one (the webapp's Prettier may reformat it)."""
     with _VECTORS_PATH.open(encoding="utf-8") as f:
         contract = json.load(f)
-    if contract["version"] != 3:
-        msg = f"conversation_key_vectors.json version {contract['version']!r} != 3"
+    if contract["version"] != 4:
+        msg = f"conversation_key_vectors.json version {contract['version']!r} != 4"
         raise AssertionError(msg)
     vectors: list[dict[str, str | None]] = contract["vectors"]
     return vectors

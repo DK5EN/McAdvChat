@@ -15,7 +15,7 @@ from pathlib import Path
 from statistics import mean
 from typing import Any, cast
 
-from ..commands.parsing import is_group
+from ..commands.parsing import is_group, is_hashtag, resolve_dst_target
 from ..logging_setup import get_logger
 from ..util import now_ms
 from ._base import StorageBase
@@ -426,17 +426,27 @@ class QueryMixin(StorageBase):
         """Get a page of messages for a destination, cursor-based.
 
         For personal DMs (dst is a callsign, not a group number), pass src
-        to query via conversation_key for a single-index scan.
+        to query via conversation_key for a single-index scan. A hashtag dst
+        ('#OE-SOTA') takes the same group-style conversation_key path as a
+        numeric group (hashtag_dst_vectors.json).
         """
         if before_timestamp is None:
             before_timestamp = now_ms()
 
+        # A hashtag dst ('#OE-SOTA') is neither digit-only nor '*', so without
+        # an explicit exclusion is_dm was true whenever src was supplied and
+        # the group/hashtag branches below never ran (hashtag_dst_vectors.json).
+        # resolve_dst_target handles a via-routed dst param ('RELAY-1,#OE-SOTA')
+        # the same way compute_conversation_key does, so the hashtag arm below
+        # stays reachable for that shape too — the common case on a mesh.
+        target = resolve_dst_target(dst) if dst else ""
+        is_hashtag_dst = bool(target) and is_hashtag(target)
         # is_dm keeps the bare digit-shape test on purpose: its question is
         # "could dst be a personal callsign", not "is dst a group" — an
         # out-of-range digit dst like '0' is neither and must fall through to
         # the exact-dst arm below (which still serves its legacy rows), not
         # into the DM arm whose conversation_key would be NULL.
-        is_dm = dst and src and not dst.isdigit() and dst != "*"
+        is_dm = dst and src and not dst.isdigit() and dst != "*" and not is_hashtag_dst
         is_group_dst = bool(dst) and is_group(dst)
 
         params: tuple[Any, ...] = ()
@@ -489,6 +499,19 @@ class QueryMixin(StorageBase):
                 " ORDER BY timestamp DESC LIMIT ?"
             )
             params = (dst, before_timestamp, limit + 1)
+        elif is_hashtag_dst:
+            # Hashtag channel: same group-style conversation_key match, using
+            # the RESOLVED tag (not the raw dst param) so a via-routed dst
+            # ('RELAY-1,#OE-SOTA' → key '#OE-SOTA') is reachable too — the
+            # common case on a mesh. compute_conversation_key keys a hashtag
+            # on the resolved tag verbatim (conversation_key_vectors.json v4).
+            query = (
+                f"SELECT {_MSG_SELECT} FROM messages"  # noqa: S608 - identifiers from fixed set; values parameterized
+                " WHERE type = 'msg' AND msg NOT GLOB '*:ack[0-9]*'"
+                " AND conversation_key = ? AND timestamp < ?"
+                " ORDER BY timestamp DESC LIMIT ?"
+            )
+            params = (target, before_timestamp, limit + 1)
         elif dst:
             # Last-resort exact match. A callsign dst normally cannot reach here: the
             # route layer resolves a missing `src` to the node's own callsign (mirroring
@@ -936,18 +959,27 @@ class QueryMixin(StorageBase):
                 result["pos_count"] = row["cnt"]
                 result["last_pos"] = row["last_ts"]
 
-        # Query 2: distinct numeric destinations
+        # Query 2: distinct numeric and hashtag destinations. GLOB '#*' was
+        # missing before this fix, making every hashtag-addressed conversation
+        # invisible to search (hashtag_dst_vectors.json).
         dest_rows = await self._query(
             "SELECT DISTINCT dst FROM messages"  # noqa: S608 - identifiers from fixed set; values parameterized
             f" WHERE timestamp >= ? AND type = 'msg'{src_filter}"
-            " AND dst GLOB '[0-9]*'",
+            " AND (dst GLOB '[0-9]*' OR dst GLOB '#*')",
             params,
         )
         # GLOB '[0-9]*' only guarantees the dst STARTS with a digit, so a dst like
         # '1abc' used to raise ValueError inside key=int and 500 the request.
-        result["destinations"] = sorted(
-            [r["dst"] for r in dest_rows if str(r["dst"]).isdigit()], key=int
+        # Numeric behaviour is unchanged: same filter, same sort.
+        numeric_destinations = sorted(
+            (r["dst"] for r in dest_rows if str(r["dst"]).isdigit()), key=int
         )
+        # GLOB '#*' only guarantees the dst STARTS with '#'; is_hashtag()
+        # re-validates the tag charset so a malformed '#' dst ('#OE_SOTA', bare
+        # '#') -- which addresses nobody (hashtag_dst_vectors.json 'unknown') --
+        # is excluded rather than surfaced as a searchable destination.
+        hashtag_destinations = sorted(r["dst"] for r in dest_rows if is_hashtag(r["dst"]))
+        result["destinations"] = numeric_destinations + hashtag_destinations
 
         # Query 3: SID activity (prefix search only)
         if search_type == "prefix":

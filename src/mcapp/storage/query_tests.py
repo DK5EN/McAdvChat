@@ -40,6 +40,14 @@ Coverage:
       case-insensitive `LIKE '%:ack%'` SQL it silently vanished from history
       sync (SQLite LIKE is case-insensitive for ASCII) while the webapp
       showed it live.
+  (f) Hashtag destinations (hashtag_dst_vectors.json, conversation_key_vectors.json
+      v4) — `get_messages_page`'s dispatch used to evaluate `is_dm` before
+      `is_group_dst`, and `is_dm` was true for a hashtag dst whenever `src`
+      was supplied, so a hashtag conversation's page always ran the DM
+      branch (computing a corrupted conversation_key) instead of matching the
+      real one. Covers a plain hashtag dst, a via-routed hashtag dst param,
+      and `get_search_summary`'s destinations list (which used to GLOB-filter
+      on digits only, making every hashtag conversation invisible to search).
 
 All timestamps are MILLISECONDS (project-wide DB convention).
 """
@@ -53,7 +61,12 @@ from typing import Any
 from ..logging_setup import get_logger
 from ..sqlite_storage import create_sqlite_storage
 from ..util import now_ms
-from .constants import BUCKET_SECONDS, DEFAULT_POS_RETENTION_HOURS, HOURLY_BUCKET_MS
+from .constants import (
+    BUCKET_SECONDS,
+    DEFAULT_POS_RETENTION_HOURS,
+    HOURLY_BUCKET_MS,
+    compute_conversation_key,
+)
 
 logger = get_logger(__name__)
 
@@ -474,6 +487,90 @@ async def run_query_tests() -> bool:  # noqa: PLR0915 - test suite lists one cas
                         " NULL-key row via the exact-dst arm (old group-shape missed it)"
                     ),
                     any("out-of-range dst zero" in m for m in zero_page["messages"]),
+                )
+            )
+
+            # --- hashtag destinations (hashtag_dst_vectors.json, conversation_key --
+            # --- _vectors.json v4) ---------------------------------------------------
+            # A plain hashtag dst message, stored with the SAME conversation_key
+            # store_message would compute (compute_conversation_key already covers
+            # this — the point here is the QUERY dispatch, not key derivation).
+            htag_ts = drift_ts + 3
+            htag_key = compute_conversation_key("OE3ABC-1", "#OE-SOTA")
+            await storage._mutate(
+                "INSERT INTO messages"
+                " (msg_id, src, dst, msg, type, timestamp, src_type, conversation_key)"
+                " VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    "DRIFT-HASHTAG",
+                    "OE3ABC-1",
+                    "#OE-SOTA",
+                    "SOTA activation on 145.500",
+                    "msg",
+                    htag_ts,
+                    "lora",
+                    htag_key,
+                ),
+            )
+            # Before the fix, is_dm was true here (src supplied, dst not digit-only,
+            # dst != '*') so the DM branch ran and computed a corrupted key instead
+            # of matching htag_key — this page would come back empty.
+            htag_page = await storage.get_messages_page(
+                "#OE-SOTA", before_timestamp=htag_ts + 10, src="OE3ABC-1"
+            )
+            results.append(
+                (
+                    (
+                        "hashtag: get_messages_page for a plain hashtag dst takes the"
+                        " group-style conversation_key path (not the DM branch)"
+                    ),
+                    any("SOTA activation" in m for m in htag_page["messages"]),
+                )
+            )
+
+            # A via-routed hashtag dst PARAM ('RELAY-1,#OE-SOTA') must resolve to the
+            # same conversation_key match — the common case on a mesh.
+            htag_via_page = await storage.get_messages_page(
+                "RELAY-1,#OE-SOTA", before_timestamp=htag_ts + 10, src="OE3ABC-1"
+            )
+            results.append(
+                (
+                    (
+                        "hashtag: get_messages_page reaches the same conversation via a"
+                        " via-routed dst param ('RELAY-1,#OE-SOTA')"
+                    ),
+                    any("SOTA activation" in m for m in htag_via_page["messages"]),
+                )
+            )
+
+            # get_search_summary must surface the hashtag destination alongside
+            # numeric groups, without breaking the existing numeric int-sort.
+            await storage._mutate(
+                "INSERT INTO messages"
+                " (msg_id, src, dst, msg, type, timestamp, src_type, conversation_key)"
+                " VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    "DRIFT-HASHTAG-NUM",
+                    "OE3ABC-1",
+                    "42",
+                    "also active in group 42",
+                    "msg",
+                    htag_ts + 1,
+                    "lora",
+                    "42",
+                ),
+            )
+            search_summary = await storage.get_search_summary("OE3ABC", 30, "all")
+            results.append(
+                (
+                    "hashtag: get_search_summary includes a hashtag destination",
+                    "#OE-SOTA" in search_summary["destinations"],
+                )
+            )
+            results.append(
+                (
+                    "hashtag: get_search_summary keeps numeric destinations, sorted by int",
+                    "42" in search_summary["destinations"],
                 )
             )
 

@@ -5,12 +5,36 @@ typed model instead of hand-parsing ``request.json()``. Validation errors are
 returned by FastAPI as HTTP 422.
 """
 
+import re
 from typing import Any, Literal
 
 from pydantic import BaseModel, Field, field_validator
 
 _BLE_PIN_MIN = 100_000
 _BLE_PIN_MAX = 999_999
+
+# Deliberately generous: MCProxy is not the place to enforce destination grammar
+# (numeric-group range is is_group()'s job, the RfC hashtag charset/9-char cap is
+# unresolved upstream and out of scope here). This only stops a `dst` from
+# corrupting the on-air `src>dst:msg` framing our own decoder parses back apart.
+_DST_MAX_LEN = 64
+
+# Characters forbidden anywhere in `dst`. Each one is a delimiter our own
+# src>dst:msg framing (and the APRS-style payload-type convention it borrows
+# from) depends on, so letting one through lets a crafted dst re-frame the
+# on-air packet:
+#   '>' - terminates the path/destination segment (the char between src and dst)
+#   ':' - terminates the destination and starts the payload (dst:msg)
+#   '!' - APRS position-report payload-type marker (first byte of msg)
+#   '@' - APRS timestamped-position payload-type marker (first byte of msg)
+# Plus NUL and any other C0 (0x00-0x1F) or C1 (0x7F-0x9F) control character --
+# none has a legitimate place in a destination and any could corrupt logs or a
+# downstream terminal.
+#
+# Comma is deliberately NOT in this set: it is the legitimate via-routing
+# separator in a destination ('RELAY-1,232'), and rejecting it would break real
+# traffic. Do not add it here.
+_DST_FORBIDDEN_CHARS_RE = re.compile(r"[>:!@\x00-\x1f\x7f-\x9f]")
 
 
 class SendMessageRequest(BaseModel):
@@ -30,6 +54,22 @@ class SendMessageRequest(BaseModel):
     # field pydantic dropped it at the request boundary, so the backend's echo was
     # unreachable and the webapp silently fell back to its sentDst heuristic.
     request_id: str | None = None
+
+    @field_validator("dst")
+    @classmethod
+    def _validate_dst(cls, v: str) -> str:
+        """Permissive guard: block only what would corrupt the wire framing.
+
+        Not a grammar check — see the module-level comments on _DST_MAX_LEN and
+        _DST_FORBIDDEN_CHARS_RE for what is intentionally NOT enforced here
+        (via-routing commas, the hashtag charset/length cap, group range).
+        """
+        if len(v) > _DST_MAX_LEN:
+            raise ValueError(f"dst exceeds {_DST_MAX_LEN} characters")
+        match = _DST_FORBIDDEN_CHARS_RE.search(v)
+        if match:
+            raise ValueError(f"dst contains forbidden character {match.group()!r}")
+        return v
 
 
 class ReadCountRequest(BaseModel):

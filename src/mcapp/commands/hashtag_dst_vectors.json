@@ -1,0 +1,199 @@
+{
+  "description": "Canonical corpus for is_hashtag(dst) and dst_kind(dst). A hashtag destination is the MeshCom FW 4.36 RfC's '#TAG' addressing token carried in the destination field. This corpus exists because all three repos (MCProxy, mc-chat, webapp) independently misclassified a '#'-prefixed destination as a personal DM, which corrupted conversation keying and ack handling. It pins CLASSIFICATION ONLY -- prefix/subscription matching (RfC US-3) is deliberately NOT specified here, because the RfC's stated boundary rule contradicts its own worked examples and is unresolved. See MeshCom-Hashtag-prep.md sections 9.1 and 15.1.\n\nis_hashtag(dst): resolve via-routing (last comma component, stripped), then true iff the target starts with '#', is at least 2 characters, and every character after the '#' is in [A-Za-z0-9-]. Case-insensitive by design: a lowercase tag must still classify as a hashtag, or it falls back into the DM branch -- the exact bug this corpus prevents. Deliberately NOT length-bounded, for the same reason.\n\ndst_kind(dst) resolves via-routing first, then applies these rules IN ORDER:\n  1. empty                                   -> 'unknown'\n  2. '*' or 'ALL'                            -> 'broadcast'\n  3. is_group(target)                        -> 'group'\n  4. is_hashtag(target)                      -> 'hashtag'\n  5. starts with '#' but is NOT a valid tag  -> 'unknown'   <-- load-bearing\n  6. all-ASCII-digit, outside 1..99999       -> 'unknown'\n  7. otherwise                               -> 'direct'\n\nRule 5 is the reason this is a kind function and not a boolean. A malformed '#' destination addresses nobody, and must NOT fall through to 'direct' -- treating it as a personal DM is the original defect, and a malformed tag is exactly the case most likely to arrive from a buggy or hostile sender. 'unknown' means 'do not deliver, do not key a conversation, do not ack'.",
+  "canonical": "MCProxy/src/mcapp/commands/hashtag_dst_vectors.json",
+  "version": 1,
+  "vectors": [
+    {
+      "name": "empty string",
+      "dst": "",
+      "is_hashtag": false,
+      "dst_kind": "unknown"
+    },
+    {
+      "name": "broadcast star",
+      "dst": "*",
+      "is_hashtag": false,
+      "dst_kind": "broadcast"
+    },
+    {
+      "name": "broadcast ALL",
+      "dst": "ALL",
+      "is_hashtag": false,
+      "dst_kind": "broadcast"
+    },
+    {
+      "name": "numeric group",
+      "dst": "232",
+      "is_hashtag": false,
+      "dst_kind": "group"
+    },
+    {
+      "name": "TEST group",
+      "dst": "TEST",
+      "is_hashtag": false,
+      "dst_kind": "group"
+    },
+    {
+      "name": "plain callsign",
+      "dst": "DK5EN-9",
+      "is_hashtag": false,
+      "dst_kind": "direct"
+    },
+    {
+      "name": "digits out of group range",
+      "dst": "100000",
+      "is_hashtag": false,
+      "dst_kind": "unknown"
+    },
+    {
+      "name": "hashtag simple",
+      "dst": "#OE",
+      "is_hashtag": true,
+      "dst_kind": "hashtag"
+    },
+    {
+      "name": "hashtag with hyphen",
+      "dst": "#OE-SOTA",
+      "is_hashtag": true,
+      "dst_kind": "hashtag"
+    },
+    {
+      "name": "hashtag with digit",
+      "dst": "#OE1",
+      "is_hashtag": true,
+      "dst_kind": "hashtag"
+    },
+    {
+      "name": "hashtag all digits after hash",
+      "dst": "#123",
+      "is_hashtag": true,
+      "dst_kind": "hashtag"
+    },
+    {
+      "name": "hashtag lowercase is still a hashtag",
+      "dst": "#oe-sota",
+      "is_hashtag": true,
+      "dst_kind": "hashtag"
+    },
+    {
+      "name": "hashtag mixed case",
+      "dst": "#Oe-Sota",
+      "is_hashtag": true,
+      "dst_kind": "hashtag"
+    },
+    {
+      "name": "over-long tag still classifies as a hashtag",
+      "dst": "#OE-SOTA-CONTEST-2026",
+      "is_hashtag": true,
+      "dst_kind": "hashtag"
+    },
+    {
+      "name": "bare hash is not a destination",
+      "dst": "#",
+      "is_hashtag": false,
+      "dst_kind": "unknown"
+    },
+    {
+      "name": "double hash",
+      "dst": "##OE",
+      "is_hashtag": false,
+      "dst_kind": "unknown"
+    },
+    {
+      "name": "hyphen-only body",
+      "dst": "#-",
+      "is_hashtag": true,
+      "dst_kind": "hashtag"
+    },
+    {
+      "name": "underscore not in tag charset",
+      "dst": "#OE_SOTA",
+      "is_hashtag": false,
+      "dst_kind": "unknown"
+    },
+    {
+      "name": "space not in tag charset",
+      "dst": "#OE SOTA",
+      "is_hashtag": false,
+      "dst_kind": "unknown"
+    },
+    {
+      "name": "colon is a payload terminator",
+      "dst": "#OE:SOTA",
+      "is_hashtag": false,
+      "dst_kind": "unknown"
+    },
+    {
+      "name": "gt is the path separator",
+      "dst": "#OE>SOTA",
+      "is_hashtag": false,
+      "dst_kind": "unknown"
+    },
+    {
+      "name": "bang is a payload terminator",
+      "dst": "#OE!SOTA",
+      "is_hashtag": false,
+      "dst_kind": "unknown"
+    },
+    {
+      "name": "at is a payload terminator",
+      "dst": "#OE@SOTA",
+      "is_hashtag": false,
+      "dst_kind": "unknown"
+    },
+    {
+      "name": "dot not in tag charset",
+      "dst": "#OE.SOTA",
+      "is_hashtag": false,
+      "dst_kind": "unknown"
+    },
+    {
+      "name": "slash not in tag charset",
+      "dst": "#OE/SOTA",
+      "is_hashtag": false,
+      "dst_kind": "unknown"
+    },
+    {
+      "name": "via-routed hashtag",
+      "dst": "RELAY-1,#OE-SOTA",
+      "is_hashtag": true,
+      "dst_kind": "hashtag"
+    },
+    {
+      "name": "multi-hop via-routed hashtag",
+      "dst": "R1-1,R2-2,#EMCOM",
+      "is_hashtag": true,
+      "dst_kind": "hashtag"
+    },
+    {
+      "name": "via-routed numeric group is not a hashtag",
+      "dst": "OE1KBC-12,232",
+      "is_hashtag": false,
+      "dst_kind": "group"
+    },
+    {
+      "name": "via-routed callsign is not a hashtag",
+      "dst": "RELAY-1,DK5EN-9",
+      "is_hashtag": false,
+      "dst_kind": "direct"
+    },
+    {
+      "name": "hash in the via path only",
+      "dst": "#R1,DK5EN-9",
+      "is_hashtag": false,
+      "dst_kind": "direct"
+    },
+    {
+      "name": "whitespace around a via-routed hashtag",
+      "dst": "RELAY-1, #OE-SOTA ",
+      "is_hashtag": true,
+      "dst_kind": "hashtag"
+    },
+    {
+      "name": "comma cannot be part of a tag body",
+      "dst": "#OE,SOTA",
+      "is_hashtag": false,
+      "dst_kind": "direct"
+    }
+  ]
+}
