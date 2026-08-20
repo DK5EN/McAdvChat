@@ -32,13 +32,18 @@ from ..sqlite_storage import create_sqlite_storage
 from .constants import (
     CREATE_SCHEMA_SQL,
     CREATE_SCHEMA_V2_SQL,
+    LATEST_SCHEMA_VERSION,
     compute_conversation_key,
     db_write,
 )
 
 logger = get_logger(__name__)
 
-FINAL_SCHEMA_VERSION = 23
+# Alias kept for connection_lifecycle_tests.py, which imports this name. The
+# actual migration terminus is the single production constant above — do not
+# hand-copy the number here again; that split is exactly what let this suite
+# and the real schema drift apart before.
+FINAL_SCHEMA_VERSION = LATEST_SCHEMA_VERSION
 BASE_TS = 1_770_000_000_000  # fixed ms timestamp so the suite is deterministic
 
 

@@ -6,8 +6,9 @@ format. Nothing compared them, so they drifted; that drift is what let the
 `!wx text:...` raw-leak ship on the dev rig while production behaved correctly.
 
 This suite runs PRODUCTION's implementation against a shared corpus
-(`command_contract.json`, duplicated verbatim in mc-chat/tests/fixtures/). The
-mock runs the SAME corpus against ITS implementation
+(`command_contract.json`, read by mc-chat from its own `contract/` prefix — the
+git-subtree source this repo's copy is synced from, see CLAUDE.md "Vendored
+Subtrees"). The mock runs the SAME corpus against ITS implementation
 (mc-chat/tests/test_contract_parity.py). If either side changes behavior without
 updating the other, its parity suite fails. See the corpus `_README`.
 """

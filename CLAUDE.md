@@ -88,7 +88,7 @@ upstream, so a contract edit starts there and reaches this repo by split + pull.
 
 ## Schema Migrations
 
-Add columns/tables via a `current_version < N` block in the chain in `storage/migrations.py` (driven from `sqlite_storage.initialize()`) and bump `FINAL_SCHEMA_VERSION`.
+Add columns/tables via a `current_version < N` block in the chain in `storage/migrations.py` (driven from `sqlite_storage.initialize()`) and bump `LATEST_SCHEMA_VERSION` in `storage/constants.py` in the same commit — that constant is the single production source for the migration terminus and both `migration_chain_tests.py` and `connection_lifecycle_tests.py` assert against it (the latter via a `FINAL_SCHEMA_VERSION` alias re-exported from `migration_chain_tests.py`, kept only for import-site stability). The step numbers in `migrations.py` are independent literals, not derived from the constant, so forgetting either half fails the migration-chain suite loudly rather than silently drifting.
 
 ## System Epoch
 
