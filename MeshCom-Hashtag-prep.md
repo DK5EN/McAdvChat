@@ -1575,10 +1575,22 @@ Everything in this section is a question to put to another team, not work we can
    overflowing field** — see B29. The RfC proposes appending a 96-character filter list to exactly
    that register. **The question for the firmware side is therefore concrete and cheap to answer:
    what is the `I` register's serialised size today, and does it plus 96 characters stay under 255?**
-   We cannot measure the current size from here — the only path to the raw payload is the BLE
-   service's notifications SSE stream, which is single-consumer and must never be opened alongside
-   production. If the headroom is thin, the filter list needs its own frame rather than a place in
-   `I`.
+
+   > **Correction (2026-08-21, wire-protocol audit).** The binding ceiling is NOT the ATT MTU: the
+   > firmware's own producer clamps the register JSON at **245 bytes** (`addBLEComToOutBuffer`,
+   > `loop_functions.cpp:607-611`) — a 247-byte wire frame — before it ever reaches the GATT layer,
+   > identically on both platforms. The measured 255-byte MTU is the **ESP32/Heltec** figure only;
+   > the RAK4631 pins ATT MTU 250 (`Bluefruit.configPrphConn`, single-notification ceiling 247), so
+   > a clamped frame still fits both. "Truncated at the GATT layer" here and in B29/P5 misattributes
+   > the cut, and the real budget question for the firmware side is tighter than stated: the `I`
+   > register's serialised JSON plus 96 characters must stay under **244 characters** (245 minus the
+   > `D` prefix byte), not under 255. ble_service's truncation ERROR names the clamp since commit
+   > `95959ae`.
+   > We cannot measure the current size from here — the only path to the raw payload is the BLE
+   > service's notifications SSE stream, which is single-consumer and must never be opened alongside
+   > production. If the headroom is thin, the filter list needs its own frame rather than a place in
+   > `I`.
+
 7. Will `getMessagePriority()` and the gateway-ACK allow-list be fixed in the same release as the
    filter, or will tagged messages ship as CRITICAL-priority un-ACKed traffic for a window?
 
