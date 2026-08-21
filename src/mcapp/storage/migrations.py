@@ -401,10 +401,28 @@ class MigrationsMixin(StorageBase):
 
                 if current_version < 23:  # noqa: PLR2004 - schema migration step
                     self._scrub_frozen_station_cache(conn)
+                    _set_schema_version(conn, 23)
+
+                if current_version < 24:  # noqa: PLR2004 - schema migration step
+                    # M2-lite (wire-protocol audit, 2026-08-21): store the BLE
+                    # data-frame FCS validity for field analysis, NOT a filtering/
+                    # acceptance gate — ble_protocol._decode_data_frame already
+                    # computes it and never rejects on mismatch. NULL for every
+                    # pre-existing row and for every UDP-sourced row going forward
+                    # (the key only ever exists on a decoded BLE @: / @! frame).
+                    try:
+                        conn.execute("ALTER TABLE messages ADD COLUMN fcs_ok INTEGER")
+                    except sqlite3.OperationalError:
+                        logger.debug("Column fcs_ok already exists in messages, skipping")
+                    logger.info(
+                        "Migration v%d → v24: added messages.fcs_ok column"
+                        " (nullable, BLE-only, storage-only — no backfill)",
+                        current_version,
+                    )
                     # Adding a step after this one? Bump LATEST_SCHEMA_VERSION in
                     # storage/constants.py in the same commit — the startup suite
                     # asserts every migration chain terminates there.
-                    _set_schema_version(conn, 23)
+                    _set_schema_version(conn, 24)
 
         await asyncio.to_thread(_init_db)
 

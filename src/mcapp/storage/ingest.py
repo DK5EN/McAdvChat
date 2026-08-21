@@ -658,7 +658,13 @@ class IngestMixin(StorageBase):
         """Binary ACK → set send_success on the original message, no row of its own.
 
         Firmware sends 7-byte ACKs to BLE: msg_id = ID of the original message being
-        acknowledged, ack_type = 0x00 (Node ACK) or 0x01 (Gateway ACK).
+        acknowledged, ack_type = 0x00 (Node ACK), 0x01 (Gateway ACK), or 0x02 (Peer
+        ACK — the addressee's own matched :ack/:rej reply, lora_functions.cpp:857-896).
+
+        L1 decision (wire-protocol audit, 2026-08-21): 0x02 is treated as the
+        addressee's answer, exactly like the inline `:ackNNN` text-ack path below —
+        it publishes the SAME `{acked, ack_kind: "peer"}` shape so the webapp
+        renders ✓✓ Delivered from either source.
         """
         logger.debug(
             "ACK received: original_msg=%s ack_type=%s (%s)",
@@ -666,6 +672,12 @@ class IngestMixin(StorageBase):
             ack_type,
             ack_type_text,
         )
+        # send_success = 1 unconditionally, for all three ack types. 0x02 (Peer ACK)
+        # implies the frame was heard by our own node too — the addressee cannot
+        # have answered a DM our node never transmitted — so folding it into the
+        # same "frame left the node" signal as 0x00/0x01 keeps send_success
+        # monotonic (transport confirmed -> stays confirmed) rather than requiring
+        # a second write for the same fact.
         rows = await self._mutate(
             "UPDATE messages SET send_success = 1 WHERE id = ("
             "  SELECT id FROM messages WHERE msg_id = ? AND type = 'msg'"
@@ -686,12 +698,50 @@ class IngestMixin(StorageBase):
                 ack_for_msg_id,
                 nearby,
             )
+
+        if ack_type == 0x02:  # noqa: PLR2004 - firmware wire constant, named above and in ble_protocol.py
+            # Peer ACK: mirror the inline `:ackNNN` path's payload EXACTLY (field
+            # names, msg_id format) — never the sent/ack_kind shape below, which
+            # means "transport only" and must never carry `acked`. `ack_for_msg_id`
+            # IS the original message's own msg_id here (ble_protocol.py's ACK
+            # decode reads it straight from the frame, already 08X hex — the same
+            # format `_insert_message_row` stores), so no extra lookup is needed,
+            # unlike the inline path which resolves it via echo_id.
+            acked_rows = await self._mutate(
+                "UPDATE messages SET acked = 1 WHERE id = ("
+                "  SELECT id FROM messages WHERE msg_id = ? AND type = 'msg'"
+                "  ORDER BY timestamp DESC LIMIT 1"
+                ")",
+                (ack_for_msg_id,),
+            )
+            # Publish only on an actual match, exactly like the inline path — an
+            # ack for a msg_id we never sent must never claim a delivery. Never let
+            # a publish failure break ingestion (hot path).
+            if acked_rows and self._message_router:
+                try:
+                    await self._message_router.publish(
+                        "storage",
+                        "msg_status",
+                        {
+                            "msg_id": ack_for_msg_id,
+                            "acked": True,
+                            "ack_kind": "peer",
+                        },
+                    )
+                except Exception:
+                    logger.exception(
+                        "Failed to publish msg_status for BLE Peer ACK of msg_id=%s",
+                        ack_for_msg_id,
+                    )
+            return
+
         # Notify frontend via SSE. This is a TRANSPORT fact only — "my own node" or
         # "a gateway" took the frame off the air, not "the addressee answered" — so
         # it must never publish `acked`, which is the field meaning peer delivery
-        # everywhere else (see the inline-ACK path below). ack_type is 0x00=Node,
-        # 0x01=Gateway per ble_protocol.py; anything else is reported rather than
-        # silently folded into "node".
+        # everywhere else (see the inline-ACK path below, and the 0x02 branch
+        # above). ack_type is 0x00=Node, 0x01=Gateway per ble_protocol.py; anything
+        # else (0x02 already returned above) is reported rather than silently
+        # folded into "node".
         if ack_type == 0x00:
             ack_kind = "node"
         elif ack_type == 0x01:
@@ -798,9 +848,9 @@ class IngestMixin(StorageBase):
                 "INSERT INTO messages"
                 " (msg_id, src, dst, msg, type, timestamp, rssi, snr, src_type, raw_json,"
                 "  via, hw_id, lora_mod, max_hop, mesh_info, firmware, fw_sub,"
-                "  last_hw_id, last_sending, transformer, echo_id, conversation_key,"
+                "  last_hw_id, last_sending, transformer, echo_id, conversation_key, fcs_ok,"
                 "  category, tags, info_score, template_hash, classifier_ver)"
-                " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,"
+                " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,"
                 "         ?, ?, ?, ?, ?)",
                 params,
             )
@@ -863,6 +913,12 @@ class IngestMixin(StorageBase):
         last_hw_id = message.get("last_hw_id")
         last_sending = message.get("last_sending")
         transformer = message.get("transformer")
+        # M2-lite: BLE data-frame FCS validity, storage only (never a filtering/
+        # acceptance gate — see ble_protocol._decode_data_frame). The key exists
+        # only on a decoded BLE @: / @! frame, so a UDP-sourced message (and every
+        # non-data BLE frame: MHeard, telemetry, generic status) leaves this NULL.
+        fcs_ok_raw = message.get("fcs_ok")
+        fcs_ok = None if fcs_ok_raw is None else int(bool(fcs_ok_raw))
 
         # Diagnostic: log every BLE notification with msg_id for ACK correlation
         if src_type in ("ble", "ble_remote"):
@@ -1099,6 +1155,7 @@ class IngestMixin(StorageBase):
             transformer,
             echo_id,
             conversation_key,
+            fcs_ok,
             *cls_cols,
         )
         # {ping}/{pong} are protocol frames (linkcheck ADR §1.2), not chat: suppress

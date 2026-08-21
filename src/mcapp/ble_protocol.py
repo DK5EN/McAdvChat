@@ -87,7 +87,12 @@ def _decode_ack_frame(
     Header parsing (byte_msg[1:7]) maps to:
       payload_type (byte 1) = 0x41
       msg_id       (bytes 2-5) = original message ID being acknowledged
-      max_hop_raw  (byte 6) = ack_type (0x00=Node, 0x01=Gateway) — NOT flags!
+      max_hop_raw  (byte 6) = ack_type — NOT flags!
+        0x00 = Node ACK (heard-only echo; lora_functions.cpp:714-724)
+        0x01 = Gateway ACK (a gateway took the frame; lora_functions.cpp:1061-1064)
+        0x02 = Peer ACK (the addressee's own matched :ack/:rej reply to a DM this
+               node originated — lora_functions.cpp:857-896, the strongest ack the
+               firmware emits: `L1`, MCProxy wire-protocol audit 2026-08-21)
 
     Bytes 7+ are terminator (0x00) + 4-byte unix timestamp appended by firmware.
     """
@@ -98,6 +103,8 @@ def _decode_ack_frame(
         ack_type_text = "Node ACK"
     elif ack_type == 0x01:
         ack_type_text = "Gateway ACK"
+    elif ack_type == 0x02:  # noqa: PLR2004 - firmware wire constant, named in the docstring above
+        ack_type_text = "Peer ACK"
     else:
         ack_type_text = f"Unknown ({ack_type})"
 
@@ -164,15 +171,17 @@ def _decode_data_frame(  # noqa: PLR0913 - all fields are needed from the shared
     # Verify frame checksum
     fcs_ok = calced_fcs == fcs
 
-    # FCS validation (permissive mode - log at debug level, continue processing)
+    # FCS validation is permissive (M2-lite): a mismatch never rejects the frame —
+    # the message text is stored regardless — but is stored alongside the row (see
+    # storage/ingest.py) for field analysis, so a mismatch belongs at WARNING, not
+    # DEBUG, and must carry both values for that analysis.
     if not fcs_ok:
-        logger.debug(
+        logger.warning(
             "Frame checksum mismatch: calculated=0x%04X, received=0x%04X, msg_id=%s",
             calced_fcs,
             fcs,
             format(msg_id, "08X"),
         )
-        # Permissive mode: log at debug level but continue processing
 
     return {
         "payload_type": payload_type,
@@ -188,6 +197,7 @@ def _decode_data_frame(  # noqa: PLR0913 - all fields are needed from the shared
         "fw_sub": fw_sub,
         "last_hw_id": last_hw_id,
         "last_sending": last_sending,
+        "fcs_ok": fcs_ok,
     }
 
 
@@ -506,6 +516,11 @@ def transform_common_fields(input_dict: dict[str, Any], own_callsign: str = "") 
         "lora_mod": input_dict.get("lora_mod"),
         "last_hw_id": input_dict.get("last_hw_id"),
         "last_sending": input_dict.get("last_sending"),
+        # M2-lite: carries the data-frame FCS validity through for both msg and pos
+        # (this function is the one thing both transformers call last) — storage
+        # only, never a filtering/acceptance signal. Absent on non-data frames
+        # (MHeard/telemetry/generic BLE), so this key is None there, same as UDP.
+        "fcs_ok": input_dict.get("fcs_ok"),
         "timestamp": now_ms(),
     }
 

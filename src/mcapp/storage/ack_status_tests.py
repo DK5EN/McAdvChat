@@ -8,11 +8,19 @@ the air" — a TRANSPORT fact — not "the addressee answered". Only the inline
 outbound message's `echo_id`) means peer delivery, and only that path may
 publish `acked: True`.
 
-Two SSE `msg_status` shapes are pinned here:
+Three SSE `msg_status` shapes are pinned here:
 
-  * binary ack  -> {"msg_id": <ack_for_msg_id>, "sent": True,
+  * binary ack (0x00/0x01) -> {"msg_id": <ack_for_msg_id>, "sent": True,
                     "ack_kind": "node" | "gateway" | "unknown(...)"}
                    NEVER contains "acked".
+  * binary Peer ACK (0x02, L1 decision) -> {"msg_id": <ack_for_msg_id>,
+                    "acked": True, "ack_kind": "peer"}
+                   the addressee's own matched :ack/:rej reply
+                   (`lora_functions.cpp:857-896`) — mirrors the inline shape
+                   below EXACTLY, and is published ONLY on an actual row match.
+                   `ack_for_msg_id` IS already the original message's own
+                   msg_id here (decoded straight off the wire), unlike the
+                   inline path which resolves it via echo_id.
   * inline ack  -> {"msg_id": <ORIGINAL outbound row's own msg_id>,
                      "acked": True, "ack_kind": "peer"}
                    published ONLY when the UPDATE actually matched a row.
@@ -264,8 +272,55 @@ async def run_ack_status_tests() -> bool:  # noqa: PLR0915 - six independent ACK
                 )
             )
 
-            # 6. Unknown ack_type: reported explicitly, not silently folded into
-            #    "node".
+            # 6. Binary Peer ACK (ack_type=0x02, L1 decision): the addressee's own
+            #    matched :ack/:rej reply, mirrored to the EXACT same
+            #    {msg_id, acked, ack_kind: "peer"} shape as the inline :ackNNN
+            #    path (case 3 above) — never combined with the sent/ack_kind
+            #    shape — and still sets send_success=1 on the original row (0x02
+            #    implies the frame was heard by our own node too).
+            router.published.clear()
+            outbound_peer_ble = {
+                "msg_id": "P2ER0001",
+                "src": "DK5EN-98",
+                "dst": "DL3NCU-1",
+                "msg": "!ctcping",
+                "type": "msg",
+                "src_type": "ble",
+                "timestamp": _BASE_TS + 10,
+            }
+            await storage.store_message(outbound_peer_ble, "{}")
+            await storage.store_message(
+                {
+                    "type": "ack",
+                    "msg_id": "P2ER0001",
+                    "ack_type": 0x02,
+                    "ack_type_text": "Peer ACK",
+                    "timestamp": _BASE_TS + 11,
+                },
+                "{}",
+            )
+            peer_ble_row = await _row("P2ER0001")
+            peer_ble_events = _msg_status_events()
+            results.append(
+                (
+                    "binary Peer ACK (0x02): send_success=1 AND acked=1 on the original row",
+                    peer_ble_row is not None
+                    and peer_ble_row.get("send_success") == 1
+                    and peer_ble_row.get("acked") == 1,
+                )
+            )
+            results.append(
+                (
+                    (
+                        'binary Peer ACK (0x02): publishes ONLY {"msg_id": "P2ER0001",'
+                        ' "acked": True, "ack_kind": "peer"} — never "sent"'
+                    ),
+                    peer_ble_events == [{"msg_id": "P2ER0001", "acked": True, "ack_kind": "peer"}],
+                )
+            )
+
+            # 7. Unknown ack_type: reported explicitly, not silently folded into
+            #    "node". (0x02 must no longer land here — case 6 above pins that.)
             router.published.clear()
             outbound_unk = {
                 "msg_id": "UNKN0001",

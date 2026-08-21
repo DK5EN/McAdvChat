@@ -76,7 +76,22 @@ ACK_PAYLOAD_TYPE = 65
 ACK_MSG_ID = 0xAABBCCDD
 ACK_TYPE_NODE = 0x00
 ACK_TYPE_GATEWAY = 0x01
+ACK_TYPE_PEER = 0x02  # L1: the addressee's own matched :ack/:rej reply
 ACK_TYPE_UNKNOWN = 0x05
+
+# --- Real wire-shape ACK 0x02 vector (MCProxy wire-protocol audit, 2026-08-21) ---
+# `40 41 <msg_id x4 LE> 02 00 <ts x4> 00` — 13 bytes on the wire (doc11 correction:
+# the listed 12-byte layout omits the final pad). Built from literal hex, not
+# `_build_ack_frame`, so this vector is independent of that helper.
+PEER_ACK_MSG_ID = 0x1AE1E057  # a real msg_id seen on air (linkcheck ADR)
+PEER_ACK_TIMESTAMP = 0x11223344
+PEER_ACK_WIRE_FRAME = (
+    bytes([0x40, 0x41])
+    + struct.pack("<I", PEER_ACK_MSG_ID)
+    + bytes([0x02, 0x00])
+    + struct.pack("<I", PEER_ACK_TIMESTAMP)
+    + bytes([0x00])
+)
 
 # --- calc_fcs swap unit vectors (sum -> MSB/LSB swap) ---
 FCS_SUM_LOW_ONLY = bytes([0x01, 0x02, 0x03])  # sum 0x0006 -> swap 0x0600 = 1536
@@ -261,6 +276,8 @@ def _test_decode_msg_frame(results: list[tuple[str, bool]]) -> None:
         "msg last_sending = bool(lasthw & 0x80)",
         decoded["last_sending"] is MSG_LAST_SENDING,
     )
+    # M2-lite: a golden (self-consistent FCS) frame decodes fcs_ok = True.
+    _check(results, "msg fcs_ok True on a golden valid frame", decoded["fcs_ok"] is True)
 
 
 def _test_decode_pos_frame(results: list[tuple[str, bool]]) -> None:
@@ -277,6 +294,7 @@ def _test_decode_pos_frame(results: list[tuple[str, bool]]) -> None:
     _check(results, "pos message (after '*' to null)", decoded["message"] == POS_MESSAGE)
     _check(results, "pos last_hw_id", decoded["last_hw_id"] == POS_LAST_HW_ID)
     _check(results, "pos last_sending False", decoded["last_sending"] is POS_LAST_SENDING)
+    _check(results, "pos fcs_ok True on a golden valid frame", decoded["fcs_ok"] is True)
 
 
 def _test_decode_malformed(results: list[tuple[str, bool]]) -> None:
@@ -358,6 +376,13 @@ def _test_fcs(results: list[tuple[str, bool]]) -> None:
         "corrupt FCS is permissive: frame still decoded with intact payload",
         corrupt_decoded is not None and corrupt_decoded["message"] == MSG_MESSAGE,
     )
+    # M2-lite: fcs_ok reports the mismatch (stored for field analysis) even
+    # though the permissive decoder still returns the payload.
+    _check(
+        results,
+        "corrupt FCS variant: fcs_ok is False",
+        corrupt_decoded is not None and corrupt_decoded["fcs_ok"] is False,
+    )
 
 
 def _test_ack(results: list[tuple[str, bool]]) -> None:
@@ -388,6 +413,31 @@ def _test_ack(results: list[tuple[str, bool]]) -> None:
         unknown is not None
         and unknown["ack_type"] == ACK_TYPE_UNKNOWN
         and unknown["ack_type_text"] == "Unknown (5)",
+    )
+
+    # L1: 0x02 is the addressee's own matched :ack/:rej reply (the strongest ack
+    # the firmware emits) and must no longer fall into the "Unknown (2)" bucket.
+    peer = decode_binary_message(_build_ack_frame(ACK_MSG_ID, ACK_TYPE_PEER))
+    _check(
+        results,
+        "ACK 0x02 -> 'Peer ACK', not 'Unknown (2)'",
+        peer is not None
+        and peer["ack_type"] == ACK_TYPE_PEER
+        and peer["ack_type_text"] == "Peer ACK",
+    )
+
+    # Real wire-shape vector: `40 41 <msg_id x4 LE> 02 00 <ts x4> 00` (13 bytes).
+    # Independent of `_build_ack_frame` — decodes the literal bytes a bench node
+    # actually sends for a delivered DM.
+    peer_wire = decode_binary_message(PEER_ACK_WIRE_FRAME)
+    _check(
+        results,
+        "real wire-shape ACK 0x02 frame decodes: payload_type, msg_id, 'Peer ACK'",
+        peer_wire is not None
+        and peer_wire["payload_type"] == ACK_PAYLOAD_TYPE
+        and peer_wire["msg_id"] == PEER_ACK_MSG_ID
+        and peer_wire["ack_type"] == ACK_TYPE_PEER
+        and peer_wire["ack_type_text"] == "Peer ACK",
     )
 
 

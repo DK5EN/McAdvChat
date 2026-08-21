@@ -59,6 +59,7 @@ async def run_migration_chain_tests() -> bool:
     await _test_v18_conversation_rekey(results)
     await _test_v22_signal_via_column(results)
     await _test_v23_frozen_cache_scrub(results)
+    await _test_v24_fcs_ok_column(results)
 
     for label, ok in results:
         print(f"    {'✅ PASS' if ok else '❌ FAIL'} | {label}")
@@ -571,6 +572,76 @@ async def _test_v23_frozen_cache_scrub(results: list[tuple[str, bool]]) -> None:
                 (
                     "v23 scrub: telemetry history is left alone (cache-only fix)",
                     tele[0]["n"] == 1,  # genuine_zero's 0.0 °C row
+                )
+            )
+        finally:
+            await storage.close()
+
+
+async def _test_v24_fcs_ok_column(results: list[tuple[str, bool]]) -> None:
+    """Seed a pre-v24 fixture (messages genuinely lacking fcs_ok) and assert the
+    v24 step adds the nullable column while preserving existing row data.
+
+    M2-lite (wire-protocol audit, 2026-08-21): `messages.fcs_ok` stores the BLE
+    data-frame FCS validity for field analysis — storage only, never a
+    filtering/acceptance gate. No backfill: the column simply does not exist on
+    older rows.
+    """
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        db_path = Path(tmp_dir) / "migration_chain_v24.db"
+        existing_msg_id = "PRE0V24T"
+
+        def _create_v23_db() -> None:
+            with db_write(db_path) as conn:
+                conn.executescript(CREATE_SCHEMA_SQL)
+                conn.executescript(CREATE_SCHEMA_V2_SQL)
+                conn.execute("DELETE FROM schema_version")
+                conn.execute("INSERT INTO schema_version (version) VALUES (23)")
+                conn.execute(
+                    "INSERT INTO messages (msg_id, src, dst, msg, type, timestamp, src_type)"
+                    " VALUES (?, ?, ?, ?, ?, ?, ?)",
+                    (existing_msg_id, "OE1PRE-1", "OE3ABC", "hi", "msg", BASE_TS, "ble"),
+                )
+                conn.commit()
+
+        await asyncio.to_thread(_create_v23_db)
+
+        try:
+            storage = await create_sqlite_storage(db_path)
+        except Exception:
+            logger.exception("v24 fcs_ok migration raised")
+            results.append(("v24 fcs_ok: migrator runs v23→HEAD without error", False))
+            return
+
+        results.append(("v24 fcs_ok: migrator runs v23→HEAD without error", True))
+        try:
+            version = await _schema_version(storage)
+            results.append(
+                (
+                    f"v24 fcs_ok: final schema_version marker is {FINAL_SCHEMA_VERSION}",
+                    version == FINAL_SCHEMA_VERSION,
+                )
+            )
+
+            cols = await storage._query("PRAGMA table_info(messages)")
+            col_names = {c["name"] for c in cols}
+            results.append(
+                ("v24 fcs_ok: messages.fcs_ok column exists after migration", "fcs_ok" in col_names)
+            )
+
+            row = await storage._query(
+                "SELECT * FROM messages WHERE msg_id = ?", (existing_msg_id,)
+            )
+            results.append(
+                (
+                    "v24 fcs_ok: pre-existing row is left with fcs_ok = NULL (no backfill)",
+                    bool(row) and row[0]["fcs_ok"] is None,
+                )
+            )
+            results.append(
+                (
+                    "v24 fcs_ok: pre-existing row's own data (msg/src/dst) is untouched",
+                    bool(row) and row[0]["msg"] == "hi" and row[0]["dst"] == "OE3ABC",
                 )
             )
         finally:
