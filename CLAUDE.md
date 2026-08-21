@@ -129,6 +129,35 @@ feature. Design and the on-air measurements: `doc/2026-08-13_1500-linkcheck-ping
   starting `{CET}`/`{MCP}`/`{SET}`). Caps are enforced server-side; the endpoint has no auth.
 - **We cannot ping ourselves** — the firmware refuses a DM to its own callsign.
 
+## Gateway Uptime (`{CET}` link)
+
+Availability of the `{CET}` time-beacon link (node uplink → MeshCom server), charted by the
+webapp's Gateway Availability card in Settings. Design and the on-air measurements:
+`doc/2026-08-21_2350-gateway-uptime-plan.md`.
+
+- **The beacon is never persisted, so the hook must sit BEFORE `_should_filter_message`.** That
+  guard drops `{CET}` before any INSERT and returns early (`storage/ingest.py`), so a recorder
+  placed after it never fires — the identical trap the link-check ingest guard documents above.
+  The hook only observes; it must never change what gets filtered.
+- **The gate is hop-count 0, NOT `not via`.** The same beacon arrives in up to three copies:
+  `udp` (no `via`), `ble_remote` (`via == src`, because `split_path` strips our own callsign and
+  leaves the originator behind), and a **foreign** gateway's multi-hop `lora` relay that must not
+  count. The webapp watchdog's `!element.via` rule rejects the BLE copy, which would break a
+  BLE-only box — do not copy it into the backend. Contract: `is_uplink_time_beacon` in
+  `storage/uptime.py`, pinned by `storage/uptime_tests.py` against all three real captured frames.
+- **`GAP_TOLERANCE_MS` must stay above the beacon cadence.** Measured 2026-08-21 on mcapp.local:
+  `23:40:31 → 23:45:34 → 23:50:37`, a **303 s** period, not the round 300 s it looks like. A
+  tolerance at or below the cadence records a gap on every healthy cycle — a link that never
+  dropped a frame reports ~60% uptime. It is 6 min for that reason, and it is the **only** value
+  baked into stored history; the amber/red split is applied at read time and stays retunable.
+- **`gap` and `dark` are different claims and must never be conflated.** `gap` = proxy running, no
+  beacon → counts against UPTIME. `dark` = proxy not running, nothing observed → counts against
+  COVERAGE only. Startup reconciliation writes the `dark` row and resets `last_beacon_ms`, so a
+  deploy restart can never look like a link outage — and it must run before the heartbeat task
+  starts, or the first tick papers over the very downtime it exists to record.
+- **The metric's resolution is one cadence.** A 20-minute outage between beacons reads as 20 min +
+  303 s, and nothing shorter than ~6 min is visible at all. Inherent to a 5-minute heartbeat.
+
 ## Web Push
 
 Web Push to browser / iOS-PWA clients, sharing one wire contract with mc-chat so both backends behave identically.

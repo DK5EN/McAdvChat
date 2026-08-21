@@ -10,7 +10,7 @@ The SQLite backend (`sqlite_storage.py`) is the default for production deploymen
 
 **Current schema: v23.** The migration chain lives in `storage/migrations.py` as `current_version < N` blocks, driven from `sqlite_storage.initialize()`; `LATEST_SCHEMA_VERSION` (`storage/constants.py`) gates it — both `migration_chain_tests.py` and `connection_lifecycle_tests.py` assert every chain terminates there. Add a new block and bump that constant in the same commit — never edit an existing block.
 
-### Tables (Schema v23)
+### Tables (Schema v25)
 
 Core message/signal tables (v10):
 
@@ -38,34 +38,55 @@ Added v7–v21:
 | `kickban_callsigns`   | v20   | Persists admin `!kb` kickbans across restarts. The curated sperrliste is re-fetched separately and is **never** persisted here  |
 | `push_subscriptions`  | v21   | Web Push subs, upsert by `endpoint`. Column is `filter_json`, **not** `filter` — the latter is a SQLite window-function keyword |
 
+Added v24–v25:
+
+| Table                  | Added | Purpose                                                                                                                                  |
+| ---------------------- | ----- | ---------------------------------------------------------------------------------------------------------------------------------------- |
+| `link_uptime_segments` | v25   | Gateway-uptime ledger — one row per CLOSED `gap`/`dark` run. `up` runs are never stored, only derived by the reader from the holes       |
+| `link_uptime_state`    | v25   | Single row (`id = 1`): `first_observed_ms`, `last_beacon_ms`, `last_tick_ms`, `open_up_start_ms` — the live tail the reader reconstructs |
+
+**Gateway-uptime ledger (v25).** Availability of the `{CET}` time-beacon link
+(node uplink → MeshCom server), charted by the webapp's Gateway Availability
+card. Deliberately a ledger of state transitions rather than one row per
+minute: row count tracks transitions (tens per month) instead of wall-clock
+time, so the 1-year query touches a few hundred rows on a Pi Zero 2W and
+`LONGEST OUTAGE` stays minute-exact at every range instead of being quantised
+to the render bucket. `gap` (proxy up, no beacon) counts against UPTIME;
+`dark` (proxy not running) counts against COVERAGE only — never conflate them.
+There is no backfill and none is possible: `{CET}` is dropped at ingest by
+`_should_filter_message`, so these tables start empty on any existing DB.
+Design: `2026-08-21_2350-gateway-uptime-plan.md`.
+
 `mheard_cache` exists in older DBs but is unused.
 
 **Key design principle:** MHeard beacons (RSSI/SNR, no coordinates) and position beacons (lat/lon, no signal) are completely disjoint packet types. `station_positions` merges them per callsign with independent field-group updates — signal fields never overwrite location fields and vice versa.
 
 ### Indexes
 
-| Index                             | Columns                     | Purpose                                |
-| --------------------------------- | --------------------------- | -------------------------------------- |
-| `idx_messages_timestamp`          | `timestamp`                 | Time-range filters                     |
-| `idx_messages_src`                | `src`                       | Source callsign lookups                |
-| `idx_messages_dst`                | `dst`                       | Destination lookups                    |
-| `idx_messages_type`               | `type`                      | Type filters                           |
-| `idx_messages_type_timestamp`     | `type, timestamp DESC`      | Smart initial payload, recent messages |
-| `idx_messages_type_dst_timestamp` | `type, dst, timestamp DESC` | Paginated channel queries              |
-| `idx_signal_log_cs_ts`            | `callsign, timestamp DESC`  | Signal log time-range queries          |
-| `idx_messages_category`           | `category`                  | Classifier category filters (v16)      |
-| `idx_messages_template_hash`      | `template_hash`             | Template/beacon grouping (v16)         |
+| Index                             | Columns                     | Purpose                                   |
+| --------------------------------- | --------------------------- | ----------------------------------------- |
+| `idx_messages_timestamp`          | `timestamp`                 | Time-range filters                        |
+| `idx_messages_src`                | `src`                       | Source callsign lookups                   |
+| `idx_messages_dst`                | `dst`                       | Destination lookups                       |
+| `idx_messages_type`               | `type`                      | Type filters                              |
+| `idx_messages_type_timestamp`     | `type, timestamp DESC`      | Smart initial payload, recent messages    |
+| `idx_messages_type_dst_timestamp` | `type, dst, timestamp DESC` | Paginated channel queries                 |
+| `idx_signal_log_cs_ts`            | `callsign, timestamp DESC`  | Signal log time-range queries             |
+| `idx_messages_category`           | `category`                  | Classifier category filters (v16)         |
+| `idx_messages_template_hash`      | `template_hash`             | Template/beacon grouping (v16)            |
+| `idx_link_uptime_segments_end`    | `end_ms`                    | Window-overlap scan for /api/uptime (v25) |
 
 ### Retention (nightly pruning at 04:00)
 
-| Table / Type                | Retention                 | Notes                   |
-| --------------------------- | ------------------------- | ----------------------- |
-| `messages` type `msg`       | 30 days                   | Chat messages           |
-| `messages` type `pos`/`ack` | 8 days                    | Legacy dual-write       |
-| `signal_log`                | 8 days                    | Raw MHeard measurements |
-| `signal_buckets` (5-min)    | 8 days                    | Fine-grained chart data |
-| `signal_buckets` (1-hour)   | 365 days                  | Long-term trend data    |
-| `station_positions`         | 30 days since `last_seen` | Stale stations removed  |
+| Table / Type                | Retention                 | Notes                                                                                                                                          |
+| --------------------------- | ------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------- |
+| `messages` type `msg`       | 30 days                   | Chat messages                                                                                                                                  |
+| `messages` type `pos`/`ack` | 8 days                    | Legacy dual-write                                                                                                                              |
+| `signal_log`                | 8 days                    | Raw MHeard measurements                                                                                                                        |
+| `signal_buckets` (5-min)    | 8 days                    | Fine-grained chart data                                                                                                                        |
+| `signal_buckets` (1-hour)   | 365 days                  | Long-term trend data                                                                                                                           |
+| `station_positions`         | 30 days since `last_seen` | Stale stations removed                                                                                                                         |
+| `link_uptime_segments`      | 400 days                  | Gateway-uptime ledger; excluded from the size-based emergency prune (dropping its oldest rows frees nothing and corrupts the history boundary) |
 
 **Nightly job (04:00):** Prunes expired data, aggregates old 5-min buckets into 1-hour buckets, runs `ANALYZE` for query planner freshness. Also runs pruning once at startup.
 

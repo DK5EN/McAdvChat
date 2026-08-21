@@ -67,15 +67,16 @@ All source lives in `src/mcapp/`. Entry point: `mcapp.main:run` (invoked via `uv
 - **config_loader.py**: Dataclass-based configuration with `MCAPP_*` environment variable overrides
 - **logging_setup.py**: Centralized logging with `EmojiFormatter`, `get_logger()`, `has_console()` detection
 - **meteo.py**: `WeatherService` class — hybrid DWD BrightSky + OpenMeteo weather provider
+- **storage/uptime.py**: `UptimeMixin` — gateway-uptime segment ledger. Records arrivals of the `{CET}` time beacon (node uplink → MeshCom server) as an append-only ledger of closed `gap`/`dark` runs; `up` runs are derived by the reader, never stored. Written from a hook in `store_message` that runs **before** `_should_filter_message` (which drops `{CET}`) plus a 30 s heartbeat in `main.py`; read via `GET /api/uptime` (`sse_routes/uptime.py`). See CLAUDE.md's Gateway Uptime section
 
 ## BLE Abstraction Layer
 
 The BLE subsystem supports two modes via a unified client interface:
 
-| Mode | File | Description |
-|------|------|-------------|
-| `remote` | `ble_client_remote.py` | HTTP/SSE client to remote BLE service |
-| `disabled` | `ble_client_disabled.py` | No-op stub for testing |
+| Mode       | File                     | Description                           |
+| ---------- | ------------------------ | ------------------------------------- |
+| `remote`   | `ble_client_remote.py`   | HTTP/SSE client to remote BLE service |
+| `disabled` | `ble_client_disabled.py` | No-op stub for testing                |
 
 For local BLE hardware access, deploy the standalone BLE service (ble_service/) on the Pi.
 
@@ -142,6 +143,7 @@ flowchart TD
 ```
 
 **Initialization Flow** (in `src/mcapp/main.py`, `main()` function):
+
 ```python
 # 1. Storage — SQLite (with migration) or in-memory deque fallback
 if cfg.storage.backend == "sqlite" and SQLITE_AVAILABLE:
@@ -168,16 +170,17 @@ message_router.register_protocol("udp", udp_handler)
 
 **Message Types & Subscriptions:**
 
-| Message Type | Subscribers | Purpose |
-|--------------|-------------|---------|
-| `mesh_message` | SSEManager, StorageHandler | Messages from LoRa mesh |
-| `ble_notification` | SSEManager, StorageHandler, CommandHandler | BLE device notifications |
-| `ble_status` | SSEManager | BLE connection status updates |
-| `websocket_message` | SSEManager | Messages to broadcast to clients |
-| `ble_message` | BLE handler | Outbound messages via BLE |
-| `udp_message` | UDP handler | Outbound messages via UDP |
+| Message Type        | Subscribers                                | Purpose                          |
+| ------------------- | ------------------------------------------ | -------------------------------- |
+| `mesh_message`      | SSEManager, StorageHandler                 | Messages from LoRa mesh          |
+| `ble_notification`  | SSEManager, StorageHandler, CommandHandler | BLE device notifications         |
+| `ble_status`        | SSEManager                                 | BLE connection status updates    |
+| `websocket_message` | SSEManager                                 | Messages to broadcast to clients |
+| `ble_message`       | BLE handler                                | Outbound messages via BLE        |
+| `udp_message`       | UDP handler                                | Outbound messages via UDP        |
 
 **Incoming Message Flow (BLE → SSE clients):**
+
 1. BLE device sends GATT notification
 2. `BLEClient._on_props_changed()` receives raw bytes
 3. `notification_handler()` parses JSON or binary format
@@ -186,6 +189,7 @@ message_router.register_protocol("udp", udp_handler)
 6. Broadcasts via SSE to all connected clients
 
 **Outgoing Message Flow (Client → Mesh):**
+
 1. Client sends message via `POST /api/send`
 2. `SSEManager` routes by type (command, BLE, or UDP message)
 3. `message_router.publish('sse', 'udp_message', data)`
@@ -195,15 +199,19 @@ message_router.register_protocol("udp", udp_handler)
 ## Protocol Details
 
 ### UDP Message Format
+
 JSON messages with fields: `src`, `dst`, `msg`, `type` (msg/pos/ack), `timestamp`, `rssi`, `snr`
 
 ### BLE Binary Messages
+
 - Prefix `D{`: JSON config messages (TYP: MH, SA, G, W, SN, etc.)
 - Prefix `@:` or `@!`: Binary mesh messages with header (payload_type, msg_id, hop_count)
 - Prefix `@A`: ACK messages
 
 ### Chat Commands
+
 All commands start with `!` and are processed by CommandHandler:
+
 - `!wx` / `!weather`: Current weather
 - `!mheard` / `!mh`: Recently heard stations
 - `!stats`: Message statistics
@@ -289,6 +297,7 @@ MCProxy/
 ## Dependencies
 
 Python packages (managed via `uv`, see `pyproject.toml`):
+
 - `dbus-next>=0.2.3`: BlueZ D-Bus interface for BLE (only in ble_service, removed from main package)
 - `timezonefinder>=6.5.0`: Timezone detection for node time sync
 - `requests>=2.31.0`: HTTP client for weather API (DWD BrightSky + OpenMeteo)
@@ -300,6 +309,7 @@ Python packages (managed via `uv`, see `pyproject.toml`):
 - `pydantic>=2.0`: Data validation
 
 System packages (installed via apt):
+
 - `lighttpd`: Static file server for Vue.js SPA
 - `bluez`: Bluetooth stack for BLE (only on Pi running BLE service)
 - `jq`: JSON processing in shell scripts
