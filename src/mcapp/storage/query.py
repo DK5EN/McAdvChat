@@ -34,6 +34,7 @@ from .constants import (
     HOURS_PER_YEAR,
     INITIAL_ACK_LIMIT,
     INVALID_CHARACTER_MSG,
+    LINK_UPTIME_RETENTION_DAYS,
     LONG_RETENTION_DAYS,
     MHEARD_STATION_SCAN_LIMIT,
     MIN_DATAPOINTS_FOR_STATS,
@@ -157,6 +158,20 @@ class QueryMixin(StorageBase):
         await self._mutate(
             "DELETE FROM station_positions WHERE last_seen IS NOT NULL AND last_seen < ?",
             (cutoff_30d_ms,),
+        )
+        # link_uptime_segments: gateway-uptime ledger, 400 days. Deliberately NOT
+        # added to the size-based emergency prune loop below — this ledger is
+        # tens of transition rows per month, orders of magnitude smaller than
+        # the tables already in that loop, so dropping its OLDEST rows would
+        # not free meaningful space but WOULD silently truncate the "no data at
+        # all before this point" boundary the reader relies on, corrupting the
+        # ledger's history for no real benefit.
+        cutoff_uptime_ms = int(
+            (now - timedelta(days=LINK_UPTIME_RETENTION_DAYS)).timestamp() * 1000
+        )
+        await self._mutate(
+            "DELETE FROM link_uptime_segments WHERE end_ms < ?",
+            (cutoff_uptime_ms,),
         )
 
         # --- Size-based pruning: enforce 1 GB hard limit ---
