@@ -1,55 +1,124 @@
 # Release History
 
-## Unreleased
+## v2.0.0 (2026-08-21)
 
-### Backend (MCProxy)
+Major release — 765 commits across both repos since v1.6.13 (229 backend, 536 frontend). McApp
+gains Link Check, Web Push, hashtag channels, an admin module with a backend-authoritative
+blocklist, and self-converging deployments — on top of a byte-level protocol-correctness audit
+against MeshCom firmware ground truth and a strict-typing and test-coverage overhaul.
 
-- **[feat]** **Link Check** — probe whether a station answers on direct RF, using the MeshCom
-  `v4.35p.07.24.2` firmware's `{ping}`/`{pong}` exchange, driven entirely from McApp over
-  Extern-UDP (the official app cannot do this: a pong is never forwarded to BLE clients).
-  `POST/DELETE/GET /api/linkcheck*` plus `proxy:linkcheck_*` SSE events. Reports **reachability and
-  the reply's RSSI/SNR** — deliberately not a round-trip time: measured on air at 21-43 s, dominated
-  by the node's TX queue and the firmware's 40 s retransmit steps rather than propagation. Caps are
-  enforced server-side (≤5 attempts, one session per target, ≤3 concurrent, 60 s cooldown) because
-  every attempt is ~4 keyings under the operator's licence. See
-  `doc/2026-08-13_1500-linkcheck-ping-pong-ADR.md`.
-- **[fix]** `{ping}`/`{pong}` protocol frames no longer appear as chat. They were being stored and
-  rendered as garbage messages (`{pong}{1234567890}`) whenever two other stations in RF range
-  probed each other. The suppression is placed after signal ingestion, so the pong's RSSI/SNR still
-  reaches `signal_log`.
-- **[fix]** `store_message()` no longer loses an entire frame when `msg` is not a string. Reachable
-  from unauthenticated UDP port 1799 via the telemetry branch, which publishes without
-  `udp_handler`'s `isinstance` guard; a crafted `{"type":"tele","msg":123}` raised `AttributeError`
-  and dropped the frame.
-- **[fix]** `ctcping`'s background tasks are now cancelled at shutdown. `_ping_bg_tasks` was
-  populated at four sites and cancelled nowhere, so shutdown could tear down transports under a
-  sleeping 30 s ACK timeout or a 300 s test monitor.
+### Highlights
 
-- **[fix]** Piped installs (`curl | sudo bash`) now pin bootstrap libs, templates, and the app to one resolved release tag for the whole run, instead of always pulling libs from the `development` branch tip regardless of the app version being installed. `--tag` is now a real time machine for libs+templates+app (previously app-only); a new `--ref`/`MCAPP_BOOTSTRAP_REF` forces just the bootstrap tree ref, independently of the app version, for developing bootstrap changes without cutting a release and as a one-line field rollback. A skew guard aborts cleanly if a pinned tag's libs predate a function the running script needs, instead of installing a mismatched pair. See `doc/2026-08-09_1600-bootstrap-tag-pinning-plan.md`.
-
-- **[chore]** Push contract raised to **v6**. `endpoints.subscribe.semantics` now states normatively
-  that a subscribe POST replaces the stored filter wholesale rather than patching it, and puts the
-  resulting ordering obligation on the client: resolve stored preferences first, POST second. It
-  also forbids the tempting server-side workaround — a backend that ignored or merged a
-  default-looking filter would break clearing groups on purpose and would diverge the two
-  implementations. Backend behaviour is unchanged; both backends already satisfied v6 the day it was
-  written.
+- **Link Check** — probe whether a station answers on direct RF via the firmware's
+  `{ping}`/`{pong}` exchange, driven entirely from McApp over Extern-UDP (the official app cannot
+  do this). Reports reachability and the reply's RSSI/SNR — deliberately not a round-trip time.
+- **Web Push** — notifications to browser and iOS-PWA clients, sharing one wire contract (v7) with
+  mc-chat so both backends behave identically.
+- **Hashtag channels** — `#TAG` destinations (MeshCom FW 4.36) are routed as channels instead of
+  being misclassified as DMs and split on the first hyphen.
+- **Admin module & blocklist** — gated admin view with feed health; kickbans persisted
+  server-side, sperrliste fetched with 24 h refresh, pushed to clients over SSE.
+- **Self-converging deployments** — versioned system epoch, slot-based updates driven from the
+  webapp's Update page, and piped installs pinned to one resolved release tag.
 
 ### Frontend (webapp)
 
-- **[fix]** Push notification settings no longer wipe themselves. Opening Settings on a cold boot —
-  which is what a service-worker update reload produces — re-POSTed the push subscription with the
-  built-in defaults before the settings store had finished loading from IndexedDB. A subscribe POST
-  replaces the **whole** server-side filter, so the user's group list was silently cleared on the
-  backend and group notifications stopped. Observed in the field after the 2026-08-17 update, with
-  the subscription itself provably intact the whole time.
-- **[fix]** Push status is no longer reported from the outcome of a network round trip. An intact
-  subscription rendered as "not enabled yet" — hiding the DM / groups / broadcast fields, which
-  reads as data loss — for as long as the VAPID fetch and subscribe POST took, worst right after a
-  deploy while the backend is still restarting. It is now committed from `getSubscription()` alone,
-  before any network call, with a distinct "checking" state for the pre-resolution unknown.
-- **[fix]** User settings can no longer be persisted before they were loaded, which would have
-  written an empty callsign, proxy host and coordinates over the stored record.
+- **[feat]** Link Check button per station with a progress modal; copy reports "response time" in
+  whole seconds and attributes RSSI/SNR to the target only for direct (`hops === 0`) replies.
+- **[feat]** Chat: optimistic send with pending/failed bubbles; send gates on BLE state, not just
+  SSE; full-route display for personal destinations; filter/delete actions reachable on mobile.
+- **[fix]** Delivered checkmarks now mean the addressee answered — a node/gateway ack no longer
+  renders as peer delivery.
+- **[fix]** Destination-aware message byte cap (`min(150, 159 - 3 - utf8Bytes(dst))`) and a
+  destination sanitizer mirroring the server grammar, so the UI can never compose a message the
+  node would silently drop.
+- **[feat]** APRS overlay symbols (render + picker), station resolution by full callsign, and a 3 h
+  recency window for the positions view.
+- **[feat]** mHeard sidebar-owned reorder, mobile drawer mode, connection status chip, drag-handle
+  hints, keyboard-focusable cards, global focus-visible ring.
+- **[feat]** Android: real notification count, its own status-bar glyph, unread count on the app
+  icon.
+- **[fix]** Push settings hardening: the settings card can no longer wipe the server-side group
+  filter, push status is committed from `getSubscription()` instead of a network round trip, and
+  settings are never persisted before they were hydrated.
+- **[feat]** WX view charts the BME680 gas resistance; a cleared telemetry EQNS coefficient
+  restores its own default instead of 0.
+
+### Backend (MCProxy)
+
+- **[feat]** Link Check session engine: `POST/DELETE/GET /api/linkcheck*`, `proxy:linkcheck_*` SSE
+  events, server-side caps (≤5 attempts, one session per target, ≤3 concurrent, 60 s cooldown) —
+  every attempt is ~4 keyings under the operator's licence.
+- **[feat]** Web Push delivery: pure match/eligibility semantics, 5 s coalescing, dedup,
+  non-blocking dispatch (mesh ingest never awaits delivery), VAPID key persistence with correct
+  key format and `sub` handling. Contract v6 fixes the subscribe-filter wipe class; v7 strips the
+  firmware ack-request suffix from payload text after all gates pass.
+- **[feat]** UDP 2.0 signal integration: firmware RSSI/SNR routed into the signal architecture
+  with correct last-hop attribution, real-time SSE surfacing and historical backfill.
+- **[refactor]** Telemetry reconciliation core: duplicate telemetry pairs deduplicated through a
+  pure reconcile function; `/O= /G= /C=` mapped to their real columns; dropped station pressure
+  recovered on both ingest paths.
+- **[feat]** Blocklist owned by the proxy: admin kickbans persisted (schema v20), sperrliste fetch
+  with retry + 24 h refresh, `proxy:blocked_callsigns` over SSE, enforced on the push path too.
+- **[fix]** Hashtag destinations classified by a dedicated `dst_kind()` predicate — case-insensitive,
+  not length-bounded — pinned by a 32-vector corpus shared with mc-chat and the webapp.
+
+### Protocol and wire-format correctness
+
+Result of a byte-level audit of the BLE (Nordic UART) and Extern-UDP interfaces against MeshCom
+firmware source as ground truth:
+
+- **[fix]** `/api/send` enforces the firmware's real limits at the API boundary: destination 1–9
+  chars with braces forbidden, byte-counted frame caps (BLE `{dst}text` ≤ 160; UDP msg ≤ 150 and
+  `:{dst}msg` ≤ 159). What used to be a silent drop in the node is now a 422 with a reason.
+- **[fix]** ACK taxonomy cleaned up: the firmware's binary ack (node/gateway took the frame) and
+  the addressee's inline reply are distinct events; BLE ack level 0x02 now publishes as peer
+  delivery.
+- **[fix]** Undecodable BLE notifications are dropped with a WARNING and counted instead of being
+  stored as garbage rows; truncated register frames (firmware's 245-byte producer clamp) are no
+  longer forwarded.
+- **[feat]** Per-frame FCS validity is stored (`messages.fcs_ok`, schema v24) for field analysis;
+  mismatches log at WARNING.
+- **[fix]** `set_callsign` carries the mandatory length byte; save-and-reboot uses the real binary
+  endpoint instead of an ASCII command the firmware prefix-matched to plain save.
+- **[fix]** `{ping}`/`{pong}` protocol frames are suppressed from chat while their RSSI/SNR still
+  reaches the signal log; a non-string `msg` on UDP port 1799 can no longer drop a whole frame.
+
+### Stability and self-healing
+
+- **[fix]** BLE register hydration is level-triggered: a completeness reconciler re-sweeps until
+  the required registers are cached, ble_service keeps a register cache that mcapp replays on
+  reconnect, a hello settle delay fixes the lost post-hello burst, and redundant RF sweeps are
+  skipped when the replay already filled the cache.
+- **[feat]** Stale-bond recovery and `ensure_connected` with implicit pairing keep the BLE link
+  usable without manual re-pairing.
+- **[feat]** System epoch: system-level machine state (packages, firewall, web front door) is
+  versioned; updates converge the new slot automatically and a watchdog self-heals boxes updated
+  by a pre-epoch runner.
+- **[fix]** Bootstrap pinning: piped installs pin libs, templates and app to one resolved release
+  tag; `--ref` allows bootstrap-only overrides; a skew guard aborts on mismatched pairs.
+- **[fix]** SQLite lifecycle: every connection is closed explicitly, bare connects get busy
+  timeouts, migrations are guarded; `ctcping` background tasks are cancelled at shutdown.
+
+### Quality and tooling
+
+- **[chore]** `mypy --strict` at zero across both source roots; unified strict ruff config;
+  type-aware strict ESLint with every `any` cast eliminated. All enforced by CI.
+- **[test]** 19 backend suites behind one hermetic, fully offline, exit-code-gated runner; Vitest
+  infrastructure on the frontend (2955 tests); cross-repo behaviour pinned by shared,
+  sha256-pinned vector corpora (conversation keys, group/hashtag destinations, blocklist
+  decisions, push contract, command contract).
+- **[refactor]** Storage god-class split into mixins, SSE handler split into APIRouter modules,
+  frontend composables extracted — the outcome of a 7-wave backend and 9-wave frontend
+  refactoring campaign.
+- **[chore]** Release pipeline hardening: tags pushed and verified before the GitHub release
+  exists, slot deploys verified against the active slot, update runner streams progress over SSE.
+
+### Upgrade notes
+
+- Schema migrations run automatically on first start (any version → v24). No user action needed.
+- Building the webapp requires Node ≥ 26; the backend stays on Python ≥ 3.11.
+- After this release the development line continues as `v2.0.1-dev.N`.
 
 ## v1.6.13 (2026-06-20)
 
