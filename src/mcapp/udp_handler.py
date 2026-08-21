@@ -55,6 +55,28 @@ _MAX_TRACKED_SOURCE_IPS = 8
 # above the mesh's inbound frame rate.
 _TARGET_CHANGE_COOLDOWN_S = 60.0
 
+# Transport-level mirror of the firmware's own EXTUDP acceptance and its
+# node-side snprintf capacity (extudp_functions.cpp ~:243-275 and ~:401-481).
+# schemas.py enforces the same shape at the HTTP boundary (POST /api/send),
+# but internal callers reach `send_message` directly through
+# `MessageRouter._send_via_udp` without ever constructing a `SendMessageRequest`
+# — this is the last line of defense for THOSE callers, not a duplicate of the
+# schema check.
+#
+# getExtern() (~:243-275) accepts `dst` only in 1..9 chars and `msg` only in
+# 1..150 bytes, silently dropping a datagram outside either range — so a
+# proxy-originated frame outside these bounds would never even be accepted by
+# the node it's sent to.
+_UDP_MAX_DST_LEN = 9
+_UDP_MAX_MSG_BYTES = 150
+
+# The node then re-wraps the accepted dst/msg as
+# `snprintf(val, 160, ":{%s}%s", dst, msg)` — 160 bytes of buffer, 1 reserved
+# for the NUL terminator, 3 consumed by the literal ':', '{', '}' bytes. Beyond
+# that the write is silently CLIPPED, possibly mid-UTF-8-sequence.
+_UDP_WIRE_FRAME_OVERHEAD_BYTES = 3  # ':', '{', '}'
+_UDP_MAX_WIRE_FRAME_BYTES = 159  # 160-byte snprintf buffer minus its NUL terminator
+
 
 def _normalize_altitude_to_meters(message: dict[str, Any]) -> None:
     """Convert APRS altitude from feet to meters in-place."""
@@ -240,6 +262,46 @@ def _log_non_chat_frame(message: dict[str, Any]) -> None:
         )
     else:
         logger.debug("Non-chat message without msg field: %s", message)
+
+
+def _dst_msg_wire_violation(dst: Any, msg: Any) -> str | None:
+    """Return a human-readable reason string if `dst`/`msg` would be rejected
+    or silently CLIPPED by the node, else `None`.
+
+    Mirrors `extudp_functions.cpp`'s `getExtern()` acceptance range (dst
+    1..9 chars, msg 1..150 bytes, silently dropped outside it) and its
+    node-side `snprintf(val, 160, ":{%s}%s", dst, msg)` wrap capacity
+    (159 content bytes: 160 minus the NUL terminator, minus the 3 literal
+    ':', '{', '}' bytes). Byte lengths, not `len()` character counts — the
+    firmware measures bytes, and a multi-byte UTF-8 character would
+    otherwise undercount.
+
+    Non-string `dst`/`msg` (a caller bug, since every production caller
+    reaches this via `MessageRouter._send_via_udp`'s normalized dict) is
+    treated as empty rather than raising, so a malformed caller gets the
+    same "blocked, not sent" outcome as an out-of-range one.
+    """
+    dst_str = dst if isinstance(dst, str) else ""
+    msg_str = msg if isinstance(msg, str) else ""
+    dst_len = len(dst_str)
+    if dst_len == 0 or dst_len > _UDP_MAX_DST_LEN:
+        return f"dst length {dst_len} outside the firmware's accepted 1..{_UDP_MAX_DST_LEN} range"
+
+    msg_bytes = len(msg_str.encode("utf-8"))
+    if msg_bytes == 0 or msg_bytes > _UDP_MAX_MSG_BYTES:
+        return (
+            f"msg is {msg_bytes} bytes, outside the firmware's accepted "
+            f"1..{_UDP_MAX_MSG_BYTES}-byte range"
+        )
+
+    dst_bytes = len(dst_str.encode("utf-8"))
+    frame_bytes = _UDP_WIRE_FRAME_OVERHEAD_BYTES + dst_bytes + msg_bytes
+    if frame_bytes > _UDP_MAX_WIRE_FRAME_BYTES:
+        return (
+            f"dst+msg wire frame is {frame_bytes} bytes, exceeds the node's "
+            f"{_UDP_MAX_WIRE_FRAME_BYTES}-byte snprintf capacity and would be clipped"
+        )
+    return None
 
 
 def _is_trusted_node_source(ip_str: str) -> bool:
@@ -797,7 +859,35 @@ class UDPHandler:
         unguarded on purpose too: a caller passing unserializable data is a
         programming error, not a transport failure, and swallowing it here
         hid bugs the same way.
+
+        A dst/msg pair the node itself could never accept or would silently
+        CLIP (see `_dst_msg_wire_violation`) is a THIRD case. It MUST raise,
+        not merely log-and-return: `MessageRouter._send_via_udp` (main.py
+        ~:1465-1491) already wraps this exact call in
+        `try: await udp_handler.send_message(...) except Exception as e:` and,
+        on exception, both surfaces a `websocket_message` error event to the
+        operator AND publishes a per-message `msg_status{send_failed: true}`
+        (`_publish_send_failed`). A bare `return` produces neither: the caller
+        sees nothing raised, so its except-block never runs, `POST /api/send`
+        still answers `{"status": "ok"}`, and the message silently vanishes —
+        exactly the black hole this guard exists to close. Every real caller
+        already has this try/except; there is no bare, unguarded call site
+        (checked: `commands/response.py`, `commands/ctcping.py`,
+        `commands/linkcheck.py`, `commands/topic_beacon.py` all publish to the
+        router's `udp_message`/`ble_message` topics rather than calling
+        `send_message` directly, so they all route through this same
+        try/except, never around it).
         """
+        violation = _dst_msg_wire_violation(message_data.get("dst"), message_data.get("msg"))
+        if violation is not None:
+            logger.warning(
+                "UDP_SEND blocked: %s (dst=%r, msg=%.60r)",
+                violation,
+                message_data.get("dst"),
+                message_data.get("msg"),
+            )
+            raise ValueError(f"UDP_SEND blocked: {violation}")
+
         json_data = json.dumps(message_data).encode("utf-8")
         logger.debug(
             "UDP_SEND to %s (%d bytes): %.200s",

@@ -26,9 +26,12 @@ from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
+import pydantic
+
 from .commands.constants import has_console
 from .commands.handler import create_command_handler
 from .main import MessageRouter
+from .schemas import SendMessageRequest
 
 _CANNED_WEATHER: dict[str, Any] = {
     "temperatur_celsius": 21.5,
@@ -137,6 +140,203 @@ def _run_blocklist_contract_vectors(record: Callable[[str, bool], None]) -> None
             f"blocklist_decision_vectors.json: {vector['name']}",
             actual == vector["decision"],
         )
+
+
+def _rejects(**kwargs: Any) -> bool:
+    """True iff constructing SendMessageRequest(**kwargs) raises a pydantic
+    ValidationError — the shape every /api/send caller sees as an HTTP 422."""
+    try:
+        SendMessageRequest(**kwargs)
+    except pydantic.ValidationError:
+        return True
+    return False
+
+
+def _run_send_message_request_schema_bounds(record: Callable[[str, bool], None]) -> None:
+    """SendMessageRequest's `dst`/`msg` bounds, derived from the firmware AND
+    from which actual transport `type` selects (sse_routes/stream.py
+    ~:109-163):
+
+    * "page_request": dst is a conversation/filter key (never reaches the
+      wire) — permissive rule (<=64 chars, no strict 9-char cap: hashtag
+      channels and long special-event callsigns are real conversation keys).
+    * "command": dst is an unused placeholder (the webapp always sends
+      'TEST') — same permissive rule, and no {dst}msg frame-size check at all
+      (a command's `msg` is an ASCII command string, not on-air text).
+    * "BLE": {dst}msg goes straight over the BLE characteristic. Strict dst
+      grammar (1..9 chars, extudp_functions.cpp getExtern()'s `iCall < 11`
+      range; no '{'/'}' — the node-side `:{%s}%s` frame delimiters, see the
+      module comment on `_DST_STRICT_FORBIDDEN_CHARS_RE`) plus a 160-byte
+      total frame cap (2 literal brace bytes + dst + msg, sendMessage()
+      ~:3388's hard drop threshold).
+    * everything else (the default "msg" type included): also routed to the
+      wire (Extern-UDP -> UDPHandler.send_message), so it gets the SAME
+      strict dst grammar, but a TIGHTER frame cap — 159 bytes (3 literal
+      ':'/'{'/'}' bytes + dst + msg, the node's own
+      `snprintf(val, 160, ":{%s}%s", dst, msg)` re-wrap) — plus getExtern()'s
+      independent 150-byte msg-alone acceptance range.
+
+    All byte counts are UTF-8 BYTES, matching the firmware — Python's `len()`
+    on `str` counts characters, which undercounts any multi-byte UTF-8
+    character (umlaut, emoji). Rejected, not truncated: a direct API caller
+    gets a 422 instead of silent on-air clipping/corruption.
+
+    Also guards the compatibility case this repo's own webapp depends on:
+    a `type: "page_request"`/`"command"` body that omits `msg` entirely must
+    still validate (pydantic's untouched default, never re-validated against
+    `min_length` unless the field is actually present in the request body).
+    """
+    # --- dst bounds: strict for wire-send types (BLE + default "msg") -----
+    record(
+        "SendMessageRequest: dst at the 9-char cap is accepted (default/UDP type)",
+        not _rejects(type="msg", dst="A" * 9, msg="hi"),
+    )
+    record(
+        "SendMessageRequest: dst one char over the 9-char cap is rejected (default/UDP type)",
+        _rejects(type="msg", dst="A" * 10, msg="hi"),
+    )
+    record(
+        "SendMessageRequest: dst containing '{' is rejected (default/UDP type)",
+        _rejects(type="msg", dst="A{B", msg="hi"),
+    )
+    record(
+        "SendMessageRequest: dst containing '}' is rejected (default/UDP type)",
+        _rejects(type="msg", dst="A}B", msg="hi"),
+    )
+    record(
+        "SendMessageRequest: empty dst is rejected (default/UDP type)",
+        _rejects(type="msg", dst="", msg="hi"),
+    )
+    record(
+        "SendMessageRequest: a via-routing comma within the 9-char cap is still accepted",
+        not _rejects(type="msg", dst="R1,232", msg="hi"),
+    )
+    record(
+        "SendMessageRequest: dst one char over the 9-char cap is rejected for type=BLE too",
+        _rejects(type="BLE", dst="A" * 10, msg="hi"),
+    )
+
+    # --- dst bounds: PERMISSIVE for page_request/command (R2 fix) ---------
+    # Real conversation keys are not length-bounded (hashtag channels; long
+    # special-event callsigns exist) — the strict 9-char wire cap must not
+    # apply here, or paging a long-keyed conversation 422s.
+    long_conversation_key = "OE1XYZ-99~OE2LONGCALL-77"  # > 9 chars, a real pair key shape
+    record(
+        "SendMessageRequest: page_request accepts a dst well over the 9-char wire cap "
+        "(a conversation key, never sent over the wire)",
+        not _rejects(type="page_request", dst=long_conversation_key),
+    )
+    record(
+        "SendMessageRequest: command accepts its placeholder dst='TEST' (4 chars, unused)",
+        not _rejects(type="command", dst="TEST", msg="--via NONE"),
+    )
+
+    # --- msg bounds ---------------------------------------------------------
+    record(
+        "SendMessageRequest: empty msg is rejected (default/UDP type)",
+        _rejects(type="msg", dst="20", msg=""),
+    )
+
+    # --- UDP-routed (default "msg" type): 3 (':','{','}') + dst + msg <= 159 -
+    dst_9 = "A" * 9
+    record(
+        "SendMessageRequest: UDP exact 159-byte total dst+msg frame is accepted",
+        not _rejects(type="msg", dst=dst_9, msg="x" * 147),
+    )
+    record(
+        "SendMessageRequest: UDP 160-byte total dst+msg frame is rejected "
+        "(tighter than BLE's 160 — the node's snprintf adds a 3rd overhead byte)",
+        _rejects(type="msg", dst=dst_9, msg="x" * 148),
+    )
+    # R1: this EXACT case used to be accepted under the (wrong, BLE-only)
+    # shared bound — 2 + 9 + 149 = 160 <= 160. For the real UDP transport it
+    # is 3 + 9 + 149 = 161 > 159 and must be rejected: this is the fix for
+    # the silent-drop black hole (schema said "queued", the node would have
+    # clipped the frame).
+    record(
+        "SendMessageRequest: dst=9 chars + msg=149 bytes over UDP is now REJECTED "
+        "(was wrongly accepted before this fix — see M3 rework)",
+        _rejects(type="msg", dst=dst_9, msg="x" * 149),
+    )
+
+    # --- BLE: 2 ('{','}') + dst + msg <= 160 -------------------------------
+    record(
+        "SendMessageRequest: BLE exact 160-byte total dst+msg frame is accepted",
+        not _rejects(type="BLE", dst=dst_9, msg="x" * 149),
+    )
+    record(
+        "SendMessageRequest: BLE 161-byte total dst+msg frame is rejected",
+        _rejects(type="BLE", dst=dst_9, msg="x" * 150),
+    )
+
+    # --- msg-alone range (UDP only): getExtern() accepts 1..150 bytes ------
+    record(
+        "SendMessageRequest: msg one byte over the 150-byte UDP acceptance range is "
+        "rejected even with a short dst (independent of the combined frame cap)",
+        _rejects(type="msg", dst="20", msg="x" * 151),
+    )
+
+    # 76 umlaut CHARACTERS is only 76 (well under any char-based bound) but
+    # 152 BYTES in UTF-8 (2 bytes/umlaut) — proves the frame cap counts bytes,
+    # not Python's len()-counted characters.
+    umlaut_msg = "ü" * 76
+    record(
+        "SendMessageRequest fixture: 76 umlauts is 76 chars but 152 bytes",
+        len(umlaut_msg) == 76 and len(umlaut_msg.encode("utf-8")) == 152,
+    )
+    record(
+        "SendMessageRequest: a multi-byte UTF-8 msg is measured in BYTES, not "
+        "characters (152 bytes trips the 150-byte UDP msg cap)",
+        _rejects(type="msg", dst=dst_9, msg=umlaut_msg),
+    )
+    # The vector above trips the independent 150-byte msg cap before the frame
+    # cap ever runs — so on its own it cannot discriminate a char-counting
+    # mutant of the FRAME total. These two can: each msg stays under every
+    # per-field cap in characters AND bytes, and only the byte-counted frame
+    # total crosses its cap.
+    #   BLE: 2 + 9 + 152 = 163 bytes > 160 (chars would be 2 + 9 + 76 = 87)
+    record(
+        "SendMessageRequest: BLE frame total is byte-counted (76 umlauts + 9-char dst "
+        "is 163 frame bytes, rejected; a char-counting frame total would accept it)",
+        _rejects(type="BLE", dst=dst_9, msg=umlaut_msg),
+    )
+    #   UDP: msg = 74 umlauts = 148 bytes (<= 150, msg cap passes), frame
+    #   3 + 9 + 148 = 160 > 159 (chars would be 3 + 9 + 74 = 86)
+    record(
+        "SendMessageRequest: UDP frame total is byte-counted (74-umlaut msg passes the "
+        "150-byte msg cap but its 160-byte frame total exceeds the 159-byte cap)",
+        _rejects(type="msg", dst=dst_9, msg="ü" * 74),
+    )
+    # An omitted `type` must land on the default "msg" and therefore the
+    # TIGHTER UDP bounds — a request built without a type is the webapp's
+    # normal chat send shape.
+    record(
+        "SendMessageRequest: omitted type defaults to 'msg' and gets the UDP bounds "
+        "(dst=9 + msg=149 bytes = 161 frame bytes, rejected)",
+        _rejects(dst=dst_9, msg="x" * 149),
+    )
+
+    # --- "command"/"page_request" carry no {dst}msg frame at all -----------
+    # A msg length that would overflow every wire-send bound above must still
+    # validate for these two types (a command string / a page filter is not
+    # on-air text).
+    record(
+        "SendMessageRequest: command is exempt from the frame-size cap "
+        "(a long command string is not an on-air {dst}msg frame)",
+        not _rejects(type="command", dst="TEST", msg="x" * 200),
+    )
+
+    # --- webapp compatibility: type "page_request" omits msg entirely --------
+    record(
+        "SendMessageRequest: a page_request body with no msg field at all still validates "
+        "(default bypasses min_length; matches sse_routes/stream.py's page_request handling)",
+        not _rejects(type="page_request", dst="20"),
+    )
+    # --- webapp compatibility: type "command" always sends dst='TEST' (4 chars) --
+    record(
+        "SendMessageRequest: a type=command body (dst='TEST', short msg) validates",
+        not _rejects(type="command", dst="TEST", msg="--via NONE"),
+    )
 
 
 class _FailingUDPHandler:
@@ -350,6 +550,10 @@ async def run_send_path_tests() -> bool:
     # 11. A failing UDP send (DNS-drift fix) surfaces to the operator and does
     #     not break MessageRouter.publish's per-handler fan-out isolation.
     await _test_udp_send_failure_surfaces_and_preserves_fanout(_record)
+
+    # 12. SendMessageRequest's dst/msg bounds (firmware-derived: getExtern()'s
+    #     1..9 char dst / sendMessage()'s 160-byte on-air frame cap).
+    _run_send_message_request_schema_bounds(_record)
 
     passed = sum(1 for _, ok in results if ok)
     total = len(results)

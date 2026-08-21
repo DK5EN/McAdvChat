@@ -36,6 +36,7 @@ All timestamps in the wire format are milliseconds.
 from __future__ import annotations
 
 import json
+import logging
 import tempfile
 from pathlib import Path
 from typing import Any
@@ -50,6 +51,9 @@ from .udp_handler import (
     strip_invalid_utf8,
     try_repair_json,
 )
+from .udp_handler import (
+    logger as _udp_handler_logger,
+)
 
 # 1000 ft rounds to 305 m (feet times FEET_TO_METERS, then rounded to an int).
 EXPECTED_METERS_FROM_1000_FEET = 305
@@ -62,6 +66,16 @@ _JUNK_BEYOND_BOUND = MAX_JSON_REPAIR_ATTEMPTS * 2
 
 # Extern-UDP listen port; only used to shape a realistic sender address tuple.
 _SENDER_PORT = 1799
+
+# --- send_message wire-frame guard (extudp_functions.cpp getExtern()'s 1..9
+#     char dst / 1..150 byte msg acceptance range, and the node's
+#     snprintf(val, 160, ":{%s}%s", dst, msg) clipping capacity) -----------
+_MAX_DST_LEN = 9  # firmware getExtern() dst acceptance range is 1..9 chars
+_MAX_MSG_BYTES = 150  # firmware getExtern() msg acceptance range is 1..150 bytes
+# 3 literal ':'/'{'/'}' bytes + dst + msg must fit the node's 160-byte
+# snprintf buffer minus its NUL terminator (159 content bytes).
+_MAX_WIRE_FRAME_BYTES = 159
+_WIRE_FRAME_OVERHEAD = 3
 
 # --- APRS symbol double-escape (aprs-escape-bug.md) ------------------------
 # Everything below is built from chr(92) rather than backslash literals on
@@ -879,6 +893,189 @@ async def _test_msg_escape_end_to_end() -> list[tuple[str, bool]]:
     return results
 
 
+class _WireGuardLogCapture(logging.Handler):
+    """Captures LogRecords emitted on `udp_handler`'s module logger, so the
+    wire-frame-guard cases below can assert a WARNING actually named the
+    violated limit — not just that nothing was sent."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.records: list[logging.LogRecord] = []
+
+    def emit(self, record: logging.LogRecord) -> None:
+        self.records.append(record)
+
+
+class _RecordingSendSocket:
+    """Duck-typed stand-in for the send-socket surface `send_message` touches
+    (same pattern as `udp_handler._RaisingSendSocket`, reimplemented here
+    rather than imported since that one always raises). Records every
+    `sendto` call so a test can assert one did — or, for the wire-guard
+    cases below, did NOT — happen.
+    """
+
+    def __init__(self) -> None:
+        self.calls: list[tuple[bytes, tuple[str, int]]] = []
+
+    def fileno(self) -> int:
+        return 1  # anything != -1, so _ensure_send_socket won't replace us
+
+    def sendto(self, data: bytes, addr: tuple[str, int]) -> int:
+        self.calls.append((data, addr))
+        return len(data)
+
+
+async def _test_send_message_wire_frame_guard() -> list[tuple[str, bool]]:
+    """`UDPHandler.send_message`'s transport-level guard (mirrors
+    extudp_functions.cpp's getExtern() acceptance range and the node's
+    snprintf(160) clipping capacity — see udp_handler.py's
+    `_dst_msg_wire_violation`). Internal callers reach `send_message`
+    directly, bypassing schemas.py's `SendMessageRequest` entirely, so this
+    is their only guard against a dst/msg pair the node could never accept
+    or would silently clip.
+
+    Each over-limit case asserts ALL THREE of: nothing reached the fake
+    socket's `sendto`, a WARNING was logged naming the violated limit, AND a
+    `ValueError` was actually RAISED — not merely logged-and-returned. The
+    raise is load-bearing: `MessageRouter._send_via_udp` (main.py
+    ~:1465-1491) wraps this exact call in `try/except Exception` and, only on
+    an actual exception, publishes the operator-visible `websocket_message`
+    error event and the per-message `msg_status{send_failed: true}`. A guard
+    that swallows the violation into a bare `return` produces neither: the
+    caller sees nothing raised, `POST /api/send` still answers
+    `{"status": "ok"}`, and the message silently vanishes.
+    """
+    results: list[tuple[str, bool]] = []
+
+    async def _try_send(
+        dst: str, msg: str
+    ) -> tuple[list[tuple[bytes, tuple[str, int]]], str, bool]:
+        """Returns (sendto calls, combined WARNING text, whether a ValueError
+        was raised)."""
+        handler = UDPHandler(listen_port=0, target_host="127.0.0.1", target_port=0)
+        fake_socket = _RecordingSendSocket()
+        handler.send_socket = fake_socket  # type: ignore[assignment]
+        capture = _WireGuardLogCapture()
+        _udp_handler_logger.addHandler(capture)
+        raised = False
+        try:
+            await handler.send_message({"type": "msg", "dst": dst, "msg": msg})
+        except ValueError:
+            raised = True
+        finally:
+            _udp_handler_logger.removeHandler(capture)
+        warning_text = " ".join(
+            r.getMessage() for r in capture.records if r.levelno == logging.WARNING
+        )
+        return fake_socket.calls, warning_text, raised
+
+    # (1) dst empty -> blocked: raises, nothing sent, warning names the dst limit.
+    calls, warning, raised = await _try_send("", "hi")
+    results.append(
+        (
+            "wire guard: empty dst raises ValueError (no sendto), warning names the dst limit",
+            calls == [] and raised and "dst length" in warning,
+        )
+    )
+
+    # (2) dst 10 chars (one over the firmware's 9-char cap) -> blocked.
+    calls, warning, raised = await _try_send("A" * (_MAX_DST_LEN + 1), "hi")
+    results.append(
+        (
+            "wire guard: dst one char over the 9-char cap raises, not clipped-and-swallowed",
+            calls == [] and raised and "dst length" in warning,
+        )
+    )
+
+    # (3) dst exactly at the 9-char cap, short msg -> passes through unchanged.
+    dst_at_cap = "A" * _MAX_DST_LEN
+    calls, _warning, raised = await _try_send(dst_at_cap, "hi")
+    sent_ok = (
+        len(calls) == 1
+        and not raised
+        and json.loads(calls[0][0].decode("utf-8"))["dst"] == dst_at_cap
+    )
+    results.append(("wire guard: dst exactly at the 9-char cap passes through", sent_ok))
+
+    # (4) msg empty -> blocked, raises, warning names the msg limit.
+    calls, warning, raised = await _try_send("20", "")
+    results.append(
+        (
+            "wire guard: empty msg raises ValueError (no sendto), warning names the msg limit",
+            calls == [] and raised and "msg is" in warning,
+        )
+    )
+
+    # (5) msg one byte over the firmware's 150-byte acceptance range -> blocked.
+    calls, warning, raised = await _try_send("20", "x" * (_MAX_MSG_BYTES + 1))
+    results.append(
+        (
+            "wire guard: msg one byte over the 150-byte acceptance range raises",
+            calls == [] and raised and "msg is" in warning,
+        )
+    )
+
+    # (6) COMBINED cap: dst and msg each individually legal, but together they
+    #     would overflow the node's snprintf(160) buffer and get silently
+    #     CLIPPED — this must raise even though neither field alone tripped
+    #     its own limit. dst=9 + msg=148 + 3 overhead = 160 > 159.
+    combined_msg_bytes = _MAX_WIRE_FRAME_BYTES - _WIRE_FRAME_OVERHEAD - _MAX_DST_LEN + 1
+    calls, warning, raised = await _try_send(dst_at_cap, "x" * combined_msg_bytes)
+    combined_label = (
+        "wire guard: combined dst+msg over the snprintf(160) capacity raises "
+        "even though each field is individually within its own limit"
+    )
+    results.append((combined_label, calls == [] and raised and "wire frame" in warning))
+
+    # (7) Same combined budget, one byte under: passes through unchanged.
+    calls, _warning, raised = await _try_send(dst_at_cap, "x" * (combined_msg_bytes - 1))
+    sent_ok = len(calls) == 1 and not raised
+    results.append(
+        (
+            "wire guard: combined dst+msg one byte under the snprintf(160) capacity passes",
+            sent_ok,
+        )
+    )
+
+    # (8) Multi-byte UTF-8: BYTES are counted, not characters. 76 umlaut
+    #     CHARACTERS is only 76 — well within the 150-char range a naive
+    #     `len()` check would (wrongly) accept — but each umlaut is 2 bytes in
+    #     UTF-8, so it is 152 BYTES: over the firmware's 150-byte range. A
+    #     char-counting bug would let this one slip through the guard.
+    umlaut_msg = "ü" * 76
+    umlaut_fixture_label = (
+        "wire guard fixture: 76 umlauts is 76 chars (would pass a char-count check) "
+        "but 152 bytes (fails the real byte-count one)"
+    )
+    results.append(
+        (
+            umlaut_fixture_label,
+            len(umlaut_msg) == 76 and len(umlaut_msg.encode("utf-8")) == 152,
+        )
+    )
+    calls, warning, raised = await _try_send("20", umlaut_msg)
+    umlaut_label = (
+        "wire guard: a multi-byte UTF-8 msg is measured in BYTES, not characters "
+        "(76 umlaut chars = 152 bytes, over the 150-byte msg range)"
+    )
+    results.append((umlaut_label, calls == [] and raised and "msg is 152 bytes" in warning))
+
+    # (9) Multi-byte UTF-8 against the COMBINED frame cap specifically: case
+    #     (8) trips the independent 150-byte msg cap before the frame total is
+    #     ever computed, so it cannot catch a char-counting mutant of the
+    #     FRAME arithmetic. Here msg = 74 umlauts = 148 bytes — under the msg
+    #     cap in bytes AND chars — and only the byte-counted frame total
+    #     crosses: 3 + 9 + 148 = 160 > 159 (a char count would see 86).
+    calls, warning, raised = await _try_send(dst_at_cap, "ü" * 74)
+    frame_bytes_label = (
+        "wire guard: the combined frame total is byte-counted (74-umlaut msg passes "
+        "the msg cap, its 160-byte frame total exceeds the snprintf capacity)"
+    )
+    results.append((frame_bytes_label, calls == [] and raised and "wire frame" in warning))
+
+    return results
+
+
 async def run_udp_parsing_tests() -> bool:
     """Run the pure-parsing helper tests; return True iff all pass."""
     results: list[tuple[str, bool]] = []
@@ -892,6 +1089,7 @@ async def run_udp_parsing_tests() -> bool:
     results.extend(_test_strip_non_scalar_fields())
     results.extend(await _test_non_scalar_end_to_end())
     results.extend(await _test_pseudo_callsign())
+    results.extend(await _test_send_message_wire_frame_guard())
 
     for label, passed in results:
         print(f"    {'✅ PASS' if passed else '❌ FAIL'} | {label}")
