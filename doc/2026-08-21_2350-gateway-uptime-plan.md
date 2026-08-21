@@ -139,16 +139,16 @@ invalidating stored history — but it can never be retuned _below_ `GAP_TOLERAN
 Downsampling: segments are merged to at most ~500 for rendering, worst state wins in a merge.
 Stats are never computed from the downsampled list.
 
-## 6. Constants (two are empirical — see §10)
+## 6. Constants (measured — see §10)
 
-| Constant            | Value                | Where                  |
-| ------------------- | -------------------- | ---------------------- |
-| `GAP_TOLERANCE_MS`  | 3 min _(to confirm)_ | `storage/constants.py` |
-| `SILENT_MS`         | 3 min                | read time              |
-| `OFF_MS`            | 15 min               | read time              |
-| `HEARTBEAT_S`       | 30 s                 | `main.py`              |
-| `DARK_THRESHOLD_MS` | 90 s                 | `storage/constants.py` |
-| retention           | 400 days             | `prune_messages`       |
+| Constant            | Value            | Where                  |
+| ------------------- | ---------------- | ---------------------- |
+| `GAP_TOLERANCE_MS`  | 6 min (measured) | `storage/constants.py` |
+| `SILENT_MS`         | 6 min            | read time              |
+| `OFF_MS`            | 15 min           | read time              |
+| `HEARTBEAT_S`       | 30 s             | `main.py`              |
+| `DARK_THRESHOLD_MS` | 90 s             | `storage/constants.py` |
+| retention           | 400 days         | `prune_messages`       |
 
 `LATEST_SCHEMA_VERSION` 24 → 25, with a `current_version < 25` step in `migrations.py` in the
 same commit (both halves, or `migration_chain_tests.py` fails loudly — as designed).
@@ -214,21 +214,39 @@ Backend, new suite `src/mcapp/storage/uptime_tests.py`, registered in `run_start
 Frontend: `linkUptime.spec.ts` (merge/min-width/format, incl. the 0.03 %-sliver case) and
 `GatewayUptimeCard.spec.ts` (renders stats, switches range, handles an empty/`unknown` payload).
 
-## 10. Open — resolved by live measurement on mcapp.local
+## 10. Measured on mcapp.local, 2026-08-21/22 (resolved)
 
-Which `{CET}` frames count as "our uplink is alive". The webapp's live watchdog uses
-`isDevicePathTimeBeacon` (`stores/messages.ts`): stream source `local|ble|udp` **and no `via`**.
-The backend needs the equivalent expressed in ingest terms (`src_type` + `via`), and the
-measured beacon interval sets `GAP_TOLERANCE_MS`.
+Both empirical unknowns are closed. Captured off the live SSE stream at `/events`.
 
-Capture 2026-08-21 23:33 local, SSE `/events` on mcapp.local:
+**Which frames count.** The same beacon reaches the proxy in up to three copies:
 
-```
-{"src_type": "lora", "src": "OE1XAR-62,DB0AU-12,DB0HOB-12,DL2JA-2", "dst": "*",
- "msg": "{CET}2026-08-21 21:32:48", "rssi": -108}
-```
+| copy                  | src                                    | via                          | hops | verdict |
+| --------------------- | -------------------------------------- | ---------------------------- | ---- | ------- |
+| `src_type=udp`        | `OE1XAR-33`                            | _(absent)_                   | 0    | COUNT   |
+| `src_type=ble_remote` | `OE1XAR-33`                            | `OE1XAR-33`                  | 0    | COUNT   |
+| `src_type=lora`       | `OE1XAR-62,DB0AU-12,DB0HOB-12,DL2JA-2` | `DB0AU-12,DB0HOB-12,DL2JA-2` | 3    | REJECT  |
 
-That one is a **foreign gateway's** beacon relayed over RF (3 hops, has `via`) — it says
-someone else's uplink is alive and must be excluded. A longer SSE capture plus a raw-wire
-sniff on the Pi are running to pin the device-path frame's exact `src_type`/`via` shape and the
-inter-arrival interval. Both values land in the wave 1 brief before dispatch.
+So the gate is **hop count 0 AND `src_type != "lora"`**, where hops are the `via` components
+remaining once the originating callsign (first component of `src`) is excluded. The third row is a
+_foreign_ gateway's uplink relayed over RF — it proves someone else's link is alive, not ours.
+
+The second row is why the webapp watchdog's rule cannot simply be copied: `split_path`
+(`ble_protocol.py`) strips our own callsign from the relay path, leaving the originator alone in
+`via`, so a plain `not via` test rejects the BLE copy and would break a BLE-only box.
+
+**The cadence.** Three consecutive uplink beacons: `23:40:31 → 23:45:34 → 23:50:37` — a **303 s**
+period, not the round 300 s it looks like, and stable to the second across both intervals.
+
+This killed the mock's 3-minute threshold. A tolerance at or below the cadence records a `gap` on
+every healthy cycle: a link that never dropped a frame would report roughly 60% uptime and an amber
+bar. `GAP_TOLERANCE_MS` is therefore 6 min — ~57 s of margin over the cadence for jitter and SSE
+reconnects, while a genuinely missed beacon (2 × 303 s = 606 s of silence) still registers as a gap,
+and two missed beacons (909 s) still cross the 15 min `OFF_MS` line into red.
+
+Consequence for the card: the legend reads **SILENT 6 MIN**, and the webapp derives that label from
+the payload's `thresholds` rather than hardcoding it, so it cannot drift from the backend.
+
+One honest limitation this exposes: because silence is measured from the last beacon, the metric's
+resolution is one cadence. A 20-minute outage between beacons is reported as 20 min + 303 s, and no
+outage shorter than ~6 min is visible at all. That is inherent to a 5-minute heartbeat, not a defect
+in the ledger.

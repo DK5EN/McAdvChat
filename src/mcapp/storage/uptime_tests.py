@@ -1,11 +1,17 @@
 """Built-in regression suite for the gateway-uptime ledger (storage/uptime.py).
 
-Covers plan §9 cases 1 and 3-6:
+Covers plan §9 cases 1-6:
 
   1. Gate predicate vectors (module-level, no DB) — which `{CET}` frames count,
      using the exact three real frames captured live on mcapp.local
      2026-08-21 23:40:31 (see uptime.py's `is_uplink_time_beacon` docstring),
      including the RF-relayed FOREIGN gateway beacon that must NOT count.
+  2. Ingest-hook ordering — driving a real `{CET}` frame through
+     `store_message` records the beacon in the ledger AND still leaves zero
+     rows in `messages`. Pins the hook's placement BEFORE
+     `_should_filter_message` in `ingest.py` — the sibling of the link-check
+     ingest trap (`linkcheck_ingest_tests.py` case 1): `_should_filter_message`
+     returns early for `{CET}`, so a hook wired in behind it would never run.
   3. Gap open/close, including the double delivery of one beacon.
   4. Startup reconciliation: long downtime → dark row + last_beacon_ms reset;
      short restart → no dark row; fresh install → seed only.
@@ -13,11 +19,6 @@ Covers plan §9 cases 1 and 3-6:
      it, longest outage is the longest single gap (never the dark stretch).
   6. Window clipping at both edges, and a window entirely before
      first_observed_ms.
-
-Case 2 (the ingest-hook ordering — a `{CET}` frame is recorded AND still not
-persisted to `messages`) belongs to wave 2's `ingest.py`/`storage/uptime.py`
-integration, not this module: there is no ingest hook wired into a bare
-`SQLiteStorage` for this suite to exercise against.
 
 Ephemeral tempfile SQLite DB per scenario (never the live DB), mirroring
 storage/migration_chain_tests.py and this package's other `*_tests.py`
@@ -34,6 +35,8 @@ from typing import Any
 
 from ..logging_setup import get_logger
 from ..sqlite_storage import create_sqlite_storage
+from ..sse_handler import SSEManager
+from ..sse_routes.uptime import build_uptime_router
 from .constants import DARK_THRESHOLD_MS, GAP_TOLERANCE_MS
 from .uptime import is_uplink_time_beacon
 
@@ -112,6 +115,49 @@ def _test_gate_predicate(results: list[tuple[str, bool]]) -> None:
             is_uplink_time_beacon(hostile_non_str_via),
         )
     )
+
+
+async def _test_hook_ordering(results: list[tuple[str, bool]]) -> None:
+    """Case 2: a real `{CET}` frame driven through `store_message` must be
+    recorded in the uptime ledger AND still leave zero rows in `messages` —
+    pins the beacon hook's placement before `_should_filter_message`."""
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        db_path = Path(tmp_dir) / "uptime_hook_order_test.db"
+        storage = await create_sqlite_storage(db_path)
+        try:
+            # Real captured device-path frame (uptime.py's is_uplink_time_beacon
+            # docstring, mcapp.local 2026-08-21 23:40:31): udp, no via, 0 hops.
+            cet_frame: dict[str, Any] = {
+                "src_type": "udp",
+                "src": "OE1XAR-33",
+                "dst": "*",
+                "msg": "{CET}2026-08-21 21:40:31",
+                "type": "msg",
+                "msg_id": "1AE1E057",
+            }
+            await storage.store_message(cet_frame, raw="")
+
+            state_rows = await storage._query("SELECT * FROM link_uptime_state WHERE id = 1")
+            message_rows = await storage._query(
+                "SELECT COUNT(*) AS c FROM messages WHERE msg_id = ?", (cet_frame["msg_id"],)
+            )
+            results.append(
+                (
+                    "store_message on a {CET} frame records a beacon in the uptime ledger",
+                    len(state_rows) == 1 and state_rows[0]["last_beacon_ms"] is not None,
+                )
+            )
+            results.append(
+                (
+                    (
+                        "the same {CET} frame is still NOT persisted into messages"
+                        " (hook runs before _should_filter_message, not instead of it)"
+                    ),
+                    int(message_rows[0]["c"]) == 0,
+                )
+            )
+        finally:
+            await storage.close()
 
 
 async def _test_gap_open_close(results: list[tuple[str, bool]]) -> None:
@@ -432,15 +478,49 @@ async def _test_window_clipping(results: list[tuple[str, bool]]) -> None:
             await storage.close()
 
 
+def _test_route_registered(results: list[tuple[str, bool]]) -> None:
+    """`GET /api/uptime` is registered on the router `build_uptime_router`
+    hands to `SSEManager._create_app` for mounting.
+
+    Built directly from `build_uptime_router`, NOT via a full
+    `SSEManager._create_app()` call: that call also builds `/api/push/*`
+    (`build_push_router`), which eagerly calls `manager.require_storage()`
+    and, unless a fake `vapid`/`dispatcher` is injected, touches the real
+    VAPID keyfile on disk (`push_tests.py`'s own reason for always injecting
+    both rather than driving `_create_app()`). A `message_router=None`
+    `SSEManager` — the `linkcheck_sse_tests.py` harness this suite otherwise
+    mirrors — has no storage wired, so it cannot get past that call either.
+    Route CONSTRUCTION here needs no storage at all: `build_uptime_router`
+    only calls `manager.require_storage()` inside the request handler, not
+    while building the router (mirrored by `sse_routes/linkcheck.py`).
+    """
+    sse = SSEManager("127.0.0.1", 0, message_router=None)
+    router = build_uptime_router(sse)
+    # router.routes is list[BaseRoute]; .path/.methods only exist on
+    # APIRoute/Route, not every BaseRoute subclass — getattr keeps this
+    # mypy-strict.
+    matches = [
+        route
+        for route in router.routes
+        if getattr(route, "path", None) == "/api/uptime"
+        and "GET" in (getattr(route, "methods", None) or set())
+    ]
+    results.append(
+        ("GET /api/uptime is registered on build_uptime_router's router", len(matches) == 1)
+    )
+
+
 async def run_uptime_tests() -> bool:
     """Run the gateway-uptime-ledger regression suite. Returns True iff all pass."""
     results: list[tuple[str, bool]] = []
 
     _test_gate_predicate(results)
+    await _test_hook_ordering(results)
     await _test_gap_open_close(results)
     await _test_startup_reconciliation(results)
     await _test_stats_maths(results)
     await _test_window_clipping(results)
+    _test_route_registered(results)
 
     for label, ok in results:
         print(f"    {'✅ PASS' if ok else '❌ FAIL'} | {label}")

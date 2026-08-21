@@ -86,6 +86,7 @@ try:
     from .sse_routes.prefs import build_prefs_router
     from .sse_routes.push import build_push_router
     from .sse_routes.stream import build_stream_router
+    from .sse_routes.uptime import build_uptime_router
     from .sse_routes.weather import build_weather_router
 
     FASTAPI_AVAILABLE = True
@@ -445,6 +446,7 @@ class SSEManager:
         app.include_router(build_deploy_router(self))
         app.include_router(build_push_router(self))
         app.include_router(build_linkcheck_router(self))
+        app.include_router(build_uptime_router(self))
 
         return app
 
