@@ -136,6 +136,25 @@ BLE_HYDRATE_BURST_CLEAR_DELAY_S = 12.0
 # only so the scheduling caller gets to return first and any traffic already
 # in flight settles before the sweep starts.
 BLE_HYDRATE_QUIET_DELAY_S = 1.0
+# Grace delay for the two hydration paths that race `BLEClientRemote`'s
+# SSE-attach register replay (`_replay_cached_registers`, ble_client_remote.py):
+# the startup re-query of an already-CONNECTED reused link
+# (`requery_reused_ble_connection`) and the SSE-recovery rehydration
+# (`_rehydrate_after_sse_recovery`). Both used to reuse
+# BLE_HYDRATE_QUIET_DELAY_S=1.0s, which only beat the replay's observed
+# ~1-1.5s completion by luck -- verified live 2026-08-21: the replay logged
+# complete at 20:19:37, the redundant sweep started at 20:19:38, one second
+# later. A plain mcapp-only restart (ble_service untouched, so the register
+# cache it holds is already warm) then ran a wasted ~9s, 10-command RF sweep
+# a fraction of a second after the replay had already populated the cache for
+# free from ble_service's own `GET /api/ble/registers`. 3.0s gives that local,
+# no-RF replay (one loopback GET plus up to twelve in-process notification
+# handoffs) comfortable headroom to land before `skip_if_complete` gets to
+# evaluate `_missing_required_ble_registers()`. Strictly between the quiet
+# delay and the burst-clearing one: unlike the quiet delay it must reliably
+# outlast a same-process operation, but unlike the burst-clearing delay there
+# is no node-side send-freeze to wait out, just another coroutine.
+BLE_HYDRATE_REPLAY_GRACE_DELAY_S = 3.0
 # Ceiling for ONE scheduled hydration sweep (the register commands plus the
 # closing device-info push; the initial delay above is deliberately outside the
 # budget, being a deterministic sleep rather than something that can wedge).
@@ -930,17 +949,21 @@ class MessageRouter:
             len(BLE_REGISTER_TYPES),
         )
 
-    async def _run_ble_register_hydration(self, initial_delay: float, reason: str) -> None:
+    async def _run_ble_register_hydration(
+        self, initial_delay: float, reason: str, *, skip_if_complete: bool = False
+    ) -> None:
         """Body of one hydration sweep. Never call directly — go through
         `schedule_ble_register_hydration`, which owns the single-flight guard
         and the task handle.
 
-        Three things happen here, in order, and the order matters:
+        Four things happen here, in order, and the order matters:
 
         1. Sleep `initial_delay`. For a sweep triggered by a fresh connect this
            is what keeps our commands OUT of the node's own post-hello burst
            (BLE_HYDRATE_BURST_CLEAR_DELAY_S); for the no-hello paths it is just
-           enough to let the caller return first (BLE_HYDRATE_QUIET_DELAY_S).
+           enough to let the caller return first (BLE_HYDRATE_QUIET_DELAY_S), or
+           long enough to let a racing register replay land first
+           (BLE_HYDRATE_REPLAY_GRACE_DELAY_S).
         2. Re-check that the link is actually up, and — where the client
            supports it — re-check it against `ble_service` rather than the
            local cache. The cache is deliberately distrusted at this point:
@@ -949,14 +972,22 @@ class MessageRouter:
            the radio) dropped. `refresh_status()` is what corrects that, and it
            is safe to spend an HTTP round trip on here in a way it was not in
            the old inline-at-startup version, because nothing is waiting.
-        3. Sweep every register, then push the device-info frame — the second
+        3. If `skip_if_complete` and every REQUIRED_BLE_REGISTER_TYPES is
+           already in `cached_ble_registers`, stop here — no RF, and no
+           closing device-info broadcast either. That broadcast exists to push
+           a freshly-swept result to every connected client; when the cache was
+           already complete there is nothing new to push, and the SSE snapshot
+           each client already read (or the replay that just filled the cache)
+           already serves it. Logged at INFO so a completeness-driven no-op is
+           visible in the log the same way a real sweep is.
+        4. Sweep every register, then push the device-info frame — the second
            half of what the legacy `connect BLE` command did via
            `_handle_ble_info_command(websocket, query_registers=False)`.
            `None` for the websocket makes it a broadcast: a scheduled sweep has
            no originating socket, and every connected client wants the result.
 
         NOT RE-ENTRANT, AND CANNOT BECOME SO. `_handle_ble_info_command` now
-        SCHEDULES a sweep of its own when `query_registers` is True, so step 3
+        SCHEDULES a sweep of its own when `query_registers` is True, so step 4
         passes False explicitly. That is what keeps the composition acyclic: a
         sweep can never schedule a sweep. Even if that False were ever lost the
         result would be a skip, not a deadlock — `schedule_ble_register_hydration`
@@ -986,6 +1017,12 @@ class MessageRouter:
             if status.state != ConnectionState.CONNECTED:
                 logger.debug("BLE register hydration (%s): link not connected, skipping", reason)
                 return
+            if skip_if_complete and not self._missing_required_ble_registers():
+                logger.info(
+                    "BLE register sweep skipped (%s) — REQUIRED registers already cached",
+                    reason,
+                )
+                return
             logger.info("BLE register hydration starting (%s)", reason)
             async with asyncio.timeout(BLE_REQUERY_TIMEOUT_S):
                 await self._query_ble_registers(wait_for_hello=False)
@@ -1001,7 +1038,14 @@ class MessageRouter:
         except Exception:
             logger.exception("BLE register hydration (%s) failed", reason)
 
-    def schedule_ble_register_hydration(self, *, reason: str, after_hello: bool) -> bool:
+    def schedule_ble_register_hydration(
+        self,
+        *,
+        reason: str,
+        after_hello: bool,
+        replay_grace: bool = False,
+        skip_if_complete: bool = False,
+    ) -> bool:
         """Schedule a full register sweep in the background. Returns True if
         this call started one, False if it was skipped.
 
@@ -1013,14 +1057,41 @@ class MessageRouter:
         none of them may pay that cost inline (an HTTP route would hang, and
         `build_app()` would hold the SSE server's bind hostage).
 
-        `after_hello` selects the initial delay and is the caller's assertion
-        about whether a hello handshake just happened, i.e. whether the node is
-        currently draining its own post-hello config burst. True (a fresh
-        connect) waits BLE_HYDRATE_BURST_CLEAR_DELAY_S for that window to
-        close; False (reused connection, SSE recovery) uses the short
-        BLE_HYDRATE_QUIET_DELAY_S. Expressed as a flag rather than a raw delay
-        so `ble_client_remote` can call this without importing timing
-        constants from `main` — that import direction is a cycle.
+        `after_hello` and `replay_grace` together select the initial delay and
+        are the caller's assertion about what it just did or is racing:
+
+        * `after_hello=True` (a fresh connect just happened, the node is
+          draining its own post-hello burst) waits BLE_HYDRATE_BURST_CLEAR_DELAY_S
+          for that window to close.
+        * `after_hello=False, replay_grace=True` (no hello, but this call races
+          `BLEClientRemote`'s SSE-attach register replay — the startup
+          already-CONNECTED re-query and the SSE-recovery hook, both of which
+          fire in the same breath as a replay of ble_service's own register
+          cache) waits the longer BLE_HYDRATE_REPLAY_GRACE_DELAY_S, so the
+          completeness check below sees the replay's result rather than racing
+          it.
+        * `after_hello=False, replay_grace=False` (no hello, nothing to race)
+          uses the short BLE_HYDRATE_QUIET_DELAY_S — just enough for the
+          caller to return first.
+
+        Two flags rather than a raw delay or an enum, so `ble_client_remote`
+        can call this with plain keyword bools without importing timing
+        constants (or a delay type) from `main` — that import direction is a
+        cycle.
+
+        `skip_if_complete`, when True, asks the sweep to check
+        `cached_ble_registers` against REQUIRED_BLE_REGISTER_TYPES once it
+        actually starts (after the initial delay) and do nothing at all —
+        no RF, no broadcast — if the set is already complete. This is for
+        "ensure populated" callers (the startup re-query, the SSE-recovery
+        hook, the completeness reconciler's own re-ask) where a replay or an
+        earlier sweep may have already finished the job by the time this one
+        would run. It defaults to False and MUST stay False for "explicit
+        refresh" callers — the legacy `connect BLE` / `info BLE` commands and
+        `POST /api/ble/ensure_connected` — where a user or the webapp is
+        asking for current values on purpose and a silent no-op would be
+        wrong even with a full cache. See `_run_ble_register_hydration` for
+        where the check actually runs.
 
         SINGLE-FLIGHT, RESOLVED AS *SKIP*, NOT SUPERSEDE. A second request
         arriving while a sweep is scheduled or running is dropped (logged at
@@ -1053,7 +1124,12 @@ class MessageRouter:
             )
             return False
 
-        delay = BLE_HYDRATE_BURST_CLEAR_DELAY_S if after_hello else BLE_HYDRATE_QUIET_DELAY_S
+        if after_hello:
+            delay = BLE_HYDRATE_BURST_CLEAR_DELAY_S
+        elif replay_grace:
+            delay = BLE_HYDRATE_REPLAY_GRACE_DELAY_S
+        else:
+            delay = BLE_HYDRATE_QUIET_DELAY_S
         # Probe for the loop BEFORE building the coroutine. `create_task` on a
         # freshly-constructed coroutine looks like the natural spelling, but the
         # coroutine object is created first and `create_task` is what raises, so
@@ -1067,7 +1143,7 @@ class MessageRouter:
             )
             return False
         self._ble_hydration_task = asyncio.create_task(
-            self._run_ble_register_hydration(delay, reason)
+            self._run_ble_register_hydration(delay, reason, skip_if_complete=skip_if_complete)
         )
         logger.debug("BLE register hydration (%s) scheduled in %.0fs", reason, delay)
         return True
@@ -1153,11 +1229,17 @@ class MessageRouter:
         without asking for a sweep — there is nothing to sweep yet) if it
         reports CONNECTING. Disarms silently (returns False) once
         `cached_ble_registers` covers every REQUIRED_BLE_REGISTER_TYPES.
-        Otherwise asks for another sweep via `schedule_ble_register_hydration`
-        (its own single-flight guard may SKIP this — that is fine, it means
-        one is already running, and the caller re-checks on its own cadence
-        regardless of whether that particular request was skipped or acted
-        on) and returns True.
+        Otherwise asks for another sweep via `schedule_ble_register_hydration`,
+        with `skip_if_complete=True` — `missing` was non-empty at THIS check,
+        but the requested sweep only actually runs after its own initial
+        delay, and by then a CONFFIN-driven burst still draining or a replay
+        elsewhere may have finished the job on its own; asking it to check
+        again immediately before sweeping avoids paying the full ~9 s of RF
+        for nothing (its own single-flight guard may also SKIP this outright
+        — that is fine, it means one is already running, and the caller
+        re-checks on its own cadence regardless of whether that particular
+        request was skipped, completeness-skipped, or acted on) and returns
+        True.
 
         `delay` is the CURRENT cadence step (the one just slept), passed in
         only to decide whether THIS check has reached the steady cadence and
@@ -1215,7 +1297,9 @@ class MessageRouter:
                 "BLE register cache incomplete, missing TYPs %s (%s)", sorted(missing), reason
             )
         self.schedule_ble_register_hydration(
-            reason=f"register reconciler ({reason})", after_hello=False
+            reason=f"register reconciler ({reason})",
+            after_hello=False,
+            skip_if_complete=True,
         )
         return True
 
@@ -1287,10 +1371,25 @@ class MessageRouter:
         `ble_client.start()`; a no-op when no BLE client is registered at all
         (e.g. disabled BLE mode).
 
-        THE ALREADY-CONNECTED CASE IS UNCHANGED: if `client.status.state` is
-        already CONNECTED here, `ble_service` was fully up before this process
-        even started, there was never a race to lose, and the sweep is still
-        scheduled immediately, exactly as before.
+        THE ALREADY-CONNECTED CASE: if `client.status.state` is already
+        CONNECTED here, `ble_service` was fully up before this process even
+        started, there was never a connect race to lose, and the sweep is
+        still scheduled immediately. It now races something else, though:
+        `BLEClientRemote`'s own SSE loop reaches this same startup moment via
+        its first successful `/api/ble/notifications` connect, which pulls
+        ble_service's register cache through `_replay_cached_registers` —
+        typically landing in ~1-1.5 s with zero RF. This call and that replay
+        run concurrently, and until this fix the sweep below used the short
+        BLE_HYDRATE_QUIET_DELAY_S=1 s, which only beat the replay by luck
+        (verified live 2026-08-21: replay logged complete at 20:19:37, the
+        sweep started at 20:19:38 — one second later, and the replay does not
+        always finish that fast). `replay_grace=True` swaps in the longer
+        BLE_HYDRATE_REPLAY_GRACE_DELAY_S so the completeness check that
+        `skip_if_complete=True` performs once the sweep actually starts
+        reliably sees the replay's result: a landed replay makes the ~9 s,
+        10-command RF sweep a pure no-op (logged, not run); a replay that
+        never lands (older ble_service, no such endpoint, or a genuinely
+        incomplete cache) still gets the full sweep, exactly as before.
 
         THE NOT-YET-CONNECTED CASE NO LONGER GIVES UP — this is the
         2026-08-21 outage fix. `ble_client.start()` returns after a single
@@ -1323,6 +1422,8 @@ class MessageRouter:
                 self.schedule_ble_register_hydration(
                     reason="startup re-query of a reused BLE connection",
                     after_hello=False,  # no connect happened, so no burst to clear
+                    replay_grace=True,  # let BLEClientRemote's SSE-attach replay land first
+                    skip_if_complete=True,  # the replay likely already did the job
                 )
                 return
             self.arm_ble_register_reconciler(
@@ -1460,6 +1561,10 @@ class MessageRouter:
                 # Fresh connect -> the node is draining its post-hello burst.
                 # Already connected -> no hello happened, nothing to wait out.
                 after_hello=not already_connected,
+                # skip_if_complete stays False (the default): this is a user
+                # (or retryConnect()) explicitly asking to (re)connect, which
+                # wants FRESH register values even if the cache already looks
+                # complete -- an explicit action must never silently no-op.
             )
             # Also arm the level-triggered reconciler, not just this one-shot
             # sweep: a fresh connect is exactly the kind of CONNECTED
@@ -1556,6 +1661,9 @@ class MessageRouter:
             self.schedule_ble_register_hydration(
                 reason="legacy 'info BLE' command",
                 after_hello=False,
+                # skip_if_complete stays False (the default): a user asking
+                # for BLE info wants a fresh sweep, not a silent no-op just
+                # because the cache already looks complete.
             )
             self.arm_ble_register_reconciler(reason="legacy 'info BLE' command")
 

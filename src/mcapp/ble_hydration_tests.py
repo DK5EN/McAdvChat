@@ -13,9 +13,20 @@ WHAT THIS SUITE PINS DOWN. The ten-command sequence and its exact order (the
 assertion that fails against the old three-command `--pos/--io/--tel` sweep),
 the mapping from those ten commands onto all twelve registers, the load-bearing
 inter-command spacing, the route's success-body gating, the single-flight
-SKIP semantics, the `after_hello` delay choice, the never-raises contract of a
-detached task, the pre-sweep link re-check, cancellation, the SSE-recovery
-hook in `ble_client_remote`, and the timeout ceiling.
+SKIP semantics, the `after_hello`/`replay_grace` delay choice, the never-raises
+contract of a detached task, the pre-sweep link re-check, cancellation, the
+SSE-recovery hook in `ble_client_remote`, and the timeout ceiling.
+
+WHAT `skip_if_complete` FIXES. Every "ensure populated" caller used to
+schedule an unconditional sweep even when `BLEClientRemote`'s SSE-attach
+register replay (`_replay_cached_registers`) had already filled the cache for
+free in ~1-1.5s -- a plain mcapp-only restart ran a redundant ~9s,
+10-command RF sweep for nothing. `skip_if_complete=True` makes the sweep
+re-check completeness once it actually starts and no-op (logged, not silent)
+if REQUIRED_BLE_REGISTER_TYPES is already satisfied; "explicit refresh"
+callers (legacy `connect BLE` / `info BLE`, `POST /api/ble/ensure_connected`)
+keep the default False on purpose, so a user-requested refresh never silently
+does nothing.
 
 NO HARDWARE, NO NETWORK, NO `/etc/mcapp`. The BLE client is a duck-typed
 recording stub registered as the `ble_client` protocol; the HTTP route is
@@ -127,6 +138,38 @@ def _quiet(*logger_names: str) -> Iterator[None]:
     finally:
         for logger, level in saved:
             logger.setLevel(level)
+
+
+class _ListLogHandler(logging.Handler):
+    """Collects formatted log messages instead of emitting them anywhere."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.messages: list[str] = []
+
+    def emit(self, record: logging.LogRecord) -> None:
+        self.messages.append(record.getMessage())
+
+
+@contextlib.contextmanager
+def _capture_logs(*logger_names: str) -> Iterator[list[str]]:
+    """Capture formatted INFO-and-above messages from the named loggers for
+    the duration of the block, restoring level and handlers afterward. Used to
+    pin the "register sweep skipped" INFO line -- a behavior with no other
+    externally observable trace, since the skip issues no commands and no
+    broadcast."""
+    handler = _ListLogHandler()
+    loggers = [logging.getLogger(name) for name in logger_names]
+    saved_levels = [lg.level for lg in loggers]
+    for lg in loggers:
+        lg.addHandler(handler)
+        lg.setLevel(logging.INFO)
+    try:
+        yield handler.messages
+    finally:
+        for lg, level in zip(loggers, saved_levels, strict=True):
+            lg.removeHandler(handler)
+            lg.setLevel(level)
 
 
 class _RecordingAsyncio:
@@ -268,15 +311,22 @@ class _RecordingRouter:
 
     def __init__(self, protocol: Any = None) -> None:
         self._protocol = protocol
-        self.schedule_calls: list[tuple[str, bool]] = []
+        self.schedule_calls: list[tuple[str, bool, bool, bool]] = []
         self.arm_calls: list[str] = []
         self.publishes: list[tuple[str, str, dict[str, Any]]] = []
 
     def get_protocol(self, name: str) -> Any:
         return self._protocol if name == "ble_client" else None
 
-    def schedule_ble_register_hydration(self, *, reason: str, after_hello: bool) -> bool:
-        self.schedule_calls.append((reason, after_hello))
+    def schedule_ble_register_hydration(
+        self,
+        *,
+        reason: str,
+        after_hello: bool,
+        replay_grace: bool = False,
+        skip_if_complete: bool = False,
+    ) -> bool:
+        self.schedule_calls.append((reason, after_hello, replay_grace, skip_if_complete))
         return True
 
     def arm_ble_register_reconciler(self, *, reason: str) -> bool:
@@ -409,9 +459,12 @@ async def _test_hello_settle_and_time_sync(record: _RecordFn, sleeps: list[float
 
 
 async def _test_after_hello_selects_delay(record: _RecordFn, sleeps: list[float]) -> None:
-    """`after_hello` picks the initial delay: the long burst-clearing one for a
-    fresh connect, the short quiet one otherwise. Asserted on the argument the
-    production code passed to sleep, not on elapsed time."""
+    """`after_hello` and `replay_grace` together pick the initial delay: the
+    long burst-clearing one for a fresh connect, the short quiet one when
+    there is nothing to wait out at all, and a third, intermediate one when
+    this call races `BLEClientRemote`'s SSE-attach register replay. Asserted
+    on the argument the production code passed to sleep, not on elapsed
+    time."""
     client = _RecordingBLEClient()
     router = _make_router(client)
 
@@ -427,16 +480,31 @@ async def _test_after_hello_selects_delay(record: _RecordFn, sleeps: list[float]
     started = router.schedule_ble_register_hydration(reason="reused link", after_hello=False)
     await asyncio.wait_for(_hydration_task(router), timeout=_TASK_JOIN_TIMEOUT_S)
     record(
-        "after_hello=False waits only BLE_HYDRATE_QUIET_DELAY_S",
+        "after_hello=False, replay_grace=False (default) waits only BLE_HYDRATE_QUIET_DELAY_S",
         started and bool(sleeps) and sleeps[0] == main_module.BLE_HYDRATE_QUIET_DELAY_S,
     )
+
+    sleeps.clear()
+    started = router.schedule_ble_register_hydration(
+        reason="sse recovery / startup re-query racing the SSE-attach replay",
+        after_hello=False,
+        replay_grace=True,
+    )
+    await asyncio.wait_for(_hydration_task(router), timeout=_TASK_JOIN_TIMEOUT_S)
     record(
-        "the burst-clearing delay is substantially longer than the quiet one",
-        main_module.BLE_HYDRATE_BURST_CLEAR_DELAY_S > main_module.BLE_HYDRATE_QUIET_DELAY_S,
+        "after_hello=False, replay_grace=True waits BLE_HYDRATE_REPLAY_GRACE_DELAY_S -- "
+        "long enough for BLEClientRemote's SSE-attach register replay to land first",
+        started and bool(sleeps) and sleeps[0] == main_module.BLE_HYDRATE_REPLAY_GRACE_DELAY_S,
+    )
+    record(
+        "the three delays are strictly ordered: quiet < replay-grace < burst-clearing",
+        main_module.BLE_HYDRATE_QUIET_DELAY_S
+        < main_module.BLE_HYDRATE_REPLAY_GRACE_DELAY_S
+        < main_module.BLE_HYDRATE_BURST_CLEAR_DELAY_S,
     )
     record(
         "each completed sweep issued the full ordered command list",
-        tuple(client.commands) == EXPECTED_REGISTER_COMMANDS * 2,
+        tuple(client.commands) == EXPECTED_REGISTER_COMMANDS * 3,
     )
 
 
@@ -622,6 +690,157 @@ async def _test_timeout_bound(record: _RecordFn) -> None:
         main_module.BLE_REQUERY_TIMEOUT_S = original_timeout
 
 
+def _complete_register_cache() -> dict[str, dict[str, str]]:
+    """A `cached_ble_registers` covering every REQUIRED_BLE_REGISTER_TYPES."""
+    return {typ: {"TYP": typ} for typ in main_module.REQUIRED_BLE_REGISTER_TYPES}
+
+
+async def _test_requery_reused_connection_skips_when_cache_complete(record: _RecordFn) -> None:
+    """THE completeness-skip fix, startup path: `requery_reused_ble_connection`'s
+    already-CONNECTED branch schedules with `skip_if_complete=True`. If
+    `BLEClientRemote`'s SSE-attach register replay already filled every
+    REQUIRED register by the time the sweep actually starts, the redundant
+    ~9s, 10-command RF sweep must not run at all -- and the skip must be
+    visible in the log, since it is otherwise silent (no commands, no
+    broadcast)."""
+    client = _RecordingBLEClient()
+    router = _make_router(client)
+    router.cached_ble_registers = _complete_register_cache()
+
+    with _capture_logs(_MAIN_LOGGER) as messages:
+        await router.requery_reused_ble_connection()
+        task = _hydration_task(router)
+        await asyncio.wait_for(task, timeout=_TASK_JOIN_TIMEOUT_S)
+
+    record(
+        "requery (already-CONNECTED): a cache already complete at sweep time issues "
+        "ZERO register commands",
+        client.commands == [],
+    )
+    record(
+        "requery (already-CONNECTED): the skip is logged at INFO, naming the reason and "
+        "why nothing ran",
+        any(
+            "register sweep skipped" in m and "REQUIRED registers already cached" in m
+            for m in messages
+        ),
+    )
+
+
+async def _test_requery_reused_connection_sweeps_when_cache_incomplete(
+    record: _RecordFn,
+) -> None:
+    """The same already-CONNECTED branch must NOT over-skip: a cache missing
+    even one REQUIRED register still gets the full ten-command sweep --
+    `skip_if_complete` is a completeness check, not a blanket skip."""
+    client = _RecordingBLEClient()
+    router = _make_router(client)
+    incomplete = _complete_register_cache()
+    del incomplete["G"]
+    router.cached_ble_registers = incomplete
+
+    await router.requery_reused_ble_connection()
+    await asyncio.wait_for(_hydration_task(router), timeout=_TASK_JOIN_TIMEOUT_S)
+
+    record(
+        "requery (already-CONNECTED): a cache missing even one REQUIRED register still "
+        "gets the FULL sweep -- skip_if_complete never over-skips",
+        tuple(client.commands) == EXPECTED_REGISTER_COMMANDS,
+    )
+
+
+async def _test_legacy_info_command_ignores_complete_cache(record: _RecordFn) -> None:
+    """THE assertion that keeps the completeness feature honest: the legacy
+    'info BLE' command path keeps `skip_if_complete=False` (the default). A
+    user (or the webapp) explicitly asking for BLE info wants a FRESH sweep,
+    even when the cache already covers every REQUIRED register -- an explicit
+    refresh must never silently no-op."""
+    client = _RecordingBLEClient()
+    router = _make_router(client)
+    router.cached_ble_registers = _complete_register_cache()
+
+    await router._handle_ble_info_command(None, query_registers=True)
+    await asyncio.wait_for(_hydration_task(router), timeout=_TASK_JOIN_TIMEOUT_S)
+
+    record(
+        "legacy 'info BLE': an explicit refresh sweeps the FULL register set even though "
+        "the cache already covers every REQUIRED type",
+        tuple(client.commands) == EXPECTED_REGISTER_COMMANDS,
+    )
+
+
+async def _test_sse_recovery_skip_races_replay(record: _RecordFn) -> None:
+    """The SSE-recovery hydration schedule (`replay_grace=True,
+    skip_if_complete=True`) exists because this call and
+    `_replay_cached_registers` race on every SSE (re)connect -- `_sse_loop`
+    calls `_rehydrate_after_sse_recovery()` then `await`s the replay
+    immediately after, and in production `BLE_HYDRATE_REPLAY_GRACE_DELAY_S`
+    (3s of real wall-clock sleep) is what makes the sweep's own completeness
+    check reliably land after the replay (~1-1.5s). Reproducing that race
+    with real timing would make this suite either flaky or slow, so this
+    drives the OUTCOME the delay guarantees directly: replay to completion
+    FIRST, schedule SECOND -- by the time the (instantaneous, thanks to
+    `_RecordingAsyncio`) sweep's completeness check runs, the cache already
+    reflects whatever the replay did or did not deliver, exactly as it would
+    after a real 3s delay. Two outcomes: a landed replay makes the scheduled
+    sweep a pure completeness no-op; a replay that 404s (older ble_service)
+    leaves the cache empty and the sweep does the real work."""
+    router = MessageRouter(None)
+    main_module._wire_ble_caches(router)
+    ble_client = _RecordingBLEClient()
+    router.register_protocol("ble_client", ble_client)
+    client = BLEClientRemote("http://127.0.0.1:9", message_router=router)
+    client._sse_lost_published = True
+
+    registers = {
+        "I": {"TYP": "I", "CALL": "DK5EN-98"},
+        "SN": {"TYP": "SN"},
+        "G": {"TYP": "G", "LAT": 48.4, "LON": 16.3},
+        "SA": {"TYP": "SA"},
+    }
+
+    async def _fake_request(method: str, endpoint: str, *_a: Any, **_k: Any) -> dict[str, Any]:
+        return {"registers": registers, "count": len(registers)}
+
+    client._request = _fake_request  # type: ignore[method-assign]
+
+    await client._replay_cached_registers()
+    client._rehydrate_after_sse_recovery()
+
+    task = _hydration_task(router)
+    await asyncio.wait_for(task, timeout=_TASK_JOIN_TIMEOUT_S)
+    record(
+        "SSE recovery vs replay: a replay that lands before sweep time makes the scheduled "
+        "sweep a pure completeness no-op -- zero RF commands, and the replayed registers "
+        "are still cached",
+        ble_client.commands == [] and router.cached_ble_registers.keys() == registers.keys(),
+    )
+
+    router_404 = MessageRouter(None)
+    main_module._wire_ble_caches(router_404)
+    ble_client_404 = _RecordingBLEClient()
+    router_404.register_protocol("ble_client", ble_client_404)
+    client_404 = BLEClientRemote("http://127.0.0.1:9", message_router=router_404)
+    client_404._sse_lost_published = True
+
+    async def _fake_404(*_a: Any, **_k: Any) -> dict[str, Any]:
+        raise BLEServiceError("not found", status_code=404)
+
+    client_404._request = _fake_404  # type: ignore[method-assign]
+
+    await client_404._replay_cached_registers()
+    client_404._rehydrate_after_sse_recovery()
+
+    task_404 = _hydration_task(router_404)
+    await asyncio.wait_for(task_404, timeout=_TASK_JOIN_TIMEOUT_S)
+    record(
+        "SSE recovery vs replay: a 404'd replay (older ble_service) leaves the cache empty, "
+        "and skip_if_complete does not skip a genuinely incomplete sweep -- the full "
+        "register set is still requested",
+        tuple(ble_client_404.commands) == EXPECTED_REGISTER_COMMANDS,
+    )
+
+
 async def _test_route_gating(record: _RecordFn) -> None:
     """`POST /api/ble/ensure_connected` is what regressed: it forwarded the
     connect and hydrated nothing. It must now schedule a sweep — but only when
@@ -636,8 +855,9 @@ async def _test_route_gating(record: _RecordFn) -> None:
     payload: dict[str, Any] = await endpoint(body)
     record(
         "route: a body with success=true schedules exactly one hydration sweep, "
-        "with after_hello=True",
-        router_ok.schedule_calls == [("POST /api/ble/ensure_connected", True)],
+        "with after_hello=True and the completeness-skip knobs left at their "
+        "explicit-refresh default (False)",
+        router_ok.schedule_calls == [("POST /api/ble/ensure_connected", True, False, False)],
     )
     record(
         "route: the forwarded response body is passed through unchanged",
@@ -729,8 +949,11 @@ async def _test_sse_recovery_hook(record: _RecordFn) -> None:
     client._rehydrate_after_sse_recovery()
     record(
         "SSE hook: recovery after a published loss schedules once, with after_hello=False "
-        "(no hello happened, so there is no burst to wait out)",
-        stub_router.schedule_calls == [("mcapp<->ble_service SSE stream recovered", False)],
+        "(no hello happened, so there is no burst to wait out), replay_grace=True (this "
+        "races _replay_cached_registers) and skip_if_complete=True (a landed replay makes "
+        "the sweep a no-op)",
+        stub_router.schedule_calls
+        == [("mcapp<->ble_service SSE stream recovered", False, True, True)],
     )
 
     client._rehydrate_after_sse_recovery()
@@ -909,10 +1132,12 @@ async def _test_reconciler_backoff_retry(record: _RecordFn, sleeps: list[float])
     client.disconnect_after_calls = 4  # 3 CONNECTED checks, then disconnected on the 4th
     router = _make_router(client)
 
-    schedule_calls: list[tuple[str, bool]] = []
+    schedule_calls: list[tuple[str, bool, bool]] = []
 
-    def _fake_schedule(*, reason: str, after_hello: bool) -> bool:
-        schedule_calls.append((reason, after_hello))
+    def _fake_schedule(
+        *, reason: str, after_hello: bool, skip_if_complete: bool = False, **_kwargs: Any
+    ) -> bool:
+        schedule_calls.append((reason, after_hello, skip_if_complete))
         return True
 
     router.schedule_ble_register_hydration = _fake_schedule  # type: ignore[method-assign]
@@ -936,8 +1161,14 @@ async def _test_reconciler_backoff_retry(record: _RecordFn, sleeps: list[float])
     )
     record(
         "reconciler backoff: a sweep is (re-)requested on every check the cache is still "
-        "incomplete at -- three times, not just once, all with after_hello=False",
-        len(schedule_calls) == 3 and all(after_hello is False for _, after_hello in schedule_calls),
+        "incomplete at -- three times, not just once, all with after_hello=False and "
+        "skip_if_complete=True (the cache may complete between this check and the "
+        "sweep's own delay)",
+        len(schedule_calls) == 3
+        and all(
+            after_hello is False and skip_if_complete is True
+            for _, after_hello, skip_if_complete in schedule_calls
+        ),
     )
     record(
         "reconciler backoff: the loop disarms cleanly (never raises) once the client "
@@ -1338,6 +1569,10 @@ async def run_ble_hydration_tests() -> bool:
         await _test_never_raises(_record)
         await _test_link_recheck(_record)
         await _test_timeout_bound(_record)
+        await _test_requery_reused_connection_skips_when_cache_complete(_record)
+        await _test_requery_reused_connection_sweeps_when_cache_incomplete(_record)
+        await _test_legacy_info_command_ignores_complete_cache(_record)
+        await _test_sse_recovery_skip_races_replay(_record)
         await _test_route_gating(_record)
         await _test_sse_recovery_hook(_record)
         await _test_reconciler_arms_on_observed_reconnect(_record)

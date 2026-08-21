@@ -831,8 +831,16 @@ class BLEClientRemote(BLEClientBase):
         stream reconnects, so every SSE blip used to permanently degrade the
         frontend to placeholder values until the user manually reconnected.
         This closes that loop: one explicit register sweep, scheduled on the
-        router, using the SHORT no-burst delay because there was no hello to
-        wait out.
+        router, using no-burst delay semantics because there was no hello to
+        wait out — specifically `replay_grace=True` rather than the plain
+        quiet delay, because this call and `_replay_cached_registers` right
+        below it in `_sse_loop` race each other on every SSE (re)connect: both
+        fire in the same breath, and the replay usually lands the whole
+        register cache in ~1-1.5 s with zero RF. The grace delay gives that
+        replay comfortable headroom to finish before `skip_if_complete=True`
+        checks completeness, so a recovery the replay already fully repaired
+        does not also pay a redundant ~9 s, 10-command sweep; a replay that
+        404s (older ble_service) or lands short still gets the full sweep.
 
         Fires only when this client is the one that published the loss (the
         `_sse_lost_published` latch), so a first-ever stream connect at startup
@@ -848,7 +856,9 @@ class BLEClientRemote(BLEClientBase):
         `self._status` to CONNECTED, and it no-ops if the radio really did go
         away. Reached through `getattr` rather than an import to keep this
         module free of a `main` import — that direction is a cycle, since
-        `main` imports the BLE client factory that imports this module.
+        `main` imports the BLE client factory that imports this module. The
+        two new keyword args are plain bools for the same reason: no delay
+        constant or enum needs to cross the module boundary, just intent.
         """
         if not self._sse_lost_published:
             return
@@ -857,7 +867,12 @@ class BLEClientRemote(BLEClientBase):
         if schedule is None:
             return
         logger.info("SSE stream recovered — scheduling BLE register re-hydration")
-        schedule(reason="mcapp<->ble_service SSE stream recovered", after_hello=False)
+        schedule(
+            reason="mcapp<->ble_service SSE stream recovered",
+            after_hello=False,
+            replay_grace=True,
+            skip_if_complete=True,
+        )
 
     async def _replay_cached_registers(self) -> None:
         """After the SSE stream (re)establishes, pull whatever register cache

@@ -983,8 +983,13 @@ def _fast_hydration_timings() -> Iterator[None]:
     the whole process shares, so a suite that leaks one slows or breaks every
     later suite in the same runner.
 
-    The three spacing delays go to zero purely to keep the suite fast. The
-    fourth does the opposite: BLE_HYDRATE_BURST_CLEAR_DELAY_S is pinned to
+    Four spacing delays go to zero purely to keep the suite fast --
+    BLE_HYDRATE_REPLAY_GRACE_DELAY_S joined that set once the already-CONNECTED
+    branch of `requery_reused_ble_connection` started scheduling with
+    `replay_grace=True` instead of the plain quiet delay: left at its real 3.0 s,
+    every CONNECTED case below would exceed _SWEEP_WAIT_S and fail on a timeout
+    that has nothing to do with what the case is pinning. The fifth constant
+    does the opposite: BLE_HYDRATE_BURST_CLEAR_DELAY_S is pinned to
     _BURST_SENTINEL_DELAY_S so that `after_hello=True` becomes an unmissably
     slow branch, which is how the cases here pin `after_hello=False` by
     consequence instead of by mocking out the scheduler.
@@ -997,6 +1002,7 @@ def _fast_hydration_timings() -> Iterator[None]:
         "BLE_QUERY_DELAY_STANDARD": 0.0,
         "BLE_QUERY_DELAY_MULTIPART": 0.0,
         "BLE_HYDRATE_QUIET_DELAY_S": 0.0,
+        "BLE_HYDRATE_REPLAY_GRACE_DELAY_S": 0.0,
         "BLE_HYDRATE_BURST_CLEAR_DELAY_S": _BURST_SENTINEL_DELAY_S,
     }
     original = {name: getattr(main_module, name) for name in patched}
@@ -1078,6 +1084,13 @@ async def _test_requery_reused_ble_connection(record: Callable[[str, bool], None
         # Connected: the scheduled sweep re-requests EVERY register, in the
         # order `_query_ble_registers` fixes. Nothing about a reused session
         # gets the frontend off its XX0XXX/0.0.0 placeholders except this.
+        # This branch now also passes `replay_grace=True, skip_if_complete=True`
+        # (BLE hydration completeness-skip work), but every stub router here
+        # starts with an EMPTY `cached_ble_registers`, so the completeness
+        # check `skip_if_complete` performs always finds registers missing and
+        # never trips -- these cases keep pinning the un-skipped, full-sweep
+        # behavior. The skip itself is pinned separately, in
+        # ble_hydration_tests.py.
         router = MessageRouter(None)
         live = _StubBLEClient(ConnectionState.CONNECTED)
         router.register_protocol("ble_client", live)
@@ -1094,7 +1107,12 @@ async def _test_requery_reused_ble_connection(record: Callable[[str, bool], None
         # consequence rather than by inspecting the call: the after_hello=True
         # delay is patched to _BURST_SENTINEL_DELAY_S above, so a sweep that
         # took that branch could not possibly deliver its commands inside
-        # _SWEEP_WAIT_S.
+        # _SWEEP_WAIT_S. This branch now selects its delay via
+        # `replay_grace=True` rather than the plain quiet delay, but
+        # `_fast_hydration_timings` zeroes BOTH BLE_HYDRATE_QUIET_DELAY_S and
+        # BLE_HYDRATE_REPLAY_GRACE_DELAY_S, so the after_hello=True/False
+        # discrimination above is unaffected by which of the two "False"
+        # delays production actually picks.
         #
         # It also pins the second half of the deal: the sweep runs seconds after
         # scheduling, so it must re-validate the link against `ble_service`
