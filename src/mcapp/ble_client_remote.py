@@ -11,6 +11,7 @@ import contextlib
 import json
 import logging
 import time
+from collections import Counter
 from collections.abc import Callable
 from http import HTTPStatus
 from typing import Any, cast
@@ -77,6 +78,55 @@ STATUS_RECONNECT_EXHAUSTED = "reconnect_exhausted"
 # error_code field, only the existing `reason` (REASON_BUSY, not mirrored
 # here since only its value "busy" is needed and it already equals this).
 ERROR_CODE_BUSY = "busy"
+
+# Cap on the hex excerpt logged for a dropped, undecodable notification (M1) —
+# enough to fingerprint a frame shape without flooding the log with an entire
+# register dump.
+_UNDECODABLE_EXCERPT_MAX_BYTES = 64
+
+# Module-level tally of dropped, undecodable BLE notifications, keyed by a
+# short human-readable reason string (e.g. "binary decode raised ValueError",
+# "unrecognized format 'raw'"). Never published, never blocks anything — it
+# exists purely so a field diagnosis ("are we silently dropping traffic?")
+# doesn't require re-adding logging first. Read via
+# `ble_client_remote.undecodable_notification_counts`.
+undecodable_notification_counts: Counter[str] = Counter()
+
+
+def _payload_excerpt(notification: dict[str, Any]) -> str:
+    """Best-effort hex excerpt of a notification's raw payload, capped at
+    _UNDECODABLE_EXCERPT_MAX_BYTES, for the one-warning-per-drop log line."""
+    raw_hex = notification.get("raw_hex")
+    if isinstance(raw_hex, str) and raw_hex:
+        return raw_hex[: _UNDECODABLE_EXCERPT_MAX_BYTES * 2]
+    raw_b64 = notification.get("raw_base64")
+    if isinstance(raw_b64, str) and raw_b64:
+        try:
+            raw_bytes = base64.b64decode(raw_b64)
+        except Exception:
+            return raw_b64[:_UNDECODABLE_EXCERPT_MAX_BYTES]
+        return raw_bytes[:_UNDECODABLE_EXCERPT_MAX_BYTES].hex()
+    return "<no payload>"
+
+
+def _drop_notification(reason: str, notification: dict[str, Any]) -> None:
+    """Record an undecodable BLE notification that must NOT be published on
+    "ble_notification" (M1): a notification neither JSON-dispatched nor
+    binary-decoded used to fall through to a raw-passthrough dict with no
+    `type`/`src`/`msg`, which every downstream filter waved through as a
+    sender-less, text-less chat row. Every drop path in
+    `_transform_notification` funnels through here instead: one WARNING (with
+    the format, the reason, and a capped hex excerpt) plus a bump of
+    `undecodable_notification_counts`, so field diagnosis stays possible
+    without the junk row.
+    """
+    undecodable_notification_counts[reason] += 1
+    logger.warning(
+        "Dropping undecodable BLE notification (format=%s, reason=%s): %s",
+        notification.get("format", "?"),
+        reason,
+        _payload_excerpt(notification),
+    )
 
 
 class BLEServiceError(RuntimeError):
@@ -580,8 +630,21 @@ class BLEClientRemote(BLEClientBase):
         return await self.send_command("--reboot")
 
     async def save_and_reboot(self) -> bool:
-        """Save settings and reboot device (0xF0 message)"""
-        return await self.set_command("--savereboot")
+        """Save settings and reboot device (0xF0 message).
+
+        Goes through ble_service's dedicated `/api/ble/config/save` endpoint
+        (which calls the adapter's real 0xF0 save+reboot builder), NOT
+        `set_command("--savereboot")` (L3): `--savereboot` doesn't exist in
+        the firmware, and `commandCheck`'s prefix match on the ASCII command
+        table matches it against `--save` instead — settings get saved, but
+        the device never reboots.
+        """
+        try:
+            response = await self._request("POST", "/api/ble/config/save")
+            return cast(bool, response.get("success", False))
+        except Exception:
+            logger.exception("Save and reboot error")
+            return False
 
     async def set_ble_pin(self, pin: int) -> bool:
         """
@@ -850,66 +913,112 @@ class BLEClientRemote(BLEClientBase):
         return output
 
     def _transform_notification(self, notification: dict[str, Any]) -> dict[str, Any] | None:
-        """Transform SSE notification to match local BLE handler format"""
+        """Transform SSE notification to match local BLE handler format.
+
+        Returns None to mean "drop, do not publish on ble_notification" (M1):
+        every branch that cannot produce a real, dispatcher-shaped output —
+        an unknown JSON TYP, a binary frame that fails to decode, or any
+        format this client doesn't recognize (including ble_service's "raw"
+        for a truncated/malformed register frame) — falls through
+        `_drop_notification` instead of a raw-passthrough dict. There used to
+        be a raw-passthrough fallback here; nothing downstream
+        (`MessageRouter._storage_handler`, `CommandHandler._message_handler`,
+        push's `_on_mesh_message`) expects that shape, so it only ever
+        produced a sender-less junk DB row / SSE event, never a legitimate
+        consumer.
+        """
         own_call = self._get_own_callsign()
-        if notification.get("format") == "json" and "parsed" in notification:
-            # JSON notification - run through dispatcher like local mode
-            parsed = cast(dict[str, Any], notification["parsed"])
-            typ = parsed.get("TYP", "?")
-            # Superset of ble_protocol's dispatch-routing list: also treat MH (has its
-            # own transform_mh() path) and CONFFIN (handled before this method is
-            # even called) as routine for logging purposes.
-            _routine_typs = {*ROUTINE_JSON_TYPS, "MH", "CONFFIN"}
-            if typ in _routine_typs:
-                logger.debug("BLE JSON TYP=%s: %s", typ, parsed)
-            else:
-                logger.info("BLE JSON TYP=%s: %s", typ, parsed)
-            output = dispatcher(parsed, own_call)
-            if output:
-                return self._finalize_transformed_output(output, notification)
-            return None  # Unknown TYP — don't publish
+        fmt = notification.get("format")
 
-        if notification.get("format") == "binary":
-            # Decode binary the same way local BLE handler does
-            raw_b64 = notification.get("raw_base64")
-            if raw_b64:
-                try:
-                    raw_bytes = base64.b64decode(raw_b64)
-                    if raw_bytes.startswith(b"@"):
-                        decoded = decode_binary_message(raw_bytes)
-                        if decoded is not None:
-                            pt = decoded.get("payload_type", 0)
-                            msg = decoded.get("message", "")
-                            # All BLE binary messages at DEBUG (stored in DB, visible in frontend)
-                            logger.debug(
-                                "BLE binary: :%s %s %03d %d/%d LH:%02X %s%s %s",
-                                format(decoded.get("msg_id", 0), "08X"),
-                                decoded.get("mesh_info", ""),
-                                pt,
-                                decoded.get("max_hop", 0),
-                                decoded.get("max_hop", 0),
-                                decoded.get("last_hw_id", 0),
-                                decoded.get("path", ""),
-                                decoded.get("dest", ""),
-                                msg,
-                            )
-                            output = dispatcher(decoded, own_call)
-                            if output:
-                                return self._finalize_transformed_output(output, notification)
-                except Exception as e:
-                    logger.warning("Failed to decode binary notification: %s", e)
-            # Fallback: return raw if decoding failed
-            return {
-                "src_type": "ble_remote",
-                "format": "binary",
-                "raw_base64": raw_b64,
-                "raw_hex": notification.get("raw_hex"),
-                "timestamp": notification.get("timestamp", now_ms()),
-            }
+        if fmt == "json":
+            return self._transform_json_notification(notification, own_call)
+        if fmt == "binary":
+            return self._transform_binary_notification(notification, own_call)
 
-        # Unknown format - pass through
-        notification["src_type"] = "ble_remote"
-        return notification
+        # Unrecognized/unknown format — including ble_service's "raw" for a
+        # truncated or otherwise malformed register frame — is never a
+        # dispatcher-shaped output either; drop it the same way.
+        _drop_notification(f"unrecognized format {fmt!r}", notification)
+        return None
+
+    def _transform_json_notification(
+        self, notification: dict[str, Any], own_call: str
+    ) -> dict[str, Any] | None:
+        """The `format == "json"` arm of `_transform_notification`, split out
+        to keep each arm's return count under ruff's ceiling."""
+        if "parsed" not in notification:
+            _drop_notification("json notification missing 'parsed'", notification)
+            return None
+        # JSON notification - run through dispatcher like local mode
+        parsed = cast(dict[str, Any], notification["parsed"])
+        typ = parsed.get("TYP", "?")
+        # Superset of ble_protocol's dispatch-routing list: also treat MH (has its
+        # own transform_mh() path) and CONFFIN (handled before this method is
+        # even called) as routine for logging purposes.
+        _routine_typs = {*ROUTINE_JSON_TYPS, "MH", "CONFFIN"}
+        if typ in _routine_typs:
+            logger.debug("BLE JSON TYP=%s: %s", typ, parsed)
+        else:
+            logger.info("BLE JSON TYP=%s: %s", typ, parsed)
+        output = dispatcher(parsed, own_call)
+        if output:
+            return self._finalize_transformed_output(output, notification)
+        _drop_notification(f"dispatcher returned None for unknown TYP {typ!r}", notification)
+        return None
+
+    @staticmethod
+    def _decode_binary_frame(raw_b64: str | None) -> tuple[dict[str, Any] | None, str | None]:
+        """Decode a base64 `@`-prefixed binary BLE frame.
+
+        Returns `(decoded, None)` on success or `(None, reason)` naming
+        exactly why it failed — factored out of `_transform_binary_notification`
+        purely to keep that method's return count under ruff's ceiling.
+        """
+        if not raw_b64:
+            return None, "binary notification missing raw_base64"
+        try:
+            raw_bytes = base64.b64decode(raw_b64)
+        except Exception as e:
+            return None, f"binary payload not valid base64 ({type(e).__name__})"
+        if not raw_bytes.startswith(b"@"):
+            return None, "binary payload missing '@' prefix"
+        try:
+            decoded = decode_binary_message(raw_bytes)
+        except Exception as e:
+            return None, f"decode_binary_message raised {type(e).__name__}"
+        if decoded is None:
+            return None, "decode_binary_message returned None"
+        return decoded, None
+
+    def _transform_binary_notification(
+        self, notification: dict[str, Any], own_call: str
+    ) -> dict[str, Any] | None:
+        """The `format == "binary"` arm of `_transform_notification`."""
+        decoded, drop_reason = self._decode_binary_frame(notification.get("raw_base64"))
+        if decoded is None:
+            _drop_notification(drop_reason or "binary decode failed", notification)
+            return None
+
+        pt = decoded.get("payload_type", 0)
+        msg = decoded.get("message", "")
+        # All BLE binary messages at DEBUG (stored in DB, visible in frontend)
+        logger.debug(
+            "BLE binary: :%s %s %03d %d/%d LH:%02X %s%s %s",
+            format(decoded.get("msg_id", 0), "08X"),
+            decoded.get("mesh_info", ""),
+            pt,
+            decoded.get("max_hop", 0),
+            decoded.get("max_hop", 0),
+            decoded.get("last_hw_id", 0),
+            decoded.get("path", ""),
+            decoded.get("dest", ""),
+            msg,
+        )
+        output = dispatcher(decoded, own_call)
+        if output:
+            return self._finalize_transformed_output(output, notification)
+        _drop_notification("binary dispatcher returned None", notification)
+        return None
 
     async def _handle_status(self, data: str) -> None:
         """Handle SSE status update"""

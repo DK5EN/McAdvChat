@@ -40,7 +40,9 @@ Exposes `run_ble_hydration_tests() -> bool`; the central orchestrator
 from __future__ import annotations
 
 import asyncio
+import base64
 import contextlib
+import json
 import logging
 import warnings
 from collections.abc import Callable, Iterator
@@ -49,6 +51,7 @@ from typing import TYPE_CHECKING, Any, cast
 from fastapi import HTTPException
 from fastapi.routing import APIRoute
 
+from . import ble_client_remote as ble_client_remote_module
 from . import main as main_module
 from .ble_client import BLEMode, BLEStatus, ConnectionState
 from .ble_client_remote import BLEClientRemote
@@ -741,6 +744,140 @@ async def _test_schedule_without_event_loop(record: _RecordFn) -> None:
     )
 
 
+def _undecodable_count() -> int:
+    """Total tally across all drop reasons in `ble_client_remote`'s
+    module-level counter — used to assert a drop happened without pinning
+    the exact reason string."""
+    return sum(ble_client_remote_module.undecodable_notification_counts.values())
+
+
+def _ble_notification_publishes(
+    router: _RecordingRouter,
+) -> list[dict[str, Any]]:
+    return [
+        data for _, message_type, data in router.publishes if message_type == "ble_notification"
+    ]
+
+
+async def _test_undecodable_binary_dropped(record: _RecordFn) -> None:
+    """M1: an undecodable binary BLE notification — whether decoding raises
+    or `decode_binary_message` cleanly returns None — must never reach
+    'ble_notification' as a sender-less junk row. It is dropped, logged once,
+    and counted."""
+    stub_router = _RecordingRouter()
+    client = BLEClientRemote("http://127.0.0.1:9", message_router=stub_router)
+
+    # Too short to unpack the fixed 6-byte header -- decode_binary_message raises.
+    raw_too_short = base64.b64encode(b"@").decode("ascii")
+    before = _undecodable_count()
+    await client._handle_notification(
+        json.dumps({"format": "binary", "raw_base64": raw_too_short, "timestamp": 1})
+    )
+    record(
+        "binary decode raising an exception: nothing published on ble_notification, counter bumped",
+        _ble_notification_publishes(stub_router) == [] and _undecodable_count() == before + 1,
+    )
+
+    # A full header but an unrecognized frame prefix -- decode_binary_message
+    # returns None cleanly (no exception).
+    unrecognized = base64.b64encode(b"@XX" + b"\x00" * 4).decode("ascii")
+    before = _undecodable_count()
+    await client._handle_notification(
+        json.dumps({"format": "binary", "raw_base64": unrecognized, "timestamp": 1})
+    )
+    record(
+        "binary decode returning None (unrecognized frame prefix): nothing published, "
+        "counter bumped",
+        _ble_notification_publishes(stub_router) == [] and _undecodable_count() == before + 1,
+    )
+
+
+async def _test_raw_format_fragment_dropped(record: _RecordFn) -> None:
+    """ble_service sends format=='raw' (no 'parsed' field) for a
+    truncated/malformed 'D{' register frame -- the whole register update was
+    already discarded on its side. mcapp must not resurrect it as a
+    raw-passthrough notification either."""
+    stub_router = _RecordingRouter()
+    client = BLEClientRemote("http://127.0.0.1:9", message_router=stub_router)
+
+    before = _undecodable_count()
+    await client._handle_notification(
+        json.dumps(
+            {
+                "format": "raw",
+                "raw_hex": "4428" + "00" * 10,
+                "raw_base64": base64.b64encode(b"D{").decode("ascii"),
+                "timestamp": 1,
+            }
+        )
+    )
+    record(
+        "format=='raw' truncated register fragment: dropped, not published, counter bumped",
+        _ble_notification_publishes(stub_router) == [] and _undecodable_count() == before + 1,
+    )
+
+
+async def _test_valid_frame_still_publishes(record: _RecordFn) -> None:
+    """Guard against over-dropping: a genuinely decodable JSON notification
+    (TYP the dispatcher recognizes) must still reach 'ble_notification'."""
+    stub_router = _RecordingRouter()
+    client = BLEClientRemote("http://127.0.0.1:9", message_router=stub_router)
+
+    before = _undecodable_count()
+    await client._handle_notification(
+        json.dumps({"format": "json", "parsed": {"TYP": "I", "CALL": "DK5EN-98"}, "timestamp": 1})
+    )
+    published = _ble_notification_publishes(stub_router)
+    record(
+        "a valid, dispatcher-recognized JSON frame (TYP=I) still publishes on ble_notification "
+        "and the drop counter does not move",
+        len(published) == 1
+        and published[0].get("CALL") == "DK5EN-98"
+        and _undecodable_count() == before,
+    )
+
+
+async def _test_unknown_typ_dropped(record: _RecordFn) -> None:
+    """A JSON notification whose TYP the dispatcher does not recognize
+    already returned None before this fix (nothing published) -- it must now
+    ALSO be logged/counted, not just silently swallowed."""
+    stub_router = _RecordingRouter()
+    client = BLEClientRemote("http://127.0.0.1:9", message_router=stub_router)
+
+    before = _undecodable_count()
+    await client._handle_notification(
+        json.dumps({"format": "json", "parsed": {"TYP": "ZZZ"}, "timestamp": 1})
+    )
+    record(
+        "unknown TYP: dispatcher returns None, nothing published, and the drop is now counted",
+        _ble_notification_publishes(stub_router) == [] and _undecodable_count() == before + 1,
+    )
+
+
+async def _test_save_and_reboot_uses_save_endpoint(record: _RecordFn) -> None:
+    """L3: `save_and_reboot()` must call ble_service's dedicated 0xF0
+    save+reboot endpoint (`POST /api/ble/config/save`), never
+    `set_command`/the ASCII '--savereboot' string -- that command doesn't
+    exist in the firmware, and `commandCheck`'s prefix match lands it on
+    '--save' instead, so the device saves but never reboots."""
+    client = BLEClientRemote("http://127.0.0.1:9", message_router=None)
+    calls: list[tuple[str, str]] = []
+
+    async def fake_request(
+        method: str, endpoint: str, data: dict[str, Any] | None = None, **_kwargs: Any
+    ) -> dict[str, Any]:
+        calls.append((method, endpoint))
+        return {"success": True}
+
+    client._request = fake_request  # type: ignore[method-assign]  # test stub, narrower signature
+
+    result = await client.save_and_reboot()
+    record(
+        "save_and_reboot: calls POST /api/ble/config/save exactly once, and only that",
+        result is True and calls == [("POST", "/api/ble/config/save")],
+    )
+
+
 async def run_ble_hydration_tests() -> bool:
     """Return True iff every BLE register-hydration regression passes."""
     if has_console:
@@ -768,6 +905,11 @@ async def run_ble_hydration_tests() -> bool:
         await _test_route_gating(_record)
         await _test_sse_recovery_hook(_record)
         await _test_schedule_without_event_loop(_record)
+        await _test_undecodable_binary_dropped(_record)
+        await _test_raw_format_fragment_dropped(_record)
+        await _test_valid_frame_still_publishes(_record)
+        await _test_unknown_typ_dropped(_record)
+        await _test_save_and_reboot_uses_save_endpoint(_record)
     finally:
         _swap_main_asyncio(real_asyncio)
 
