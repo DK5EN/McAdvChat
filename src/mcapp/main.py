@@ -87,6 +87,14 @@ SHUTDOWN_TIMEOUT_SSE_S = 3.0
 # an SSE reconnect is served instantly instead of re-querying the radio.
 BLE_REGISTER_TYPES = ("I", "SN", "G", "SA", "SE", "S1", "SW", "S2", "W", "AN", "IO", "TM")
 
+# The subset of BLE_REGISTER_TYPES the webapp's frontend actually depends on
+# (its own REQUIRED row) -- everything else the sweep fetches anyway, but must
+# NEVER drive a retry. "AN" (analog inputs) does not exist on nRF52 hardware
+# at all, so requiring it would mean the reconciler below (see
+# MessageRouter.arm_ble_register_reconciler) never reaches completeness on
+# that hardware and warns forever for a register that will never arrive.
+REQUIRED_BLE_REGISTER_TYPES = frozenset({"I", "SN", "G", "SA"})
+
 # Callsign bases that mean "nobody has configured this yet". Each is a valid
 # callsign SHAPE, so CALLSIGN_STRICT_RE accepts them and only an explicit list can
 # tell them apart from a real station. Compared against the SSID-stripped base, so
@@ -140,6 +148,23 @@ BLE_HYDRATE_QUIET_DELAY_S = 1.0
 # single-flight guard. See MessageRouter.schedule_ble_register_hydration.
 BLE_REQUERY_TIMEOUT_S = 25.0
 
+# Register-completeness reconciler cadence (seconds) -- see
+# MessageRouter.arm_ble_register_reconciler. This is a LEVEL-triggered watchdog,
+# not a one-shot: it keeps re-checking cached_ble_registers against
+# REQUIRED_BLE_REGISTER_TYPES until the set is complete or the link drops,
+# closing the class of bug where every EDGE-triggered hydration path (a
+# one-shot sweep racing the node's connect pipeline, a skip because the link
+# looked disconnected at that instant, a burst that only partially landed) had
+# no second chance. The first check waits out the node's own post-hello burst
+# window (BLE_HYDRATE_BURST_CLEAR_DELAY_S=12s) with a few seconds of margin --
+# checking any earlier risks mistaking a burst that is still draining for a
+# stuck cache. The two retries after that are silent (a slow sweep or a
+# transient skip is unremarkable); only once the cadence reaches the steady
+# 600s interval does incompleteness become worth a WARNING.
+BLE_RECONCILE_FIRST_CHECK_DELAY_S = 15.0
+BLE_RECONCILE_BACKOFF_DELAY_S = 60.0
+BLE_RECONCILE_STEADY_INTERVAL_S = 600.0
+
 # Minimum movement, in degrees, before the node's live GPS position is written
 # back to the runtime overlay. NOT a debounce against jitter alone: MeshCom
 # firmware rounds the fix to 4 decimals (`cround4` in gps_functions.cpp, ~11 m),
@@ -187,6 +212,12 @@ class MessageRouter:
         # _shutdown_services needs a handle to cancel it before the BLE client
         # is torn down under it. See schedule_ble_register_hydration.
         self._ble_hydration_task: asyncio.Task[None] | None = None
+        # The one in-flight register-completeness reconciler, or None. Same
+        # reasoning as `_ble_hydration_task` re: why this lives on the router
+        # rather than a local — plus `_shutdown_services` needs a handle to
+        # cancel it before it can re-arm a fresh sweep in response to the one
+        # being torn down under it. See arm_ble_register_reconciler.
+        self._ble_reconcile_task: asyncio.Task[None] | None = None
 
         if message_storage_handler:
             self.subscribe("mesh_message", self._storage_handler)
@@ -1055,25 +1086,226 @@ class MessageRouter:
         with contextlib.suppress(asyncio.CancelledError):
             await task
 
+    def _missing_required_ble_registers(self) -> frozenset[str]:
+        """REQUIRED_BLE_REGISTER_TYPES not yet present in `cached_ble_registers`."""
+        return REQUIRED_BLE_REGISTER_TYPES - self.cached_ble_registers.keys()
+
+    def arm_ble_register_reconciler(self, *, reason: str) -> bool:
+        """Arm the register-completeness reconciler: a LEVEL-triggered watchdog
+        that keeps re-checking `cached_ble_registers` against
+        REQUIRED_BLE_REGISTER_TYPES — instead of the EDGE-triggered one-shot
+        sweeps every other hydration path schedules — until the set is
+        complete or the link drops.
+
+        THE FIX for the 2026-08-21 outage: a deploy that restarts mcapp and
+        ble_service together left `cached_ble_registers` empty forever,
+        because every existing trigger fires once and gives up — the startup
+        re-query races ble_service's ~10s connect pipeline and always loses
+        when both restart together, and a hydration sweep that skips because
+        the link looks disconnected at that instant (main.py's own
+        `_run_ble_register_hydration`) had nothing left armed afterwards. This
+        method is the thing every "the link is connected, or might be soon"
+        event arms instead of (or alongside) a single sweep, so a lost race or
+        a mid-flight skip gets a second, third, and Nth chance rather than
+        silence.
+
+        Call at any of: a transition to CONNECTED (mcapp-initiated, in
+        `BLEClientRemote.connect`/`ensure_connected`, or OBSERVED via an SSE
+        status event in `BLEClientRemote._handle_status`); CONFFIN received
+        (`BLEClientRemote._handle_notification`); the register cache being
+        wiped while the link is still actually connected
+        (`_clear_ble_cache_on_disconnect`, defensive — every current wipe path
+        also marks the client disconnected, so this should be a no-op in
+        practice); and startup finding a connection ble_service kept alive
+        across an mcapp restart (`requery_reused_ble_connection`, which this
+        replaced the one-shot sweep in).
+
+        SINGLE TASK, NOT RE-ARMED ON TOP OF ITSELF. A reconciler already
+        running is left alone — its own next check (at most
+        BLE_RECONCILE_STEADY_INTERVAL_S away) covers whatever just happened,
+        the same "skip beats cancel-and-restart" reasoning as
+        `schedule_ble_register_hydration`. Returns True iff this call started
+        a new reconciler loop, False if one was already armed or no event
+        loop is running — never raises, mirroring that method's contract, for
+        the same reason: every caller is a non-critical background hook that
+        must never be the thing that breaks its caller.
+        """
+        if self._ble_reconcile_task is not None and not self._ble_reconcile_task.done():
+            logger.debug("BLE register reconciler (%s): already armed", reason)
+            return False
+        try:
+            asyncio.get_running_loop()
+        except RuntimeError:
+            logger.debug("BLE register reconciler (%s) not armed: no running event loop", reason)
+            return False
+        self._ble_reconcile_task = asyncio.create_task(self._run_ble_register_reconciler(reason))
+        logger.debug("BLE register reconciler armed (%s)", reason)
+        return True
+
+    async def _reconcile_check_once(self, reason: str, delay: float) -> bool:
+        """One reconciler check. Returns True to keep looping, False to
+        disarm. Split out of `_run_ble_register_reconciler` purely to keep
+        that method's branch count under ruff's ceiling — there is no other
+        caller and no state lives here between calls.
+
+        Bails (returns False) if the BLE client is gone or reports
+        DISCONNECTED/ERROR/DISCONNECTING. Keeps looping (returns True,
+        without asking for a sweep — there is nothing to sweep yet) if it
+        reports CONNECTING. Disarms silently (returns False) once
+        `cached_ble_registers` covers every REQUIRED_BLE_REGISTER_TYPES.
+        Otherwise asks for another sweep via `schedule_ble_register_hydration`
+        (its own single-flight guard may SKIP this — that is fine, it means
+        one is already running, and the caller re-checks on its own cadence
+        regardless of whether that particular request was skipped or acted
+        on) and returns True.
+
+        `delay` is the CURRENT cadence step (the one just slept), passed in
+        only to decide whether THIS check has reached the steady cadence and
+        therefore warrants a WARNING instead of silence — it plays no part
+        in choosing the next delay, which the caller computes.
+
+        CONNECTING IS NOT A DISARM REASON (advisor rework R1b). ble_service
+        pushes `reconnecting` (-> CONNECTING) before `connected` on EVERY
+        connect ladder — verified against ble_service's own connect code and
+        the live 2026-08-21 journal — so a check landing while the link is
+        still mid-connect is the *common* case, not an anomaly: the very
+        first check (15s after arming) races it routinely, as does a check
+        whose `refresh_status()` round trip overlaps a mid-session reconnect.
+        Treating CONNECTING as "disarm" (as this used to) meant the startup
+        arm gave up silently on exactly the fleet-real ordering this whole
+        mechanism exists to survive. The cadence still advances on a
+        CONNECTING check (so a permanently-stuck-CONNECTING link still
+        reaches the steady 600s WARNING eventually, worded slightly
+        differently from the "missing TYPs" one since there is no register
+        list to name yet) — this just doesn't give up on it, and doesn't
+        waste a sweep request on a link that cannot answer one.
+        """
+        client = self._get_ble_client()
+        if client is None:
+            logger.debug("BLE register reconciler (%s): no BLE client, disarming", reason)
+            return False
+        if hasattr(client, "refresh_status"):
+            status = await client.refresh_status()
+        else:
+            status = client.status
+
+        at_steady_cadence = delay >= BLE_RECONCILE_STEADY_INTERVAL_S
+        if status.state == ConnectionState.CONNECTING:
+            if at_steady_cadence:
+                logger.warning(
+                    "BLE register cache still incomplete — link stuck CONNECTING (%s)", reason
+                )
+            return True
+
+        if status.state != ConnectionState.CONNECTED:
+            logger.debug(
+                "BLE register reconciler (%s): link %s, disarming", reason, status.state.value
+            )
+            return False
+
+        missing = self._missing_required_ble_registers()
+        if not missing:
+            logger.debug(
+                "BLE register reconciler (%s): required registers complete, disarming", reason
+            )
+            return False
+
+        if at_steady_cadence:
+            logger.warning(
+                "BLE register cache incomplete, missing TYPs %s (%s)", sorted(missing), reason
+            )
+        self.schedule_ble_register_hydration(
+            reason=f"register reconciler ({reason})", after_hello=False
+        )
+        return True
+
+    async def _run_ble_register_reconciler(self, reason: str) -> None:
+        """Body of the reconciler loop armed by `arm_ble_register_reconciler`.
+        Never call directly — the task handle and the "one at a time"
+        guarantee live in that method, not here.
+
+        Cadence: sleep BLE_RECONCILE_FIRST_CHECK_DELAY_S, check; if still
+        incomplete, sleep BLE_RECONCILE_BACKOFF_DELAY_S, check; from then on
+        sleep BLE_RECONCILE_STEADY_INTERVAL_S between checks. See
+        `_reconcile_check_once` for what one check actually does.
+
+        NEVER RAISES, by the same construction and for the same reason as
+        `_run_ble_register_hydration`: this runs fully detached from whatever
+        armed it.
+        """
+        delay = BLE_RECONCILE_FIRST_CHECK_DELAY_S
+        try:
+            while True:
+                await asyncio.sleep(delay)
+                if not await self._reconcile_check_once(reason, delay):
+                    return
+                delay = (
+                    BLE_RECONCILE_STEADY_INTERVAL_S
+                    if delay >= BLE_RECONCILE_BACKOFF_DELAY_S
+                    else BLE_RECONCILE_BACKOFF_DELAY_S
+                )
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception("BLE register reconciler (%s) failed", reason)
+        finally:
+            # R2 hardening: clear the handle only if it still points at THIS
+            # task. `cancel_ble_register_reconciler` nulls the handle itself
+            # before cancelling, but if a NEW arm lands in the window between
+            # that null and this (cancelled) task's `finally` actually
+            # running, an unconditional clear here would wipe out the new
+            # task's handle instead of this dead one's -- leaving an armed
+            # reconciler running untracked, invisible to shutdown and to a
+            # later `arm_ble_register_reconciler`'s "already armed" check.
+            if self._ble_reconcile_task is asyncio.current_task():
+                self._ble_reconcile_task = None
+
+    async def cancel_ble_register_reconciler(self) -> None:
+        """Cancel and reap an armed reconciler. Called from the shutdown
+        ladder BEFORE `cancel_ble_register_hydration`, so it cannot re-arm a
+        fresh sweep in response to the hydration task being torn down under
+        it."""
+        task = self._ble_reconcile_task
+        self._ble_reconcile_task = None
+        if task is None or task.done():
+            return
+        task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await task
+
     async def requery_reused_ble_connection(self) -> None:
-        """Schedule the register sweep a fresh BLE connect would have got, for
-        the case where this process (mcapp) starts up and finds the remote
-        `ble_service` already holding a connection from BEFORE the restart.
+        """Arm the register-completeness reconciler for the case where this
+        process (mcapp) starts up and finds the remote `ble_service` already
+        holding a connection from BEFORE the restart — or, since a deploy
+        restarts both processes together, about to finish establishing one.
 
         `ble_service` is a separate, long-lived process; a plain `mcapp`
         restart never re-triggers the device's own hello handshake, so the
         firmware's auto-config push (the only thing that normally delivers the
         register set — see `_query_ble_registers`'s docstring) never fires
         either. Called once from `build_app()` right after
-        `ble_client.start()`; a no-op when nothing is connected yet (e.g.
-        disabled BLE mode, or the device just isn't paired right now).
+        `ble_client.start()`; a no-op when no BLE client is registered at all
+        (e.g. disabled BLE mode).
 
-        SCHEDULES, IT NO LONGER SWEEPS INLINE. It used to `await` the sweep,
-        which was affordable while that meant three commands (~2.4 s) and is
-        not now that it means ten (~9 s): `build_app()` calls this before the
-        SSE server binds, so every second spent here is a second the proxy
-        answers nothing on :8080. The bound that used to protect startup
-        (BLE_REQUERY_TIMEOUT_S) now protects the background task instead.
+        THE ALREADY-CONNECTED CASE IS UNCHANGED: if `client.status.state` is
+        already CONNECTED here, `ble_service` was fully up before this process
+        even started, there was never a race to lose, and the sweep is still
+        scheduled immediately, exactly as before.
+
+        THE NOT-YET-CONNECTED CASE NO LONGER GIVES UP — this is the
+        2026-08-21 outage fix. `ble_client.start()` returns after a single
+        status check, long before ble_service's own connect pipeline
+        (~2 s ExecStartPre + 8 s AUTO_CONNECT_DELAY, ~10 s total) has
+        necessarily finished, so `client.status.state` here was routinely
+        still DISCONNECTED/CONNECTING whenever both processes restarted
+        together — a race the old version always lost by simply returning,
+        leaving `cached_ble_registers` empty forever with nothing armed.
+        Arming the reconciler instead fixes that: its own first check runs
+        ~15 s later (BLE_RECONCILE_FIRST_CHECK_DELAY_S), which is enough
+        slack for the connect pipeline to land, and if the client genuinely
+        never connects (nothing paired, or BLE really is disabled) that first
+        check just finds it still not CONNECTED and disarms itself — no harm
+        done, no sweep ever issued.
 
         Still self-contained by construction, because the caller cannot afford
         the other failure mode either: this NEVER RAISES. The call site sits
@@ -1082,23 +1314,19 @@ class MessageRouter:
         DISABLED BLE mode for the entire process lifetime. Letting a failed
         register refresh reach that handler would trade the mesh link for a
         weather seed.
-
-        `client.status` is the local cache, deliberately, not an
-        `await refresh_status()`: `start()` has just refreshed it from the
-        remote service one statement earlier, so a second HTTP round trip
-        would only add a way for startup to hang. The sweep itself re-checks
-        against the service once it is safely off the startup path.
         """
         try:
             client = self._get_ble_client()
-            # `client` is deliberately `Any` (the protocol registry is untyped),
-            # so the connection probe lives inside the guard too rather than
-            # trusting a duck-typed object's `.status` not to blow up.
-            if client is None or client.status.state != ConnectionState.CONNECTED:
+            if client is None:
                 return
-            self.schedule_ble_register_hydration(
-                reason="startup re-query of a reused BLE connection",
-                after_hello=False,  # no connect happened, so no burst to clear
+            if client.status.state == ConnectionState.CONNECTED:
+                self.schedule_ble_register_hydration(
+                    reason="startup re-query of a reused BLE connection",
+                    after_hello=False,  # no connect happened, so no burst to clear
+                )
+                return
+            self.arm_ble_register_reconciler(
+                reason="startup re-query of a reused (or still-connecting) BLE connection",
             )
         except Exception:
             logger.exception("Startup register re-query on the reused BLE connection failed")
@@ -1233,6 +1461,11 @@ class MessageRouter:
                 # Already connected -> no hello happened, nothing to wait out.
                 after_hello=not already_connected,
             )
+            # Also arm the level-triggered reconciler, not just this one-shot
+            # sweep: a fresh connect is exactly the kind of CONNECTED
+            # transition that should get retried on the reconciler's own
+            # cadence if this sweep is skipped or lands short.
+            self.arm_ble_register_reconciler(reason="legacy 'connect BLE' command")
 
     async def _handle_ble_disconnect_command(self) -> None:
         """Handle BLE disconnect command"""
@@ -1324,6 +1557,7 @@ class MessageRouter:
                 reason="legacy 'info BLE' command",
                 after_hello=False,
             )
+            self.arm_ble_register_reconciler(reason="legacy 'info BLE' command")
 
     async def _backend_resolve_ip(self, hostname: str) -> None:
         """Resolve hostname to IP address and publish result."""
@@ -1710,12 +1944,29 @@ def _wire_ble_caches(message_router: MessageRouter) -> None:
     message_router.subscribe("ble_notification", _cache_ble_register)
 
     async def _clear_ble_cache_on_disconnect(routed_message: dict[str, Any]) -> None:
-        """Clear BLE register cache when device disconnects."""
+        """Clear BLE register cache when device disconnects.
+
+        Every current wipe path (`BLEClientRemote.disconnect`, the real
+        disconnect branch in `_handle_status`, and the SSE-loss grace-period
+        handler) also marks the client itself DISCONNECTED at essentially the
+        same moment, so the defensive check below should be a no-op in
+        practice. It exists anyway because a wipe that ever fired while the
+        underlying link is ACTUALLY still connected — some future caller, or
+        a reordering under this one — would otherwise sit unrepaired until an
+        unrelated event happened to re-arm recovery: cheap insurance, not a
+        currently reachable path.
+        """
         data = routed_message["data"]
         cmd = data.get("command", "")
         if "disconnect" in cmd and data.get("result") in ("ok", "lost"):
             message_router.cached_ble_registers.clear()
             logger.info("BLE register cache cleared (disconnect)")
+            client = message_router.get_protocol("ble_client")
+            status = getattr(client, "status", None) if client is not None else None
+            if status is not None and status.state == ConnectionState.CONNECTED:
+                message_router.arm_ble_register_reconciler(
+                    reason="BLE register cache wiped while still connected"
+                )
 
     message_router.subscribe("ble_status", _clear_ble_cache_on_disconnect)
 
@@ -2343,6 +2594,11 @@ async def _shutdown_services(ctx: AppContext) -> None:
     # are torn down under them.
     await ctx.command_handler.stop_linkcheck()
     await ctx.command_handler.stop_ctcping()
+
+    # The reconciler is cancelled first: it can re-arm a fresh hydration sweep
+    # in response to the one below being cancelled out from under it, so it
+    # has to stop asking before the hydration task it asks is reaped.
+    await ctx.message_router.cancel_ble_register_reconciler()
 
     # A hydration sweep can sit for ~12 s in its burst-clearing sleep and then
     # spend ~9 s issuing register commands, so it must be reaped BEFORE the BLE

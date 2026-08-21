@@ -399,6 +399,7 @@ class BLEClientRemote(BLEClientBase):
                 self._status.device_address = mac
                 self._last_connect_attempt = 0  # Reset cooldown on success
                 await self._publish_status("connect BLE result", "ok", f"Connected to {mac}")
+                self._arm_ble_register_reconciler(reason="BLEClientRemote.connect succeeded")
             else:
                 self._status.state = ConnectionState.ERROR
                 self._status.error = response.get("message", "Connection failed")
@@ -486,6 +487,7 @@ class BLEClientRemote(BLEClientBase):
             self._status.device_address = mac
             self._last_connect_attempt = 0
             await self._publish_status("connect BLE result", "ok", f"Connected to {mac}")
+            self._arm_ble_register_reconciler(reason="BLEClientRemote.ensure_connected succeeded")
         else:
             self._status.state = ConnectionState.ERROR
             self._status.error = message or "Connection failed"
@@ -729,6 +731,7 @@ class BLEClientRemote(BLEClientBase):
                     response.raise_for_status()
                     self._sse_backoff = SSE_BACKOFF_INITIAL_S  # Reset on successful connection
                     self._rehydrate_after_sse_recovery()
+                    await self._replay_cached_registers()
 
                     event_type: str = ""
                     event_data: str = ""
@@ -856,6 +859,62 @@ class BLEClientRemote(BLEClientBase):
         logger.info("SSE stream recovered — scheduling BLE register re-hydration")
         schedule(reason="mcapp<->ble_service SSE stream recovered", after_hello=False)
 
+    async def _replay_cached_registers(self) -> None:
+        """After the SSE stream (re)establishes, pull whatever register cache
+        `ble_service` itself already holds via `GET /api/ble/registers`, and
+        feed each one through the exact same path a live BLE notification
+        takes — so `_cache_ble_register` and the webapp's SSE both see them
+        identically, and the register-completeness reconciler's next check
+        can find the cache already complete without ever issuing a single RF
+        command.
+
+        Response contract (fixed, ble_service side): `{"registers":
+        {"<TYP>": {...raw 0x44 dict, including "TYP"...}, ...}, "count": N}`,
+        200 with `{}` when nothing is cached yet. The endpoint exists only on
+        a NEW ble_service — an old one 404s, and this must degrade cleanly
+        against that, not break the SSE loop. A connection error (ble_service
+        still mid-restart right as our stream came up) is exactly as
+        non-fatal: both are logged at DEBUG and otherwise silently ignored.
+
+        Runs on EVERY (re)connect, not just recovery from a prior loss —
+        unlike `_rehydrate_after_sse_recovery`, there is no cheap local signal
+        here for "is this the first-ever connect", and asking ble_service for
+        its cache is harmless (and returns `{}`) when there is nothing to
+        replay.
+        """
+        if self.message_router is None:
+            return
+        try:
+            response = await self._request("GET", "/api/ble/registers", retries=0, quiet=True)
+        except BLEServiceError as e:
+            if e.status_code == HTTPStatus.NOT_FOUND:
+                logger.debug("ble_service has no /api/ble/registers endpoint (older version)")
+            else:
+                logger.debug("GET /api/ble/registers failed: %s", e)
+            return
+        except Exception as e:
+            logger.debug("GET /api/ble/registers unreachable (non-fatal): %s", e)
+            return
+
+        registers = response.get("registers")
+        if not isinstance(registers, dict) or not registers:
+            return
+
+        replayed = 0
+        for typ, raw in registers.items():
+            if not isinstance(raw, dict):
+                continue
+            logger.debug("BLE register replay from ble_service cache: TYP=%s", typ)
+            await self._handle_notification(
+                json.dumps({"format": "json", "parsed": raw, "timestamp": now_ms()})
+            )
+            replayed += 1
+        if replayed:
+            logger.info(
+                "Replayed %d cached BLE register(s) from ble_service on SSE (re)connect",
+                replayed,
+            )
+
     async def _handle_notification(self, data: str) -> None:
         """Handle incoming SSE notification"""
         try:
@@ -877,6 +936,13 @@ class BLEClientRemote(BLEClientBase):
                             "timestamp": now_ms(),
                         },
                     )
+                    # CONFFIN claims the node just finished its post-hello
+                    # config burst — arm the reconciler so completeness gets
+                    # verified shortly after, instead of trusting a single
+                    # burst to have actually delivered every REQUIRED
+                    # register (CONFFIN itself carries no completeness
+                    # information, just "I'm done sending").
+                    self._arm_ble_register_reconciler(reason="CONFFIN received")
                     return
 
             # Publish through message router if available
@@ -898,6 +964,23 @@ class BLEClientRemote(BLEClientBase):
     def _get_own_callsign(self) -> str:
         """Get own callsign from message router if available."""
         return getattr(self.message_router, "my_callsign", "") if self.message_router else ""
+
+    def _arm_ble_register_reconciler(self, reason: str) -> None:
+        """Arm the router's register-completeness reconciler, if one is wired.
+
+        Reached through `getattr` rather than an import, same as
+        `_rehydrate_after_sse_recovery` — `main` imports the BLE client
+        factory that imports this module, so importing `main` back would be a
+        cycle. A `message_router` of `None` (e.g. a bare client in a test) or
+        one without the method (a stub) is a silent no-op, never an
+        AttributeError.
+        """
+        if self.message_router is None:
+            return
+        arm = getattr(self.message_router, "arm_ble_register_reconciler", None)
+        if arm is None:
+            return
+        arm(reason=reason)
 
     @staticmethod
     def _finalize_transformed_output(
@@ -1020,6 +1103,54 @@ class BLEClientRemote(BLEClientBase):
         _drop_notification("binary dispatcher returned None", notification)
         return None
 
+    async def _handle_connected_transition(
+        self, old_state: ConnectionState, status: dict[str, Any]
+    ) -> None:
+        """Shared handling for every `_handle_status` transition that lands
+        on CONNECTED, regardless of what state preceded it -- split out of
+        `_handle_status` purely to keep that method's branch count under
+        ruff's ceiling; there is no other caller.
+
+        Device identity fields are refreshed unconditionally: the old code
+        only did this on the DISCONNECTED->CONNECTED path, which meant the
+        far more common CONNECTING->CONNECTED transition (see the caller's
+        comment) left `device_address`/`device_name` stale until some LATER
+        event happened to refresh them.
+
+        The publish stays special-cased to DISCONNECTED->CONNECTED
+        ("BLE auto-reconnected") -- every other predecessor state
+        (CONNECTING, ERROR, DISCONNECTING) already got its own status frame
+        on the way there (STATUS_RECONNECTING's "reconnecting BLE", or the
+        error/disconnect frames above), so publishing a second "connected"
+        frame here would be a duplicate, not new information. The ARM,
+        however, is unconditional: whichever state preceded CONNECTED, the
+        node just went through (or resumed) a hello handshake and may have a
+        register set to (re-)deliver.
+        """
+        self._status.device_address = status.get("device_address")
+        self._status.device_name = status.get("device_name")
+        if old_state == ConnectionState.DISCONNECTED:
+            logger.info("BLE auto-reconnected (remote service restored connection)")
+            await self._publish_status("connect BLE result", "ok", "BLE auto-reconnected")
+        else:
+            logger.info(
+                "BLE remote state changed: %s -> %s",
+                old_state.value,
+                ConnectionState.CONNECTED.value,
+            )
+        # THE 2026-08-21 regression scenario and its fleet-real cousin: this
+        # transition is OBSERVED, not mcapp-initiated -- ble_service
+        # reconnected on its own (auto-reconnect logic, or a restart racing
+        # ours) and told us only via this SSE status event. Nothing else in
+        # this client schedules a sweep for that case:
+        # `connect()`/`ensure_connected()` are not on the call stack, and
+        # `_rehydrate_after_sse_recovery` only fires when THIS client
+        # published the loss first (`_sse_lost_published`), which a link
+        # that came back on ble_service's own initiative never set.
+        # ble_service always hellos on its own connect, so the burst window
+        # applies the same as any other fresh connect.
+        self._arm_ble_register_reconciler(reason="observed BLE reconnect (SSE status)")
+
     async def _handle_status(self, data: str) -> None:
         """Handle SSE status update"""
         try:
@@ -1098,14 +1229,23 @@ class BLEClientRemote(BLEClientBase):
                         await self._publish_status(
                             "disconnect BLE", "lost", "BLE connection lost (device reboot)"
                         )
-                elif (
-                    old_state == ConnectionState.DISCONNECTED
-                    and new_state == ConnectionState.CONNECTED
-                ):
-                    logger.info("BLE auto-reconnected (remote service restored connection)")
-                    self._status.device_address = status.get("device_address")
-                    self._status.device_name = status.get("device_name")
-                    await self._publish_status("connect BLE result", "ok", "BLE auto-reconnected")
+                elif new_state == ConnectionState.CONNECTED:
+                    # ANY transition to CONNECTED arms the reconciler, not
+                    # just the DISCONNECTED->CONNECTED one (advisor rework
+                    # R1a): ble_service pushes `reconnecting` (-> CONNECTING
+                    # here, see the STATUS_RECONNECTING arm above) BEFORE
+                    # `connected` on EVERY connect ladder -- verified against
+                    # ble_service's own connect code and the live 2026-08-21
+                    # journal, which logged
+                    # disconnected->connecting->connected. So
+                    # CONNECTING->CONNECTED, not DISCONNECTED->CONNECTED, is
+                    # the transition that actually fires on the fleet; a
+                    # version that only armed on the latter (as this used to)
+                    # armed nothing on the path that matters. See
+                    # `_handle_connected_transition` for what "arm" means
+                    # here and why the two prior states get different
+                    # logging but the same arm.
+                    await self._handle_connected_transition(old_state, status)
                 else:
                     logger.info(
                         "BLE remote state changed: %s -> %s", old_state.value, new_state.value

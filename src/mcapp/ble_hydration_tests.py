@@ -54,7 +54,7 @@ from fastapi.routing import APIRoute
 from . import ble_client_remote as ble_client_remote_module
 from . import main as main_module
 from .ble_client import BLEMode, BLEStatus, ConnectionState
-from .ble_client_remote import BLEClientRemote
+from .ble_client_remote import BLEClientRemote, BLEServiceError
 from .commands.constants import has_console
 from .main import MessageRouter
 from .schemas import BleEnsureConnectRequest
@@ -178,6 +178,18 @@ class _RecordingBLEClient:
         self.gate: asyncio.Event | None = None
         self.gate_reached: asyncio.Event | None = None
         self.wedge_seconds = 0.0
+        # Reconciler-loop test knob: once `refresh_calls` reaches this count,
+        # every SUBSEQUENT `refresh_status()` call reports DISCONNECTED,
+        # regardless of `self.status`. Lets a reconciler test bound an
+        # otherwise-infinite "stays incomplete forever" loop to a
+        # deterministic number of checks without racing real wall-clock time.
+        self.disconnect_after_calls: int | None = None
+        # Same idea, the other direction: once `refresh_calls` reaches this
+        # count, every SUBSEQUENT `refresh_status()` call reports CONNECTED
+        # (checked before `disconnect_after_calls`, so the latter can still
+        # terminate a test that sets both). Models a link that starts
+        # CONNECTING and lands CONNECTED a fixed number of checks later.
+        self.connected_after_calls: int | None = None
 
     async def refresh_status(self) -> BLEStatus:
         self.refresh_calls += 1
@@ -187,6 +199,16 @@ class _RecordingBLEClient:
             if self.gate_reached is not None:
                 self.gate_reached.set()
             await self.gate.wait()
+        if (
+            self.connected_after_calls is not None
+            and self.refresh_calls >= self.connected_after_calls
+        ):
+            self.status.state = ConnectionState.CONNECTED
+        if (
+            self.disconnect_after_calls is not None
+            and self.refresh_calls >= self.disconnect_after_calls
+        ):
+            self.status.state = ConnectionState.DISCONNECTED
         return self.status
 
     async def send_command(self, cmd: str) -> None:
@@ -247,6 +269,7 @@ class _RecordingRouter:
     def __init__(self, protocol: Any = None) -> None:
         self._protocol = protocol
         self.schedule_calls: list[tuple[str, bool]] = []
+        self.arm_calls: list[str] = []
         self.publishes: list[tuple[str, str, dict[str, Any]]] = []
 
     def get_protocol(self, name: str) -> Any:
@@ -254,6 +277,10 @@ class _RecordingRouter:
 
     def schedule_ble_register_hydration(self, *, reason: str, after_hello: bool) -> bool:
         self.schedule_calls.append((reason, after_hello))
+        return True
+
+    def arm_ble_register_reconciler(self, *, reason: str) -> bool:
+        self.arm_calls.append(reason)
         return True
 
     async def publish(self, source: str, message_type: str, data: dict[str, Any]) -> None:
@@ -722,6 +749,415 @@ async def _test_sse_recovery_hook(record: _RecordFn) -> None:
     )
 
 
+async def _test_reconciler_arms_on_observed_reconnect(record: _RecordFn) -> None:
+    """THE 2026-08-21 regression: a deploy restarts mcapp and ble_service
+    together. ble_service reconnects entirely on its own initiative and tells
+    mcapp only via an SSE status event -- mcapp never called `connect()`, and
+    since no SSE stream loss was ever published, `_rehydrate_after_sse_recovery`'s
+    latch never fires either. Before this fix, NOTHING armed hydration for
+    that case and `cached_ble_registers` stayed empty forever. Also covers the
+    two mcapp-initiated transitions (`connect()`/`ensure_connected()`), which
+    set state directly and never reach `_handle_status` at all."""
+    stub_router = _RecordingRouter()
+    client = BLEClientRemote("http://127.0.0.1:9", message_router=stub_router)
+    client._status.state = ConnectionState.DISCONNECTED
+
+    await client._handle_status(
+        json.dumps(
+            {"state": "connected", "device_address": _DEVICE_MAC, "device_name": _DEVICE_NAME}
+        )
+    )
+    record(
+        "observed reconnect: a DISCONNECTED->CONNECTED SSE status transition arms the "
+        "reconciler even though mcapp initiated nothing and no SSE loss was ever published",
+        stub_router.arm_calls == ["observed BLE reconnect (SSE status)"]
+        and not client._sse_lost_published,
+    )
+    record(
+        "observed reconnect: the auto-reconnected status frame is still published unchanged",
+        any(
+            data.get("command") == "connect BLE result" and data.get("result") == "ok"
+            for _, message_type, data in stub_router.publishes
+            if message_type == "ble_status"
+        ),
+    )
+
+    stub_router.arm_calls.clear()
+    connect_client = BLEClientRemote("http://127.0.0.1:9", message_router=stub_router)
+
+    async def _fake_connect_request(*_a: Any, **_k: Any) -> dict[str, Any]:
+        return {"success": True}
+
+    connect_client._request = _fake_connect_request  # type: ignore[method-assign]
+    connected = await connect_client.connect(_DEVICE_MAC)
+    record(
+        "observed reconnect: a successful mcapp-initiated connect() also arms the reconciler",
+        connected and stub_router.arm_calls == ["BLEClientRemote.connect succeeded"],
+    )
+
+    stub_router.arm_calls.clear()
+    ensure_client = BLEClientRemote("http://127.0.0.1:9", message_router=stub_router)
+
+    async def _fake_ensure_request(*_a: Any, **_k: Any) -> dict[str, Any]:
+        return {"success": True, "message": "", "error_code": None}
+
+    ensure_client._request = _fake_ensure_request  # type: ignore[method-assign]
+    ensure_result = await ensure_client.ensure_connected(_DEVICE_MAC, pin=123456)
+    record(
+        "observed reconnect: a successful ensure_connected() also arms the reconciler",
+        ensure_result["success"] is True
+        and stub_router.arm_calls == ["BLEClientRemote.ensure_connected succeeded"],
+    )
+
+
+async def _test_reconciler_arms_on_connecting_to_connected(record: _RecordFn) -> None:
+    """Advisor rework R1a -- THE FLEET-REAL PATH. ble_service pushes
+    `reconnecting` (-> CONNECTING) BEFORE `connected` on every connect
+    ladder -- verified against ble_service's own connect code and the live
+    2026-08-21 journal, which logged disconnected->connecting->connected.
+    Before this fix, only the DISCONNECTED->CONNECTED branch armed the
+    reconciler; the ordinary CONNECTING->CONNECTED transition fell into a
+    bare `else` that only logs, arming nothing on the transition that
+    actually fires on the fleet."""
+    stub_router = _RecordingRouter()
+    client = BLEClientRemote("http://127.0.0.1:9", message_router=stub_router)
+    client._status.state = ConnectionState.CONNECTING
+
+    await client._handle_status(
+        json.dumps(
+            {"state": "connected", "device_address": _DEVICE_MAC, "device_name": _DEVICE_NAME}
+        )
+    )
+    record(
+        "observed reconnect: the fleet-real CONNECTING->CONNECTED SSE status transition "
+        "arms the reconciler too, not just the DISCONNECTED->CONNECTED one",
+        stub_router.arm_calls == ["observed BLE reconnect (SSE status)"],
+    )
+    record(
+        "observed reconnect: device identity fields are refreshed on this path too, not "
+        "just on the DISCONNECTED->CONNECTED one",
+        client._status.device_address == _DEVICE_MAC and client._status.device_name == _DEVICE_NAME,
+    )
+
+
+async def _test_reconciler_disarms_when_required_complete(
+    record: _RecordFn, sleeps: list[float]
+) -> None:
+    """A cache that already covers every REQUIRED_BLE_REGISTER_TYPES must NOT
+    trigger a redundant ~9s sweep: the reconciler's very first check finds it
+    complete and disarms silently, with zero commands issued."""
+    client = _RecordingBLEClient()
+    router = _make_router(client)
+    router.cached_ble_registers = {
+        typ: {"TYP": typ} for typ in main_module.REQUIRED_BLE_REGISTER_TYPES
+    }
+
+    sleeps.clear()
+    armed = router.arm_ble_register_reconciler(reason="test: already complete")
+    task = router._ble_reconcile_task
+    if task is None:
+        raise RuntimeError("test setup: reconciler did not arm")
+    await asyncio.wait_for(task, timeout=_TASK_JOIN_TIMEOUT_S)
+    record(
+        "reconciler: a cache that already covers every REQUIRED TYP disarms after exactly "
+        "one check and schedules NO sweep",
+        armed
+        and client.commands == []
+        and sleeps == [main_module.BLE_RECONCILE_FIRST_CHECK_DELAY_S],
+    )
+    record(
+        "reconciler: the task handle is cleared on disarm",
+        router._ble_reconcile_task is None,
+    )
+
+
+async def _test_reconciler_ignores_missing_optional(record: _RecordFn, sleeps: list[float]) -> None:
+    """Missing only an OPTIONAL TYP (AN, which does not exist on nRF52
+    hardware at all) must never drive a retry loop -- only
+    REQUIRED_BLE_REGISTER_TYPES decides completeness."""
+    client = _RecordingBLEClient()
+    router = _make_router(client)
+    router.cached_ble_registers = {
+        typ: {"TYP": typ} for typ in main_module.BLE_REGISTER_TYPES if typ != "AN"
+    }
+    if "AN" in router.cached_ble_registers or not (
+        router.cached_ble_registers.keys() >= main_module.REQUIRED_BLE_REGISTER_TYPES
+    ):
+        raise RuntimeError("test setup: fixture does not model 'missing only AN'")
+
+    sleeps.clear()
+    router.arm_ble_register_reconciler(reason="test: only AN missing")
+    task = router._ble_reconcile_task
+    if task is None:
+        raise RuntimeError("test setup: reconciler did not arm")
+    await asyncio.wait_for(task, timeout=_TASK_JOIN_TIMEOUT_S)
+    record(
+        "reconciler: missing only the OPTIONAL TYP 'AN' never drives a retry -- one silent "
+        "check, then disarm",
+        client.commands == [] and sleeps == [main_module.BLE_RECONCILE_FIRST_CHECK_DELAY_S],
+    )
+
+
+async def _test_reconciler_backoff_retry(record: _RecordFn, sleeps: list[float]) -> None:
+    """A cache that stays incomplete retries on the documented cadence -- 15s,
+    then 60s, then every 600s -- until the link itself is reported gone.
+    `schedule_ble_register_hydration` is stubbed out so the cadence and retry
+    count can be pinned exactly, independent of a real sweep's own
+    interleaving (that real interaction is covered separately by
+    `_test_hydration_skip_does_not_disarm_recovery`)."""
+    client = _RecordingBLEClient()
+    client.disconnect_after_calls = 4  # 3 CONNECTED checks, then disconnected on the 4th
+    router = _make_router(client)
+
+    schedule_calls: list[tuple[str, bool]] = []
+
+    def _fake_schedule(*, reason: str, after_hello: bool) -> bool:
+        schedule_calls.append((reason, after_hello))
+        return True
+
+    router.schedule_ble_register_hydration = _fake_schedule  # type: ignore[method-assign]
+
+    sleeps.clear()
+    router.arm_ble_register_reconciler(reason="test: stays incomplete")
+    task = router._ble_reconcile_task
+    if task is None:
+        raise RuntimeError("test setup: reconciler did not arm")
+    await asyncio.wait_for(task, timeout=_TASK_JOIN_TIMEOUT_S)
+
+    record(
+        "reconciler backoff: cadence is 15s, then 60s, then steady 600s",
+        sleeps
+        == [
+            main_module.BLE_RECONCILE_FIRST_CHECK_DELAY_S,
+            main_module.BLE_RECONCILE_BACKOFF_DELAY_S,
+            main_module.BLE_RECONCILE_STEADY_INTERVAL_S,
+            main_module.BLE_RECONCILE_STEADY_INTERVAL_S,
+        ],
+    )
+    record(
+        "reconciler backoff: a sweep is (re-)requested on every check the cache is still "
+        "incomplete at -- three times, not just once, all with after_hello=False",
+        len(schedule_calls) == 3 and all(after_hello is False for _, after_hello in schedule_calls),
+    )
+    record(
+        "reconciler backoff: the loop disarms cleanly (never raises) once the client "
+        "reports disconnected",
+        task.done() and not task.cancelled() and task.exception() is None,
+    )
+    record(
+        "reconciler backoff: refresh_status was consulted once per check, four times total",
+        client.refresh_calls == 4,
+    )
+
+
+async def _test_reconciler_keeps_looping_while_connecting(
+    record: _RecordFn, sleeps: list[float]
+) -> None:
+    """Advisor rework R1b -- CONNECTING must NOT disarm the reconciler. Before
+    this fix, a check landing on CONNECTING (ble_service's own connect ladder
+    mid-flight, or a `refresh_status()` snapshot racing a reconnect) hit the
+    same "anything other than CONNECTED -> disarm" branch as a genuine
+    DISCONNECTED/ERROR, giving up permanently on the fleet-real ordering
+    where the very first check (15s after arming) routinely lands before
+    ble_service's connect ladder has finished. The loop must keep looping
+    (no disarm, no wasted sweep request) while CONNECTING, then sweep
+    normally the moment a later check finds CONNECTED."""
+    client = _RecordingBLEClient(state=ConnectionState.CONNECTING)
+    client.connected_after_calls = 3  # checks 1-2 see CONNECTING, check 3 sees CONNECTED
+    client.disconnect_after_calls = 8  # bounds the loop well past one full sweep completing
+    router = _make_router(client)
+
+    sleeps.clear()
+    router.arm_ble_register_reconciler(reason="test: stays connecting then connects")
+    task = router._ble_reconcile_task
+    if task is None:
+        raise RuntimeError("test setup: reconciler did not arm")
+    await asyncio.wait_for(task, timeout=_TASK_JOIN_TIMEOUT_S)
+    # As with the hydration-skip test above: the reconciler disarming only
+    # means ITS OWN loop stopped -- the sweep it last scheduled is a separate
+    # task that keeps running independently, so wait for that too before
+    # inspecting `client.commands`.
+    hydration_task = router._ble_hydration_task
+    if hydration_task is not None:
+        await asyncio.wait_for(hydration_task, timeout=_TASK_JOIN_TIMEOUT_S)
+
+    record(
+        "reconciler CONNECTING: the first two checks (CONNECTING) neither disarm nor "
+        "request a sweep -- the cadence just advances, 15s then 60s",
+        sleeps[:2]
+        == [
+            main_module.BLE_RECONCILE_FIRST_CHECK_DELAY_S,
+            main_module.BLE_RECONCILE_BACKOFF_DELAY_S,
+        ],
+    )
+    record(
+        "reconciler CONNECTING: once a later check finds CONNECTED, the reconciler goes on "
+        "to drive a full register sweep to completion",
+        tuple(client.commands[: len(EXPECTED_REGISTER_COMMANDS)]) == EXPECTED_REGISTER_COMMANDS,
+    )
+    record(
+        "reconciler CONNECTING: the loop completes cleanly (never raises)",
+        task.done() and not task.cancelled() and task.exception() is None,
+    )
+
+
+async def _test_reconciler_finally_guard_survives_interleaved_arm(record: _RecordFn) -> None:
+    """Advisor rework R2 -- hardening. `cancel_ble_register_reconciler` nulls
+    the handle BEFORE cancelling and awaiting the old task. If a NEW arm
+    lands in the window between that null and the old (now-cancelled)
+    task's `finally` actually running, the old task's finally must not wipe
+    out the new task's handle -- an untracked reconciler surviving
+    shutdown/replacement invisibly. Driven by hand here rather than raced,
+    to make the exact ordering deterministic."""
+    client = _RecordingBLEClient()
+    router = _make_router(client)
+
+    router.arm_ble_register_reconciler(reason="first")
+    old_task = router._ble_reconcile_task
+    if old_task is None:
+        raise RuntimeError("test setup: reconciler did not arm")
+    await asyncio.sleep(0)  # let old_task start and suspend inside its own try block
+
+    # Simulate cancel_ble_register_reconciler's first half by hand: null the
+    # handle, then cancel -- WITHOUT yet awaiting the task. This is exactly
+    # the window the advisor's race lands in.
+    router._ble_reconcile_task = None
+    old_task.cancel()
+
+    # A new arm lands in that window, exactly as an SSE-driven arm could.
+    new_armed = router.arm_ble_register_reconciler(reason="second, races the first's teardown")
+    new_task = router._ble_reconcile_task
+    record(
+        "finally guard: a new arm during the old task's teardown window succeeds",
+        new_armed and new_task is not None and new_task is not old_task,
+    )
+
+    with contextlib.suppress(asyncio.CancelledError):
+        await old_task
+    record(
+        "finally guard: the old task's finally does not clear the NEW task's handle",
+        router._ble_reconcile_task is new_task,
+    )
+
+    if new_task is not None:
+        new_task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await new_task
+
+
+async def _test_hydration_skip_does_not_disarm_recovery(record: _RecordFn) -> None:
+    """Bug (3): `_run_ble_register_hydration`'s not-connected skip used to be
+    the only thing that happened after a lost race -- it consumed the single
+    trigger and left nothing armed, so recovery never got a second chance.
+    Shown in two parts: the skip is orthogonal to the reconciler's own
+    task-tracking (it is called directly, bypassing
+    `schedule_ble_register_hydration`'s single-flight bookkeeping entirely),
+    and a reconciler armed around the same time still goes on to drive a full
+    sweep to completion regardless of that earlier, unrelated skip."""
+    client = _RecordingBLEClient(state=ConnectionState.DISCONNECTED)
+    router = _make_router(client)
+
+    await router._run_ble_register_hydration(0, "unrelated sweep, link looked down")
+    record(
+        "hydration skip: issues zero commands and leaves no hydration task registered",
+        client.commands == [] and router._ble_hydration_task is None,
+    )
+
+    # The link is fine and something (any of the CONNECTED-transition hooks in
+    # production) arms recovery moments later.
+    client.status.state = ConnectionState.CONNECTED
+    client.disconnect_after_calls = 10  # bounds the loop; ample budget for one full sweep
+    armed = router.arm_ble_register_reconciler(reason="post-skip recovery")
+    record("hydration skip: recovery can still be armed after an earlier, unrelated skip", armed)
+    task = router._ble_reconcile_task
+    if task is None:
+        raise RuntimeError("test setup: reconciler did not arm")
+
+    await asyncio.wait_for(task, timeout=_TASK_JOIN_TIMEOUT_S)
+    # The reconciler disarming (task done) only means ITS OWN loop stopped --
+    # the last sweep IT scheduled is a separate task that keeps running
+    # independently (it does not re-check status between commands once
+    # started), so the actual register sequence isn't guaranteed to have
+    # landed yet. Wait for that sweep too before inspecting `client.commands`.
+    hydration_task = router._ble_hydration_task
+    if hydration_task is not None:
+        await asyncio.wait_for(hydration_task, timeout=_TASK_JOIN_TIMEOUT_S)
+    record(
+        "hydration skip: the reconciler armed afterwards still drives a full register sweep "
+        "to completion -- the earlier skip did not permanently disarm recovery",
+        tuple(client.commands[: len(EXPECTED_REGISTER_COMMANDS)]) == EXPECTED_REGISTER_COMMANDS,
+    )
+    record(
+        "hydration skip: the reconciler completes cleanly (never raises)",
+        task.done() and not task.cancelled() and task.exception() is None,
+    )
+
+
+async def _test_sse_register_replay(record: _RecordFn) -> None:
+    """Task 3 (agent B's contract): after the SSE stream (re)establishes,
+    `GET /api/ble/registers` replays ble_service's own register cache through
+    the SAME notification path a live BLE frame takes, so `_cache_ble_register`
+    and the webapp's SSE see them identically and the reconciler's next check
+    can find the cache already complete without ever touching the radio. A
+    404 (older ble_service without the endpoint) or a connection error must
+    both be non-fatal."""
+    stub_router = MessageRouter(None)
+    main_module._wire_ble_caches(stub_router)
+    client = BLEClientRemote("http://127.0.0.1:9", message_router=stub_router)
+
+    registers = {
+        "I": {"TYP": "I", "CALL": "DK5EN-98"},
+        "SN": {"TYP": "SN"},
+        "G": {"TYP": "G", "LAT": 48.4, "LON": 16.3},
+        "SA": {"TYP": "SA"},
+    }
+    calls: list[tuple[str, str]] = []
+
+    async def _fake_request(method: str, endpoint: str, *_a: Any, **_k: Any) -> dict[str, Any]:
+        calls.append((method, endpoint))
+        return {"registers": registers, "count": len(registers)}
+
+    client._request = _fake_request  # type: ignore[method-assign]
+    await client._replay_cached_registers()
+
+    record(
+        "SSE replay: GET /api/ble/registers is called exactly once",
+        calls == [("GET", "/api/ble/registers")],
+    )
+    record(
+        "SSE replay: every replayed register lands in cached_ble_registers via the same "
+        "path a live notification takes",
+        stub_router.cached_ble_registers.keys() == registers.keys()
+        and stub_router.cached_ble_registers["I"]["CALL"] == "DK5EN-98",
+    )
+
+    # A 404 (older ble_service, no such endpoint) is non-fatal.
+    no_endpoint_router = MessageRouter(None)
+    main_module._wire_ble_caches(no_endpoint_router)
+    no_endpoint_client = BLEClientRemote("http://127.0.0.1:9", message_router=no_endpoint_router)
+
+    async def _fake_404(*_a: Any, **_k: Any) -> dict[str, Any]:
+        raise BLEServiceError("not found", status_code=404)
+
+    no_endpoint_client._request = _fake_404  # type: ignore[method-assign]
+    await no_endpoint_client._replay_cached_registers()  # must not raise
+    record(
+        "SSE replay: a 404 (older ble_service, no such endpoint) is non-fatal and caches nothing",
+        no_endpoint_router.cached_ble_registers == {},
+    )
+
+    # A connection error is equally non-fatal.
+    async def _fake_unreachable(*_a: Any, **_k: Any) -> dict[str, Any]:
+        raise RuntimeError("Connection error: refused")
+
+    no_endpoint_client._request = _fake_unreachable  # type: ignore[method-assign]
+    await no_endpoint_client._replay_cached_registers()  # must not raise
+    record(
+        "SSE replay: a connection error is equally non-fatal",
+        no_endpoint_router.cached_ble_registers == {},
+    )
+
+
 async def _test_schedule_without_event_loop(record: _RecordFn) -> None:
     """Scheduling from a thread with no running loop reports False instead of
     raising — callers must never break because scheduling was impossible.
@@ -904,6 +1340,15 @@ async def run_ble_hydration_tests() -> bool:
         await _test_timeout_bound(_record)
         await _test_route_gating(_record)
         await _test_sse_recovery_hook(_record)
+        await _test_reconciler_arms_on_observed_reconnect(_record)
+        await _test_reconciler_arms_on_connecting_to_connected(_record)
+        await _test_reconciler_disarms_when_required_complete(_record, sleeps)
+        await _test_reconciler_ignores_missing_optional(_record, sleeps)
+        await _test_reconciler_backoff_retry(_record, sleeps)
+        await _test_reconciler_keeps_looping_while_connecting(_record, sleeps)
+        await _test_reconciler_finally_guard_survives_interleaved_arm(_record)
+        await _test_hydration_skip_does_not_disarm_recovery(_record)
+        await _test_sse_register_replay(_record)
         await _test_schedule_without_event_loop(_record)
         await _test_undecodable_binary_dropped(_record)
         await _test_raw_format_fragment_dropped(_record)
