@@ -1,6 +1,6 @@
 [project]
 name = "mcapp-ble-service"
-version = "2.0.0"
+version = "2.0.1"
 description = "Remote BLE service for McApp MeshCom gateway"
 readme = "README.md"
 requires-python = ">=3.11"
