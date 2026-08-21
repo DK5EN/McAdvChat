@@ -637,6 +637,324 @@ def _test_notification_callback_malformed_frame_distinguished_from_truncation(
         restore_side_effects()
 
 
+async def _test_register_cache_write_and_overwrite(record: Any) -> None:
+    """A cleanly-parsed `D{...}` register frame lands in `state.register_cache`
+    keyed by its `TYP`; a second frame with the SAME `TYP` overwrites
+    (last-write-wins), and a frame with a DIFFERENT `TYP` is added alongside
+    the first rather than replacing it."""
+    restore_side_effects = _snapshot_side_effects()
+    original_cache = dict(ble_main.state.register_cache)
+    try:
+        ble_main.state.register_cache.clear()
+
+        ble_main.notification_callback(b'D{"TYP":"I","callsign":"DK5EN-98"}\x00\x00')
+        record(
+            "register cache: a parsed I-register frame lands in the cache",
+            ble_main.state.register_cache.get("I") == {"TYP": "I", "callsign": "DK5EN-98"},
+        )
+
+        ble_main.notification_callback(b'D{"TYP":"I","callsign":"DK5EN-99"}\x00\x00')
+        record(
+            "register cache: a second frame with the SAME TYP overwrites (last-write-wins)",
+            ble_main.state.register_cache.get("I") == {"TYP": "I", "callsign": "DK5EN-99"},
+        )
+        record(
+            "register cache: overwriting one TYP does not create a second entry for it",
+            len(ble_main.state.register_cache) == 1,
+        )
+
+        ble_main.notification_callback(b'D{"TYP":"SN","fw":"4.35p.07.24"}\x00\x00')
+        record(
+            "register cache: a different TYP is added ALONGSIDE the first, not instead of it",
+            ble_main.state.register_cache.get("I") == {"TYP": "I", "callsign": "DK5EN-99"}
+            and ble_main.state.register_cache.get("SN") == {"TYP": "SN", "fw": "4.35p.07.24"},
+        )
+    finally:
+        ble_main.state.register_cache.clear()
+        ble_main.state.register_cache.update(original_cache)
+        restore_side_effects()
+
+
+async def _test_registers_endpoint_contract_shape(record: Any) -> None:
+    """`GET /api/ble/registers` must return exactly the contract the mcapp
+    client (Wave A, built in parallel against this same contract) is coded
+    against: `{"registers": {"<TYP>": {...}}, "count": <int>}`, 200 always,
+    `registers: {}` / `count: 0` when nothing has been cached yet.
+    """
+    original_key = ble_main.API_KEY
+    ble_main.API_KEY = ""
+    original_cache = dict(ble_main.state.register_cache)
+    try:
+        client = TestClient(ble_main.app)
+
+        ble_main.state.register_cache.clear()
+        response_empty = client.get("/api/ble/registers")
+        record(
+            "/api/ble/registers: 200 with an empty dict/count 0 when nothing is cached",
+            response_empty.status_code == 200
+            and response_empty.json() == {"registers": {}, "count": 0},
+        )
+
+        ble_main.state.register_cache["I"] = {"TYP": "I", "callsign": "DK5EN-98"}
+        ble_main.state.register_cache["SN"] = {"TYP": "SN", "fw": "4.35p.07.24"}
+        body = client.get("/api/ble/registers").json()
+        record(
+            "/api/ble/registers: registers is keyed by TYP with the parsed dict verbatim "
+            "(TYP field included) and count matches the number of cached TYPs",
+            body
+            == {
+                "registers": {
+                    "I": {"TYP": "I", "callsign": "DK5EN-98"},
+                    "SN": {"TYP": "SN", "fw": "4.35p.07.24"},
+                },
+                "count": 2,
+            },
+        )
+    finally:
+        ble_main.state.register_cache.clear()
+        ble_main.state.register_cache.update(original_cache)
+        ble_main.API_KEY = original_key
+
+
+async def _test_register_cache_excludes_conffin_and_mh(record: Any) -> None:
+    """`CONFFIN` (a burst-terminator marker, not a config value) and `MH` (a
+    rolling mheard list, not a stable register) must never be cached --
+    caching either would misrepresent a marker or a rolling list as if it
+    were steady device config. A genuine register TYP right after both must
+    still be cached, proving the exclusion is specific, not a general
+    regression of the caching path."""
+    restore_side_effects = _snapshot_side_effects()
+    original_cache = dict(ble_main.state.register_cache)
+    try:
+        ble_main.state.register_cache.clear()
+
+        ble_main.notification_callback(b'D{"TYP":"CONFFIN"}\x00\x00')
+        record(
+            "register cache: CONFFIN is never cached (a burst terminator, not a register)",
+            ble_main.state.register_cache == {},
+        )
+
+        ble_main.notification_callback(b'D{"TYP":"MH","CALL":"OE5HWN-12"}\x00\x00')
+        record(
+            "register cache: MH is never cached (a rolling mheard list -- 'last MH' "
+            "would misrepresent it as steady config)",
+            ble_main.state.register_cache == {},
+        )
+
+        ble_main.notification_callback(b'D{"TYP":"IO","gpio":1}\x00\x00')
+        record(
+            "register cache: a genuine register TYP right after CONFFIN/MH IS cached "
+            "(the exclusion is specific, not a general regression)",
+            ble_main.state.register_cache.get("IO") == {"TYP": "IO", "gpio": 1},
+        )
+    finally:
+        ble_main.state.register_cache.clear()
+        ble_main.state.register_cache.update(original_cache)
+        restore_side_effects()
+
+
+async def _test_register_cache_unaffected_by_truncated_or_malformed_frames(record: Any) -> None:
+    """A truncated frame (the firmware's 245-byte producer clamp cutting a
+    payload mid-field) or a malformed-but-closed one (the M4 discard path --
+    see `_decode_register_frame`) must never reach the cache at all: neither
+    ever parses to a dict, so `_cache_register_if_applicable` is never even
+    called for them -- there is no partial-register concept anywhere in this
+    path (see `_decode_register_frame`'s docstring)."""
+    _handler, restore_logs = _capture_logs(ble_main.logger)
+    restore_side_effects = _snapshot_side_effects()
+    original_cache = dict(ble_main.state.register_cache)
+    try:
+        ble_main.state.register_cache.clear()
+
+        truncated = b'D{"TYP":"I","callsign":"DK5EN-98","firmware":"4.35p.07.2'
+        ble_main.notification_callback(truncated)
+        record(
+            "register cache: a truncated D{ frame does not pollute the cache",
+            ble_main.state.register_cache == {},
+        )
+
+        malformed = b'D{"TYP":"I","callsign":"DK5EN-98",}'
+        ble_main.notification_callback(malformed)
+        record(
+            "register cache: a malformed-but-closed D{ frame does not pollute the cache either",
+            ble_main.state.register_cache == {},
+        )
+    finally:
+        ble_main.state.register_cache.clear()
+        ble_main.state.register_cache.update(original_cache)
+        restore_logs()
+        restore_side_effects()
+
+
+async def _test_register_cache_cleared_on_target_change(record: Any) -> None:
+    """`_note_register_cache_target` must clear `state.register_cache` when
+    the connect TARGET changes to a different MAC, but must KEEP it across a
+    reconnect to the SAME device (a plain disconnect/reconnect) -- staleness
+    across a reconnect to the same node is the deliberate trade-off (see the
+    helper's docstring), but a cache from node X must never be attributed to
+    node Y. Also checks (via AST, not a live connect -- avoiding the real
+    HELLO_SETTLE_DELAY_S/POST_CONNECT_SETTLE_S sleeps) that both real connect
+    entry points actually call the helper, since a correct helper nobody
+    calls would pass every assertion above and still ship the bug.
+    """
+    snapshot = _snapshot_state("register_cache_mac", "post_connect_init")
+    original_cache = dict(ble_main.state.register_cache)
+    try:
+        ble_main.state.register_cache.clear()
+        ble_main.state.register_cache_mac = None
+
+        # First-ever call: nothing to clear (cache is already empty).
+        ble_main._note_register_cache_target("AA:BB:CC:DD:EE:01")
+        ble_main.state.register_cache["I"] = {"TYP": "I", "callsign": "DK5EN-98"}
+        record(
+            "_note_register_cache_target: the first-ever call does not clear an "
+            "already-empty cache",
+            ble_main.state.register_cache == {"I": {"TYP": "I", "callsign": "DK5EN-98"}},
+        )
+
+        # Reconnect to the SAME device (e.g. after a plain disconnect): kept.
+        ble_main._note_register_cache_target("AA:BB:CC:DD:EE:01")
+        record(
+            "_note_register_cache_target: reconnecting to the SAME device keeps the "
+            "cache (a plain disconnect must not blank it)",
+            ble_main.state.register_cache == {"I": {"TYP": "I", "callsign": "DK5EN-98"}},
+        )
+
+        # Connect to a DIFFERENT device: cleared.
+        ble_main._note_register_cache_target("AA:BB:CC:DD:EE:02")
+        record(
+            "_note_register_cache_target: connecting to a DIFFERENT device clears the "
+            "cache -- node X's values must never be attributed to node Y",
+            ble_main.state.register_cache == {},
+        )
+        record(
+            "_note_register_cache_target: the cache's target MAC now tracks the new device",
+            ble_main.state.register_cache_mac == "AA:BB:CC:DD:EE:02",
+        )
+
+        # NOT `inspect.cleandoc()` here (unlike some other AST-check tests in
+        # this file): both functions below are module-level (getsource already
+        # returns them at column 0, directly parseable), and cleandoc's margin
+        # computation over a SINGLE-LINE signature strips the body's own
+        # indentation too -- proven while writing this test: it turned
+        # `_connect_and_initialize`'s body fully flush with its own `def`
+        # line and raised a bare `IndentationError` out of `ast.parse`.
+        connect_init_calls = {
+            node.func.id
+            for node in ast.walk(ast.parse(inspect.getsource(ble_main._connect_and_initialize)))
+            if isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
+        }
+        record(
+            "_connect_and_initialize calls _note_register_cache_target -- covers "
+            "/api/ble/connect, auto-reconnect and startup auto-connect",
+            "_note_register_cache_target" in connect_init_calls,
+        )
+
+        ensure_route_calls = {
+            node.func.id
+            for node in ast.walk(ast.parse(inspect.getsource(ble_main.ensure_connected_route)))
+            if isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
+        }
+        record(
+            "/api/ble/ensure_connected calls _note_register_cache_target too -- it does "
+            "NOT go through _connect_and_initialize, so this would otherwise be a gap",
+            "_note_register_cache_target" in ensure_route_calls,
+        )
+    finally:
+        ble_main.state.register_cache.clear()
+        ble_main.state.register_cache.update(original_cache)
+        _restore_state(snapshot)
+
+
+async def _test_hello_settle_delay_ordering(record: Any) -> None:
+    """`HELLO_SETTLE_DELAY_S` must actually run between enabling
+    notifications and sending hello in BOTH post-connect-init paths --
+    `_connect_and_initialize` (where `start_notify()` is local to it) and
+    `_ensure_connected_post_init` (whose caller, `ensure_connected()`, already
+    ran `start_notify()` before this function is even entered) -- not just be
+    declared as a constant somewhere unused.
+
+    Patches `asyncio.sleep` so nothing really waits, and records every
+    start_notify/send_hello/sleep/query_extended_registers call -- plus the
+    exact delay each sleep was given -- into one ordered list, so the
+    assertion is about actual call ORDER (discriminating: moving the sleep to
+    after send_hello, or dropping it, both change this exact list) rather
+    than merely "the constant is referenced somewhere".
+    """
+    order: list[str] = []
+
+    class _OrderedAdapter:
+        def __init__(self) -> None:
+            self.is_busy = False
+            self.is_connected = True
+
+        def reset_bus(self) -> None:
+            order.append("reset_bus")
+
+        async def connect(self, mac: str) -> bool:
+            order.append("connect")
+            return True
+
+        async def start_notify(self) -> None:
+            order.append("start_notify")
+
+        async def send_hello(self) -> bool:
+            order.append("send_hello")
+            return True
+
+        async def query_extended_registers(self) -> None:
+            order.append("query_extended_registers")
+
+    fake = _OrderedAdapter()
+    original_adapter = ble_main._adapter
+    original_sleep = ble_main.asyncio.sleep
+    snapshot = _snapshot_state("register_cache_mac", "post_connect_init")
+    original_cache = dict(ble_main.state.register_cache)
+
+    async def _fake_sleep(delay: float) -> None:
+        order.append(f"sleep:{delay}")
+
+    ble_main._adapter = cast("Callable[[], BLEAdapter]", lambda: fake)
+    ble_main.asyncio.sleep = _fake_sleep  # type: ignore[assignment]
+    try:
+        await ble_main._connect_and_initialize(_ENSURE_CONNECTED_TEST_MAC)
+        record(
+            "_connect_and_initialize: HELLO_SETTLE_DELAY_S sleep runs strictly between "
+            f"start_notify() and send_hello() -- observed order: {order}",
+            order
+            == [
+                "reset_bus",
+                "connect",
+                "start_notify",
+                f"sleep:{ble_main.HELLO_SETTLE_DELAY_S}",
+                "send_hello",
+                f"sleep:{ble_main.POST_CONNECT_SETTLE_S}",
+                "query_extended_registers",
+            ],
+        )
+
+        order.clear()
+        await ble_main._ensure_connected_post_init(cast("BLEAdapter", fake))
+        record(
+            "_ensure_connected_post_init: also sleeps HELLO_SETTLE_DELAY_S before "
+            "send_hello() -- start_notify already ran inside ensure_connected() by the "
+            f"time this runs, so it is absent from this list -- observed order: {order}",
+            order
+            == [
+                f"sleep:{ble_main.HELLO_SETTLE_DELAY_S}",
+                "send_hello",
+                f"sleep:{ble_main.POST_CONNECT_SETTLE_S}",
+                "query_extended_registers",
+            ],
+        )
+    finally:
+        ble_main.asyncio.sleep = original_sleep
+        ble_main._adapter = original_adapter
+        ble_main.state.register_cache.clear()
+        ble_main.state.register_cache.update(original_cache)
+        _restore_state(snapshot)
+
+
 def _load_state_safe() -> tuple[str | None, str | None]:
     """Call `_load_ble_state()`, capturing rather than propagating a raise —
     the thing under test IS whether it raises, so the test needs to observe
@@ -3733,8 +4051,10 @@ async def _test_reset_bus_gated_on_busy(record: Any) -> None:
     disconnect.
     """
     original_settle = ble_main.POST_CONNECT_SETTLE_S
+    original_hello_settle = ble_main.HELLO_SETTLE_DELAY_S
     original_adapter = ble_main._adapter
     ble_main.POST_CONNECT_SETTLE_S = 0
+    ble_main.HELLO_SETTLE_DELAY_S = 0
     try:
         fake_busy = _FakeResetBusAdapter(busy=True)
         ble_main._adapter = cast("Callable[[], BLEAdapter]", lambda: fake_busy)
@@ -3760,6 +4080,7 @@ async def _test_reset_bus_gated_on_busy(record: Any) -> None:
     finally:
         ble_main._adapter = original_adapter
         ble_main.POST_CONNECT_SETTLE_S = original_settle
+        ble_main.HELLO_SETTLE_DELAY_S = original_hello_settle
 
 
 def _test_connect_route_unchanged(record: Any) -> None:
@@ -3793,6 +4114,7 @@ def _test_ensure_connected_route_auth_boundary(record: Any) -> None:
     original_key = ble_main.API_KEY
     original_file = ble_main.BLE_STATE_FILE
     original_settle = ble_main.POST_CONNECT_SETTLE_S
+    original_hello_settle = ble_main.HELLO_SETTLE_DELAY_S
     fake, original_adapter = _install_ensure_connected_fake_adapter()
     snapshot = _snapshot_state(
         "user_disconnected",
@@ -3809,6 +4131,7 @@ def _test_ensure_connected_route_auth_boundary(record: Any) -> None:
     with tempfile.TemporaryDirectory() as tmp_dir:
         ble_main.BLE_STATE_FILE = pathlib.Path(tmp_dir) / "ble_state.json"
         ble_main.POST_CONNECT_SETTLE_S = 0
+        ble_main.HELLO_SETTLE_DELAY_S = 0
         try:
             ble_main.API_KEY = "supersecretkey123"
             client = TestClient(ble_main.app)
@@ -3853,6 +4176,7 @@ def _test_ensure_connected_route_auth_boundary(record: Any) -> None:
             ble_main._adapter = original_adapter
             ble_main.BLE_STATE_FILE = original_file
             ble_main.POST_CONNECT_SETTLE_S = original_settle
+            ble_main.HELLO_SETTLE_DELAY_S = original_hello_settle
             _restore_state(snapshot)
             restore_side_effects()
 
@@ -4000,6 +4324,7 @@ async def _test_ensure_connected_route_cancels_background_tasks(record: Any) -> 
     fake, original_adapter = _install_ensure_connected_fake_adapter()
     original_file = ble_main.BLE_STATE_FILE
     original_settle = ble_main.POST_CONNECT_SETTLE_S
+    original_hello_settle = ble_main.HELLO_SETTLE_DELAY_S
     snapshot = _snapshot_state(
         "user_disconnected",
         "last_connected_mac",
@@ -4019,6 +4344,7 @@ async def _test_ensure_connected_route_cancels_background_tasks(record: Any) -> 
     with tempfile.TemporaryDirectory() as tmp_dir:
         ble_main.BLE_STATE_FILE = pathlib.Path(tmp_dir) / "ble_state.json"
         ble_main.POST_CONNECT_SETTLE_S = 0
+        ble_main.HELLO_SETTLE_DELAY_S = 0
         try:
             reconnect_task = asyncio.create_task(_hang())
             auto_connect_task = asyncio.create_task(_hang())
@@ -4069,6 +4395,7 @@ async def _test_ensure_connected_route_cancels_background_tasks(record: Any) -> 
             ble_main._adapter = original_adapter
             ble_main.BLE_STATE_FILE = original_file
             ble_main.POST_CONNECT_SETTLE_S = original_settle
+            ble_main.HELLO_SETTLE_DELAY_S = original_hello_settle
             _restore_state(snapshot)
             restore_side_effects()
 
@@ -4134,6 +4461,7 @@ async def _test_ensure_connected_route_error_code_mapping(record: Any) -> None:
 
     original_file = ble_main.BLE_STATE_FILE
     original_settle = ble_main.POST_CONNECT_SETTLE_S
+    original_hello_settle = ble_main.HELLO_SETTLE_DELAY_S
     snapshot = _snapshot_state(
         "user_disconnected",
         "last_connected_mac",
@@ -4149,6 +4477,7 @@ async def _test_ensure_connected_route_error_code_mapping(record: Any) -> None:
     with tempfile.TemporaryDirectory() as tmp_dir:
         ble_main.BLE_STATE_FILE = pathlib.Path(tmp_dir) / "ble_state.json"
         ble_main.POST_CONNECT_SETTLE_S = 0
+        ble_main.HELLO_SETTLE_DELAY_S = 0
         try:
             for result, expected_code in cases:
                 _fake, original_adapter = _install_ensure_connected_fake_adapter(result=result)
@@ -4167,6 +4496,7 @@ async def _test_ensure_connected_route_error_code_mapping(record: Any) -> None:
         finally:
             ble_main.BLE_STATE_FILE = original_file
             ble_main.POST_CONNECT_SETTLE_S = original_settle
+            ble_main.HELLO_SETTLE_DELAY_S = original_hello_settle
             _restore_state(snapshot)
             restore_side_effects()
 
@@ -4220,6 +4550,7 @@ async def _test_ensure_connected_route_pin_required(record: Any) -> None:
     fake, original_adapter = _install_ensure_connected_fake_adapter(fault="disconnect_after_hello")
     original_file = ble_main.BLE_STATE_FILE
     original_settle = ble_main.POST_CONNECT_SETTLE_S
+    original_hello_settle = ble_main.HELLO_SETTLE_DELAY_S
     snapshot = _snapshot_state(
         "user_disconnected",
         "last_connected_mac",
@@ -4235,6 +4566,7 @@ async def _test_ensure_connected_route_pin_required(record: Any) -> None:
     with tempfile.TemporaryDirectory() as tmp_dir:
         ble_main.BLE_STATE_FILE = pathlib.Path(tmp_dir) / "ble_state.json"
         ble_main.POST_CONNECT_SETTLE_S = 0
+        ble_main.HELLO_SETTLE_DELAY_S = 0
         try:
             response = await ble_main.ensure_connected_route(
                 ble_main.EnsureConnectRequest(device_address=_ENSURE_CONNECTED_TEST_MAC)
@@ -4264,6 +4596,7 @@ async def _test_ensure_connected_route_pin_required(record: Any) -> None:
             ble_main._adapter = original_adapter
             ble_main.BLE_STATE_FILE = original_file
             ble_main.POST_CONNECT_SETTLE_S = original_settle
+            ble_main.HELLO_SETTLE_DELAY_S = original_hello_settle
             _restore_state(snapshot)
             restore_side_effects()
 
@@ -4281,6 +4614,7 @@ async def _test_ensure_connected_route_happy_path(record: Any) -> None:
     )
     original_file = ble_main.BLE_STATE_FILE
     original_settle = ble_main.POST_CONNECT_SETTLE_S
+    original_hello_settle = ble_main.HELLO_SETTLE_DELAY_S
     snapshot = _snapshot_state(
         "user_disconnected",
         "last_connected_mac",
@@ -4296,6 +4630,7 @@ async def _test_ensure_connected_route_happy_path(record: Any) -> None:
     with tempfile.TemporaryDirectory() as tmp_dir:
         ble_main.BLE_STATE_FILE = pathlib.Path(tmp_dir) / "ble_state.json"
         ble_main.POST_CONNECT_SETTLE_S = 0
+        ble_main.HELLO_SETTLE_DELAY_S = 0
         try:
             response = await ble_main.ensure_connected_route(
                 ble_main.EnsureConnectRequest(device_address=_ENSURE_CONNECTED_TEST_MAC, pin=123456)
@@ -4329,6 +4664,7 @@ async def _test_ensure_connected_route_happy_path(record: Any) -> None:
             ble_main._adapter = original_adapter
             ble_main.BLE_STATE_FILE = original_file
             ble_main.POST_CONNECT_SETTLE_S = original_settle
+            ble_main.HELLO_SETTLE_DELAY_S = original_hello_settle
             _restore_state(snapshot)
             restore_side_effects()
 
@@ -4429,6 +4765,7 @@ async def _test_ensure_connected_route_disarms_the_pin_probe(record: Any) -> Non
     """
     original_file = ble_main.BLE_STATE_FILE
     original_settle = ble_main.POST_CONNECT_SETTLE_S
+    original_hello_settle = ble_main.HELLO_SETTLE_DELAY_S
     snapshot = _snapshot_state(
         "user_disconnected",
         "last_connected_mac",
@@ -4446,6 +4783,7 @@ async def _test_ensure_connected_route_disarms_the_pin_probe(record: Any) -> Non
     with tempfile.TemporaryDirectory() as tmp_dir:
         ble_main.BLE_STATE_FILE = pathlib.Path(tmp_dir) / "ble_state.json"
         ble_main.POST_CONNECT_SETTLE_S = 0
+        ble_main.HELLO_SETTLE_DELAY_S = 0
         try:
             for label, kwargs in (
                 ("a clean success", {}),
@@ -4506,6 +4844,7 @@ async def _test_ensure_connected_route_disarms_the_pin_probe(record: Any) -> Non
             await _drain_reconnect_task()
             ble_main.BLE_STATE_FILE = original_file
             ble_main.POST_CONNECT_SETTLE_S = original_settle
+            ble_main.HELLO_SETTLE_DELAY_S = original_hello_settle
             _restore_state(snapshot)
             restore_side_effects()
 
@@ -4526,6 +4865,7 @@ async def _test_ensure_connected_route_persists_the_pin(record: Any) -> None:
     """
     original_file = ble_main.BLE_STATE_FILE
     original_settle = ble_main.POST_CONNECT_SETTLE_S
+    original_hello_settle = ble_main.HELLO_SETTLE_DELAY_S
     snapshot = _snapshot_state(
         "user_disconnected",
         "last_connected_mac",
@@ -4543,6 +4883,7 @@ async def _test_ensure_connected_route_persists_the_pin(record: Any) -> None:
     with tempfile.TemporaryDirectory() as tmp_dir:
         ble_main.BLE_STATE_FILE = pathlib.Path(tmp_dir) / "ble_state.json"
         ble_main.POST_CONNECT_SETTLE_S = 0
+        ble_main.HELLO_SETTLE_DELAY_S = 0
         try:
             # --- accepted PIN is persisted ---
             ble_main.state.ble_pin = 111111
@@ -4609,6 +4950,7 @@ async def _test_ensure_connected_route_persists_the_pin(record: Any) -> None:
         finally:
             ble_main.BLE_STATE_FILE = original_file
             ble_main.POST_CONNECT_SETTLE_S = original_settle
+            ble_main.HELLO_SETTLE_DELAY_S = original_hello_settle
             _restore_state(snapshot)
             restore_side_effects()
 
@@ -4629,6 +4971,7 @@ async def _test_reset_bus_gated_on_post_connect_init(record: Any) -> None:
     """
     original_adapter = ble_main._adapter
     original_settle = ble_main.POST_CONNECT_SETTLE_S
+    original_hello_settle = ble_main.HELLO_SETTLE_DELAY_S
     original_file = ble_main.BLE_STATE_FILE
     snapshot = _snapshot_state(
         "user_disconnected",
@@ -4647,8 +4990,10 @@ async def _test_reset_bus_gated_on_post_connect_init(record: Any) -> None:
     with tempfile.TemporaryDirectory() as tmp_dir:
         ble_main.BLE_STATE_FILE = pathlib.Path(tmp_dir) / "ble_state.json"
         ble_main.POST_CONNECT_SETTLE_S = 0
+        ble_main.HELLO_SETTLE_DELAY_S = 0
         try:
             ble_main.POST_CONNECT_SETTLE_S = 0
+            ble_main.HELLO_SETTLE_DELAY_S = 0
             fake_free = _FakeResetBusAdapter(busy=False)
             ble_main._adapter = cast("Callable[[], BLEAdapter]", lambda: fake_free)
             ble_main.state.post_connect_init = 1
@@ -4688,6 +5033,7 @@ async def _test_reset_bus_gated_on_post_connect_init(record: Any) -> None:
             ble_main._adapter = original_adapter
             ble_main.BLE_STATE_FILE = original_file
             ble_main.POST_CONNECT_SETTLE_S = original_settle
+            ble_main.HELLO_SETTLE_DELAY_S = original_hello_settle
             _restore_state(snapshot)
             restore_side_effects()
 
@@ -4706,6 +5052,7 @@ async def _test_ensure_connected_post_init_deadline(record: Any) -> None:
     original_deadline = ble_main.POST_CONNECT_INIT_DEADLINE_S
     original_file = ble_main.BLE_STATE_FILE
     original_settle = ble_main.POST_CONNECT_SETTLE_S
+    original_hello_settle = ble_main.HELLO_SETTLE_DELAY_S
     snapshot = _snapshot_state(
         "user_disconnected",
         "last_connected_mac",
@@ -4723,6 +5070,7 @@ async def _test_ensure_connected_post_init_deadline(record: Any) -> None:
     with tempfile.TemporaryDirectory() as tmp_dir:
         ble_main.BLE_STATE_FILE = pathlib.Path(tmp_dir) / "ble_state.json"
         ble_main.POST_CONNECT_SETTLE_S = 0
+        ble_main.HELLO_SETTLE_DELAY_S = 0
         ble_main.POST_CONNECT_INIT_DEADLINE_S = 0.05
         try:
             response = await ble_main.ensure_connected_route(
@@ -4751,6 +5099,7 @@ async def _test_ensure_connected_post_init_deadline(record: Any) -> None:
             ble_main.POST_CONNECT_INIT_DEADLINE_S = original_deadline
             ble_main.BLE_STATE_FILE = original_file
             ble_main.POST_CONNECT_SETTLE_S = original_settle
+            ble_main.HELLO_SETTLE_DELAY_S = original_hello_settle
             _restore_state(snapshot)
             restore_side_effects()
 
@@ -4784,7 +5133,13 @@ def _test_connect_timeout_budget_nests(record: Any) -> None:
     )
     # The inner deadline still has to be generous enough for the nominal path,
     # or every connect would be cut short instead of only pathological ones.
-    nominal = ble_main.POST_CONNECT_SETTLE_S + 2 * ble_adapter.REGISTER_QUERY_DELAY_S
+    # Includes HELLO_SETTLE_DELAY_S: `_ensure_connected_post_init` sleeps that
+    # long before send_hello() too (see the hello-timing mitigation).
+    nominal = (
+        ble_main.HELLO_SETTLE_DELAY_S
+        + ble_main.POST_CONNECT_SETTLE_S
+        + 2 * ble_adapter.REGISTER_QUERY_DELAY_S
+    )
     record(
         f"timeout budget: POST_CONNECT_INIT_DEADLINE_S ({ble_main.POST_CONNECT_INIT_DEADLINE_S}s) "
         f"leaves >=2x headroom over the nominal post-connect init ({nominal:.1f}s)",
@@ -5118,6 +5473,19 @@ async def run_ble_service_tests() -> bool:
     _test_notification_callback_register_json_happy_path(_record)
     _test_notification_callback_truncated_frame_is_loud_not_silent(_record)
     _test_notification_callback_malformed_frame_distinguished_from_truncation(_record)
+    # Register cache (GET /api/ble/registers) + hello-settle-delay timing.
+    # Tuple loop rather than one `await` per line, purely to keep this
+    # function under ruff's PLR0915 statement cap -- same convention as the
+    # ensure_connected()/Wave B loops below.
+    for case in (
+        _test_register_cache_write_and_overwrite,
+        _test_registers_endpoint_contract_shape,
+        _test_register_cache_excludes_conffin_and_mh,
+        _test_register_cache_unaffected_by_truncated_or_malformed_frames,
+        _test_register_cache_cleared_on_target_change,
+        _test_hello_settle_delay_ordering,
+    ):
+        await case(_record)
     _test_ble_state_missing_corrupt_and_nondict(_record)
     _test_ble_pin_persistence(_record)
     _test_status_payload_shape(_record)

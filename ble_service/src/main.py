@@ -42,6 +42,22 @@ RECONNECT_DELAYS_S = (5, 10, 20, 60)
 SSE_PING_INTERVAL_S = 30.0  # ⚠ client (ble_client_remote.py SSE_READ_TIMEOUT_S) must exceed this
 POST_CONNECT_SETTLE_S = 1.0
 INTER_MESSAGE_DELAY_S = 0.2
+# Observed live on mcapp.local, 2026-08-21: after a deploy, the node's
+# post-hello 0x44 config register burst (the auto-sent I/SN/G/SA/SE+S1/
+# SW+S2/W/AN registers -- see the module docstring's "Extended Register
+# Queries" section) never arrived at all, while explicitly queried IO/TM
+# replies came back fine -- i.e. the link and the write path were both
+# healthy, only the AUTOMATIC post-hello burst was missing. A phone app
+# observably waits close to a second between subscribing to notifications
+# (CCCD write / start_notify) and sending hello; this service was sending
+# hello ~200ms after start_notify (main.py:535-567 pre-fix) -- far faster
+# than any phone -- which is suspected of racing the firmware's own
+# connect-callback setup so it never arms the burst. This delay is a
+# mitigation pending a bench btmon repro against real firmware, NOT a
+# proven fix -- the guaranteed recovery is the mcapp-side register-value
+# reconciler (built in parallel; queries whatever this delay fails to
+# shake loose). See `_connect_and_initialize` and `_ensure_connected_post_init`.
+HELLO_SETTLE_DELAY_S = 0.7
 # Hard deadline for the ensure_connected() composite (Wave B). Wave A replaced
 # the old 3x-attempt connect ladder with a single attempt (plus at most one
 # scan-retry for a not-yet-known MAC), each step already bounded by its own
@@ -113,6 +129,21 @@ _ERROR_CODE_GATT_FAILED = "gatt_failed"
 _ERROR_CODE_PIN_REQUIRED = "pin_required"
 _ERROR_CODE_TIMEOUT = "timeout"
 _ERROR_CODE_BUSY = "busy"  # == REASON_BUSY; kept as its own name for the error_code vocabulary
+
+# Register TYPs eligible for the GET /api/ble/registers cache (BLE-XX). This is
+# every register the device auto-sends on connect PLUS the two it only sends
+# on explicit query (see the module's "Extended Register Queries" docstring
+# section: I, SN, G, SA, SE+S1, SW+S2, W, AN are auto-sent; IO and TM are
+# query-only) -- i.e. every TYP that represents a real, cacheable slice of
+# device config. Deliberately excludes two TYPs that DO appear in `D{...}`
+# frames but are not "a register":
+#   - CONFFIN: a burst-terminator marker, not a config value in itself.
+#   - MH: a rolling mheard list, not a stable register -- caching only the
+#     last-seen MH frame would misrepresent it as "the" mheard state when it
+#     is really just whichever station was heard most recently.
+_CACHEABLE_REGISTER_TYPS = frozenset(
+    {"I", "SN", "G", "SA", "SE", "S1", "SW", "S2", "W", "IO", "TM", "AN"}
+)
 
 
 def _now_ms() -> int:
@@ -201,6 +232,18 @@ class ServiceState:
     activity_log: deque[dict[str, Any]] = field(
         default_factory=lambda: deque(maxlen=ACTIVITY_LOG_SIZE)
     )
+
+    # Register cache (GET /api/ble/registers): the last cleanly-parsed
+    # `D{...}` frame per TYP, last-write-wins. This is memory the notification
+    # deque alone never provided -- NOTIFICATION_QUEUE_SIZE is bounded and
+    # unread entries are lost across an mcapp restart, so a register that only
+    # arrives once per connect (the auto-sent burst) could be gone before
+    # anything ever read it. See `_cache_register_if_applicable` and
+    # `_note_register_cache_target`.
+    register_cache: dict[str, dict[str, Any]] = field(default_factory=dict)
+    # The MAC the register_cache's contents currently describe -- None until
+    # the first connect attempt. See `_note_register_cache_target`.
+    register_cache_mac: str | None = None
 
 
 state = ServiceState()
@@ -346,6 +389,79 @@ def _decode_register_frame(data: bytes, notification: dict[str, Any]) -> bool:
         return True
 
 
+def _cache_register_if_applicable(parsed: Any) -> None:
+    """Store a cleanly-parsed `D{...}` register frame in `state.register_cache`,
+    keyed by its `TYP` value, last-write-wins -- called only from
+    `notification_callback` after `_decode_register_frame` has already
+    reported a clean `json.loads` success (format == "json"), so a truncated
+    or malformed frame never reaches here at all (see that function's
+    docstring: it returns False and the caller drops the frame before this is
+    ever called).
+
+    Never raises and does nothing for anything that is not one of
+    `_CACHEABLE_REGISTER_TYPS` -- in particular CONFFIN (a burst terminator,
+    not a register) and MH (a rolling mheard list, not a stable register) are
+    silently ignored, not cached under a misleading "last MH" key.
+
+    Deliberately never cleared on a plain disconnect (see
+    `_note_register_cache_target` for the one event that DOES clear it): a
+    cached register value is the node's last known config, and serving a
+    stale-but-real value from before a dropped link is preferable to serving
+    nothing, especially since this cache exists precisely because the
+    post-hello auto-sent burst has been observed to go missing entirely (see
+    HELLO_SETTLE_DELAY_S).
+    """
+    if not isinstance(parsed, dict):
+        return
+    typ = parsed.get("TYP")
+    if not isinstance(typ, str) or typ not in _CACHEABLE_REGISTER_TYPS:
+        return
+    state.register_cache[typ] = parsed
+
+
+def _note_register_cache_target(mac: str) -> None:
+    """Register `mac` as the device `state.register_cache`'s contents
+    describe, clearing the cache first if it currently holds a DIFFERENT
+    device's values.
+
+    Deliberate choice: the cache is NOT cleared on every disconnect (see
+    `_cache_register_if_applicable`'s docstring) -- but a cache populated by
+    node X must never be attributed to node Y. Switching the connect TARGET
+    is the one event this module can observe that means the cached values
+    are no longer even about the currently-relevant device, so it is the
+    only thing that clears the cache early rather than waiting for fresh
+    values to overwrite each key one at a time (which could otherwise leave
+    a stale mix of X's and Y's registers visible for however long it takes
+    Y to resend its own full burst).
+
+    Called from every connect entry point, BEFORE the connect attempt
+    itself -- `_connect_and_initialize` (explicit /api/ble/connect,
+    auto-reconnect, startup auto-connect) and `ensure_connected_route`
+    (`/api/ble/ensure_connected`, which does not go through
+    `_connect_and_initialize`) -- rather than only on success: clearing only
+    after a successful connect would let a stale, wrong-device cache answer
+    GET /api/ble/registers for the whole (sometimes tens-of-seconds)
+    duration of a connect attempt to a different device.
+
+    A no-op (does not clear) the first time it is ever called, since
+    `register_cache_mac` starts at None and the cache starts empty -- and
+    a no-op on every subsequent call for the SAME mac, which is what makes
+    reconnecting to the same node (auto-reconnect, or the user re-tapping
+    the node they were already on) keep the cache instead of blanking it.
+    """
+    if state.register_cache_mac is not None and state.register_cache_mac != mac:
+        cleared = len(state.register_cache)
+        state.register_cache.clear()
+        logger.info(
+            "Register cache cleared: connect target changed from %s to %s "
+            "(%d cached register(s) discarded)",
+            state.register_cache_mac,
+            mac,
+            cleared,
+        )
+    state.register_cache_mac = mac
+
+
 def notification_callback(data: bytes) -> None:
     """Called when BLE notification received"""
     timestamp = _now_ms()
@@ -371,6 +487,7 @@ def notification_callback(data: bytes) -> None:
                 # code that still shipped the fragment to every SSE client.
                 # Drop it here instead: never enqueued, never forwarded.
                 return
+            _cache_register_if_applicable(notification.get("parsed"))
         elif data.startswith(b"@"):
             # Binary mesh message
             notification["format"] = "binary"
@@ -534,6 +651,7 @@ def _save_ble_pin(pin: int) -> None:
 
 async def _connect_and_initialize(mac: str) -> bool:
     """Connect to device and run post-connect initialization. Returns True on success."""
+    _note_register_cache_target(mac)
     adapter = _adapter()
 
     # Clean up a stale bus before reconnect -- but only when nothing else is
@@ -561,6 +679,9 @@ async def _connect_and_initialize(mac: str) -> bool:
     success = await adapter.connect(mac)
     if success:
         await adapter.start_notify()
+        # HELLO_SETTLE_DELAY_S: see its definition for why hello no longer
+        # follows start_notify immediately.
+        await asyncio.sleep(HELLO_SETTLE_DELAY_S)
         await adapter.send_hello()
         await asyncio.sleep(POST_CONNECT_SETTLE_S)
         await adapter.query_extended_registers()
@@ -617,6 +738,10 @@ async def _ensure_connected_post_init(adapter: BLEAdapter) -> None:
     covered by ENSURE_CONNECTED_DEADLINE_S, and together they can outlast the
     mcapp client's whole request budget. See POST_CONNECT_INIT_DEADLINE_S.
     """
+    # HELLO_SETTLE_DELAY_S: `ensure_connected()` already ran start_notify()
+    # before returning, so hello still followed it almost immediately without
+    # this -- see that constant's definition.
+    await asyncio.sleep(HELLO_SETTLE_DELAY_S)
     await adapter.send_hello()
     await asyncio.sleep(POST_CONNECT_SETTLE_S)
     if adapter.is_connected:
@@ -1143,6 +1268,19 @@ class SetPinRequest(BaseModel):
     pin: int
 
 
+class RegisterCacheResponse(BaseModel):
+    """GET /api/ble/registers response.
+
+    `registers` is keyed by `TYP`; each value is the exact parsed `D{...}`
+    JSON object last received for that TYP, `TYP` field included. Always 200,
+    `registers: {}` / `count: 0` when nothing has been cached yet -- see
+    `state.register_cache` for the cache's staleness/clearing semantics.
+    """
+
+    registers: dict[str, dict[str, Any]]
+    count: int
+
+
 # --- API Endpoints ---
 
 
@@ -1285,6 +1423,7 @@ async def ensure_connected_route(
     """
     mac = request.device_address
     adapter = _adapter()
+    _note_register_cache_target(mac)
 
     # Preempt our OWN background reconnect/auto-connect before doing anything
     # else -- otherwise a background reconnect can race the caller: the user
@@ -1481,6 +1620,25 @@ async def cancel_reconnect(_: bool = Depends(verify_api_key)) -> ResultResponse:
 async def get_activity(_: bool = Depends(verify_api_key)) -> dict[str, Any]:
     """Return the activity log (last 50 events)."""
     return {"events": list(state.activity_log), "count": len(state.activity_log)}
+
+
+@app.get("/api/ble/registers", response_model=RegisterCacheResponse)
+async def get_registers(_: bool = Depends(verify_api_key)) -> RegisterCacheResponse:
+    """Return every register value cached from a cleanly-parsed `D{...}`
+    notification frame so far, keyed by `TYP`.
+
+    Always 200 -- `registers: {}` when nothing has been cached yet (before
+    the first successful connect, or right after the cache was cleared by a
+    connect-target change; see `_note_register_cache_target`). Values persist
+    across a plain disconnect/reconnect to the SAME device (last known config
+    is more useful than nothing) and are last-write-wins per TYP, so a value
+    here can be from any point since the last connect-target change, not
+    necessarily the current connection -- staleness is the deliberate
+    trade-off, see `_cache_register_if_applicable`.
+    """
+    return RegisterCacheResponse(
+        registers=dict(state.register_cache), count=len(state.register_cache)
+    )
 
 
 @app.post("/api/ble/send", response_model=ResultResponse)
