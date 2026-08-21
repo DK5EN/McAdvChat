@@ -83,10 +83,20 @@ if TYPE_CHECKING:
 # get_children() ARE statically declared.
 DBusInterface = Any
 
-_MAX_CALLSIGN_LEN = 15
+# Firmware storage bound, not an arbitrary MCProxy choice: `node_call` is a
+# fixed `char[10]` on every platform (nrf52/WisBlock-API.h, esp32/esp32_flash.h)
+# and is filled via `snprintf(..., sizeof(node_call), ...)`, so anything past 9
+# characters is silently truncated in flash rather than rejected. The old
+# value here (15) was looser than that real ceiling -- a 10-15 char callsign
+# would have been accepted here only to come back truncated from the device.
+_MAX_CALLSIGN_LEN = 9
 _BLE_MTU_LIMIT = 247
 _MAX_SSID_LEN = 32
 _MAX_WIFI_PASSWORD_LEN = 63
+# The wire format's inner length-prefix byte (set_callsign, set_wifi) is a
+# single unsigned byte -- this is the hard ceiling that field can express,
+# independent of any single field's own MTU/firmware-storage bound.
+_INNER_LENGTH_BYTE_MAX = 0xFF
 # `_frame()`'s length prefix is a SINGLE byte: length = len(payload) + 2 must
 # fit in it, i.e. the largest value `int.to_bytes(1, "big")` can represent.
 # This is a different, larger boundary than `_BLE_MTU_LIMIT` (247) -- that one
@@ -1461,21 +1471,41 @@ class BLEAdapter:
 
         Returns:
             True if successful
+
+        Wire format (`phone_commands.cpp:283,439-452`): `[len][0x50][len_byte]
+        [callsign bytes]` -- the firmware reads `conf_data[2]` as the
+        callsign's length and the callsign itself from offset 3. Omitting that
+        inner length byte (the bug this method used to have) does not just
+        misparse the length -- it eats the callsign's own first byte as the
+        length field over an otherwise zero-filled buffer, so "DK5EN-98" was
+        silently stored as "K5EN-98".
         """
         if not self.is_connected:
             raise RuntimeError("Not connected")
 
         # Validate callsign format
         if not callsign or len(callsign) > _MAX_CALLSIGN_LEN:
-            raise ValueError("Callsign must be 1-15 characters")
+            raise ValueError(f"Callsign must be 1-{_MAX_CALLSIGN_LEN} characters")
 
         callsign_bytes = callsign.encode("utf-8")
-        length = len(callsign_bytes) + 2
+        if len(callsign_bytes) > _INNER_LENGTH_BYTE_MAX:
+            # Unreachable today (_MAX_CALLSIGN_LEN=9 caps this well below 255
+            # even for multi-byte UTF-8), but the wire format's inner length
+            # is a single byte -- guard it explicitly rather than silently
+            # truncating/wrapping if that constant is ever loosened.
+            raise ValueError(
+                f"Callsign too long for the wire format's 1-byte inner length field: "
+                f"{len(callsign_bytes)} bytes (max {_INNER_LENGTH_BYTE_MAX})"
+            )
+
+        # Wire format: 1B callsign length, then the callsign bytes.
+        payload = bytes([len(callsign_bytes)]) + callsign_bytes
+        length = len(payload) + 2
 
         if length > _BLE_MTU_LIMIT:
-            raise ValueError(f"Callsign too long: {length} bytes (max 247)")
+            raise ValueError(f"Callsign too long: {length} bytes (max {_BLE_MTU_LIMIT})")
 
-        return await self.write(_frame(MsgType.SET_CALLSIGN, callsign_bytes))
+        return await self.write(_frame(MsgType.SET_CALLSIGN, payload))
 
     async def set_wifi(self, ssid: str, password: str) -> bool:
         """

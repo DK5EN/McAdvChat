@@ -19,11 +19,17 @@ A code review missed it; a test would not have.
 
 Coverage was later extended to the rest of the module's load-bearing
 surfaces: the `_api_key_valid` auth boundary (both as a unit and through
-`TestClient` at the HTTP layer), the `crc16_ccitt` wire-frame checksum against
-external known-answer vectors, `/api/ble/status`'s payload shape (pinned
+`TestClient` at the HTTP layer), `/api/ble/status`'s payload shape (pinned
 against what `src/mcapp/ble_client_remote.py`'s `refresh_status()` actually
 parses), `PATCH /api/ble/pin`'s range validation, and `_retry_connect` — the
 shared backoff loop behind both auto-reconnect and startup auto-connect.
+
+(A `crc16_ccitt` wire-frame checksum used to be covered here too. It was
+removed along with the `fcs_ok` notification field it backed:
+`ble_service/src/main.py` ran CRC-16/CCITT over the wrong byte range at the
+wrong offset -- comparing a CRC against the timestamp MSB and pad, not the
+actual frame FCS -- so it was False on essentially every real frame and had
+zero consumers repo-wide. See the 2026-08-21 wire audit, finding L5.)
 
 That extension turned up a second family of bugs, all now fixed in
 `ble_service/src/main.py` and pinned here: the state-file readers guarded
@@ -64,13 +70,11 @@ from __future__ import annotations
 
 import ast
 import asyncio
-import binascii
 import hashlib
 import inspect
 import json
 import logging
 import pathlib
-import random
 import sys
 import tempfile
 import textwrap
@@ -485,55 +489,6 @@ def _test_auth_boundary_via_testclient(record: Any) -> None:
         ble_main.API_KEY = original
 
 
-def _test_crc16_ccitt_vectors(record: Any) -> None:
-    """Known-answer vectors for the wire-frame checksum (CRC-16/CCITT-FALSE:
-    poly 0x1021, init 0xFFFF, no reflection, no final XOR — also known as
-    CRC-16/IBM-3740). The "123456789" check value (0x29B1) is the standard
-    CRC catalogue's published check value for this exact parameter set
-    (https://reveng.sourceforge.io/crc-catalogue/16.htm) — an external
-    reference, not re-derived from this file — so it catches a wrong
-    poly/init/bit-order, not just a wrong loop trip count. A wrong value here
-    silently corrupts every BLE binary frame's FCS.
-
-    Proved discriminating during development: monkeypatching
-    `ble_main.CRC16_POLY` from 0x1021 to 0x8005 (the CRC-16/IBM polynomial)
-    changed crc16_ccitt(b"123456789") from 0x29B1 to 0xAEE7, failing the
-    check-value assertion as expected; reverted before writing this file.
-
-    The fixed vectors are also backed by a differential against
-    `binascii.crc_hqx(data, 0xFFFF)` — CPython's own table-driven C
-    implementation of this exact parameter set, seeded to 0xFFFF instead of
-    XMODEM's 0. That is a second independent oracle covering the whole input
-    domain rather than three points, which matters because `crc16_ccitt` is a
-    hand-rolled bit-at-a-time loop: an off-by-one in the shift/mask survives
-    some inputs and not others.
-    """
-    record(
-        "crc16_ccitt(b''): stays at the 0xFFFF init value (loop never runs)",
-        ble_main.crc16_ccitt(b"") == 0xFFFF,
-    )
-    record("crc16_ccitt(b'A'): single-byte known answer", ble_main.crc16_ccitt(b"A") == 0xB915)
-    record(
-        "crc16_ccitt(b'123456789'): CRC-16/CCITT-FALSE published check value 0x29B1",
-        ble_main.crc16_ccitt(b"123456789") == 0x29B1,
-    )
-    for sample in (b"\x00", b"\xff", b"hello world", bytes(range(256))):
-        value = ble_main.crc16_ccitt(sample)
-        record(f"crc16_ccitt fits in 16 bits for {sample[:16]!r}", 0 <= value <= 0xFFFF)
-
-    # Deterministic corpus (fixed seed): identical every run, no wall clock.
-    rng = random.Random(0xC0FFEE)  # noqa: S311 - test corpus, not cryptography
-    corpus = [bytes(rng.getrandbits(8) for _ in range(rng.randint(0, 64))) for _ in range(500)]
-    mismatches = [
-        blob for blob in corpus if ble_main.crc16_ccitt(blob) != binascii.crc_hqx(blob, 0xFFFF)
-    ]
-    record(
-        "crc16_ccitt matches stdlib binascii.crc_hqx(init=0xFFFF) over a 500-blob corpus "
-        f"-- {len(mismatches)} mismatch(es)",
-        not mismatches,
-    )
-
-
 def _test_json_frame_looks_truncated_helper(record: Any) -> None:
     """Direct unit coverage of the truncation heuristic, isolated from
     logging/queueing: unbalanced or unclosed braces => truncated; balanced
@@ -573,62 +528,71 @@ def _test_notification_callback_register_json_happy_path(record: Any) -> None:
 
 
 def _test_notification_callback_truncated_frame_is_loud_not_silent(record: Any) -> None:
-    """REGRESSION target (the defect this brief closes): a `D{` register-
-    update frame cut off by an ATT MTU overflow -- exactly what MeshCom FW
-    4.36's proposed filter-list register field risks -- must not vanish
-    behind only a DEBUG-level trace. It must:
-      (a) still be queued, not dropped with no trace at all;
-      (b) never be reported as a successful 'json' parse (no silent partial
-          apply of a half-arrived register update);
-      (c) be logged at a level that is actually seen (WARNING or higher,
+    """REGRESSION target: a `D{` register-update frame cut off by the
+    firmware's own 245-byte register-JSON producer clamp
+    (`addBLEComToOutBuffer`, `loop_functions.cpp:607-611`) -- exactly what
+    MeshCom FW 4.36's proposed filter-list register field risks -- must not
+    vanish behind only a DEBUG-level trace, AND must not be forwarded as a
+    junk fragment either. It must:
+      (a) be logged at a level that is actually seen (WARNING or higher,
           never DEBUG);
-      (d) name BOTH that it looks truncated AND that the update was
-          dropped, so the failure is diagnosable, not just noted.
+      (b) name BOTH that it looks truncated AND that the update was
+          dropped, so the failure is diagnosable, not just noted;
+      (c) never be reported as a successful 'json' parse (no silent partial
+          apply of a half-arrived register update);
+      (d) be genuinely discarded -- NOT enqueued for SSE delivery at all.
+          "Discarded" used to mean "logged but still forwarded as
+          format: raw", which was pure noise on the wire dressed up as
+          forwarding; this is the real fix.
 
     Proved discriminating: reverting `_decode_register_frame` to the old
     bare `json.loads(json_str)` (no try/except, no `_json_frame_looks_
-    truncated` call) makes this raise straight out of `notification_
-    callback`'s inner try into its own generic `except Exception as e:
-    logger.warning("Notification decode error: %s", e)` fallback -- which
-    still logs at WARNING but with no truncation/MTU diagnosis and no
-    length information, failing assertion (d) below. Verified by hand during
+    truncated` call, no bool return) makes this raise straight out of
+    `notification_callback`'s inner try into its own generic `except
+    Exception as e: logger.warning("Notification decode error: %s", e)`
+    fallback -- which still logs at WARNING but with no truncation
+    diagnosis or length information (failing assertion (b)), and which
+    still enqueues the notification (failing assertion (d), since that
+    fallback path does not `return` early). Verified by hand during
     development (edit in place, run, revert) per the no-git-stash brief
     constraint; not left as a permanent mutant in this file.
     """
     handler, restore_logs = _capture_logs(ble_main.logger)
     restore_side_effects = _snapshot_side_effects()
     try:
-        # Missing closing brace and a dangling key/value -- exactly what an
-        # ATT MTU cutting a JSON payload mid-field looks like on the wire.
+        # Missing closing brace and a dangling key/value -- exactly what the
+        # firmware's producer clamp cutting a JSON payload mid-field looks
+        # like on the wire.
         truncated = b'D{"typ":"I","callsign":"DK5EN-98","firmware":"4.35p.07.2'
 
         before = len(ble_main.state.notification_queue)
         ble_main.notification_callback(truncated)
 
         record(
-            "notification_callback: a truncated D{ frame is still queued, not dropped with "
-            "no trace at all",
-            len(ble_main.state.notification_queue) == before + 1,
-        )
-        queued = ble_main.state.notification_queue[-1]
-        record(
-            "notification_callback: a truncated D{ frame is NOT reported as a successful "
-            "'json' parse (the register update did not silently apply)",
-            queued.get("format") != "json" and "parsed" not in queued,
+            "notification_callback: a truncated D{ frame is genuinely discarded -- NOT "
+            "enqueued for SSE delivery",
+            len(ble_main.state.notification_queue) == before,
         )
         record(
             "notification_callback: the drop is logged at WARNING or higher, never DEBUG",
             any(r.levelno >= logging.WARNING for r in handler.records),
         )
         record(
-            "notification_callback: the log names both the likely cause (MTU/truncation) "
-            "and that the register update was dropped",
+            "notification_callback: the log names both the likely cause (truncation) and "
+            "that the register update was dropped -- and no longer blames the ATT MTU as "
+            "the binding cause",
             any(
-                "mtu" in r.getMessage().lower()
-                and "trunc" in r.getMessage().lower()
-                and "dropped" in r.getMessage().lower()
+                "trunc" in r.getMessage().lower() and "dropped" in r.getMessage().lower()
                 for r in handler.records
+            )
+            and not any(
+                "exceeds the negotiated" in r.getMessage().lower() for r in handler.records
             ),
+        )
+        record(
+            "notification_callback: the log names the firmware's producer clamp "
+            "(addBLEComToOutBuffer) as the binding cause, not the GATT/MTU layer",
+            any("addblecomtooutbuffer" in r.getMessage().lower() for r in handler.records),
         )
     finally:
         restore_logs()
@@ -639,8 +603,10 @@ def _test_notification_callback_malformed_frame_distinguished_from_truncation(
     record: Any,
 ) -> None:
     """A frame that arrived intact but is not valid JSON (a firmware/encoding
-    bug, not an MTU sizing problem) must be reported as malformed, not as a
-    truncation -- conflating the two would point at the wrong fix."""
+    bug, not a clamp/size problem) must be reported as malformed, not as a
+    truncation -- conflating the two would point at the wrong fix. Like a
+    truncated frame, it must be genuinely discarded, not forwarded as
+    format: raw."""
     handler, restore_logs = _capture_logs(ble_main.logger)
     restore_side_effects = _snapshot_side_effects()
     try:
@@ -648,6 +614,7 @@ def _test_notification_callback_malformed_frame_distinguished_from_truncation(
         # trailing comma makes it invalid JSON.
         malformed = b'D{"typ":"I","callsign":"DK5EN-98",}'
 
+        before = len(ble_main.state.notification_queue)
         ble_main.notification_callback(malformed)
 
         record(
@@ -660,11 +627,10 @@ def _test_notification_callback_malformed_frame_distinguished_from_truncation(
             "(WARNING or higher), not silently",
             any(r.levelno >= logging.WARNING for r in handler.records),
         )
-        queued = ble_main.state.notification_queue[-1]
         record(
-            "notification_callback: a malformed D{ frame is not reported as a successful "
-            "'json' parse either",
-            queued.get("format") != "json",
+            "notification_callback: a malformed D{ frame is genuinely discarded -- NOT "
+            "enqueued for SSE delivery either",
+            len(ble_main.state.notification_queue) == before,
         )
     finally:
         restore_logs()
@@ -1915,6 +1881,87 @@ async def _test_send_command_oversized_raises_clear_error(record: Any) -> None:
         oversized_error is not None
         and "256" in str(oversized_error)
         and "253" in str(oversized_error),
+    )
+
+
+async def _test_set_callsign_golden_bytes(record: Any) -> None:
+    """`set_callsign` (0x50) wire format needs a 1-byte inner callsign-length
+    field -- the firmware reads `conf_data[2]` as that length and the
+    callsign itself starting at offset 3 (`phone_commands.cpp:283,439-452`).
+    The pre-fix builder sent `_frame(SET_CALLSIGN, callsign_bytes)` with no
+    such field, so the firmware ate the callsign's own first byte as the
+    length (over an otherwise zero-filled buffer): "DK5EN-98" was silently
+    stored on the device as "K5EN-98".
+
+    Golden frame for "DK5EN-98", verified byte-by-byte against the firmware
+    handler: `0B 50 08 44 4B 35 45 4E 2D 39 38` -- outer length 0x0B (9
+    payload bytes + 2 header bytes), type 0x50, inner length 0x08 (8 ASCII
+    chars), then the ASCII callsign itself.
+
+    Proved discriminating: the pre-fix builder produces
+    `0A 50 44 4B 35 45 4E 2D 39 38` for the same input -- one byte shorter,
+    missing the inner length field entirely, and thus mis-framed from the
+    type byte on. This test fails against that shape and passes only once
+    the inner length byte is present.
+    """
+    adapter = ble_adapter.BLEAdapter()
+    adapter._status.state = ble_adapter.ConnectionState.CONNECTED
+
+    sent: list[bytes] = []
+
+    async def _fake_write(data: bytes) -> bool:
+        sent.append(data)
+        return True
+
+    adapter.write = _fake_write  # type: ignore[method-assign]
+
+    await adapter.set_callsign("DK5EN-98")
+
+    expected = bytes.fromhex("0B 50 08 44 4B 35 45 4E 2D 39 38")
+    record(
+        "set_callsign('DK5EN-98'): wire frame matches the firmware-verified golden bytes "
+        f"0B 50 08 44 4B 35 45 4E 2D 39 38 -- got "
+        f"{sent[-1].hex(' ').upper() if sent else '<no write>'}",
+        bool(sent) and sent[-1] == expected,
+    )
+
+
+async def _test_set_callsign_length_validation(record: Any) -> None:
+    """The firmware's `node_call` storage is a fixed `char[10]` on every
+    platform (`nrf52/WisBlock-API.h`, `esp32/esp32_flash.h`), filled via
+    `snprintf(..., sizeof(node_call), ...)` -- so anything past 9 characters
+    is silently truncated in flash rather than rejected. `set_callsign` must
+    reject an over-length callsign itself (ValueError) rather than accept it
+    and let the firmware quietly truncate it. Both cases raise/return before
+    ever calling `write()`, so no GATT stubbing is needed here.
+    """
+    adapter = ble_adapter.BLEAdapter()
+    adapter._status.state = ble_adapter.ConnectionState.CONNECTED
+
+    # 9 chars is the firmware's real ceiling (node_call[10] minus the NUL) --
+    # must be accepted, not rejected by an over-strict bound. It still fails
+    # afterwards with "Not connected" at the GATT write (no fake bus wired
+    # up), which proves the length check itself let it through.
+    nine_char_error: Exception | None = None
+    try:
+        await adapter.set_callsign("OE5XYZ-99")
+    except Exception as e:
+        nine_char_error = e
+    record(
+        "set_callsign: a 9-character callsign (the real firmware ceiling) passes length "
+        f"validation -- got {nine_char_error!r}",
+        isinstance(nine_char_error, RuntimeError),
+    )
+
+    ten_char_error: Exception | None = None
+    try:
+        await adapter.set_callsign("OE5XYZW-99")  # 10 chars
+    except Exception as e:
+        ten_char_error = e
+    record(
+        "set_callsign: a 10-character callsign is rejected with ValueError instead of "
+        f"being silently truncated by the firmware -- got {ten_char_error!r}",
+        isinstance(ten_char_error, ValueError),
     )
 
 
@@ -5067,7 +5114,6 @@ async def run_ble_service_tests() -> bool:
     _test_auto_reconnect_persists_the_name(_record)
     _test_api_key_valid(_record)
     _test_auth_boundary_via_testclient(_record)
-    _test_crc16_ccitt_vectors(_record)
     _test_json_frame_looks_truncated_helper(_record)
     _test_notification_callback_register_json_happy_path(_record)
     _test_notification_callback_truncated_frame_is_loud_not_silent(_record)
@@ -5097,6 +5143,8 @@ async def run_ble_service_tests() -> bool:
     await _test_send_command_oversized_raises_clear_error(_record)
     await _test_log_negotiated_mtu(_record)
     for case in (
+        _test_set_callsign_golden_bytes,
+        _test_set_callsign_length_validation,
         _test_connect_with_scan_retry,
         _test_ensure_connected_already_connected_is_noop,
         _test_ensure_connected_happy_path_sets_trusted,

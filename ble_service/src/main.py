@@ -10,6 +10,7 @@ import base64
 import json
 import logging
 import os
+import re
 import secrets
 import time
 from collections import deque
@@ -33,11 +34,8 @@ from .ble_adapter import (
     build_hello_bytes,
 )
 
-_MIN_FRAME_WITH_FCS = 4  # 2 payload bytes + 2 FCS bytes
 _BLE_PIN_MIN = 100_000
 _BLE_PIN_MAX = 999_999
-CRC16_POLY = 0x1021
-CRC16_MSB = 0x8000
 NOTIFICATION_QUEUE_SIZE = 1000
 ACTIVITY_LOG_SIZE = 50
 RECONNECT_DELAYS_S = (5, 10, 20, 60)
@@ -224,30 +222,23 @@ def _adapter() -> BLEAdapter:
     return state.ble_adapter
 
 
-def crc16_ccitt(data: bytes) -> int:
-    """Calculate CRC16-CCITT checksum (polynomial 0x1021)"""
-    crc = 0xFFFF
-    for byte in data:
-        crc ^= byte << 8
-        for _ in range(8):
-            crc = crc << 1 ^ CRC16_POLY if crc & CRC16_MSB else crc << 1
-            crc &= 0xFFFF
-    return crc
-
-
 def _json_frame_looks_truncated(json_str: str) -> bool:
     """Heuristic: does `json_str` (a `D{...}` register-update frame's JSON
     payload, already stripped of the leading 'D' and any zero-byte padding)
     look like it was cut off mid-object rather than being genuinely
     malformed?
 
-    A frame chopped by a GATT-layer ATT MTU overflow loses only its TAIL --
-    it never gains stray bytes in the middle -- so the two failure shapes
-    are distinguishable without a full parser: truncation leaves the braces
-    unbalanced and/or the string not ending in '}'; a malformed-but-intact
-    frame (bad value, a stray character, a trailing comma...) still closes
-    cleanly. Not proof either way, just the best signal available from a
-    bare `json.JSONDecodeError` -- see `_decode_register_frame`.
+    A frame chopped by the firmware's register-JSON producer clamp
+    (`addBLEComToOutBuffer`, `loop_functions.cpp:607-611` -- caps the JSON at
+    245 bytes before it ever reaches the wire, 247 bytes including the
+    length/type header, well under both platforms' negotiated ATT MTU) loses
+    only its TAIL -- it never gains stray bytes in the middle -- so the two
+    failure shapes are distinguishable without a full parser: truncation
+    leaves the braces unbalanced and/or the string not ending in '}'; a
+    malformed-but-intact frame (bad value, a stray character, a trailing
+    comma...) still closes cleanly. Not proof either way, just the best
+    signal available from a bare `json.JSONDecodeError` -- see
+    `_decode_register_frame`.
     """
     stripped = json_str.rstrip()
     if not stripped.endswith("}"):
@@ -255,7 +246,21 @@ def _json_frame_looks_truncated(json_str: str) -> bool:
     return stripped.count("{") != stripped.count("}")
 
 
-def _decode_register_frame(data: bytes, notification: dict[str, Any]) -> None:
+_TYP_HINT_RE = re.compile(r'"typ"\s*:\s*"([^"]*)"', re.IGNORECASE)
+
+
+def _typ_hint(json_str: str) -> str | None:
+    """Best-effort `TYP` field pulled out of a register frame's JSON text by
+    regex, even when the frame is truncated or otherwise unparseable by
+    `json.loads` -- so a dropped-frame log can name which register update was
+    lost instead of just a byte count. Returns None when no `"typ"` key is
+    present (including when `"typ"` is itself the field the clamp cut off).
+    """
+    match = _TYP_HINT_RE.search(json_str)
+    return match.group(1) if match else None
+
+
+def _decode_register_frame(data: bytes, notification: dict[str, Any]) -> bool:
     """Decode a `D{...}` register-update notification into `notification`,
     in place. Never raises.
 
@@ -271,47 +276,58 @@ def _decode_register_frame(data: bytes, notification: dict[str, Any]) -> None:
     warning indistinguishable from routine noise. This logs loudly instead,
     and distinguishes two causes that have different fixes:
 
-      - a truncated frame (`_json_frame_looks_truncated`) -- almost
-        certainly the ATT MTU cutting off a payload the firmware tried to
-        send whole (the concern for MeshCom FW 4.36's proposed filter-list
-        register field). Logged at ERROR with the byte/char lengths, so an
-        operator can correlate against the negotiated MTU
-        `BLEAdapter._log_negotiated_mtu` logs once per connect.
+      - a truncated frame (`_json_frame_looks_truncated`) -- the firmware's
+        own 245-byte producer clamp in `addBLEComToOutBuffer`
+        (`loop_functions.cpp:607-611`) cutting a register JSON payload it
+        tried to send whole (the concern for MeshCom FW 4.36's proposed
+        filter-list register field, and for `I` already: today's worst case
+        is ~243 bytes, one char of margin). This is NOT an ATT MTU issue --
+        the clamp binds before the frame ever reaches the GATT layer, on
+        both bench platforms identically, well under either platform's
+        negotiated MTU. Logged at ERROR with the observed byte/char lengths
+        and, when recoverable from the partial JSON, the `TYP` of the
+        register that got cut.
       - a genuinely malformed frame -- balanced/closed but not valid JSON,
         or not valid UTF-8 at all. Logged at WARNING: this is a
-        firmware/decoding bug, not an MTU sizing problem.
+        firmware/decoding bug, not a clamp/size problem.
 
-    Either way `notification["format"]` is set to "raw" (never "json") and
-    no partial/best-effort value is applied -- there is nothing here that
-    silently accepts a half-decoded register update.
+    Either way `notification["format"]` is set to "raw" (never "json"), no
+    partial/best-effort value is applied, and this returns False so the
+    caller can drop the frame instead of forwarding it -- there is nothing
+    here that silently accepts, or queues for delivery, a half-decoded
+    register update. Returns True only for a clean `json.loads` success.
     """
     raw_len = len(data)
     try:
         json_str = data.rstrip(b"\x00").decode("utf-8")[1:]
     except UnicodeDecodeError:
         # A byte sequence cut off mid multi-byte UTF-8 codepoint is itself
-        # strong truncation evidence -- ATT MTU truncation is byte-exact, it
-        # does not respect codepoint boundaries.
+        # strong truncation evidence -- the firmware's producer clamp is
+        # byte-exact, it does not respect codepoint boundaries.
         notification["format"] = "raw"
         logger.exception(
             "Dropped BLE register update: D{ frame (%d bytes) is not valid UTF-8 -- looks "
-            "truncated (cut mid-character), most likely the ATT MTU cutting off a register "
-            "JSON payload. The whole register update was discarded, not partially applied.",
+            "truncated (cut mid-character), most likely the firmware's 245-byte register-"
+            "JSON producer clamp (addBLEComToOutBuffer, loop_functions.cpp:607-611) cutting "
+            "the payload before it reached the wire. The whole register update was "
+            "discarded, not partially applied, and was not forwarded.",
             raw_len,
         )
-        return
+        return False
 
     try:
         notification["parsed"] = json.loads(json_str)
-        notification["format"] = "json"
     except json.JSONDecodeError as e:
         notification["format"] = "raw"
         if _json_frame_looks_truncated(json_str):
+            typ = _typ_hint(json_str)
             logger.exception(
-                "Dropped BLE register update: D{ frame (%d bytes, %d chars decoded) looks "
-                "truncated (unbalanced or unclosed JSON) -- most likely exceeds the "
-                "negotiated BLE MTU. The whole register update was discarded, not partially "
-                "applied.",
+                "Dropped BLE register update%s: D{ frame (%d bytes, %d chars decoded) looks "
+                "truncated (unbalanced or unclosed JSON) -- most likely the firmware's "
+                "245-byte register-JSON producer clamp (addBLEComToOutBuffer, "
+                "loop_functions.cpp:607-611), not an ATT MTU overflow. The whole register "
+                "update was discarded, not partially applied, and was not forwarded.",
+                f" (TYP={typ!r})" if typ else "",
                 raw_len,
                 len(json_str),
             )
@@ -319,11 +335,15 @@ def _decode_register_frame(data: bytes, notification: dict[str, Any]) -> None:
             logger.warning(
                 "Dropped BLE register update: malformed JSON in D{ frame (%d bytes) -- the "
                 "frame arrived intact (braces balanced, properly closed), so this is a "
-                "firmware/decoding bug, not an MTU sizing problem; json error: %s. The "
-                "register update was discarded.",
+                "firmware/decoding bug, not a clamp/size problem; json error: %s. The "
+                "register update was discarded and was not forwarded.",
                 raw_len,
                 e,
             )
+        return False
+    else:
+        notification["format"] = "json"
+        return True
 
 
 def notification_callback(data: bytes) -> None:
@@ -340,24 +360,21 @@ def notification_callback(data: bytes) -> None:
     # Attempt to decode
     try:
         if data.startswith(b"D{"):
-            _decode_register_frame(data, notification)
+            if not _decode_register_frame(data, notification):
+                # Truncated or malformed register frame: _decode_register_frame
+                # already logged why (loudly -- ERROR or WARNING, never just
+                # DEBUG). There is no partial-register concept (see its
+                # docstring) and nothing downstream consumes format == "raw"
+                # for a D{ frame (ble_client_remote.py only handles
+                # "json"/"binary"), so queuing it for SSE delivery was pure
+                # noise dressed up as forwarding -- an "discarded" log next to
+                # code that still shipped the fragment to every SSE client.
+                # Drop it here instead: never enqueued, never forwarded.
+                return
         elif data.startswith(b"@"):
             # Binary mesh message
             notification["format"] = "binary"
             notification["prefix"] = data[:2].decode("ascii", errors="replace")
-
-            # FCS validation (permissive mode - log warnings but continue processing)
-            if len(data) >= _MIN_FRAME_WITH_FCS:
-                payload = data[:-2]
-                fcs = int.from_bytes(data[-2:], byteorder="little")
-                calced_fcs = crc16_ccitt(payload)
-                fcs_ok = calced_fcs == fcs
-
-                notification["fcs_ok"] = fcs_ok
-                if not fcs_ok:
-                    logger.debug(
-                        "FCS mismatch: calculated=0x%04X, received=0x%04X", calced_fcs, fcs
-                    )
         else:
             notification["format"] = "unknown"
     except Exception as e:
