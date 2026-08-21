@@ -1,6 +1,11 @@
 # Data files
 mcdump.json
+# SQLite fixtures hold real mesh traffic (callsigns, positions, private DMs) and must
+# never be committed. The `-*` pattern catches the WAL/SHM/journal sidecars: a DB left
+# open by a crashed run leaves `messages.db-wal` + `messages.db-shm` behind, and those
+# matched none of the patterns here, so `tests/` showed up untracked in every status.
 tests/fixtures/*.db
+tests/fixtures/*.db-*
 CLAUDE.md
 
 # Local configuration (contains personal data)

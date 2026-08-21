@@ -77,6 +77,30 @@ flowchart TD
     MCN2 <-. "433MHz LoRa Mesh<br/>(Ham Radio Frequencies)" .-> ESP2
 ```
 
+## Signal Data Path (RSSI/SNR → signal_log / signal_buckets / station_positions)
+
+Both transports above feed the same signal architecture (`doc/2026-02-11_1400-position-signal-architecture-ADR.md`,
+amended by UDP 2.0 Track U — `doc/UDP-2.0-impl.md`):
+
+```mermaid
+flowchart LR
+    BLEN["BLE MHeard beacon<br/>(src_type=ble, no msg_id)"] --> SM["store_message()"]
+    UDPN["UDP Handler :1799<br/>lora pos/msg<br/>(src_type=lora, has rssi/snr)"] --> SM
+
+    SM --> IS["_ingest_signal()<br/>validates VALID_RSSI/SNR_RANGE"]
+    IS --> SL["signal_log<br/>(+ source: 'mheard'/'lora')"]
+    IS --> SB["signal_buckets<br/>(5-min live accumulate,<br/>1-h nightly rollup)"]
+    IS --> SP["station_positions<br/>.signal group"]
+
+    UDPN -. "pos also carries lat/lon" .-> POS["station_positions<br/>.position group<br/>(independent field group)"]
+```
+
+A UDP `pos` packet updates **both** the signal and position field groups in the same
+`store_message()` call (they're independent columns — see the ADR). A UDP `msg` packet
+only updates signal (no coordinates in a text message). `node`/`udp` src_types (the
+node's own traffic) carry a `0/0` signal sentinel and are excluded from this path by an
+explicit `src_type` check.
+
 ## BLE Mode Selection
 
 | Mode | BLE Client | Description |

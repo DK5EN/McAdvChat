@@ -5,11 +5,10 @@ Centralized logging configuration for McApp.
 Replaces scattered `if has_console: print(...)` patterns with proper logging.
 Keeps emoji prefixes for visual scanning in logs.
 """
+
 import logging
 import sys
-from typing import Callable
-
-VERSION = "v0.50.0"
+from typing import ClassVar
 
 # Default format with emoji support
 LOG_FORMAT = "%(asctime)s | %(levelname)-8s | %(name)-20s | %(message)s"
@@ -20,20 +19,30 @@ DATE_FORMAT = "%Y-%m-%d %H:%M:%S"
 class EmojiFormatter(logging.Formatter):
     """Custom formatter that keeps emoji prefixes and adds level-based prefixes."""
 
-    LEVEL_EMOJIS = {
-        logging.DEBUG: "",       # No extra emoji for debug (message may have one)
-        logging.INFO: "",        # No extra emoji for info
+    LEVEL_EMOJIS: ClassVar[dict[int, str]] = {
+        logging.DEBUG: "",  # No extra emoji for debug (message may have one)
+        logging.INFO: "",  # No extra emoji for info
         logging.WARNING: "⚠️ ",
         logging.ERROR: "❌ ",
         logging.CRITICAL: "💥 ",
     }
 
     def format(self, record: logging.LogRecord) -> str:
-        # Add emoji prefix for warnings/errors if not already present
+        # Add emoji prefix for warnings/errors if not already present. Mutating the
+        # shared record would stack the prefix if multiple handlers format it, so
+        # format the message text ourselves and restore record.msg afterward.
         emoji = self.LEVEL_EMOJIS.get(record.levelno, "")
-        if emoji and not record.getMessage().strip().startswith(tuple("⚠️❌💥🔧📡🔍🔄")):
-            record.msg = f"{emoji}{record.msg}"
-        return super().format(record)
+        message = record.getMessage()
+        original_msg = record.msg
+        original_args = record.args
+        if emoji and not message.strip().startswith(tuple("⚠️❌💥🔧📡🔍🔄")):
+            record.msg = f"{emoji}{message}"
+            record.args = None
+        try:
+            return super().format(record)
+        finally:
+            record.msg = original_msg
+            record.args = original_args
 
 
 def setup_logging(
@@ -95,21 +104,6 @@ def has_console() -> bool:
     Useful for backward compatibility during migration.
     """
     return sys.stdout.isatty()
-
-
-# Convenience function for gradual migration
-def console_print(msg: str, level: str = "info", logger_name: str = "mcapp") -> None:
-    """
-    Bridge function for migrating from print() to logging.
-    Can be used during transition period.
-
-    Usage:
-        console_print("Server started", level="info")
-        # Instead of: if has_console: print("Server started")
-    """
-    logger = get_logger(logger_name)
-    log_func: Callable[..., None] = getattr(logger, level.lower(), logger.info)
-    log_func(msg)
 
 
 # Module-level logger for this module

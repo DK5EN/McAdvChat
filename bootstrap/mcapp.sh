@@ -13,8 +13,12 @@
 #   --reconfigure Re-prompt for configuration values
 #   --fix         Repair mode: reinstall broken components
 #   --skip        Skip system setup & packages, deploy only
+#   --converge    Converge system-level state (packages, firewall, web front
+#                 door) to this release's epoch; deploy nothing
 #   --dev         Install latest development pre-release
 #   --tag TAG     Install a specific release tag (e.g. v1.5.1)
+#   --ref REF     Force the bootstrap tree ref (branch or tag), independent
+#                 of the app version (also: MCAPP_BOOTSTRAP_REF)
 #   --quiet       Minimal output (for cron jobs)
 #   --version     Show script version and exit
 
@@ -23,19 +27,34 @@ set -eo pipefail
 #──────────────────────────────────────────────────────────────────
 # CONSTANTS
 #──────────────────────────────────────────────────────────────────
-readonly SCRIPT_VERSION="2.4.0"
+readonly SCRIPT_VERSION="2.6.0"
+
+# Integer version of the system-level machine state (packages, firewall, web
+# front door). Bump this when setup_system/install_packages output changes in
+# a way existing installs must converge to. Independent of the app version
+# and of the DB schema version.
+readonly SYSTEM_EPOCH=1
 
 # Detect piped mode (curl | bash) — BASH_SOURCE is empty when piped
+# SCRIPT_DIR is intentionally NOT readonly: source_libs() overwrites it with
+# the pinned bootstrap tree's path when no local lib/ is found (piped mode,
+# or a bare temp-file run with no sibling lib/ — see §3.7), so that the
+# SCRIPT_DIR-based template lookups in lib/packages.sh and lib/deploy.sh
+# resolve against the pinned tree instead of falling back to a raw URL.
 if [[ -n "${BASH_SOURCE[0]:-}" && "${BASH_SOURCE[0]}" != "bash" ]]; then
-  readonly SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+  SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
   readonly PIPED_MODE=false
 else
-  readonly SCRIPT_DIR=""
+  SCRIPT_DIR=""
   readonly PIPED_MODE=true
 fi
 
-readonly GITHUB_REPO_BRANCH_DEFAULT="development"
-GITHUB_RAW_BASE="https://raw.githubusercontent.com/DK5EN/McApp/${GITHUB_REPO_BRANCH_DEFAULT}"
+# Rebased onto the resolved install ref (MCAPP_INSTALL_REF) by
+# resolve_install_ref() in main(), before source_libs() runs — so every
+# consumer (lib/packages.sh template fallbacks, lib/deploy.sh's
+# download_webapp(), lib/detect.sh's get_remote_webapp_version() fallback)
+# is pinned to the same release as the libs and the app. Empty until then.
+GITHUB_RAW_BASE=""
 
 # Re-enable nounset now that BASH_SOURCE detection is done
 set -u
@@ -45,9 +64,19 @@ readonly CONFIG_DIR="/etc/mcapp"
 readonly CONFIG_FILE="${CONFIG_DIR}/config.json"
 readonly WEBAPP_DIR="/var/www/html/webapp"
 readonly SCRIPTS_DIR="/usr/local/bin"
-readonly SHARE_DIR="/usr/local/share/mcapp"
 readonly GITHUB_REPO="DK5EN/McApp"
 readonly GITHUB_API_BASE="https://api.github.com/repos/${GITHUB_REPO}"
+
+# A tag resolve_install_ref() accepts (from --tag, or parsed out of an API
+# response) must match this before it is ever interpolated into a URL —
+# guards against a malformed --tag and against a hostile/broken API response
+# (e.g. "v1.0.0; rm -rf /").
+readonly BOOTSTRAP_TAG_PATTERN='^v[0-9]+\.[0-9]+\.[0-9]+(-dev\.[0-9]+)?$'
+
+# Looser guard for --ref/MCAPP_BOOTSTRAP_REF, which may name a branch (e.g.
+# "development") rather than a release tag. Still refused before it reaches
+# a URL — just not required to look like a version.
+readonly BOOTSTRAP_REF_PATTERN='^[A-Za-z0-9._/-]+$'
 
 # User home directory (handles sudo correctly)
 # When running with sudo, $HOME is /root, but we want the actual user's home
@@ -78,6 +107,33 @@ init_paths() {
   OLD_VENV_DIR="${real_home}/venv"
 }
 
+#──────────────────────────────────────────────────────────────────
+# SYSTEM EPOCH
+#──────────────────────────────────────────────────────────────────
+readonly SYSTEM_EPOCH_FILE="/var/lib/mcapp/system-epoch"
+
+# Prints the installed system epoch (integer). Prints 0 if the marker file is
+# missing or does not contain a plain integer.
+get_installed_epoch() {
+  local v
+  if [[ ! -f "$SYSTEM_EPOCH_FILE" ]]; then
+    echo 0
+    return
+  fi
+  v=$(<"$SYSTEM_EPOCH_FILE")
+  if [[ "$v" =~ ^[0-9]+$ ]]; then
+    echo "$v"
+  else
+    echo 0
+  fi
+}
+
+# Writes the current SYSTEM_EPOCH to the marker file (root-written).
+write_system_epoch() {
+  mkdir -p "$(dirname "$SYSTEM_EPOCH_FILE")"
+  echo "$SYSTEM_EPOCH" > "$SYSTEM_EPOCH_FILE"
+}
+
 # Colors for output
 readonly RED='\033[0;31m'
 readonly GREEN='\033[0;32m'
@@ -96,6 +152,19 @@ QUIET=false
 DEV_MODE=false
 PIN_TAG=""
 SKIP_TO_DEPLOY=false
+CONVERGE_MODE=false
+BOOTSTRAP_REF_FLAG=""
+
+# Set once by resolve_install_ref() in main(), before source_libs(). See
+# that function for the split between the two: MCAPP_INSTALL_REF pins the
+# bootstrap tree (libs + templates) and always names something fetchable
+# (a tag, or a branch on the warned API-failure fallback);
+# MCAPP_INSTALL_APP_VERSION is the version deploy_app() is told to install —
+# "unknown" instead of a branch name on that same fallback, so deploy_app()
+# takes its own already-tested "can't determine remote version" path rather
+# than trying to download a release tarball for a branch.
+MCAPP_INSTALL_REF=""
+MCAPP_INSTALL_APP_VERSION=""
 
 #──────────────────────────────────────────────────────────────────
 # LOGGING
@@ -138,25 +207,281 @@ command_exists() {
 }
 
 #──────────────────────────────────────────────────────────────────
+# INSTALL REF RESOLUTION
+#──────────────────────────────────────────────────────────────────
+# Resolves what release (or branch, on a warned fallback) pins this run,
+# BEFORE lib/deploy.sh's own resolve_target_version() is available — this
+# duplicates its --tag/--dev/default logic in miniature because
+# source_libs() has not run yet at this point (see fetch_bootstrap_tree()
+# below, which needs the resolved ref to know what to fetch). No `jq`: a
+# fresh Pi OS Lite has none, and install_packages() (lib/packages.sh) is what
+# installs it, much later. Populates MCAPP_INSTALL_REF and
+# MCAPP_INSTALL_APP_VERSION (see the declarations above) instead of
+# echoing/returning, so main() does not need a subshell capture for what is
+# fundamentally a two-value result.
+resolve_install_ref() {
+  # --ref/MCAPP_BOOTSTRAP_REF forces ONLY the bootstrap tree ref (libs +
+  # templates) — independently of the app version, per §3.6. It must NOT
+  # short-circuit app-version resolution: --tag/--dev/default/D2 still run
+  # below and decide MCAPP_INSTALL_APP_VERSION on their own. This is what
+  # makes `--ref development` reproduce pre-pinning behavior exactly (libs
+  # from branch tip, app from the latest release) and what makes
+  # `--ref development --tag v1.6.13` land on tree=development, app=v1.6.13.
+  local ref_overridden=false
+  local override="${BOOTSTRAP_REF_FLAG:-${MCAPP_BOOTSTRAP_REF:-}}"
+  if [[ -n "$override" ]]; then
+    if ! [[ "$override" =~ $BOOTSTRAP_REF_PATTERN ]]; then
+      log_error "Invalid --ref/MCAPP_BOOTSTRAP_REF value: ${override}"
+      exit 1
+    fi
+    log_info "Bootstrap tree ref forced via --ref/MCAPP_BOOTSTRAP_REF: ${override}"
+    MCAPP_INSTALL_REF="$override"
+    ref_overridden=true
+  fi
+
+  if [[ -n "$PIN_TAG" ]]; then
+    # --tag: pins the app version directly. No API call at all. Validation
+    # still runs even when --ref already set the tree ref.
+    if ! [[ "$PIN_TAG" =~ $BOOTSTRAP_TAG_PATTERN ]]; then
+      log_error "Invalid --tag value: ${PIN_TAG}"
+      exit 1
+    fi
+    MCAPP_INSTALL_APP_VERSION="$PIN_TAG"
+    [[ "$ref_overridden" == "true" ]] || MCAPP_INSTALL_REF="$PIN_TAG"
+    return 0
+  fi
+
+  local api_url body tag
+  if [[ "$DEV_MODE" == "true" ]]; then
+    api_url="${GITHUB_API_BASE}/releases?per_page=100"
+  else
+    api_url="${GITHUB_API_BASE}/releases/latest"
+  fi
+
+  body=$(curl -fsSL --connect-timeout 5 "$api_url" 2>/dev/null) || body=""
+
+  if [[ -n "$body" ]]; then
+    if [[ "$DEV_MODE" == "true" ]]; then
+      # Every prerelease in this project is tagged vX.Y.Z-dev.N (see
+      # scripts/release.sh) — matching that suffix is equivalent to jq's
+      # `select(.prerelease) | .tag_name` without a JSON parser. Highest by
+      # sort -V mirrors get_latest_prerelease_version() in lib/deploy.sh.
+      tag=$(echo "$body" \
+        | grep -o '"tag_name" *: *"[^"]*"' \
+        | sed -E 's/.*"tag_name" *: *"([^"]*)".*/\1/' \
+        | grep -E -- '-dev\.[0-9]+$' \
+        | sort -V | tail -1)
+    else
+      # /releases/latest returns a single release object — its tag_name is
+      # the answer.
+      tag=$(echo "$body" \
+        | grep -o '"tag_name" *: *"[^"]*"' \
+        | head -1 \
+        | sed -E 's/.*"tag_name" *: *"([^"]*)".*/\1/')
+    fi
+  fi
+
+  if [[ -n "${tag:-}" ]] && [[ "$tag" =~ $BOOTSTRAP_TAG_PATTERN ]]; then
+    MCAPP_INSTALL_APP_VERSION="$tag"
+    [[ "$ref_overridden" == "true" ]] || MCAPP_INSTALL_REF="$tag"
+    return 0
+  fi
+
+  # API unreachable, rate-limited, or returned something we refuse to trust
+  # (never interpolate an unvalidated tag into a URL). D2's split (§3.4):
+  # a fresh install has nothing to salvage and must not silently become
+  # "whatever branch tip happens to be today" — abort with the --tag
+  # workaround, even when --ref already named a tree (a fresh install that
+  # cannot name an APP version has nothing to salvage either — --ref only
+  # ever overrides the tree). An existing install (repair/--skip/--converge)
+  # is the one case where finishing beats being pinned, and the operator is
+  # watching.
+  if [[ ! -f "$CONFIG_FILE" ]]; then
+    log_error "Could not resolve a release to install (GitHub API unreachable or returned no usable tag)."
+    log_error "No existing installation to fall back on. Retry once connectivity is back, or pin explicitly:"
+    log_error "  sudo ./mcapp.sh --tag <version>   (e.g. --tag v1.6.13)"
+    exit 1
+  fi
+
+  log_warn "GitHub API unreachable — could not resolve a pinned app version."
+  log_warn "App version is left unresolved; deploy_app() will leave the current slot as-is."
+  MCAPP_INSTALL_APP_VERSION="unknown"
+
+  if [[ "$ref_overridden" != "true" ]]; then
+    local fallback_branch="main"
+    [[ "$DEV_MODE" == "true" ]] && fallback_branch="development"
+    log_warn "Falling back to '${fallback_branch}' branch tip for bootstrap libs/templates."
+    MCAPP_INSTALL_REF="$fallback_branch"
+  fi
+}
+
+#──────────────────────────────────────────────────────────────────
 # SOURCE LIBRARY FILES
 #──────────────────────────────────────────────────────────────────
+
+# Fetch the bootstrap tree (lib/*.sh + templates/) pinned to <ref> and echo
+# the path to its bootstrap/ directory. Replaces per-file downloads of
+# lib/*.sh: a tarball at the pinned ref works out of the box against ANY
+# tag's actual file set (an old tag's libs may not be today's six files),
+# and templates come along for free (§3.2/§3.3) — SCRIPT_DIR is pointed at
+# the returned path by the caller, which is exactly what
+# lib/packages.sh's/lib/deploy.sh's SCRIPT_DIR-based template lookups
+# already prefer over a raw-URL fallback.
+#
+# Primary: the checksummed release asset mcapp-<ref>.tar.gz (only tags have
+# release assets — same verification shape as
+# download_and_install_release()'s app tarball in lib/deploy.sh). Fallback:
+# an unverified codeload archive of the ref itself (branch or tag), which
+# covers both a tag without assets and a plain branch ref (--ref
+# development, or the API-failure fallback above).
+#
+# NOTE: like the download_libs() this replaces, do NOT set an EXIT trap
+# here — this runs inside a $() capture in source_libs(), so a trap set
+# here would delete the temp dir the moment this function returns, before
+# the caller can use it. Cleanup is the caller's job.
+fetch_bootstrap_tree() {
+  local ref="$1"
+  local tmp_dir
+  tmp_dir=$(mktemp -d)
+  local archive="${tmp_dir}/tree.tar.gz"
+  local got_verified_asset=false
+
+  if [[ "$ref" =~ $BOOTSTRAP_TAG_PATTERN ]]; then
+    local tarball_name="mcapp-${ref}.tar.gz"
+    local checksum_name="mcapp-${ref}.tar.gz.sha256"
+    local release_url="https://github.com/${GITHUB_REPO}/releases/download/${ref}"
+
+    # Save under the asset's REAL name. release.sh generates the checksum as
+    # `shasum -a 256 mcapp-<ref>.tar.gz > mcapp-<ref>.tar.gz.sha256`, so the
+    # file's single content line names `mcapp-<ref>.tar.gz`; `sha256sum -c`
+    # resolves that name relative to $tmp_dir. Downloading to a placeholder
+    # name made verification fail for every VALID tarball ("No such file or
+    # directory"), and the mismatch branch returns 1 without falling back to
+    # codeload — i.e. it broke the primary path for every piped install.
+    # lib/deploy.sh's download_and_install_release() has always done this
+    # correctly; match it.
+    archive="${tmp_dir}/${tarball_name}"
+
+    if curl -fsSL --connect-timeout 10 -o "$archive" "${release_url}/${tarball_name}" 2>/dev/null; then
+      if curl -fsSL --connect-timeout 10 -o "${tmp_dir}/${checksum_name}" \
+        "${release_url}/${checksum_name}" 2>/dev/null; then
+        log_info "Verifying bootstrap tree checksum..." >&2
+        if ! (cd "$tmp_dir" && sha256sum -c "$checksum_name" --quiet 2>/dev/null); then
+          log_error "Bootstrap tree checksum verification failed for ${ref}" >&2
+          rm -rf "$tmp_dir"
+          return 1
+        fi
+        log_ok "Bootstrap tree checksum verified" >&2
+      else
+        log_warn "No checksum published for ${tarball_name} — skipping verification" >&2
+      fi
+      got_verified_asset=true
+    else
+      log_warn "Release asset ${tarball_name} not found — falling back to codeload (no checksum)" >&2
+    fi
+  fi
+
+  if [[ "$got_verified_asset" != "true" ]]; then
+    local codeload_url="https://codeload.github.com/${GITHUB_REPO}/tar.gz/refs/tags/${ref}"
+    if ! [[ "$ref" =~ $BOOTSTRAP_TAG_PATTERN ]]; then
+      codeload_url="https://codeload.github.com/${GITHUB_REPO}/tar.gz/refs/heads/${ref}"
+    fi
+    log_warn "Fetching bootstrap tree for ${ref} without a published checksum (codeload)" >&2
+    if ! curl -fsSL --connect-timeout 10 -o "$archive" "$codeload_url" 2>/dev/null; then
+      log_error "Failed to fetch bootstrap tree for ${ref} (release asset and codeload both failed)" >&2
+      rm -rf "$tmp_dir"
+      return 1
+    fi
+  fi
+
+  if ! tar -xzf "$archive" -C "$tmp_dir" --strip-components=1 --warning=no-unknown-keyword 2>/dev/null; then
+    log_error "Failed to extract bootstrap tree for ${ref}" >&2
+    rm -rf "$tmp_dir"
+    return 1
+  fi
+
+  if [[ ! -d "${tmp_dir}/bootstrap" ]]; then
+    log_error "Extracted tree for ${ref} has no bootstrap/ directory" >&2
+    rm -rf "$tmp_dir"
+    return 1
+  fi
+
+  echo "${tmp_dir}/bootstrap"
+}
+
+# Functions main() reaches into across the six sourced libs. Not
+# exhaustive — one or more canaries per lib file, enough to catch a
+# script/lib API skew (e.g. --tag pinning an old release whose libs predate
+# a function main() now calls) as a clean abort instead of a bootstrap run
+# that dies partway through with a cryptic "command not found".
+readonly REQUIRED_LIB_FUNCTIONS=(
+  detect_install_state
+  get_debian_codename
+  get_python_version
+  check_desktop_image
+  migrate_old_installation
+  collect_config
+  setup_system
+  install_packages
+  ensure_web_frontend
+  caddy_config_marker
+  deploy_app
+  activate_services
+  health_check
+  print_success_summary
+)
+
+# §3.5 skew guard: verify every function in REQUIRED_LIB_FUNCTIONS was
+# actually defined by the libs source_libs() just sourced.
+verify_lib_skew() {
+  local ref="$1"
+  local -a missing=()
+  local fn
+  for fn in "${REQUIRED_LIB_FUNCTIONS[@]}"; do
+    declare -F "$fn" &>/dev/null || missing+=("$fn")
+  done
+
+  if (( ${#missing[@]} == 0 )); then
+    return 0
+  fi
+
+  log_error "${ref}'s bootstrap libs do not provide: ${missing[*]}"
+  if [[ "$ref" =~ $BOOTSTRAP_TAG_PATTERN ]]; then
+    log_error "Run that release's own installer instead:"
+    log_error "  curl -fsSL https://raw.githubusercontent.com/DK5EN/McApp/${ref}/bootstrap/mcapp.sh \\"
+    log_error "    | sudo bash -s -- --tag ${ref}"
+  else
+    # ref is a branch (e.g. the D2 API-failure fallback, or --ref itself) —
+    # "--tag ${ref}" would not be a valid tag, so don't suggest it.
+    log_error "'${ref}' is a branch, not a release tag — re-run pinned to a known-good tag instead:"
+    log_error "  sudo ./mcapp.sh --tag <version>   (e.g. --tag v1.6.13)"
+  fi
+  exit 1
+}
+
 source_libs() {
   local lib_dir
 
   # If running from bootstrap directory, use local libs
   if [[ -n "$SCRIPT_DIR" && -d "${SCRIPT_DIR}/lib" ]]; then
     lib_dir="${SCRIPT_DIR}/lib"
-  # If installed to share dir, use those
-  elif [[ -d "${SHARE_DIR}/lib" ]]; then
-    lib_dir="${SHARE_DIR}/lib"
-  # Piped mode: download from GitHub (always fresh to pick up bootstrap changes)
-  elif [[ "$PIPED_MODE" == "true" ]]; then
-    lib_dir=$(download_libs)
-    # Clean up downloaded libs when script exits
-    trap "rm -rf '$lib_dir'" EXIT
   else
-    log_error "Cannot find library files"
-    exit 1
+    # No local libs found — piped mode, or a bare temp-file run with no
+    # sibling lib/ (update-runner's broken-slot recovery path, §3.7; this
+    # used to be keyed on PIPED_MODE alone, which left that recovery path
+    # dead). Fetch the tree pinned to MCAPP_INSTALL_REF instead of a branch
+    # tip.
+    local tree tree_parent
+    tree=$(fetch_bootstrap_tree "$MCAPP_INSTALL_REF") || exit 1
+    tree_parent=$(dirname "$tree")
+    # Clean up the extracted tree's parent temp dir when the script exits.
+    # NOTE: fetch_bootstrap_tree runs inside a $() capture above, so an EXIT
+    # trap set INSIDE it would fire (deleting the temp dir) the moment that
+    # capture completes — before this function can use it. Cleanup must be
+    # installed here, by the caller.
+    trap "rm -rf '$tree_parent'" EXIT
+    SCRIPT_DIR="$tree"
+    lib_dir="${SCRIPT_DIR}/lib"
   fi
 
   # shellcheck source=lib/detect.sh
@@ -171,30 +496,6 @@ source_libs() {
   source "${lib_dir}/deploy.sh"
   # shellcheck source=lib/health.sh
   source "${lib_dir}/health.sh"
-}
-
-# Download library files from GitHub for piped mode (curl | bash)
-# NOTE: Do NOT set EXIT trap here — this runs in a subshell via $(),
-# so an EXIT trap would delete the temp dir before the caller can use it.
-# Cleanup is handled by the caller in source_libs().
-download_libs() {
-  local tmp_dir
-  tmp_dir=$(mktemp -d)
-
-  local lib_files=("detect.sh" "config.sh" "system.sh" "packages.sh" "deploy.sh" "health.sh")
-
-  log_info "Piped mode detected — downloading bootstrap libraries..." >&2
-
-  for lib in "${lib_files[@]}"; do
-    if ! curl -fsSL --connect-timeout 10 \
-      "${GITHUB_RAW_BASE}/bootstrap/lib/${lib}" -o "${tmp_dir}/${lib}"; then
-      log_error "Failed to download lib/${lib} from ${GITHUB_RAW_BASE}"
-      rm -rf "$tmp_dir"
-      exit 1
-    fi
-  done
-
-  echo "$tmp_dir"
 }
 
 #──────────────────────────────────────────────────────────────────
@@ -223,13 +524,20 @@ parse_args() {
         SKIP_TO_DEPLOY=true
         shift
         ;;
+      --converge)
+        CONVERGE_MODE=true
+        shift
+        ;;
       --dev)
         DEV_MODE=true
-        GITHUB_RAW_BASE="https://raw.githubusercontent.com/DK5EN/McApp/development"
         shift
         ;;
       --tag)
         PIN_TAG="$2"
+        shift 2
+        ;;
+      --ref)
+        BOOTSTRAP_REF_FLAG="$2"
         shift 2
         ;;
       --quiet)
@@ -251,6 +559,11 @@ parse_args() {
         ;;
     esac
   done
+
+  if [[ "$CONVERGE_MODE" == "true" && "$SKIP_TO_DEPLOY" == "true" ]]; then
+    log_error "--converge and --skip are mutually exclusive"
+    exit 1
+  fi
 }
 
 show_help() {
@@ -266,15 +579,26 @@ Options:
   --reconfigure Re-prompt for configuration values
   --fix         Repair mode: reinstall broken components
   --skip        Skip system setup & packages, deploy only
+  --converge    Converge system-level state (packages, firewall, web front
+                door) to this release's epoch; deploy nothing
   --dev         Install latest development pre-release
   --tag TAG     Install a specific release tag (e.g. v1.5.1, v1.6.0)
+  --ref REF     Force the bootstrap tree ref (branch or tag) independently
+                of the app version — for developing bootstrap changes
+                without cutting a release, or as a field rollback
+                (--ref development reproduces pre-pinning branch-tip
+                behavior). Also settable via MCAPP_BOOTSTRAP_REF.
   --quiet       Minimal output (for cron jobs)
   --version     Show script version and exit
   --help, -h    Show this help message
 
+A piped install pins script, bootstrap libs, templates, and app to the same
+resolved release tag (or --tag's tag) for the whole run — see --ref above to
+override just the libs/templates ref.
+
 Examples:
   # Fresh install or update
-  curl -fsSL ${GITHUB_RAW_BASE}/bootstrap/mcapp.sh | sudo bash
+  curl -fsSL https://raw.githubusercontent.com/DK5EN/McApp/main/bootstrap/mcapp.sh | sudo bash
 
   # Check what would be updated
   sudo ./mcapp.sh --check
@@ -294,6 +618,13 @@ Examples:
 
   # Install a specific version (for bisecting regressions)
   sudo ./mcapp.sh --skip --tag v1.5.1
+
+  # Develop bootstrap changes without cutting a release, or roll back a
+  # field problem to pre-pinning behavior
+  sudo ./mcapp.sh --ref development
+
+  # Converge system-level state to this release's epoch (deploys nothing)
+  sudo ./mcapp.sh --converge
 
   # Change configuration
   sudo ./mcapp.sh --reconfigure
@@ -321,7 +652,23 @@ main() {
   # Initialize paths that depend on the real user's home
   init_paths
 
+  log_info "Piped mode: ${PIPED_MODE}"
+
+  # Resolve the ref that pins this run BEFORE source_libs() — libs are not
+  # sourced yet, so this cannot use lib/deploy.sh's resolve_target_version()
+  # (see resolve_install_ref() above). Populates MCAPP_INSTALL_REF /
+  # MCAPP_INSTALL_APP_VERSION; export so a re-exec or a sourced child
+  # process can see them too.
+  resolve_install_ref
+  export MCAPP_INSTALL_REF MCAPP_INSTALL_APP_VERSION
+  log_info "Bootstrap ref: ${MCAPP_INSTALL_REF}"
+  GITHUB_RAW_BASE="https://raw.githubusercontent.com/DK5EN/McApp/${MCAPP_INSTALL_REF}"
+
   source_libs
+
+  # §3.5: an old tag's libs may not provide every function this script's
+  # main() calls — catch that as a clean abort, not a mid-run crash.
+  verify_lib_skew "$MCAPP_INSTALL_REF"
 
   # Phase 1: Detect current state
   log_step "Detecting system state..."
@@ -347,6 +694,40 @@ main() {
     exit 0
   fi
 
+  if [[ "$CONVERGE_MODE" == "true" ]]; then
+    # --converge: bring system-level state (packages, firewall, web front
+    # door) up to this release's epoch. Never deploys the app, never touches
+    # slots, never falls through to Phase 5.
+    if [[ "$state" == "fresh" || "$state" == "incomplete" ]]; then
+      log_error "--converge requires an existing installation (state: ${state})"
+      exit 1
+    fi
+
+    local installed_epoch
+    installed_epoch=$(get_installed_epoch)
+    if [[ "$installed_epoch" -ge "$SYSTEM_EPOCH" ]]; then
+      log_info "System state up to date (epoch ${SYSTEM_EPOCH})"
+      exit 0
+    fi
+
+    log_step "Converging system state (epoch ${installed_epoch} -> ${SYSTEM_EPOCH})..."
+    log_step "Configuring system..."
+    setup_system
+
+    log_step "Installing packages..."
+    install_packages
+
+    write_system_epoch
+
+    log_step "Running health checks..."
+    if ! health_check; then
+      log_error "Health checks failed - check logs above"
+      exit 1
+    fi
+
+    exit 0
+  fi
+
   if [[ "$SKIP_TO_DEPLOY" == "true" ]]; then
     # --skip: jump straight to deploy, service restart, and health check
     if [[ "$state" == "fresh" || "$state" == "incomplete" ]]; then
@@ -354,6 +735,22 @@ main() {
       exit 1
     fi
     log_info "Skipping system setup and packages (--skip)"
+
+    # --skip stays deploy-only plus the idempotent ensure_web_frontend()
+    # (steady-state no-op, no restart) — it does not run setup_system() or
+    # install_packages(), so it cannot by itself bring a box up to a new
+    # SYSTEM_EPOCH (e.g. a new firewall rule or package). Full system-level
+    # convergence is owned by `--converge`, gated on SYSTEM_EPOCH vs the
+    # installed marker at /var/lib/mcapp/system-epoch: a no-op once the box
+    # is current, otherwise setup_system + install_packages + health_check.
+    #
+    # `--converge` is invoked from two places: scripts/update-runner.py runs
+    # it (via the newly deployed slot's bootstrap) after every successful
+    # update, and mcapp's converge watchdog triggers it for boxes whose
+    # update was driven by a pre-epoch runner that doesn't know the
+    # converge phase exists.
+    log_step "Ensuring web front end (lighttpd :8082 + Caddy :80/:443)..."
+    ensure_web_frontend
   else
     # Phase 1.5: Migration from old installation (if needed)
     if [[ "$state" == "migrate" ]]; then
@@ -378,12 +775,17 @@ main() {
     # Phase 4: Package installation
     log_step "Installing packages..."
     install_packages
+    write_system_epoch
   fi
 
   # Phase 5: Application deployment
   log_step "Deploying application..."
   [[ -n "$PIN_TAG" ]] && log_info "Pinning to tag: ${PIN_TAG}"
-  deploy_app "$FORCE" "$DEV_MODE" "$PIN_TAG"
+  # Pass the already-resolved version through so deploy_app() does not make
+  # its own, independently-resolved API call — net API calls for the whole
+  # run stay at one, and libs/templates/app cannot land on different tags if
+  # a release is cut mid-run (§3.1).
+  deploy_app "$FORCE" "$DEV_MODE" "$PIN_TAG" "$MCAPP_INSTALL_APP_VERSION"
 
   # Phase 6: Service activation
   log_step "Activating services..."
@@ -429,9 +831,10 @@ dry_run_report() {
       echo "  [SYSTEM] Disable unused services"
       echo "  [PACKAGES] Install uv package manager"
       echo "  [PACKAGES] Install apt packages (jq, curl, screen, etc.)"
-      echo "  [PACKAGES] Install and configure lighttpd"
+      echo "  [PACKAGES] Install and configure lighttpd (backend on 127.0.0.1:8082)"
+      echo "  [PACKAGES] Install and configure Caddy (LAN-HTTPS front door on :80/:443)"
       echo "  [DEPLOY] Download release tarball to ~/mcapp"
-      echo "  [DEPLOY] Run uv sync to install Python dependencies"
+      echo "  [DEPLOY] Run uv sync --all-packages to install Python dependencies"
       echo "  [DEPLOY] Download and install webapp"
       echo "  [SERVICES] Enable and start mcapp, lighttpd"
       ;;
@@ -445,7 +848,7 @@ dry_run_report() {
       echo "  [MIGRATE] Detected old installation (/usr/local/bin scripts)"
       echo "  [MIGRATE] Stop mcapp service"
       echo "  [MIGRATE] Download release tarball to ~/mcapp"
-      echo "  [MIGRATE] Run uv sync for dependencies"
+      echo "  [MIGRATE] Run uv sync --all-packages for dependencies"
       echo "  [MIGRATE] Update systemd service to use 'uv run mcapp'"
       echo "  [MIGRATE] Add missing config fields"
       echo "  [SYSTEM] Configure tmpfs, firewall, journald"
@@ -460,7 +863,83 @@ dry_run_report() {
       ;;
   esac
 
+  report_caddy_state
+
   echo ""
+}
+
+#──────────────────────────────────────────────────────────────────
+# CADDY / LIGHTTPD PORT-STATE REPORT (for --check dry-run output)
+#──────────────────────────────────────────────────────────────────
+# Live-inspects the system (not simulated) so --check reflects reality
+# regardless of detect_install_state()'s fresh/incomplete/upgrade/migrate
+# bucketing above. CADDY_CONFIG_VERSION and LIGHTTPD_MCAPP_CONF_VERSION are
+# defined in lib/packages.sh, already sourced by the time this runs.
+report_caddy_state() {
+  echo "Caddy / lighttpd port state:"
+
+  if command_exists caddy; then
+    local caddy_ver
+    caddy_ver=$(caddy version 2>/dev/null | head -1)
+    echo "  caddy binary:   present (${caddy_ver:-unknown version})"
+  else
+    echo "  caddy binary:   NOT installed (would run: apt-get install -y caddy)"
+  fi
+
+  if systemctl is-enabled --quiet caddy 2>/dev/null; then
+    echo "  caddy service:  enabled"
+  else
+    echo "  caddy service:  NOT enabled (would enable on install)"
+  fi
+
+  if systemctl is-active --quiet caddy 2>/dev/null; then
+    echo "  caddy service:  running"
+  else
+    echo "  caddy service:  NOT running (would start on install)"
+  fi
+
+  local caddyfile="/etc/caddy/Caddyfile"
+  local tls_enabled="false"
+  if [[ -f "$CONFIG_FILE" ]] && command_exists jq; then
+    tls_enabled=$(jq -r '.TLS_ENABLED // false' "$CONFIG_FILE" 2>/dev/null)
+  fi
+
+  # Use the full marker (version AND hostname) so the dry run reports the same
+  # verdict configure_caddy() will act on — a renamed box is stale even at the
+  # current version, because the rendered :443 site addresses embed the hostname.
+  local caddy_marker=""
+  if declare -F caddy_config_marker &>/dev/null; then
+    caddy_marker=$(caddy_config_marker)
+  else
+    caddy_marker="mcapp-caddy-config-version: ${CADDY_CONFIG_VERSION:-0}"
+  fi
+
+  if [[ -f "$caddyfile" ]] && grep -qF "$caddy_marker" "$caddyfile" 2>/dev/null; then
+    echo "  Caddyfile:      up to date (${caddy_marker})"
+  elif [[ "$tls_enabled" == "true" ]]; then
+    echo "  Caddyfile:      owned by ssl-tunnel-setup.sh (TLS_ENABLED in config.json) — untouched"
+  elif [[ -f "$caddyfile" ]]; then
+    echo "  Caddyfile:      present but outdated (would rewrite to version ${CADDY_CONFIG_VERSION})"
+  else
+    echo "  Caddyfile:      missing (would write ${caddyfile})"
+  fi
+
+  local lh_conf="/etc/lighttpd/conf-available/99-mcapp.conf"
+  if [[ -f "$lh_conf" ]] && grep -qF "mcapp-lighttpd-config-version: ${LIGHTTPD_MCAPP_CONF_VERSION:-0}" "$lh_conf" 2>/dev/null; then
+    echo "  lighttpd conf:  up to date (version ${LIGHTTPD_MCAPP_CONF_VERSION}, bound to 127.0.0.1:8082)"
+  else
+    echo "  lighttpd conf:  would migrate to 127.0.0.1:8082 (version ${LIGHTTPD_MCAPP_CONF_VERSION})"
+  fi
+
+  if ss -tln 2>/dev/null | grep -q ':80\b'; then
+    if ss -tlnp 2>/dev/null | grep ':80\b' | grep -q 'caddy'; then
+      echo "  port 80 owner:  caddy (expected)"
+    else
+      echo "  port 80 owner:  something other than caddy — check for a conflict"
+    fi
+  else
+    echo "  port 80 owner:  nothing listening"
+  fi
 }
 
 # Run main

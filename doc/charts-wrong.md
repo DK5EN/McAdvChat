@@ -135,7 +135,9 @@ Beobachtung: Aktuell kommen Daten stark über **UDP** rein (`src_type: lora/node
 
 ```python
 import sqlite3
-con = sqlite3.connect('/var/lib/mcapp/messages.db'); cur = con.cursor()
+
+con = sqlite3.connect("/var/lib/mcapp/messages.db")
+cur = con.cursor()
 
 # Stauchung sichtbar machen: Stunden-Buckets nur in 00-02 UTC trotz voller Tagescounts
 cur.execute("""
@@ -201,7 +203,7 @@ Lückenlose Beweiskette im Proxy-Code:
 2. **Der geschriebene Timestamp ist die Node-Zeit, nicht die Pi-Empfangszeit.**
    ```python
    # sqlite_storage.py:1092
-   timestamp = message.get("timestamp", int(time.time() * 1000))   # kein Reassign bis :1223
+   timestamp = message.get("timestamp", int(time.time() * 1000))  # kein Reassign bis :1223
    # ble_protocol.py:401 (transform_mh) — message["timestamp"] = node_timestamp
    ```
    Für BLE-mHeard ist `message["timestamp"]` immer gesetzt (= `node_timestamp` aus
@@ -475,8 +477,8 @@ des Tages **fehlt**. Keine Stauchung, sondern **Datenverlust 22 h/Tag**.
 
 Nightly-Job (`main.py:1458-1466`):
 ```python
-remaining = await storage_handler.prune_messages(...)   # 1. löscht alte 5min-Buckets
-await storage_handler.aggregate_hourly_buckets()         # 2. will sie DANACH zu 1h rollen
+remaining = await storage_handler.prune_messages(...)  # 1. löscht alte 5min-Buckets
+await storage_handler.aggregate_hourly_buckets()  # 2. will sie DANACH zu 1h rollen
 ```
 
 - `prune_messages` (`sqlite_storage.py:1672`) löscht 5min-Buckets älter als `prune_hours_pos` (Default

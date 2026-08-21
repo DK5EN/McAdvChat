@@ -3,44 +3,134 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
+import json
 import time
+from typing import Any
 
 from ..logging_setup import get_logger
+from ..util import now_ms
 from ._base import CommandHandlerBase
-from .constants import MAX_CHUNKS, MAX_RESPONSE_LENGTH, has_console
+from .constants import CHUNK_SEND_DELAY_SECONDS, MAX_CHUNKS, MAX_RESPONSE_LENGTH
 
 logger = get_logger(__name__)
+
+# Shutdown drain budget for in-flight chunk sends: one inter-chunk gap
+# (CHUNK_SEND_DELAY_SECONDS = 12 s) plus margin for the final publish, so a
+# response caught mid-gap can still deliver its next chunk. main.py's shutdown
+# ladder budgets ~16 s across its other steps and mcapp.service relies on
+# systemd's default TimeoutStopSec of 90 s, so 15 s here keeps the worst-case
+# shutdown around 31 s — comfortably inside the SIGKILL deadline.
+RESPONSE_DRAIN_TIMEOUT_S = 15.0
 
 
 class ResponseMixin(CommandHandlerBase):
     """Mixin providing response sending and chunking methods."""
 
+    def _init_response(self) -> None:
+        """Initialize response background-task tracking. Called from CommandHandler.__init__."""
+        self._response_bg_tasks: set[asyncio.Task[Any]] = set()
+        # Per-recipient serialization so two multi-chunk replies to the same
+        # station queue instead of interleaving their "(n/m)" sequences on air.
+        # Refcounted so entries are removed once no task holds or waits on them.
+        self._response_locks: dict[str, asyncio.Lock] = {}
+        self._response_lock_refs: dict[str, int] = {}
+
+    async def stop_pending_responses(self) -> None:
+        """Drain in-flight background chunk-sends, cancelling stragglers. Call during shutdown."""
+        pending = [task for task in self._response_bg_tasks if not task.done()]
+        if pending:
+            # Let multi-chunk replies finish naturally — a user who already saw
+            # "(1/3)" should still receive chunks 2-3. Transports (BLE/UDP) are
+            # stopped after this in main.py's _shutdown_services, so sends still work.
+            _done, still_pending = await asyncio.wait(pending, timeout=RESPONSE_DRAIN_TIMEOUT_S)
+            if still_pending:
+                recipients = sorted(
+                    {task.get_name().partition(":")[2] or "?" for task in still_pending}
+                )
+                logger.warning(
+                    "Shutdown cut off %d response(s) mid-transmission (recipients: %s)",
+                    len(still_pending),
+                    ", ".join(recipients),
+                )
+                for task in still_pending:
+                    task.cancel()
+                with contextlib.suppress(Exception):
+                    await asyncio.gather(*still_pending, return_exceptions=True)
+        self._response_bg_tasks.clear()
+
     async def send_response(self, response: str, recipient: str, src_type: str = "udp") -> None:
-        """Send response back to requester, chunking if necessary"""
+        """Send response back to requester, chunking in a background task.
+
+        Chunk sends are spaced by CHUNK_SEND_DELAY_SECONDS (LoRa airtime), so a
+        multi-chunk response must not block the caller (message routing / the
+        inbound pipeline) for that duration — hence the background task.
+        """
         if not response:
             return
 
-        if has_console:
-            print(
-                f"🐛 send_response:"
-                f" recipient='{recipient}',"
-                f" my_callsign='{self.my_callsign}',"
-                f" equal="
-                f"{recipient.upper() == self.my_callsign}"
-            )
-
-        # Split response into chunks if too long
         chunks = self._chunk_response(response)
+        # Task name carries the recipient so stop_pending_responses can report
+        # who was cut off without keeping a parallel task→recipient map.
+        task = asyncio.create_task(
+            self._send_chunks(chunks, recipient, src_type), name=f"send_chunks:{recipient}"
+        )
+        self._response_bg_tasks.add(task)
+        task.add_done_callback(self._response_bg_tasks.discard)
 
-        for i, chunk in enumerate(chunks[:MAX_CHUNKS]):
+    async def _send_chunks(self, chunks: list[str], recipient: str, src_type: str) -> None:
+        """Serialize chunk sends per recipient, then transmit.
+
+        Holding the recipient's lock for the full multi-chunk run means a second
+        reply to the same station queues behind the first instead of interleaving
+        its "(n/m)" sequence on air. Different recipients stay concurrent.
+        """
+        key = recipient.upper()
+        lock = self._response_locks.setdefault(key, asyncio.Lock())
+        self._response_lock_refs[key] = self._response_lock_refs.get(key, 0) + 1
+        try:
+            async with lock:
+                await self._transmit_chunks(chunks, recipient, src_type)
+        finally:
+            remaining = self._response_lock_refs[key] - 1
+            if remaining:
+                self._response_lock_refs[key] = remaining
+            else:
+                del self._response_lock_refs[key]
+                del self._response_locks[key]
+
+    async def _transmit_chunks(self, chunks: list[str], recipient: str, src_type: str) -> None:
+        """Send response chunks in order, preserving the 12 s LoRa airtime spacing.
+
+        Bug A: a broadcast-shaped recipient ("*"/"ALL"/empty) is treated as
+        local-only, same as our own callsign. This is safe without threading an
+        extra flag through send_response/_send_chunks (both cross-mixin-called
+        from routing.py against the CommandHandlerBase Protocol in _base.py, so
+        widening either signature would require touching that shared stub too):
+        `_should_execute_command`'s broadcast branch denies execution outright
+        for anyone else's traffic on "*"/"ALL"/"", so `response_target` — and
+        therefore `recipient` here — can only take that shape as the reply to
+        one of OUR OWN commands. suppression.should_suppress_outbound already
+        keeps the ORIGINAL "!command" text off the air for that same case (dst
+        fails is_valid_destination); the reply is plain text, not a command, so
+        without this it went out as a real broadcast instead of staying local.
+        """
+        recipient_upper = recipient.upper()
+        is_local_only = recipient_upper == self.my_callsign or recipient_upper in ("*", "ALL", "")
+        logger.debug(
+            "send_response: recipient='%s', my_callsign='%s', local_only=%s",
+            recipient,
+            self.my_callsign,
+            is_local_only,
+        )
+
+        for i, raw_chunk in enumerate(chunks[:MAX_CHUNKS]):
+            chunk = raw_chunk
             if len(chunks) > 1:
                 chunk_header = f"({i + 1}/{min(len(chunks), MAX_CHUNKS)}) "
-                chunk = chunk_header + chunk
+                chunk = chunk_header + raw_chunk
 
-            if recipient.upper() == self.my_callsign:
-                if has_console:
-                    print("🔄 CommandHandler: Self-response, sending directly to WebSocket")
-
+            if is_local_only:
                 # Send directly via WebSocket, bypass BLE routing
                 if self.message_router:
                     msg_id = f"{int(time.time()):08X}_{i}"
@@ -51,7 +141,7 @@ class ResponseMixin(CommandHandlerBase):
                         "msg": chunk,
                         "src_type": "ble",
                         "type": "msg",
-                        "timestamp": int(time.time() * 1000),
+                        "timestamp": now_ms(),
                     }
                     await self.message_router.publish(
                         "command", "websocket_message", websocket_message
@@ -59,61 +149,50 @@ class ResponseMixin(CommandHandlerBase):
 
                     # Persist self-response to DB so it survives page reload
                     if self.storage_handler:
-                        import json
                         raw_json = json.dumps(websocket_message)
                         await self.storage_handler.store_message(websocket_message, raw_json)
 
-            else:
-                # Send via message router
-                if self.message_router:
-                    message_data = {
-                        "dst": recipient,
-                        "msg": chunk,
-                        "src_type": "command_response",
-                        "type": "msg",
-                    }
+            # Send via message router
+            elif self.message_router:
+                message_data = {
+                    "dst": recipient,
+                    "msg": chunk,
+                    "src_type": "command_response",
+                    "type": "msg",
+                }
 
-                    # Route to appropriate protocol (BLE or UDP)
-                    if has_console:
-                        print("command handler: src_type", src_type)
+                # Route to appropriate protocol (BLE or UDP)
+                logger.debug("command handler: src_type=%s", src_type)
 
-                    try:
-                        if src_type in ("ble", "ble_remote"):
-                            await self.message_router.publish(
-                                "command", "ble_message", message_data
-                            )
-                            if has_console:
-                                print(
-                                    f"📋 CommandHandler: Sent chunk {i + 1} via BLE to {recipient}"
-                                )
-                        elif src_type in ["udp", "node", "lora"]:
-                            # Update message data for UDP transport
-                            message_data["src_type"] = "command_response_udp"
-                            await self.message_router.publish(
-                                "command", "udp_message", message_data
-                            )
-                            if has_console:
-                                print(
-                                    f"📋 CommandHandler: Sent chunk {i + 1} via UDP to {recipient}"
-                                )
-                        else:
-                            logger.warning(
-                                "RESPONSE LOST: No transport for src_type=%r, "
-                                "recipient=%s, msg=%s",
-                                src_type, recipient, chunk[:40],
-                            )
-                    except Exception as ble_error:
+                try:
+                    if src_type in ("ble", "ble_remote"):
+                        await self.message_router.publish("command", "ble_message", message_data)
+                        logger.debug("Sent chunk %d via BLE to %s", i + 1, recipient)
+                    elif src_type in ["udp", "node", "lora"]:
+                        # Update message data for UDP transport
+                        message_data["src_type"] = "command_response_udp"
+                        await self.message_router.publish("command", "udp_message", message_data)
+                        logger.debug("Sent chunk %d via UDP to %s", i + 1, recipient)
+                    else:
                         logger.warning(
-                            "CommandHandler: send failed to %s: %s", recipient, ble_error,
+                            "RESPONSE LOST: No transport for src_type=%r, recipient=%s, msg=%s",
+                            src_type,
+                            recipient,
+                            chunk[:40],
                         )
-                        continue
+                except Exception as ble_error:
+                    logger.warning(
+                        "CommandHandler: send failed to %s: %s",
+                        recipient,
+                        ble_error,
+                    )
+                    continue
 
             # Small delay between chunks
             if i < len(chunks) - 1:
-                await asyncio.sleep(12)
+                await asyncio.sleep(CHUNK_SEND_DELAY_SECONDS)
 
-            if has_console:
-                print(f"📋 CommandHandler: Sent response chunk {i + 1} to {recipient}")
+            logger.debug("Sent response chunk %d to %s", i + 1, recipient)
 
     def _chunk_response(self, response: str) -> list[str]:
         """Split response into chunks - simple and robust"""
@@ -126,47 +205,26 @@ class ResponseMixin(CommandHandlerBase):
         chunks = []
 
         # Split on padding separator first (for our two-line responses)
-        if ", " in response and len(response.split(", ")) == 2:
+        if ", " in response and len(response.split(", ")) == 2:  # noqa: PLR2004 - two-part response format
             chunks = response.split(", ")
+        # Split long single responses on station boundaries
+        elif " | " in response:
+            parts = response.split(" | ")
+            current = ""
+
+            for part in parts:
+                test = current + (" | " if current else "") + part
+                if len(test.encode("utf-8")) <= max_bytes:
+                    current = test
+                else:
+                    if current:
+                        chunks.append(current)
+                    current = part
+
+            if current:
+                chunks.append(current)
         else:
-            # Split long single responses on station boundaries
-            if " | " in response:
-                parts = response.split(" | ")
-                current = ""
-
-                for part in parts:
-                    test = current + (" | " if current else "") + part
-                    if len(test.encode("utf-8")) <= max_bytes:
-                        current = test
-                    else:
-                        if current:
-                            chunks.append(current)
-                        current = part
-
-                if current:
-                    chunks.append(current)
-            else:
-                # Fallback: character-wise split
-                chunks = [response[i : i + max_bytes] for i in range(0, len(response), max_bytes)]
+            # Fallback: character-wise split
+            chunks = [response[i : i + max_bytes] for i in range(0, len(response), max_bytes)]
 
         return chunks[:MAX_CHUNKS]
-
-    def _pad_for_chunk_break(self, text: str, target_length: int = MAX_RESPONSE_LENGTH - 2) -> str:
-        """Pad text to force clean chunk boundary using byte-aware calculation"""
-        text_bytes = text.encode("utf-8")
-
-        if len(text_bytes) < target_length:
-            # Calculate padding needed in bytes
-            padding_needed = target_length - len(text_bytes)
-            # Use spaces for padding (1 byte each)
-            padded_text = text + " " * padding_needed + ", "
-        else:
-            # Text is already at or over target, just add separator
-            padded_text = text + ", "
-
-        if has_console:
-            original_bytes = len(text.encode("utf-8"))
-            padded_bytes = len(padded_text.encode("utf-8"))
-            print(f"🔍 Padding: '{text[:30]}...' {original_bytes}→{padded_bytes} bytes")
-
-        return padded_text

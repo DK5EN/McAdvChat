@@ -8,26 +8,59 @@ git subtree in other packages without importing meshcom_mock directly.
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
-from datetime import datetime, timezone
-from typing import Any, Literal, Protocol, runtime_checkable
+from datetime import UTC, datetime
+from typing import Any, Literal, Protocol, get_args, runtime_checkable
 
-# ── Category vocabulary ─────────────────────────────────────────────────
-# Kept as a tuple so it can be used as a frozen set of legal values.
-# ``other`` is the fallback when no rule matches.
+# -- Shared compiled patterns (CLS-05) ------------------------------------
+# Previously template.py and score.py each defined their own EMOJI_RE, with
+# a subtle semantic difference: score.py's variation-selector code point was
+# INSIDE the character class (matching it as its own standalone occurrence,
+# double-counting an emoji + its trailing selector as two matches), while
+# template.py's was an optional SUFFIX on the character class (consuming an
+# emoji and its trailing selector as one atomic match). One canonical
+# definition here uses template's (more correct for both substitution and
+# counting) form.
 
-CATEGORIES: tuple[str, ...] = (
-    "timestamp_beacon",
-    "wx_beacon",
-    "node_advert",
-    "sw_advert",
-    "greeting",
-    "qso",
-    "alert",
-    "directed",
-    "bot_command",
-    "other",
+URL_RE: re.Pattern[str] = re.compile(r"https?://\S+")
+
+EMOJI_RE: re.Pattern[str] = re.compile(
+    "["  # start character class
+    "\U0001f300-\U0001faff"  # Misc Symbols & Pictographs through Symbols & Pictographs Ext-A
+    "\u2600-\u27bf"  # Misc Symbols, Dingbats
+    "\u2300-\u23ff"  # Misc Technical (clocks, arrows, etc.)
+    "]"
+    "\ufe0f?"  # optional variation selector -- consumed as part of the preceding match
 )
+
+# -- Directed-destination predicate ---------------------------------------
+# "Directed" is a property of the ROUTING, not of the text: a message is
+# directed when its destination resolves to a personal callsign rather than
+# to a group / broadcast / time channel. Pinned across all three repos by
+# directed_dst_vectors.json (canonical copy sits beside this module and
+# rides the classifier subtree into MCProxy; the webapp vendors a
+# parse-equal copy and replays it against classifyDst()).
+#
+# The pattern is applied with .search() to the RAW dst, so it resolves
+# via-routing itself: `(?:^|,)` plus the `$` anchor and a comma-free
+# character class force the match onto the LAST comma component, which is
+# the real target ('DJ8MEH-82,DJ8MEH-8' -> 'DJ8MEH-8'). This mirrors the
+# webapp's effectiveDst(). The rest:
+#   (?!(?:ALL|TEST|TIME)\s*$)  broadcast alias / group 'TEST' / time channel
+#   (?=[^,]*[A-Z])             must contain a letter -- rejects every numeric
+#                              group id, in or out of the 1..99999 range, and
+#                              '*' (which the character class rejects anyway)
+#   [A-Z0-9./-]+               callsign with an OPTIONAL -SSID, so a bare
+#                              'DL1EEN' is directed too; '.' and '/' keep
+#                              portable//P-style suffixes on the person side
+# `(?i)` must stay leading -- Python rejects a mid-pattern global flag.
+DIRECTED_DST_PATTERN: str = r"(?i)(?:^|,)\s*(?!(?:ALL|TEST|TIME)\s*$)(?=[^,]*[A-Z])[A-Z0-9./-]+\s*$"
+
+DIRECTED_DST_RE: re.Pattern[str] = re.compile(DIRECTED_DST_PATTERN)
+
+# -- Category vocabulary ---------------------------------------------------
+# ``other`` is the fallback when no rule matches.
 
 MessageCategory = Literal[
     "timestamp_beacon",
@@ -39,8 +72,17 @@ MessageCategory = Literal[
     "alert",
     "directed",
     "bot_command",
+    # Test/probe messages ("test", "prova", "probe", "essai", ...). Emitted by
+    # seed.py's "Test message" rule and consumed as automated-noise by
+    # profile/corpus.py's DROP_CATEGORIES -- it must be a first-class category.
+    "test_msg",
     "other",
 ]
+
+# CLS-05: derived from MessageCategory instead of duplicating the same 10
+# strings in a second literal tuple that could silently drift out of sync.
+# Kept as a tuple so it can be used as a frozen set of legal values.
+CATEGORIES: tuple[str, ...] = get_args(MessageCategory)
 
 # Bumped whenever classifier output semantics change (hash algorithm,
 # score formula, category vocabulary).  Rule edits bump the per-DB
@@ -48,19 +90,28 @@ MessageCategory = Literal[
 # lives alongside the DB version in ``classifier_ver`` on each row.
 CLASSIFIER_SCHEMA_VERSION: int = 1
 
+# CLS-05: the 12-hex-char SHA-1 prefix length was a bare `[:12]` literal
+# duplicated in template.py's fingerprint() and classify.py's _fallback_hash().
+TEMPLATE_HASH_LEN: int = 12
 
-# ── Timestamp helper ─────────────────────────────────────────────────────
+
+# -- Timestamp helper -------------------------------------------------------
 # Duplicated from meshcom_mock.storage so the classifier package is self-
 # contained when used as a git subtree in other packages.
 
 
-def _ms_to_zulu(ms: int) -> str:
-    """Convert millisecond epoch to ISO 8601 UTC string."""
-    dt = datetime.fromtimestamp(ms / 1000, tz=timezone.utc)
+def ms_to_zulu(ms: int) -> str:
+    """Convert millisecond epoch to ISO 8601 UTC string.
+
+    CLS-04: public (was `_ms_to_zulu`) — MCProxy's storage layer imports this
+    across the subtree boundary; it was reaching into a private symbol that
+    any mc-chat rename would silently break.
+    """
+    dt = datetime.fromtimestamp(ms / 1000, tz=UTC)
     return dt.strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
-# ── SSE types ────────────────────────────────────────────────────────────
+# -- SSE types ---------------------------------------------------------------
 
 
 @dataclass
@@ -76,7 +127,7 @@ class EventBusProtocol(Protocol):
     async def publish(self, event: SSEEvent) -> None: ...
 
 
-# ── Storage Protocol ─────────────────────────────────────────────────────
+# -- Storage Protocol ---------------------------------------------------------
 # All methods that the classifier calls on the storage object.  Both
 # meshcom_mock.storage.Storage and MCProxy's sqlite_storage must satisfy
 # this Protocol structurally.
@@ -85,7 +136,7 @@ class EventBusProtocol(Protocol):
 class StorageProtocol(Protocol):
     # Rules
     async def get_classifier_rules(self, enabled_only: bool = False) -> list[dict[str, Any]]: ...
-    async def insert_classifier_rule(
+    async def insert_classifier_rule(  # noqa: PLR0913 - signature fixed by call sites
         self,
         *,
         name: str,
@@ -130,7 +181,7 @@ class StorageProtocol(Protocol):
         limit: int = 500,
         offset: int = 0,
     ) -> list[dict[str, Any]]: ...
-    async def update_message_classification(
+    async def update_message_classification(  # noqa: PLR0913 - signature fixed by call sites
         self,
         row_id: Any,
         *,
@@ -143,6 +194,7 @@ class StorageProtocol(Protocol):
 
     # Meta / versioning
     async def set_meta(self, key: str, value: str) -> None: ...
+    async def bump_classifier_version(self) -> int: ...
 
     # Stats (used by collect_stats)
     async def count_messages_by_category(self, since_ms: int) -> dict[str, int]: ...
@@ -153,7 +205,7 @@ class StorageProtocol(Protocol):
     def get_heartbeat_window_size(self) -> int: ...
 
 
-# ── Classification result ────────────────────────────────────────────────
+# -- Classification result ----------------------------------------------------
 
 
 @dataclass(frozen=True, slots=True)

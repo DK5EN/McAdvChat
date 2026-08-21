@@ -12,7 +12,7 @@ shows which signals dominate.
     Weight  Signal          Direction
     ------  --------------  ---------
     +0.30   len_factor      length in words (caps at 15)
-    +0.20   directed        category == 'directed'
+    +0.20   directed        category or 'directed' tag
     +0.20   group_chat      category in ('qso', 'other')
     +0.15   freshness       1 / (1 + template_count)
     -0.25   emoji_density   emoji chars / text length
@@ -27,18 +27,11 @@ from __future__ import annotations
 
 import re
 
-# ── Emoji regex (deliberately a local copy, not imported from template.py) ──
-# Covers the same ranges as template.EMOJI_RE so the two are kept in sync:
-#   \U0001F300-\U0001FAFF  extended pictographs / emoticons / symbols
-#   \u2600-\u27BF          misc symbols, dingbats, etc.
-#   \u2300-\u23FF          misc technical (clocks, arrows, …)
-#   \ufe0f                 variation selector-16 (emoji presentation)
-#
-# The variation selector is included in the class so it adds to the count
-# alongside the base character — both are replaced when fingerprinting.
-EMOJI_RE: re.Pattern[str] = re.compile(
-    r"[\U0001F300-\U0001FAFF\u2600-\u27BF\u2300-\u23FF\ufe0f]"
-)
+from .types import EMOJI_RE
+
+# CLS-05: EMOJI_RE now imported from .types (single canonical definition,
+# shared with template.py -- previously this was a deliberately separate
+# local copy that had drifted into a subtly different regex).
 
 # ── Weights (tune here) ─────────────────────────────────────────────────────
 _W_LEN_FACTOR: float = 0.30
@@ -49,7 +42,7 @@ _W_EMOJI_DENSITY: float = -0.25
 _W_URL_DENSITY: float = -0.10
 _W_KNOWN_BEACON: float = -0.40
 
-_LEN_CAP: float = 15.0   # word count that saturates len_factor
+_LEN_CAP: float = 15.0  # word count that saturates len_factor
 
 # Clamp ceilings for low-value content.
 _BOT_COMMAND_CAP: float = 0.25
@@ -72,7 +65,7 @@ def compute(
     Weighted blend::
 
         + 0.30 * len_factor       # min(word_count / 15, 1.0)
-        + 0.20 * directed         # 1.0 if category == 'directed' else 0.0
+        + 0.20 * directed         # 1.0 if directed by category OR tag
         + 0.20 * group_chat       # 1.0 if category in ('qso', 'other') else 0.0
         + 0.15 * freshness        # 1.0 / (1 + template_count)
         - 0.25 * emoji_density    # emoji_count / max(len(text), 1)
@@ -89,7 +82,11 @@ def compute(
     # Positive contributors
     word_count: int = len(re.findall(r"\w+", text))
     len_factor: float = min(word_count / _LEN_CAP, 1.0)
-    directed: float = 1.0 if category == "directed" else 0.0
+    # Read the TAG, not just the category: `category` is single-valued and
+    # first-match-wins, so a DM whose text also matched a content rule is
+    # categorised 'greeting'/'test_msg'/... and would otherwise lose the
+    # directedness bonus. seed.py's "Direct callsign" rule emits both.
+    directed: float = 1.0 if category == "directed" or "directed" in tag_set else 0.0
     group_chat: float = 1.0 if category in ("qso", "other") else 0.0
     freshness: float = 1.0 / (1 + template_count)
 

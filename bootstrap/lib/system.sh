@@ -332,6 +332,15 @@ configure_nftables() {
       needs_update=true
     fi
 
+    # Update if port 443 (Caddy HTTPS front door) is missing — Wave 0.
+    # Without this clause, already-marked installs (e.g. mcapp, which has the
+    # marker + the 2985 rule) would SKIP the rewrite and never open :443,
+    # leaving LAN/iPhone HTTPS clients firewall-dropped even with Caddy up.
+    if ! grep -q "dport 443" "$nft_conf" 2>/dev/null; then
+      log_info "  Updating nftables rules (adding Caddy HTTPS port 443)..."
+      needs_update=true
+    fi
+
     if [[ "$needs_update" == "false" ]]; then
       log_info "  nftables rules already configured"
       return 0
@@ -348,13 +357,15 @@ configure_nftables() {
 #
 # Required ports:
 #   22/tcp   - SSH (rate limited, LAN exempt)
-#   80/tcp   - HTTP (lighttpd webapp + API proxy)
+#   80/tcp   - HTTP (Caddy front door → lighttpd/FastAPI)
+#   443/tcp  - HTTPS (Caddy front door — Wave 0)
 #   1799/udp - MeshCom node communication
 #   5353/udp - mDNS (avahi for .local resolution)
 #   2985/tcp - Update runner SSE stream
 #
 # Internal only (not exposed):
-#   2981/tcp - FastAPI SSE/REST (proxied via lighttpd on :80)
+#   2981/tcp - FastAPI SSE/REST (proxied via Caddy→lighttpd)
+#   8082/tcp - lighttpd backend (127.0.0.1 only, behind Caddy)
 
 flush ruleset
 
@@ -377,8 +388,11 @@ table inet filter {
     # SSH - rate limit external connections (6 new per minute)
     tcp dport 22 ct state new limit rate 6/minute accept
 
-    # HTTP (lighttpd webapp + API proxy)
+    # HTTP (Caddy front door → lighttpd/FastAPI)
     tcp dport 80 accept
+
+    # HTTPS (Caddy HTTPS front door — Wave 0; LAN/iPhone clients hit :443)
+    tcp dport 443 accept
 
     # Update runner SSE stream (frontend-triggered updates)
     tcp dport 2985 accept
@@ -487,8 +501,11 @@ configure_iptables_legacy() {
   iptables -A INPUT -p tcp --dport 22 -m state --state NEW -m recent --update --seconds 60 --hitcount 4 -j DROP
   iptables -A INPUT -p tcp --dport 22 -j ACCEPT
 
-  # HTTP (lighttpd - proxies ports 2980/2981)
+  # HTTP (Caddy front door → lighttpd/FastAPI)
   iptables -A INPUT -p tcp --dport 80 -j ACCEPT
+
+  # HTTPS (Caddy HTTPS front door — Wave 0; LAN/iPhone clients hit :443)
+  iptables -A INPUT -p tcp --dport 443 -j ACCEPT
 
   # Update runner SSE stream (frontend-triggered updates)
   iptables -A INPUT -p tcp --dport 2985 -j ACCEPT

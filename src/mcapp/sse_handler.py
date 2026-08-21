@@ -4,60 +4,95 @@ Server-Sent Events (SSE) transport for McApp using FastAPI.
 
 This module provides an alternative to WebSocket for clients that prefer
 HTTP-based event streaming. It runs alongside the existing WebSocket server.
+
+`SSEManager._create_app` (SSE-01) assembles its REST/SSE surface from
+`sse_routes/` — one `APIRouter` module per concern (stream, prefs, classifier,
+weather, deploy). This module keeps the `SSEManager`/`SSEClient` core
+(connection bookkeeping, broadcast, the SSE event-type/formatting helpers,
+the update-runner/slot-info helpers used only by the deploy router, and the
+`initial_events()` startup-burst generator shared by the stream router) plus
+lifecycle (`start_server`/`stop_server`) and the module-level regression test.
 """
+
 import asyncio
+import contextlib
 import json
+import logging
+import pathlib
+import tempfile
 import time
-import uuid
+from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
-from datetime import datetime, timezone
-from typing import Any
+from typing import Any, ClassVar
 
+from . import __version__
+from .ble_client import ConnectionState
+from .classifier import Classifier
+from .commands.parsing import SPAM_GROUP
+from .linkcheck import is_link_check_payload
 from .logging_setup import get_logger
+from .schemas import DeleteMessagesRequest
+from .sqlite_storage import SQLiteStorage, create_sqlite_storage
+from .storage.constants import db_write
+from .system_converge import (
+    REQUIRED_SYSTEM_EPOCH,
+    UPDATE_ARGS_FILE,
+    UPDATE_RUNNER_PORT,
+    UPDATE_TRIGGER_FILE,
+    read_installed_epoch,
+)
+from .util import now_ms
 
-# Module-level TimezoneFinder singleton: the constructor loads a ~100 KB dataset
-# into memory, so we instantiate once on first use and reuse across requests.
-_tz_finder: Any = None
+SSE_CLIENT_QUEUE_SIZE = 256
+SLOT_COUNT = 3  # ⚠ must match scripts/update-runner.py's NUM_SLOTS
+SERVER_SHUTDOWN_TIMEOUT = 5.0
+DEFAULT_SSE_PORT = 2981
+
+VERSION = f"v{__version__}"  # emitted in the FastAPI app metadata and GET /api/status
+
+# Hosts that are only reachable from the Pi itself — never hand these to a
+# remote browser as an update-runner stream URL (it would connect to its own
+# machine). See reachable_runner_host / launch_update_runner.
+_LOOPBACK_HOSTS = frozenset({"127.0.0.1", "localhost", "0.0.0.0", "::1"})  # noqa: S104 - string literals compared against, not a bind address
 
 
-def _get_tz_finder() -> Any:
-    global _tz_finder
-    if _tz_finder is None:
-        from timezonefinder import TimezoneFinder
-        _tz_finder = TimezoneFinder()
-    return _tz_finder
+def reachable_runner_host(request_host: str | None, bind_host: str) -> str:
+    """Pick the hostname a remote client can reach the update-runner on.
 
-VERSION = "v0.50.0"
+    Prefer the Host the client used to reach the API (forwarded by lighttpd),
+    stripped of any port. Ignore loopback/wildcard values — those are only
+    reachable from the Pi itself and are exactly what made the browser connect
+    to its own localhost:2985. Fall back to the bind address, mapping the
+    0.0.0.0 wildcard to localhost as a last resort.
+    """
+    if request_host:
+        candidate = request_host.split(":", 1)[0].strip()
+        if candidate and candidate.lower() not in _LOOPBACK_HOSTS:
+            return candidate
+    return bind_host if bind_host != "0.0.0.0" else "localhost"  # noqa: S104 - comparing bind host string, not binding
+
 
 logger = get_logger(__name__)
 
 # Import FastAPI and related modules
 try:
-    from fastapi import FastAPI, HTTPException, Request
+    from fastapi import FastAPI, HTTPException
     from fastapi.middleware.cors import CORSMiddleware
-    from fastapi.responses import StreamingResponse
+    from starlette.routing import Route
 
-    from .schemas import (
-        BlePinRequest,
-        BlockedTextRequest,
-        ClassifierRuleCreate,
-        ClassifierRulePatch,
-        ClassifierRuleTest,
-        DeleteMessagesRequest,
-        HiddenDestinationsRequest,
-        ReadCountRequest,
-        ReclassifyRequest,
-        SendMessageRequest,
-        SidebarStateRequest,
-        TemplateActionRequest,
-        UpdateStartRequest,
-    )
+    from .sse_routes.classifier import build_classifier_router
+    from .sse_routes.deploy import build_deploy_router
+    from .sse_routes.linkcheck import build_linkcheck_router
+    from .sse_routes.prefs import build_prefs_router
+    from .sse_routes.push import build_push_router
+    from .sse_routes.stream import build_stream_router
+    from .sse_routes.weather import build_weather_router
 
     FASTAPI_AVAILABLE = True
 except ImportError:
     FASTAPI_AVAILABLE = False
     logger.warning("FastAPI not installed. SSE transport will not be available.")
-    logger.warning("Install with: pip install fastapi uvicorn")
+    logger.warning("Install with: uv sync --all-packages")
 
 try:
     import uvicorn
@@ -75,14 +110,22 @@ class SSEClient:
         self.client_id = client_id
         # Queue stores pre-formatted SSE event strings so broadcast payloads are
         # serialized once and shared across all clients instead of re-formatted N times.
-        self.queue: asyncio.Queue[str] = asyncio.Queue()
+        # Bounded so a slow/stalled consumer can't grow the queue without limit; on
+        # overflow the client is disconnected rather than backpressuring the broadcaster.
+        self.queue: asyncio.Queue[str] = asyncio.Queue(maxsize=SSE_CLIENT_QUEUE_SIZE)
         self.connected = True
         self.connected_at = time.time()
 
     async def send(self, event: str) -> None:
-        """Queue a pre-formatted SSE event string for this client."""
-        if self.connected:
-            await self.queue.put(event)
+        """Queue a pre-formatted SSE event string; disconnect slow consumers."""
+        if not self.connected:
+            return
+        try:
+            self.queue.put_nowait(event)
+        except asyncio.QueueFull:
+            # Slow consumer: mark disconnected so its generator exits and cleans up.
+            self.disconnect()
+            raise
 
     def disconnect(self) -> None:
         """Mark client as disconnected."""
@@ -97,20 +140,25 @@ class SSEManager:
     """
 
     def __init__(
-        self, host: str, port: int,
-        message_router: Any = None, weather_service: Any = None
+        self, host: str, port: int, message_router: Any = None, weather_service: Any = None
     ):
         self.host = host
         self.port = port
         self.message_router = message_router
         self.weather_service = weather_service
-        self.classifier: Any = None
+        self.classifier: Classifier | None = None
         self.clients: dict[str, SSEClient] = {}
         self.clients_lock = asyncio.Lock()
         self.app: FastAPI | None = None
         self.server: Any = None
         self._server_task: asyncio.Task[None] | None = None
-        self._shutdown_event = asyncio.Event()
+        self.shutdown_event = asyncio.Event()
+        # Set by build_push_router so stop_server() can cancel the push dispatcher's
+        # perpetual drain/sweep tasks. Typed Any because push_delivery is only importable
+        # behind the FastAPI try/except above. Previously the dispatcher was reachable
+        # only as an attribute monkey-patched onto the APIRouter, so no shutdown path
+        # could see it and both tasks were still pending at process exit.
+        self.push_dispatcher: Any = None
 
         # Subscribe to messages from the router
         if message_router:
@@ -119,19 +167,255 @@ class SSEManager:
             message_router.subscribe("ble_notification", self._broadcast_handler)
             message_router.subscribe("ble_status", self._broadcast_handler)
             message_router.subscribe("msg_status", self._status_handler)
+            message_router.subscribe("linkcheck_event", self._linkcheck_handler)
             # Note: websocket_direct not supported for SSE (no individual connection reference)
 
         logger.info("SSEManager initialized for %s:%d", host, port)
 
-    def set_classifier(self, classifier: Any) -> None:
+    def set_classifier(self, classifier: Classifier) -> None:
         """Wire the classifier so REST routes can access rules/templates/reclassify."""
         self.classifier = classifier
+
+    # ── Storage/classifier accessors shared by every sse_routes module (CO-07) ──
+    # `manager.require_storage()`/`require_classifier()` raise a loud 503 only when the
+    # dependency itself isn't wired up yet. Once wired, it's always the real
+    # SQLiteStorage/Classifier — a missing method on it is a bug, not a
+    # degraded-mode case, so callers no longer hasattr-guard each call site.
+
+    def _get_storage_or_none(self) -> SQLiteStorage | None:
+        """Return the wired storage handler, or None if not yet available."""
+        return self.message_router.storage_handler if self.message_router else None
+
+    def require_storage(self) -> SQLiteStorage:
+        """Return the storage handler, or raise a 503 if not wired up."""
+        storage = self._get_storage_or_none()
+        if not storage:
+            raise HTTPException(status_code=503, detail="Storage not available")
+        return storage
+
+    def require_classifier(self) -> Classifier:
+        """Return the wired classifier, or raise a 503 if not wired up."""
+        if self.classifier is None:
+            raise HTTPException(status_code=503, detail="Classifier not available")
+        return self.classifier
+
+    async def after_rule_mutation(
+        self, storage: SQLiteStorage, classifier: Classifier
+    ) -> dict[str, int | str]:
+        """Shared postlude for rule create/patch/delete: bump the classifier
+        version, reload it, broadcast the refreshed rule list, and return the
+        standard success response.
+        """
+        new_ver = await storage.bump_classifier_version()
+        await classifier.load()
+        rules = await storage.get_classifier_rules_raw()
+        await self.broadcast_event(
+            "proxy:classifier_rules",
+            {"rules": rules, "classifier_version": new_ver},
+        )
+        return {"status": "ok", "classifier_version": new_ver}
+
+    async def register_client(self, client_id: str) -> SSEClient:
+        """Create and register a new SSE client under the clients lock."""
+        client = SSEClient(client_id)
+        async with self.clients_lock:
+            self.clients[client_id] = client
+        logger.debug("SSE client connected: %s", client_id)
+        return client
+
+    async def initial_events(self, client_id: str) -> AsyncIterator[str]:  # noqa: PLR0912, PLR0915 - complex handler kept intact
+        """Yield the SSE client's startup burst: smart_initial/summary/prefs
+        snapshots, classifier rules+stats, and BLE status.
+
+        Extracted from `/events`'s `event_generator` (SSE-01); the caller wraps
+        this in its own try/except so a failure here degrades to "no initial
+        snapshot" rather than killing the stream.
+        """
+        storage = self._get_storage_or_none()
+        if storage:
+            initial_data, summary = await storage.get_smart_initial_with_summary()
+            logger.debug(
+                "SSE client %s: sending smart_initial (%d msgs, %d pos, %d acks)",
+                client_id,
+                len(initial_data["messages"]),
+                len(initial_data["positions"]),
+                len(initial_data.get("acks", [])),
+            )
+            yield self.format_sse_event(
+                {
+                    "type": "response",
+                    "msg": "smart_initial",
+                    "data": initial_data,
+                },
+                SSEManager._RESPONSE_EVENT_MAP["smart_initial"],
+            )
+            yield self.format_sse_event(
+                {
+                    "type": "response",
+                    "msg": "summary",
+                    "data": summary,
+                },
+                SSEManager._RESPONSE_EVENT_MAP["summary"],
+            )
+            # Send persisted read counts for unread badge sync
+            read_counts = await storage.get_read_counts()
+            if read_counts:
+                yield self.format_sse_event(
+                    {
+                        "type": "response",
+                        "msg": "read_counts",
+                        "data": read_counts,
+                    },
+                    SSEManager._RESPONSE_EVENT_MAP["read_counts"],
+                )
+            hidden_dsts = await storage.get_hidden_destinations()
+            if hidden_dsts:
+                yield self.format_sse_event(
+                    {
+                        "type": "response",
+                        "msg": "hidden_destinations",
+                        "data": hidden_dsts,
+                    },
+                    SSEManager._RESPONSE_EVENT_MAP["hidden_destinations"],
+                )
+            blocked_texts = await storage.get_blocked_texts()
+            if blocked_texts:
+                yield self.format_sse_event(
+                    {
+                        "type": "response",
+                        "msg": "blocked_texts",
+                        "data": blocked_texts,
+                    },
+                    SSEManager._RESPONSE_EVENT_MAP["blocked_texts"],
+                )
+            # V9.4/V9.5: blocked callsigns (sperrliste loaded server-side + admin
+            # kickbans), owned by the CommandHandler. Always emitted, including
+            # `[]` (V9.5) — unlike blocked_texts/hidden_destinations, the webapp
+            # fully REPLACES its blocklist on every received event, so gating
+            # this burst on non-empty content left a client that reconnected
+            # after an admin `!kb delall` (a non-empty-gated mutation broadcast)
+            # stuck with its stale non-empty blocklist forever. mc-chat's
+            # meshcom_mock/api.py carries the same fix.
+            command_handler = (
+                self.message_router.get_protocol("commands") if self.message_router else None
+            )
+            blocked_callsigns = sorted(getattr(command_handler, "blocked_callsigns", set()))
+            yield self.format_sse_event(
+                {
+                    "type": "response",
+                    "msg": "blocked_callsigns",
+                    "data": blocked_callsigns,
+                },
+                SSEManager._RESPONSE_EVENT_MAP["blocked_callsigns"],
+            )
+            sidebar = await storage.get_mheard_sidebar()
+            if sidebar:
+                yield self.format_sse_event(
+                    {
+                        "type": "response",
+                        "msg": "mheard_sidebar",
+                        "data": sidebar,
+                    },
+                    SSEManager._RESPONSE_EVENT_MAP["mheard_sidebar"],
+                )
+            wx_sidebar = await storage.get_wx_sidebar()
+            if wx_sidebar:
+                yield self.format_sse_event(
+                    {
+                        "type": "response",
+                        "msg": "wx_sidebar",
+                        "data": wx_sidebar,
+                    },
+                    SSEManager._RESPONSE_EVENT_MAP["wx_sidebar"],
+                )
+            # Classifier rules snapshot — webapp hydrates its rule editor without
+            # a round-trip.
+            # `storage` is already truthy inside this block — no need to re-test it here
+            # or below.
+            if self.classifier is not None:
+                try:
+                    rule_rows = await storage.get_classifier_rules_raw()
+                    yield self.format_sse_event(
+                        {"rules": rule_rows},
+                        "proxy:classifier_rules",
+                    )
+                except Exception as exc:
+                    logger.warning("classifier rules snapshot failed: %s", exc)
+            if self.classifier is not None:
+                try:
+                    stats = await self.classifier.collect_stats()
+                    stats["blocked_text_hits_24h"] = await storage.count_blocked_text_hits_24h()
+                    yield self.format_sse_event(stats, "proxy:classifier_stats")
+                except Exception as exc:
+                    logger.warning("classifier stats snapshot failed: %s", exc)
+            try:
+                fp = await storage.get_filter_prefs()
+                yield self.format_sse_event(fp, "proxy:filter_prefs")
+            except Exception as exc:
+                logger.warning("filter_prefs snapshot failed: %s", exc)
+        else:
+            logger.warning(
+                "SSE client %s: no storage handler available",
+                client_id,
+            )
+
+        # Send BLE status using same format the frontend expects
+        ble_client = self.message_router.get_protocol("ble_client") if self.message_router else None
+        if ble_client:
+            # Refresh from remote service to get real state
+            if hasattr(ble_client, "refresh_status"):
+                status = await ble_client.refresh_status()
+            else:
+                status = ble_client.status
+            is_connected = status.state == ConnectionState.CONNECTED
+
+            if is_connected:
+                ble_info = {
+                    "src_type": "BLE",
+                    "TYP": "blueZ",
+                    "command": "connect BLE result",
+                    "result": "ok",
+                    "msg": "BLE connection already running",
+                    "device_address": status.device_address,
+                    "device_name": status.device_name,
+                    "mode": status.mode.value,
+                    "timestamp": now_ms(),
+                }
+            else:
+                ble_info = {
+                    "src_type": "BLE",
+                    "TYP": "blueZ",
+                    "command": "disconnect",
+                    "result": "ok",
+                    "msg": "BLE not connected",
+                    "timestamp": now_ms(),
+                }
+            yield self.format_sse_event(ble_info, "ble:status")
+
+            # If BLE is connected, serve cached registers instantly
+            # instead of re-querying the device.
+            if is_connected:
+                cached_regs = getattr(
+                    self.message_router,
+                    "cached_ble_registers",
+                    {},
+                )
+                if cached_regs:
+                    for reg_data in cached_regs.values():
+                        yield self.format_sse_event(reg_data, self._get_event_type(reg_data))
+                    logger.debug(
+                        "SSE client %s: sent %d cached BLE registers",
+                        client_id,
+                        len(cached_regs),
+                    )
+
+        logger.debug("SSE client %s: initial data sent", client_id)
 
     def _create_app(self) -> FastAPI:
         """Create and configure the FastAPI application."""
 
         @asynccontextmanager
-        async def lifespan(app: FastAPI) -> Any:
+        async def lifespan(_app: FastAPI) -> Any:
             """Handle startup and shutdown."""
             logger.info("SSE server starting up")
             yield
@@ -154,944 +438,93 @@ class SSEManager:
             allow_headers=["*"],
         )
 
-        # SSE endpoint
-        @app.get("/events")
-        async def sse_endpoint(request: Request) -> StreamingResponse:
-            """
-            Server-Sent Events endpoint.
-
-            Clients connect here to receive real-time message updates.
-            """
-            client_id = str(uuid.uuid4())[:8]
-            client = SSEClient(client_id)
-
-            async with self.clients_lock:
-                self.clients[client_id] = client
-
-            logger.debug("SSE client connected: %s", client_id)
-
-            async def event_generator() -> Any:
-                try:
-                    # Send initial connection confirmation
-                    yield self._format_sse_event(
-                        {
-                            "type": "connected",
-                            "client_id": client_id,
-                            "timestamp": int(time.time() * 1000),
-                        },
-                        "system:connected",
-                    )
-
-                    # Send initial data (messages, positions, BLE status)
-                    try:
-                        storage = (
-                            self.message_router.storage_handler
-                            if self.message_router else None
-                        )
-                        if storage:
-                            if hasattr(storage, 'get_smart_initial_with_summary'):
-                                initial_data, summary = (
-                                    await storage.get_smart_initial_with_summary()
-                                )
-                            else:
-                                initial_data = await storage.get_smart_initial()
-                                summary = await storage.get_summary()
-                            logger.debug(
-                                "SSE client %s: sending smart_initial"
-                                " (%d msgs, %d pos, %d acks)",
-                                client_id,
-                                len(initial_data["messages"]),
-                                len(initial_data["positions"]),
-                                len(initial_data.get("acks", [])),
-                            )
-                            yield self._format_sse_event({
-                                "type": "response",
-                                "msg": "smart_initial",
-                                "data": initial_data,
-                            }, "proxy:initial")
-                            yield self._format_sse_event({
-                                "type": "response",
-                                "msg": "summary",
-                                "data": summary,
-                            }, "proxy:summary")
-                            # Send persisted read counts for unread badge sync
-                            if hasattr(storage, 'get_read_counts'):
-                                read_counts = await storage.get_read_counts()
-                                if read_counts:
-                                    yield self._format_sse_event({
-                                        "type": "response",
-                                        "msg": "read_counts",
-                                        "data": read_counts,
-                                    }, "proxy:read_counts")
-                            if hasattr(storage, 'get_hidden_destinations'):
-                                hidden_dsts = await storage.get_hidden_destinations()
-                                if hidden_dsts:
-                                    yield self._format_sse_event({
-                                        "type": "response",
-                                        "msg": "hidden_destinations",
-                                        "data": hidden_dsts,
-                                    }, "proxy:hidden_destinations")
-                            if hasattr(storage, 'get_blocked_texts'):
-                                blocked_texts = await storage.get_blocked_texts()
-                                if blocked_texts:
-                                    yield self._format_sse_event({
-                                        "type": "response",
-                                        "msg": "blocked_texts",
-                                        "data": blocked_texts,
-                                    }, "proxy:blocked_texts")
-                            if hasattr(storage, 'get_mheard_sidebar'):
-                                sidebar = await storage.get_mheard_sidebar()
-                                if sidebar:
-                                    yield self._format_sse_event({
-                                        "type": "response",
-                                        "msg": "mheard_sidebar",
-                                        "data": sidebar,
-                                    }, "proxy:mheard_sidebar")
-                            if hasattr(storage, 'get_wx_sidebar'):
-                                wx_sidebar = await storage.get_wx_sidebar()
-                                if wx_sidebar:
-                                    yield self._format_sse_event({
-                                        "type": "response",
-                                        "msg": "wx_sidebar",
-                                        "data": wx_sidebar,
-                                    }, "proxy:wx_sidebar")
-                            # Classifier rules snapshot — webapp hydrates its rule editor without
-                            # a round-trip.
-                            if self.classifier is not None and storage is not None:
-                                try:
-                                    rule_rows = await storage._execute(
-                                        "SELECT id, name, pattern, scope, category, extra_tags, "
-                                        "priority, enabled, builtin, created_at, updated_at "
-                                        "FROM classifier_rules ORDER BY priority ASC, id ASC"
-                                    )
-                                    yield self._format_sse_event(
-                                        {"rules": rule_rows},
-                                        "proxy:classifier_rules",
-                                    )
-                                except Exception as exc:
-                                    logger.warning("classifier rules snapshot failed: %s", exc)
-                            if self.classifier is not None:
-                                try:
-                                    stats = await self.classifier.collect_stats()
-                                    yield self._format_sse_event(stats, "proxy:classifier_stats")
-                                except Exception as exc:
-                                    logger.warning("classifier stats snapshot failed: %s", exc)
-                            if hasattr(storage, "get_filter_prefs"):
-                                try:
-                                    fp = await storage.get_filter_prefs()
-                                    yield self._format_sse_event(fp, "proxy:filter_prefs")
-                                except Exception as exc:
-                                    logger.warning("filter_prefs snapshot failed: %s", exc)
-                        else:
-                            logger.warning(
-                                "SSE client %s: no storage handler available",
-                                client_id,
-                            )
-
-                        # Send BLE status using same format the frontend expects
-                        ble_client = (
-                            self.message_router.get_protocol("ble_client")
-                            if self.message_router else None
-                        )
-                        if ble_client:
-                            from .ble_client import ConnectionState
-
-                            # Refresh from remote service to get real state
-                            if hasattr(ble_client, 'refresh_status'):
-                                status = await ble_client.refresh_status()
-                            else:
-                                status = ble_client.status
-                            is_connected = status.state == ConnectionState.CONNECTED
-
-                            if is_connected:
-                                ble_info = {
-                                    "src_type": "BLE",
-                                    "TYP": "blueZ",
-                                    "command": "connect BLE result",
-                                    "result": "ok",
-                                    "msg": "BLE connection already running",
-                                    "device_address": status.device_address,
-                                    "device_name": status.device_name,
-                                    "mode": status.mode.value,
-                                    "timestamp": int(time.time() * 1000),
-                                }
-                            else:
-                                ble_info = {
-                                    "src_type": "BLE",
-                                    "TYP": "blueZ",
-                                    "command": "disconnect",
-                                    "result": "ok",
-                                    "msg": "BLE not connected",
-                                    "timestamp": int(time.time() * 1000),
-                                }
-                            yield self._format_sse_event(ble_info, "ble:status")
-
-                            # If BLE is connected, serve cached registers instantly
-                            # instead of re-querying the device.
-                            if is_connected:
-                                cached_regs = getattr(
-                                    self.message_router,
-                                    'cached_ble_registers', {},
-                                )
-                                if cached_regs:
-                                    for reg_data in cached_regs.values():
-                                        yield self._format_sse_event(
-                                            reg_data, self._get_event_type(reg_data)
-                                        )
-                                    logger.debug(
-                                        "SSE client %s: sent %d cached BLE"
-                                        " registers",
-                                        client_id, len(cached_regs),
-                                    )
-
-                        logger.debug("SSE client %s: initial data sent", client_id)
-                    except Exception as e:
-                        logger.error(
-                            "SSE client %s: failed to send initial data: %s",
-                            client_id, e, exc_info=True,
-                        )
-
-                    while client.connected and not self._shutdown_event.is_set():
-                        # Check if client disconnected
-                        if await request.is_disconnected():
-                            break
-
-                        try:
-                            # Wait for pre-formatted event with timeout (for keepalive)
-                            event = await asyncio.wait_for(client.queue.get(), timeout=30.0)
-                            yield event
-                        except asyncio.TimeoutError:
-                            # Send keepalive ping
-                            yield self._format_sse_event(
-                                {
-                                    "type": "ping",
-                                    "timestamp": int(time.time() * 1000),
-                                },
-                                "system:ping",
-                            )
-
-                except asyncio.CancelledError:
-                    pass
-                finally:
-                    client.disconnect()
-                    async with self.clients_lock:
-                        self.clients.pop(client_id, None)
-                    logger.debug("SSE client disconnected: %s", client_id)
-
-            return StreamingResponse(
-                event_generator(),
-                media_type="text/event-stream",
-                headers={
-                    "Cache-Control": "no-cache",
-                    "Connection": "keep-alive",
-                    "X-Accel-Buffering": "no",  # Disable nginx buffering
-                },
-            )
-
-        # Message sending endpoint
-        @app.post("/api/send")
-        async def send_message(request: SendMessageRequest) -> dict[str, str]:
-            """
-            Send a message through the mesh network.
-
-            This endpoint mirrors the WebSocket message sending functionality.
-            """
-            if not self.message_router:
-                raise HTTPException(status_code=503, detail="Message router not available")
-
-            message_data = {
-                "type": request.type,
-                "dst": request.dst,
-                "msg": request.msg,
-            }
-
-            if request.src:
-                message_data["src"] = request.src
-
-            try:
-                if request.type == "page_request":
-                    # Paginated message fetch — response via SSE stream
-                    page_data = {
-                        "dst": request.dst,
-                        "before": getattr(request, "before", None),
-                        "limit": getattr(request, "limit", 20),
-                    }
-                    if request.src:
-                        page_data["src"] = request.src
-                    await self.message_router.route_command(
-                        "get_messages_page",
-                        websocket=None,
-                        data=page_data,
-                    )
-                elif request.type == "command":
-                    # Route command through message router
-                    await self.message_router.route_command(
-                        request.msg,
-                        websocket=None,
-                        MAC=request.MAC,
-                        BLE_Pin=request.BLE_Pin,
-                    )
-                elif request.type == "BLE":
-                    # Publish BLE message
-                    await self.message_router.publish(
-                        "sse",
-                        "ble_message",
-                        {"msg": request.msg, "dst": request.dst},
-                    )
-                else:
-                    # Publish UDP message (default)
-                    await self.message_router.publish("sse", "udp_message", message_data)
-
-                return {"status": "ok", "message": "Message queued for delivery"}
-
-            except Exception as e:
-                logger.error("Failed to send message via SSE API: %s", e)
-                raise HTTPException(status_code=500, detail=str(e))
-
-        # Status endpoint — intentional health/observability endpoint.
-        # Returns version, connected client count, and uptime.
-        # Not called by the frontend UI, but useful for ops monitoring and debugging.
-        @app.get("/api/status")
-        async def get_status() -> dict[str, int | str]:
-            """Get SSE server status (version, client count, uptime). Health endpoint."""
-            async with self.clients_lock:
-                client_count = len(self.clients)
-
-            return {
-                "status": "ok",
-                "version": VERSION,
-                "clients": client_count,
-                "uptime_seconds": int(time.time() - getattr(self, "_start_time", time.time())),
-            }
-
-        # Read counts endpoints (unread badge persistence)
-        @app.get("/api/read_counts")
-        async def get_read_counts() -> Any:
-            """Get persisted read counts for unread badge sync."""
-            storage = (
-                self.message_router.storage_handler if self.message_router else None
-            )
-            if not storage or not hasattr(storage, "get_read_counts"):
-                raise HTTPException(status_code=503, detail="Storage not available")
-            return await storage.get_read_counts()
-
-        @app.post("/api/read_counts")
-        async def set_read_count(body: ReadCountRequest) -> dict[str, str]:
-            """Persist a read count for a destination."""
-            storage = (
-                self.message_router.storage_handler if self.message_router else None
-            )
-            if not storage or not hasattr(storage, "set_read_count"):
-                raise HTTPException(status_code=503, detail="Storage not available")
-            await storage.set_read_count(body.dst, body.count)
-            return {"status": "ok"}
-
-        # Hidden destinations endpoints (persist hidden groups)
-        @app.get("/api/hidden_destinations")
-        async def get_hidden_destinations() -> Any:
-            """Get list of hidden destination identifiers."""
-            storage = (
-                self.message_router.storage_handler if self.message_router else None
-            )
-            if not storage or not hasattr(storage, "get_hidden_destinations"):
-                raise HTTPException(status_code=503, detail="Storage not available")
-            return await storage.get_hidden_destinations()
-
-        @app.post("/api/hidden_destinations")
-        async def set_hidden_destinations(body: HiddenDestinationsRequest) -> dict[str, str]:
-            """Update hidden destinations. Bulk: {destinations: [...]}."""
-            storage = (
-                self.message_router.storage_handler if self.message_router else None
-            )
-            if not storage or not hasattr(storage, "set_hidden_destinations"):
-                raise HTTPException(status_code=503, detail="Storage not available")
-            await storage.set_hidden_destinations(body.destinations)
-            return {"status": "ok"}
-
-        # Blocked texts endpoints (persist blocked message patterns)
-        @app.get("/api/blocked_texts")
-        async def get_blocked_texts() -> Any:
-            """Get list of blocked text patterns."""
-            storage = (
-                self.message_router.storage_handler if self.message_router else None
-            )
-            if not storage or not hasattr(storage, "get_blocked_texts"):
-                raise HTTPException(status_code=503, detail="Storage not available")
-            return await storage.get_blocked_texts()
-
-        @app.post("/api/blocked_texts")
-        async def set_blocked_texts(body: BlockedTextRequest) -> dict[str, str]:
-            """Add/remove a blocked text pattern. Single: {text, blocked}."""
-            storage = (
-                self.message_router.storage_handler if self.message_router else None
-            )
-            if not storage or not hasattr(storage, "update_blocked_text"):
-                raise HTTPException(status_code=503, detail="Storage not available")
-            await storage.update_blocked_text(body.text, body.blocked)
-            return {"status": "ok"}
-
-        # Delete messages by destination
-        @app.post("/api/delete_messages")
-        async def delete_messages(body: DeleteMessagesRequest) -> dict[str, int | str]:
-            """Delete all messages for a destination from the database."""
-            storage = (
-                self.message_router.storage_handler if self.message_router else None
-            )
-            if not storage or not hasattr(storage, "delete_messages_by_dst"):
-                raise HTTPException(status_code=503, detail="Storage not available")
-            deleted = await storage.delete_messages_by_dst(body.dst, body.own_call)
-            return {"status": "ok", "deleted": deleted}
-
-        # mHeard sidebar endpoints (persist station order + hidden)
-        @app.get("/api/mheard/sidebar")
-        async def get_mheard_sidebar() -> dict[str, Any]:
-            """Get mheard sidebar state."""
-            storage = (
-                self.message_router.storage_handler if self.message_router else None
-            )
-            if not storage or not hasattr(storage, "get_mheard_sidebar"):
-                raise HTTPException(status_code=503, detail="Storage not available")
-            result = await storage.get_mheard_sidebar()
-            return result or {"order": [], "hidden": []}
-
-        @app.post("/api/mheard/sidebar")
-        async def set_mheard_sidebar(body: SidebarStateRequest) -> dict[str, str]:
-            """Set mheard sidebar state."""
-            storage = (
-                self.message_router.storage_handler if self.message_router else None
-            )
-            if not storage or not hasattr(storage, "set_mheard_sidebar"):
-                raise HTTPException(status_code=503, detail="Storage not available")
-            await storage.set_mheard_sidebar(body.order, body.hidden)
-            return {"status": "ok"}
-
-        # WX sidebar endpoints (persist station order + hidden)
-        @app.get("/api/wx/sidebar")
-        async def get_wx_sidebar() -> dict[str, Any]:
-            """Get WX sidebar state."""
-            storage = (
-                self.message_router.storage_handler if self.message_router else None
-            )
-            if not storage or not hasattr(storage, "get_wx_sidebar"):
-                raise HTTPException(status_code=503, detail="Storage not available")
-            result = await storage.get_wx_sidebar()
-            return result or {"order": [], "hidden": []}
-
-        @app.post("/api/wx/sidebar")
-        async def set_wx_sidebar(body: SidebarStateRequest) -> dict[str, str]:
-            """Set WX sidebar state."""
-            storage = (
-                self.message_router.storage_handler if self.message_router else None
-            )
-            if not storage or not hasattr(storage, "set_wx_sidebar"):
-                raise HTTPException(status_code=503, detail="Storage not available")
-            await storage.set_wx_sidebar(body.order, body.hidden)
-            return {"status": "ok"}
-
-        @app.get("/api/filter_prefs")
-        async def get_filter_prefs() -> Any:
-            storage = (
-                self.message_router.storage_handler if self.message_router else None
-            )
-            if not storage or not hasattr(storage, "get_filter_prefs"):
-                raise HTTPException(status_code=503, detail="Storage not available")
-            return await storage.get_filter_prefs()
-
-        @app.post("/api/filter_prefs")
-        async def set_filter_prefs(body: dict[str, Any]) -> dict[str, str]:
-            # Pure passthrough: the frontend persists a camelCase settings blob
-            # (enabled, hiddenCategories, minInfoScore, hideAutoBeacons) that is
-            # round-tripped verbatim, so we keep an untyped dict instead of a
-            # model to avoid silently dropping keys.
-            storage = (
-                self.message_router.storage_handler if self.message_router else None
-            )
-            if not storage or not hasattr(storage, "set_filter_prefs"):
-                raise HTTPException(status_code=503, detail="Storage not available")
-            await storage.set_filter_prefs(body)
-            return {"status": "ok"}
-
-        # Health check endpoint
-        @app.get("/health")
-        async def health_check() -> dict[str, str]:
-            """Health check endpoint for load balancers."""
-            return {"status": "healthy"}
-
-        # Weather data endpoint
-        @app.get("/api/weather")
-        async def get_weather() -> Any:
-            """Get current weather data from the meteo service."""
-            if not self.weather_service:
-                raise HTTPException(status_code=503, detail="Weather service not available")
-
-            # If no GPS yet, try cached GPS or trigger BLE query
-            if self.weather_service.lat is None and self.message_router:
-                cached = getattr(self.message_router, 'cached_gps', None)
-                if cached:
-                    self.weather_service.update_location(cached['lat'], cached['lon'])
-                else:
-                    # Query BLE device for GPS (one-shot)
-                    ble = self.message_router.get_protocol('ble_client')
-                    if ble and hasattr(ble, 'is_connected') and ble.is_connected:
-                        await ble.send_command("--pos")
-                    return {
-                        "error": "Warte auf GPS vom Gerät...",
-                        "timestamp": int(time.time() * 1000),
-                    }
-
-            data = await asyncio.to_thread(self.weather_service.get_weather_data)
-            return data
-
-        @app.get("/api/weather/preview")
-        async def get_weather_preview(text: str = "") -> dict[str, str]:
-            """Return the formatted WX message as it would appear on the mesh."""
-            if not self.weather_service:
-                raise HTTPException(status_code=503, detail="Weather service not available")
-
-            if self.weather_service.lat is None:
-                return {"preview": "WX: Warte auf GPS..."}
-
-            data = await asyncio.to_thread(self.weather_service.get_weather_data)
-            if "error" in data:
-                return {"preview": f"WX ERR: {data['error'][:25]}"}
-
-            formatted = self.weather_service.format_for_lora(data, prefix_text=text)
-            return {"preview": formatted}
-
-        # Server time endpoint (for frontend clock sync)
-        @app.get("/api/time")
-        async def get_time() -> dict[str, int | str]:
-            """Return server time for frontend clock sync."""
-            return {
-                "server_time_ms": int(time.time() * 1000),
-                "timezone": time.tzname[time.daylight and time.localtime().tm_isdst],
-            }
-
-        # Telemetry data endpoint (for WX charts)
-        @app.get("/api/telemetry")
-        async def get_telemetry(hours: int = 48) -> Any:
-            """Get telemetry data for weather charts."""
-            storage = (
-                self.message_router.storage_handler if self.message_router else None
-            )
-            if not storage or not hasattr(storage, "get_telemetry_chart_data"):
-                raise HTTPException(
-                    status_code=503, detail="Telemetry not available"
-                )
-            return await storage.get_telemetry_chart_data(hours=min(hours, 744))
-
-        @app.get("/api/telemetry/yearly")
-        async def get_telemetry_yearly() -> Any:
-            """Get telemetry data aggregated into 4h buckets for yearly charts."""
-            storage = (
-                self.message_router.storage_handler if self.message_router else None
-            )
-            if not storage or not hasattr(storage, "get_telemetry_chart_data_bucketed"):
-                raise HTTPException(
-                    status_code=503, detail="Telemetry not available"
-                )
-            return await storage.get_telemetry_chart_data_bucketed()
-
-        @app.get("/api/timezone")
-        async def get_timezone(lat: float, lon: float) -> dict[str, str | float]:
-            """Return UTC offset for given coordinates using timezonefinder."""
-            import zoneinfo
-            from datetime import datetime
-
-            tz_name = _get_tz_finder().timezone_at(lat=lat, lng=lon)
-            if not tz_name:
-                raise HTTPException(
-                    status_code=400, detail="No timezone found for coordinates"
-                )
-            zone = zoneinfo.ZoneInfo(tz_name)
-            offset = datetime.now(zone).utcoffset()
-            if offset is None:
-                raise HTTPException(
-                    status_code=500, detail="Unable to calculate UTC offset"
-                )
-            offset_seconds = offset.total_seconds()
-            offset_hours = offset_seconds / 3600
-            abbreviation = datetime.now(zone).strftime("%Z")
-            return {"timezone": tz_name, "abbreviation": abbreviation, "utc_offset": offset_hours}
-
-        # ── BLE Service Forwards ───────────────────────────────────
-
-        @app.patch("/api/ble/pin")
-        async def set_ble_pin(body: BlePinRequest) -> dict[str, bool]:
-            """Forward PIN update to the BLE service so it can authenticate on reconnect."""
-            pin = body.pin
-            ble = (
-                self.message_router.get_protocol("ble_client")
-                if self.message_router else None
-            )
-            if not ble or not hasattr(ble, "set_ble_pin"):
-                raise HTTPException(status_code=503, detail="BLE client not available")
-            try:
-                ok = await ble.set_ble_pin(pin)
-            except Exception as e:
-                logger.error("set_ble_pin forward failed: %s", e)
-                raise HTTPException(status_code=502, detail=str(e))
-            return {"ok": ok}
-
-        # ── Update / Deployment Endpoints ──────────────────────────
-
-        @app.post("/api/update/start")
-        async def start_update(body: UpdateStartRequest | None = None) -> dict[str, str]:
-            """Launch the update runner process."""
-            dev = body.dev if body else False
-            return await self._launch_update_runner("update", dev=dev)
-
-        @app.post("/api/update/rollback")
-        async def start_rollback() -> dict[str, str]:
-            """Launch the update runner in rollback mode."""
-            return await self._launch_update_runner("rollback")
-
-        @app.get("/api/update/slots")
-        async def get_slots() -> dict[str, Any]:
-            """Get slot metadata (versions, active slot, rollback target)."""
-            return await asyncio.to_thread(self._read_slot_info)
-
-        # ── Classifier REST surface ──────────────────────────────────
-
-        def _storage() -> Any:
-            s = self.message_router.storage_handler if self.message_router else None
-            if not s:
-                raise HTTPException(status_code=503, detail="Storage not available")
-            return s
-
-        def _classifier() -> Any:
-            if self.classifier is None:
-                raise HTTPException(status_code=503, detail="Classifier not available")
-            return self.classifier
-
-        @app.get("/api/classifier/rules")
-        async def get_classifier_rules() -> Any:
-            storage = _storage()
-            return await storage._execute(
-                "SELECT id, name, pattern, scope, category, extra_tags, priority, "
-                "enabled, builtin, created_at, updated_at "
-                "FROM classifier_rules ORDER BY priority ASC, id ASC"
-            )
-
-        @app.post("/api/classifier/rules")
-        async def create_classifier_rule(body: ClassifierRuleCreate) -> dict[str, int | str]:
-            storage = _storage()
-            classifier = _classifier()
-            now = datetime.now(timezone.utc).isoformat()
-            await storage._execute(
-                "INSERT INTO classifier_rules "
-                "(name, pattern, scope, category, extra_tags, priority, enabled, "
-                " builtin, created_at, updated_at) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, 0, ?, ?)",
-                (
-                    body.name,
-                    body.pattern,
-                    body.scope,
-                    body.category,
-                    json.dumps(body.extra_tags),
-                    body.priority,
-                    1 if body.enabled else 0,
-                    now, now,
-                ),
-                fetch=False,
-            )
-            new_ver = await storage.bump_classifier_version()
-            await classifier.load()
-            rules = await storage._execute(
-                "SELECT id, name, pattern, scope, category, extra_tags, priority, "
-                "enabled, builtin, created_at, updated_at "
-                "FROM classifier_rules ORDER BY priority ASC, id ASC"
-            )
-            await self.broadcast_event(
-                "proxy:classifier_rules",
-                {"rules": rules, "classifier_version": new_ver},
-            )
-            return {"status": "ok", "classifier_version": new_ver}
-
-        @app.patch("/api/classifier/rules/{rule_id}")
-        async def patch_classifier_rule(
-            rule_id: int, body: ClassifierRulePatch
-        ) -> dict[str, int | str]:
-            storage = _storage()
-            classifier = _classifier()
-            # exclude_unset → only fields the client actually sent are updated.
-            fields = body.model_dump(exclude_unset=True)
-            existing = await storage._execute(
-                "SELECT id FROM classifier_rules WHERE id = ?", (rule_id,),
-            )
-            if not existing:
-                raise HTTPException(status_code=404, detail="Rule not found")
-            updatable = {"name", "pattern", "scope", "category", "priority", "enabled"}
-            assignments: list[str] = []
-            params: list[Any] = []
-            for key in updatable:
-                if key in fields:
-                    if key == "enabled":
-                        assignments.append("enabled = ?")
-                        params.append(1 if fields[key] else 0)
-                    else:
-                        assignments.append(f"{key} = ?")
-                        params.append(fields[key])
-            if "extra_tags" in fields:
-                assignments.append("extra_tags = ?")
-                params.append(json.dumps(fields["extra_tags"]))
-            if not assignments:
-                return {"status": "noop"}
-            assignments.append("updated_at = ?")
-            params.append(datetime.now(timezone.utc).isoformat())
-            params.append(rule_id)
-            await storage._execute(
-                f"UPDATE classifier_rules SET {', '.join(assignments)} WHERE id = ?",
-                tuple(params),
-                fetch=False,
-            )
-            new_ver = await storage.bump_classifier_version()
-            await classifier.load()
-            rules = await storage._execute(
-                "SELECT id, name, pattern, scope, category, extra_tags, priority, "
-                "enabled, builtin, created_at, updated_at "
-                "FROM classifier_rules ORDER BY priority ASC, id ASC"
-            )
-            await self.broadcast_event(
-                "proxy:classifier_rules",
-                {"rules": rules, "classifier_version": new_ver},
-            )
-            return {"status": "ok", "classifier_version": new_ver}
-
-        @app.delete("/api/classifier/rules/{rule_id}")
-        async def delete_classifier_rule(rule_id: int) -> dict[str, int | str]:
-            storage = _storage()
-            classifier = _classifier()
-            row = await storage._execute(
-                "SELECT builtin FROM classifier_rules WHERE id = ?", (rule_id,),
-            )
-            if not row:
-                raise HTTPException(status_code=404, detail="Rule not found")
-            if row[0]["builtin"]:
-                raise HTTPException(status_code=404, detail="Builtin rules cannot be deleted")
-            await storage._execute(
-                "DELETE FROM classifier_rules WHERE id = ?", (rule_id,),
-                fetch=False,
-            )
-            new_ver = await storage.bump_classifier_version()
-            await classifier.load()
-            rules = await storage._execute(
-                "SELECT id, name, pattern, scope, category, extra_tags, priority, "
-                "enabled, builtin, created_at, updated_at "
-                "FROM classifier_rules ORDER BY priority ASC, id ASC"
-            )
-            await self.broadcast_event(
-                "proxy:classifier_rules",
-                {"rules": rules, "classifier_version": new_ver},
-            )
-            return {"status": "ok", "classifier_version": new_ver}
-
-        @app.post("/api/classifier/rules/test")
-        async def test_classifier_rule(body: ClassifierRuleTest) -> dict[str, Any]:
-            import re as _re
-            storage = _storage()
-            pattern = body.pattern
-            scope = body.scope
-            sample_msg = body.sample_msg
-            try:
-                regex = _re.compile(pattern)
-            except _re.error as exc:
-                raise HTTPException(status_code=400, detail=f"Invalid regex: {exc}")
-
-            sample_match: bool | None = None
-            if sample_msg is not None:
-                sample_match = bool(regex.search(sample_msg))
-
-            rows = await storage._execute(
-                "SELECT id, msg_id, src, dst, msg, type, timestamp FROM messages "
-                "ORDER BY id DESC LIMIT 500"
-            )
-            matches: list[dict[str, Any]] = []
-            for row in rows:
-                if scope == "src":
-                    target = row.get("src") or ""
-                elif scope == "dst":
-                    target = row.get("dst") or ""
-                elif scope == "combined":
-                    target = (
-                        f"{row.get('src') or ''}|{row.get('dst') or ''}|{row.get('msg') or ''}"
-                    )
-                else:
-                    target = row.get("msg") or ""
-                if regex.search(target):
-                    matches.append(row)
-                    if len(matches) >= 10:
-                        break
-            return {
-                "matches": sample_match if sample_match is not None else bool(matches),
-                "sample_match": sample_match,
-                "sample_matches": matches,
-                "scanned": len(rows),
-            }
-
-        @app.get("/api/classifier/templates")
-        async def get_classifier_templates(
-            min_count: int = 0,
-            auto_only: bool = False,
-            limit: int = 100,
-        ) -> Any:
-            storage = _storage()
-            where: list[str] = []
-            params: list[Any] = []
-            if min_count > 0:
-                where.append("count >= ?")
-                params.append(min_count)
-            if auto_only:
-                where.append("auto_beacon = 1")
-            where_sql = f" WHERE {' AND '.join(where)}" if where else ""
-            params.append(max(1, min(limit, 500)))
-            return await storage._execute(
-                f"SELECT template_hash, example_msg, example_src, srcs, count, "
-                f"first_seen, last_seen, auto_beacon, user_action "
-                f"FROM beacon_templates{where_sql} "
-                f"ORDER BY count DESC LIMIT ?",
-                tuple(params),
-            )
-
-        @app.patch("/api/classifier/templates/{template_hash}")
-        async def patch_classifier_template(
-            template_hash: str, body: TemplateActionRequest
-        ) -> dict[str, Any]:
-            storage = _storage()
-            action = body.user_action
-            existing = await storage._execute(
-                "SELECT template_hash FROM beacon_templates WHERE template_hash = ?",
-                (template_hash,),
-            )
-            if not existing:
-                raise HTTPException(status_code=404, detail="Template not found")
-            await storage._execute(
-                "UPDATE beacon_templates SET user_action = ? WHERE template_hash = ?",
-                (action, template_hash),
-                fetch=False,
-            )
-            return {"status": "ok", "user_action": action}
-
-        @app.post("/api/classifier/templates/{template_hash}/preview")
-        async def preview_classifier_template(template_hash: str) -> dict[str, Any]:
-            storage = _storage()
-            rows = await storage._execute(
-                "SELECT id, msg_id, src, dst, msg, type, timestamp, category, tags, "
-                "info_score FROM messages WHERE template_hash = ? "
-                "ORDER BY timestamp DESC LIMIT 20",
-                (template_hash,),
-            )
-            return {"template_hash": template_hash, "messages": rows}
-
-        @app.post("/api/classifier/reclassify")
-        async def post_classifier_reclassify(
-            body: ReclassifyRequest | None = None
-        ) -> dict[str, Any]:
-            classifier = _classifier()
-            req = body or ReclassifyRequest()
-
-            async def _progress(job: Any) -> None:
-                await self.broadcast_event(
-                    "proxy:reclassify_progress",
-                    {
-                        "job_id": job.job_id, "processed": job.processed,
-                        "total": job.total, "done": job.done,
-                    },
-                )
-
-            job = await classifier.reclassify(
-                since_ms=req.since,
-                category_filter=req.category or None,
-                force=req.force,
-                progress_cb=_progress,
-            )
-            return {"job_id": job.job_id, "estimated_rows": job.total}
-
-        @app.get("/api/classifier/status")
-        async def get_classifier_status() -> dict[str, Any]:
-            classifier = _classifier()
-            return {
-                "classifier_version": classifier.version,
-                "jobs": [
-                    {
-                        "job_id": j.job_id,
-                        "total": j.total,
-                        "processed": j.processed,
-                        "done": j.done,
-                        "error": j.error,
-                    }
-                    for j in classifier.get_all_jobs()
-                ],
-            }
+        app.include_router(build_stream_router(self, VERSION))
+        app.include_router(build_prefs_router(self))
+        app.include_router(build_classifier_router(self))
+        app.include_router(build_weather_router(self))
+        app.include_router(build_deploy_router(self))
+        app.include_router(build_push_router(self))
+        app.include_router(build_linkcheck_router(self))
 
         return app
 
     # ── Update / Deployment Helpers ─────────────────────────────
 
-    def _get_installed_version(self) -> str:
-        """Read installed version from version.html."""
-        import pathlib
-        for path in [
-            pathlib.Path("/var/www/html/webapp/version.html"),
-            pathlib.Path.home() / "mcapp-slots" / "current" / "webapp" / "version.html",
-        ]:
-            if path.exists():
-                return path.read_text().strip()
-        return "not_installed"
-
-    async def _launch_update_runner(
-        self, mode: str, dev: bool = False,
+    async def launch_update_runner(
+        self,
+        mode: str,
+        dev: bool = False,
+        request_host: str | None = None,
     ) -> dict[str, Any]:
-        """Launch the standalone update runner via systemd .path trigger."""
-        import pathlib
-        import socket
+        """Launch the standalone update runner via systemd .path trigger.
+
+        `mode` is one of "update", "rollback", or "converge" (converge re-runs
+        the current slot's `mcapp.sh --converge` to bring system-level state
+        -- packages, firewall, web front door -- up to `REQUIRED_SYSTEM_EPOCH`
+        without touching slots or restarting mcapp; see system_converge.py).
+
+        `request_host` is the Host the client used to reach this API; it is used
+        to build the stream/status URLs so a remote browser connects to the Pi
+        (not its own loopback). See reachable_runner_host.
+        """
 
         logger.info("Update requested: mode=%s dev=%s", mode, dev)
 
-        # Check if runner is already active (port 2985 in use)
+        # Check if runner is already active (port in use). SSE-05: a blocking
+        # socket.connect_ex() here would stall the event loop (and every other
+        # SSE stream) for up to 1s; asyncio.open_connection() is non-blocking.
         try:
-            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            sock.settimeout(1)
-            result = sock.connect_ex(("127.0.0.1", 2985))
-            sock.close()
-            if result == 0:
-                raise HTTPException(
-                    status_code=409,
-                    detail="Update already in progress",
-                )
-        except OSError:
+            _, writer = await asyncio.wait_for(
+                asyncio.open_connection("127.0.0.1", UPDATE_RUNNER_PORT), timeout=1.0
+            )
+            writer.close()
+            with contextlib.suppress(OSError):
+                await writer.wait_closed()
+            raise HTTPException(
+                status_code=409,
+                detail="Update already in progress",
+            )
+        except (OSError, TimeoutError):
             pass
 
         # Write args file and trigger file for systemd .path unit
-        args_file = pathlib.Path("/var/lib/mcapp/update-args.json")
-        trigger_file = pathlib.Path("/var/lib/mcapp/update-trigger")
-
         await asyncio.to_thread(
-            args_file.write_text, json.dumps({"mode": mode, "dev": dev}),
+            UPDATE_ARGS_FILE.write_text,
+            json.dumps({"mode": mode, "dev": dev}),
         )
-        await asyncio.to_thread(trigger_file.write_text, "")
+        await asyncio.to_thread(UPDATE_TRIGGER_FILE.write_text, "")
         logger.info("Update trigger file written")
 
         # Frontend will retry stream connection until runner is ready
 
-        # Determine the host from request context
-        host = self.host if self.host != "0.0.0.0" else "localhost"
+        # Build the runner URLs on the host the CLIENT used to reach us, not
+        # self.host (the loopback bind address) — otherwise a remote browser is
+        # told to connect to its own 127.0.0.1:2985 and fails every retry.
+        host = reachable_runner_host(request_host, self.host)
 
         return {
             "status": "launched",
             "mode": mode,
-            "stream_url": f"http://{host}:2985/stream",
-            "status_url": f"http://{host}:2985/status",
+            "stream_url": f"http://{host}:{UPDATE_RUNNER_PORT}/stream",
+            "status_url": f"http://{host}:{UPDATE_RUNNER_PORT}/status",
         }
 
-    def _read_slot_info(self) -> dict[str, Any]:
+    def read_slot_info(self) -> dict[str, Any]:
         """Read slot metadata from filesystem."""
-        import pathlib
+
         slots_dir = pathlib.Path.home() / "mcapp-slots"
         meta_dir = slots_dir / "meta"
 
         if not slots_dir.exists():
-            return {"slots": [], "active_slot": None, "can_rollback": False}
+            return {
+                "slots": [],
+                "active_slot": None,
+                "can_rollback": False,
+                "system_epoch": {
+                    "installed": read_installed_epoch(),
+                    "required": REQUIRED_SYSTEM_EPOCH,
+                },
+            }
 
         # Get active slot
         active_slot = None
@@ -1102,15 +535,14 @@ class SSEManager:
                 active_slot = int(target.split("-")[1])
 
         slots = []
-        for i in range(3):
+        for i in range(SLOT_COUNT):
             meta_file = meta_dir / f"slot-{i}.json"
             if meta_file.exists():
                 meta = json.loads(meta_file.read_text())
             else:
-                meta = {"slot": i, "version": None, "status": "empty",
-                        "deployed_at": None}
+                meta = {"slot": i, "version": None, "status": "empty", "deployed_at": None}
             meta["slot"] = i
-            meta["active"] = (i == active_slot)
+            meta["active"] = i == active_slot
             if i == active_slot:
                 meta["status"] = "active"
             elif meta.get("version"):
@@ -1121,10 +553,7 @@ class SSEManager:
 
         # Find rollback target
         rollback_target = None
-        candidates = []
-        for s in slots:
-            if s["slot"] != active_slot and s.get("version"):
-                candidates.append(s)
+        candidates = [s for s in slots if s["slot"] != active_slot and s.get("version")]
         if candidates:
             candidates.sort(key=lambda x: x.get("deployed_at", ""), reverse=True)
             rollback_target = candidates[0]["slot"]
@@ -1134,29 +563,34 @@ class SSEManager:
             "active_slot": active_slot,
             "can_rollback": rollback_target is not None,
             "rollback_target": rollback_target,
+            "system_epoch": {
+                "installed": read_installed_epoch(),
+                "required": REQUIRED_SYSTEM_EPOCH,
+            },
         }
 
     # Mapping (type, msg) pairs → SSE event name for response messages
-    _RESPONSE_EVENT_MAP: dict[str, str] = {
+    _RESPONSE_EVENT_MAP: ClassVar[dict[str, str]] = {
         "smart_initial": "proxy:initial",
         "summary": "proxy:summary",
         "read_counts": "proxy:read_counts",
         "hidden_destinations": "proxy:hidden_destinations",
         "blocked_texts": "proxy:blocked_texts",
+        "blocked_callsigns": "proxy:blocked_callsigns",
         "mheard_sidebar": "proxy:mheard_sidebar",
         "wx_sidebar": "proxy:wx_sidebar",
         "messages_page": "proxy:messages_page",
     }
 
     # Mapping simple type → SSE event name
-    _SIMPLE_TYPE_MAP: dict[str, str] = {
+    _SIMPLE_TYPE_MAP: ClassVar[dict[str, str]] = {
         "connected": "system:connected",
         "ping": "system:ping",
         "msg_status": "msg:status",
     }
 
     # Mapping mheard msg strings → SSE event name
-    _MHEARD_MSG_MAP: dict[str, str] = {
+    _MHEARD_MSG_MAP: ClassVar[dict[str, str]] = {
         "mheard progress": "mheard:progress",
         "mheard stats": "mheard:stats",
         "mheard progress monthly": "mheard:progress-monthly",
@@ -1187,7 +621,7 @@ class SSEManager:
         return "mesh:message"
 
     @staticmethod
-    def _format_sse_event(data: dict[str, Any], event_type: str | None = None) -> str:
+    def format_sse_event(data: dict[str, Any], event_type: str | None = None) -> str:
         """Format data as SSE event."""
         lines = []
         if event_type:
@@ -1197,8 +631,31 @@ class SSEManager:
         return "\n".join(lines) + "\n"
 
     async def _broadcast_handler(self, routed_message: dict[str, Any]) -> None:
-        """Handle messages from the router and broadcast to SSE clients."""
+        """Handle messages from the router and broadcast to SSE clients.
+
+        Blocklist-aware via the shared MessageRouter.blocklist_decision():
+        blocked personal/position traffic is not delivered at all, and blocked
+        group/broadcast traffic is quarantined to SPAM_GROUP so it stays out of
+        normal views but remains inspectable. The dst rewrite is applied to a
+        shallow COPY — never the shared routed_message["data"] — so the
+        storage/command subscribers of the same message are unaffected.
+        """
         message_data = routed_message["data"]
+        # {ping}/{pong} are protocol frames, not chat (linkcheck ADR §1.2):
+        # storage refuses to persist them and push eligibility clause (d)
+        # refuses to announce them, so the live stream must not show them
+        # either — the SAME shared predicate, so all three user-visible
+        # surfaces (history, push, SSE) agree by construction. The webapp's
+        # link-check UI is fed by _linkcheck_handler's `proxy:linkcheck_*`
+        # events, which carry everything these raw frames do and more.
+        if is_link_check_payload(message_data.get("msg", "")):
+            return
+        router = self.message_router
+        decision = router.blocklist_decision(message_data) if router is not None else "pass"
+        if decision == "drop":
+            return
+        if decision == "redirect":
+            message_data = {**message_data, "dst": SPAM_GROUP}
         await self.broadcast_message(message_data)
 
         if logger.isEnabledFor(10):  # DEBUG level
@@ -1210,51 +667,71 @@ class SSEManager:
                 truncated,
             )
 
+    async def _linkcheck_handler(self, routed_message: dict[str, Any]) -> None:
+        """Forward LinkCheckMixin session events to SSE clients.
+
+        The mixin publishes `{"event": "linkcheck_result", ...}` on the
+        "linkcheck_event" topic; the webapp subscribes to `proxy:linkcheck_*`.
+        Deliberately NOT routed through `_broadcast_handler`: these are our own
+        session events, not mesh payloads, so they carry no `src` for
+        `blocklist_decision()` to judge and must not be filtered as if they did.
+        """
+        payload = routed_message["data"]
+        event = payload.get("event")
+        if not isinstance(event, str) or not event:
+            logger.warning("linkcheck_event without a usable 'event' key: %r", payload)
+            return
+        await self.broadcast_event(f"proxy:{event}", payload)
+
     async def _status_handler(self, routed_message: dict[str, Any]) -> None:
         """Forward message status updates (ACK) to SSE clients."""
         data = routed_message["data"]
         await self.broadcast_message({"type": "msg_status", **data})
 
-    async def broadcast_message(self, message: dict[str, Any]) -> None:
-        """Broadcast message to all connected SSE clients."""
+    async def send_to(self, client_id: str, message: dict[str, Any]) -> bool:
+        """Send one message to a single SSE client. Returns False if the client
+        is unknown/gone (caller decides fallback; we never broadcast here)."""
         async with self.clients_lock:
-            clients = list(self.clients.values())
-
-        if not clients:
-            return
-
-        # Serialize once, fan out in parallel so one slow client doesn't stall the rest.
-        event = self._format_sse_event(message, self._get_event_type(message))
-        results = await asyncio.gather(
-            *(client.send(event) for client in clients),
-            return_exceptions=True,
-        )
-        for client, result in zip(clients, results):
-            if isinstance(result, Exception):
-                logger.warning(
-                    "Failed to queue message for SSE client %s: %s",
-                    client.client_id, result,
-                )
+            client = self.clients.get(client_id)
+        if client is None or not client.connected:
+            return False
+        event = self.format_sse_event(message, self._get_event_type(message))
+        try:
+            await client.send(event)
+        except asyncio.QueueFull:
+            logger.warning("SSE send_to: client %s queue full, disconnected", client_id)
+            return False
+        return True
 
     async def broadcast_event(self, event_type: str, payload: dict[str, Any]) -> None:
-        """Fan out a pre-typed SSE event. Classifier events use this path so the
-        inference in _get_event_type() stays limited to mesh-payload heuristics.
+        """Fan out a pre-typed SSE event to all connected clients. Classifier events
+        use this path so the inference in _get_event_type() stays limited to
+        mesh-payload heuristics.
         """
         async with self.clients_lock:
             clients = list(self.clients.values())
         if not clients:
             return
-        event = self._format_sse_event(payload, event_type)
+        # Serialize once, fan out in parallel so one slow client doesn't stall the rest.
+        event = self.format_sse_event(payload, event_type)
         results = await asyncio.gather(
             *(client.send(event) for client in clients),
             return_exceptions=True,
         )
-        for client, result in zip(clients, results):
+        for client, result in zip(clients, results, strict=False):
             if isinstance(result, Exception):
                 logger.warning(
-                    "Failed to queue %s for SSE client %s: %s",
-                    event_type, client.client_id, result,
+                    "Dropping SSE client %s: could not queue %s (queue full / slow consumer): %s",
+                    client.client_id,
+                    event_type,
+                    result,
                 )
+
+    async def broadcast_message(self, message: dict[str, Any]) -> None:
+        """Broadcast a mesh-payload message to all connected SSE clients, inferring
+        its event type from the payload shape via _get_event_type().
+        """
+        await self.broadcast_event(self._get_event_type(message), message)
 
     async def _disconnect_all_clients(self) -> None:
         """Disconnect all SSE clients."""
@@ -1292,26 +769,28 @@ class SSEManager:
             await self.server.serve()
         except asyncio.CancelledError:
             pass
-        except Exception as e:
-            logger.error("SSE server error: %s", e)
+        except Exception:
+            logger.exception("SSE server error")
 
     async def stop_server(self) -> None:
         """Stop the SSE/FastAPI server."""
         # Tell every active event_generator loop to wind down on the next tick.
-        self._shutdown_event.set()
+        self.shutdown_event.set()
         if self.server:
             self.server.should_exit = True
 
             # Wait for server to stop
             if self._server_task:
                 try:
-                    await asyncio.wait_for(self._server_task, timeout=5.0)
-                except asyncio.TimeoutError:
+                    await asyncio.wait_for(self._server_task, timeout=SERVER_SHUTDOWN_TIMEOUT)
+                except TimeoutError:
                     self._server_task.cancel()
-                    try:
+                    with contextlib.suppress(asyncio.CancelledError):
                         await self._server_task
-                    except asyncio.CancelledError:
-                        pass
+
+        if self.push_dispatcher is not None:
+            with contextlib.suppress(Exception):
+                await self.push_dispatcher.stop()
 
         await self._disconnect_all_clients()
         logger.info("SSE server stopped")
@@ -1324,7 +803,7 @@ class SSEManager:
 # Convenience function for backward compatibility
 def create_sse_manager(
     host: str = "127.0.0.1",
-    port: int = 2981,
+    port: int = DEFAULT_SSE_PORT,
     message_router: Any = None,
     weather_service: Any = None,
 ) -> SSEManager | None:
@@ -1338,3 +817,671 @@ def create_sse_manager(
         return None
 
     return SSEManager(host, port, message_router, weather_service)
+
+
+async def run_startup_tests() -> bool:  # noqa: PLR0915 - regression suite kept as one flat sequence
+    """SSE-layer regression suite.
+
+    1. UDP 2.0 Track U (U3): UDP-lora signal reaches SSE clients live.
+       A lora `pos`/`msg` packet is published as a plain `mesh_message` (same as any
+       other transport) and `_get_event_type` has no BLE-specific branch for it, so it
+       already falls through to the generic `mesh:message` event — the same path BLE
+       MHeard signal relies on. This proves that path still fires for a UDP-lora packet
+       without needing a dedicated signal SSE event.
+    2. DM delete via the real /api/delete_messages route (Wave 6): empty
+       own_call resolves the proxy's configured callsign server-side (used to
+       degenerate the conversation key to 'X<>X', silently deleting nothing);
+       the webapp's pair-overload payload ({dst: A, own_call: B} addressing a
+       third-party 'A~B' bucket) deletes only that pair and leaves the
+       operator's own conversation with A intact; a case-mismatched own_call
+       (operator typed lowercase in Settings) still resolves after
+       DeleteMessagesRequest normalizes it; a genuinely wrong own_call deletes
+       0 rows AND now logs a warning instead of a silent no-op; the info log
+       line disambiguates two pair deletes that share a bare dst; and group/
+       '*'/'Time' deletes are unaffected (regression guard for leaving dst
+       un-normalized). Ephemeral tempfile SQLite DB, mirroring the storage
+       test-suite pattern (never touches the live DB).
+    3. D10a: `_get_event_type` mapping-table coverage. Every entry in
+       `_SIMPLE_TYPE_MAP`, `_MHEARD_MSG_MAP`, and `_RESPONSE_EVENT_MAP` is
+       asserted to map to its exact SSE event name, plus the BLE/resolve-ip
+       branches, the "response with unknown msg" fallback, and the final
+       default fallback — so a mis-map that silently mis-routes a frontend
+       event is caught immediately.
+    4. D10b: bounded per-client queue overflow. `SSEClient.send()` must raise
+       `asyncio.QueueFull` and disconnect the client once its queue (maxsize
+       `SSE_CLIENT_QUEUE_SIZE`) is full, without growing past maxsize; and
+       `SSEManager.broadcast_event()` must not be blocked/raise when one
+       client's queue is full — it disconnects the slow client and still
+       delivers to healthy clients.
+    """
+    results: list[tuple[str, bool]] = []
+
+    manager = SSEManager(host="127.0.0.1", port=0, message_router=None)
+    client = SSEClient("test-client")
+    manager.clients[client.client_id] = client
+
+    lora_pos = {
+        "msg_id": "AAAA0100",
+        "src": "OE1XYZ-9",
+        "dst": "*",
+        "msg": "",
+        "type": "pos",
+        "src_type": "lora",
+        "timestamp": 1_770_000_000_000,
+        "rssi": -95,
+        "snr": 9,
+        "lat": 48.2,
+        "lon": 16.3,
+    }
+    routed_message = {
+        "source": "udp",
+        "type": "mesh_message",
+        "data": lora_pos,
+        "timestamp": 1_770_000_000_000,
+    }
+    await manager._broadcast_handler(routed_message)  # noqa: SLF001 - white-box startup test
+
+    queued = None if client.queue.empty() else client.queue.get_nowait()
+    results.append(("UDP-lora mesh_message reaches a connected SSE client", queued is not None))
+
+    if queued is not None:
+        lines = queued.strip("\n").split("\n")
+        event_line = next((line for line in lines if line.startswith("event: ")), "")
+        data_line = next((line for line in lines if line.startswith("data: ")), "")
+        event_type = event_line.removeprefix("event: ")
+        event_data = json.loads(data_line.removeprefix("data: "))
+
+        results.append(
+            ("broadcast SSE event uses the generic mesh:message type", event_type == "mesh:message")
+        )
+        results.append(
+            (
+                "broadcast SSE event carries the lora rssi/snr unchanged",
+                event_data.get("rssi") == lora_pos["rssi"]
+                and event_data.get("snr") == lora_pos["snr"],
+            )
+        )
+
+    # 2. DM delete own_call fallback via the real prefs route.
+    class _StubMessageRouter:
+        """Minimal MessageRouter stand-in: storage + configured callsign."""
+
+        def __init__(self, storage: SQLiteStorage, callsign: str) -> None:
+            self.storage_handler = storage
+            self.my_callsign = callsign
+
+        def subscribe(self, _topic: str, _handler: Any) -> None:
+            return
+
+    base_ts = 1_770_000_000_000
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        storage = await create_sqlite_storage(pathlib.Path(tmp_dir) / "sse_delete_test.db")
+        try:
+            dm_in = {
+                "msg_id": "BBBB0001",
+                "src": "OE5ABC-1",
+                "dst": "DK5EN-15",
+                "msg": "hi",
+                "type": "msg",
+                "src_type": "node",
+                "timestamp": base_ts + 1,
+            }
+            dm_out = {
+                "msg_id": "BBBB0002",
+                "src": "DK5EN-15",
+                "dst": "OE5ABC-1",
+                "msg": "hello back",
+                "type": "msg",
+                "src_type": "node",
+                "timestamp": base_ts + 2,
+            }
+            other_dm = {
+                "msg_id": "BBBB0003",
+                "src": "OE7FOO-1",
+                "dst": "OE9BAR-2",
+                "msg": "unrelated",
+                "type": "msg",
+                "src_type": "node",
+                "timestamp": base_ts + 3,
+            }
+            conversation_rows = (dm_in, dm_out)
+            for m in (*conversation_rows, other_dm):
+                await storage.store_message(m, json.dumps(m))
+
+            delete_manager = SSEManager(
+                host="127.0.0.1", port=0, message_router=_StubMessageRouter(storage, "DK5EN")
+            )
+            prefs_router = build_prefs_router(delete_manager)
+            delete_endpoint = next(
+                route.endpoint
+                for route in prefs_router.routes
+                if isinstance(route, Route) and route.path == "/api/delete_messages"
+            )
+
+            # Client omits own_call (old webapp): key used to degenerate to
+            # 'OE5ABC<>OE5ABC' and delete nothing.
+            response = await delete_endpoint(
+                DeleteMessagesRequest(dst="OE5ABC-1", own_call="", read_key="OE5ABC")
+            )
+            results.append(
+                (
+                    "delete_messages with empty own_call deletes the DM conversation",
+                    response.get("deleted") == len(conversation_rows),
+                )
+            )
+
+            remaining = await storage._query(  # noqa: SLF001 - white-box startup test
+                "SELECT conversation_key FROM messages WHERE type = 'msg'"
+            )
+            keys = [row["conversation_key"] for row in remaining]
+            results.append(
+                (
+                    "fallback delete removes only the targeted conversation",
+                    keys == ["OE7FOO<>OE9BAR"],
+                )
+            )
+
+            # --- Wave 6 fixtures: reproduces the production incident, where
+            # dst=DD7MH logged three merged delete counts for three distinct
+            # third-party pairs, plus operator-callsign case sensitivity and
+            # the group/'*'/'Time' branches that must stay unaffected.
+            pair_hb3xtk_in = {
+                "msg_id": "CCCC0001",
+                "src": "DD7MH-1",
+                "dst": "HB3XTK-2",
+                "msg": "hi",
+                "type": "msg",
+                "src_type": "node",
+                "timestamp": base_ts + 10,
+            }
+            pair_hb3xtk_out = {
+                "msg_id": "CCCC0002",
+                "src": "HB3XTK-2",
+                "dst": "DD7MH-1",
+                "msg": "reply",
+                "type": "msg",
+                "src_type": "node",
+                "timestamp": base_ts + 11,
+            }
+            pair_dh1fr_in = {
+                "msg_id": "CCCC0003",
+                "src": "DD7MH-1",
+                "dst": "DH1FR-1",
+                "msg": "hi",
+                "type": "msg",
+                "src_type": "node",
+                "timestamp": base_ts + 12,
+            }
+            pair_dh1fr_out = {
+                "msg_id": "CCCC0004",
+                "src": "DH1FR-1",
+                "dst": "DD7MH-1",
+                "msg": "reply",
+                "type": "msg",
+                "src_type": "node",
+                "timestamp": base_ts + 13,
+            }
+            own_dd7mh = {
+                "msg_id": "CCCC0005",
+                "src": "DD7MH-1",
+                "dst": "DK5EN-15",
+                "msg": "to me",
+                "type": "msg",
+                "src_type": "node",
+                "timestamp": base_ts + 14,
+            }
+            case_mismatch_dm = {
+                "msg_id": "CCCC0006",
+                "src": "OE3ZZZ-3",
+                "dst": "DK5EN-77",
+                "msg": "ping",
+                "type": "msg",
+                "src_type": "node",
+                "timestamp": base_ts + 15,
+            }
+            group_msg = {
+                "msg_id": "CCCC0007",
+                "src": "OE1XYZ-1",
+                "dst": "232",
+                "msg": "group chatter",
+                "type": "msg",
+                "src_type": "node",
+                "timestamp": base_ts + 16,
+            }
+            star_msg = {
+                "msg_id": "CCCC0008",
+                "src": "OE1XYZ-1",
+                "dst": "*",
+                "msg": "broadcast",
+                "type": "msg",
+                "src_type": "node",
+                "timestamp": base_ts + 17,
+            }
+            for m in (
+                pair_hb3xtk_in,
+                pair_hb3xtk_out,
+                pair_dh1fr_in,
+                pair_dh1fr_out,
+                own_dd7mh,
+                case_mismatch_dm,
+                group_msg,
+                star_msg,
+            ):
+                await storage.store_message(m, json.dumps(m))
+
+            # A pre-filter legacy '{CET}' row (the webapp's virtual 'Time'
+            # chat): store_message's _should_filter_message drops NEW ones, so
+            # inserting directly mirrors the only rows the 'Time' branch can
+            # still remove.
+            with db_write(storage.db_path) as raw_conn:
+                raw_conn.execute(
+                    "INSERT INTO messages"
+                    " (msg_id, src, dst, msg, type, timestamp, conversation_key)"
+                    " VALUES (?, ?, ?, ?, ?, ?, ?)",
+                    ("CCCC0009", "OE1XYZ-1", "*", "{CET}12:00:00", "msg", base_ts + 18, "*"),
+                )
+                raw_conn.commit()
+
+            class _CaptureHandler(logging.Handler):
+                """Collects records emitted by storage.prefs during a delete."""
+
+                def __init__(self) -> None:
+                    super().__init__()
+                    self.records: list[logging.LogRecord] = []
+
+                def emit(self, record: logging.LogRecord) -> None:
+                    self.records.append(record)
+
+            capture = _CaptureHandler()
+            prefs_logger = logging.getLogger("mcapp.storage.prefs")
+            prev_prefs_log_level = prefs_logger.level
+            # This headless runner never calls setup_logging(), so the logger
+            # sits at the library default (WARNING) — raise it for the capture
+            # window or the INFO completion line below is never even built.
+            prefs_logger.setLevel(logging.INFO)
+            prefs_logger.addHandler(capture)
+            try:
+                # Pair overload: {dst: DD7MH, own_call: HB3XTK} must delete
+                # only the DD7MH<>HB3XTK pair, leaving the operator's own
+                # DD7MH<>DK5EN conversation ('A<>me') intact.
+                hb3xtk_pair_size = len((pair_hb3xtk_in, pair_hb3xtk_out))
+                hb3xtk_response = await delete_endpoint(
+                    DeleteMessagesRequest(dst="DD7MH", own_call="HB3XTK", read_key="DD7MH~HB3XTK")
+                )
+                results.append(
+                    (
+                        "pair-overload delete removes exactly the DD7MH<>HB3XTK pair",
+                        hb3xtk_response.get("deleted") == hb3xtk_pair_size,
+                    )
+                )
+
+                own_conv_rows = await storage._query(  # noqa: SLF001 - white-box startup test
+                    "SELECT COUNT(*) AS n FROM messages WHERE conversation_key = 'DD7MH<>DK5EN'"
+                )
+                results.append(
+                    (
+                        (
+                            "pair-overload delete leaves the operator's own"
+                            " DD7MH<>DK5EN conversation intact"
+                        ),
+                        own_conv_rows[0]["n"] == len((own_dd7mh,)),
+                    )
+                )
+
+                # A second pair delete sharing the same bare dst='DD7MH' — the
+                # exact production shape (three merged 'Deleted N for
+                # dst=DD7MH' log lines for three distinct pairs).
+                dh1fr_pair_size = len((pair_dh1fr_in, pair_dh1fr_out))
+                dh1fr_response = await delete_endpoint(
+                    DeleteMessagesRequest(dst="DD7MH", own_call="DH1FR", read_key="DD7MH~DH1FR")
+                )
+                results.append(
+                    (
+                        (
+                            "second pair-overload delete (same bare dst) removes"
+                            " exactly the DD7MH<>DH1FR pair"
+                        ),
+                        dh1fr_response.get("deleted") == dh1fr_pair_size,
+                    )
+                )
+
+                info_lines = [r.getMessage() for r in capture.records if r.levelno == logging.INFO]
+                hb3xtk_lines = [m for m in info_lines if "HB3XTK" in m]
+                dh1fr_lines = [m for m in info_lines if "DH1FR" in m]
+                results.append(
+                    (
+                        "delete log line disambiguates two pair deletes sharing dst=DD7MH",
+                        bool(hb3xtk_lines)
+                        and bool(dh1fr_lines)
+                        and hb3xtk_lines[0] != dh1fr_lines[0],
+                    )
+                )
+
+                # Case-mismatched own_call (operator typed lowercase + a
+                # different SSID in Settings): DeleteMessagesRequest
+                # normalizes it before it reaches compute_conversation_key
+                # (which is never touched), so the delete still resolves.
+                case_response = await delete_endpoint(
+                    DeleteMessagesRequest(dst="OE3ZZZ-3", own_call="dk5en-98", read_key="OE3ZZZ")
+                )
+                results.append(
+                    (
+                        "case-mismatched own_call still deletes after normalization",
+                        case_response.get("deleted") == 1,
+                    )
+                )
+
+                # A genuinely wrong own_call (not just case/SSID) matches no
+                # rows and must be visible in the journal, not a silent,
+                # permanent, HTTP-200 no-op.
+                capture.records.clear()
+                wrong_response = await delete_endpoint(
+                    DeleteMessagesRequest(
+                        dst="OE9BAR-2", own_call="ZZWRONG", read_key="OE9BAR~ZZWRONG"
+                    )
+                )
+                results.append(
+                    ("non-matching own_call deletes 0 rows", wrong_response.get("deleted") == 0)
+                )
+                zero_match_warnings = [
+                    r.getMessage() for r in capture.records if r.levelno == logging.WARNING
+                ]
+                results.append(
+                    (
+                        "non-matching own_call emits a zero-match warning naming dst/own_call",
+                        any("OE9BAR" in m and "ZZWRONG" in m for m in zero_match_warnings),
+                    )
+                )
+                # The warning must also name the conversation key that DOES
+                # exist for this dst ('OE7FOO<>OE9BAR') — that hint is the one
+                # journal line that identifies the real partner callsign.
+                results.append(
+                    (
+                        "zero-match warning names the conversation keys the dst really has",
+                        any("OE7FOO<>OE9BAR" in m for m in zero_match_warnings),
+                    )
+                )
+
+                # Counterpart, and the reason the warning is triaged rather
+                # than unconditional: deleting a conversation that is simply
+                # already empty is NORMAL (retention prune, an offline-cache-
+                # only bucket, or a rapid double-click), and the webapp
+                # deliberately stays silent for it (stores/messages.ts,
+                # `hadServerRecord`). Warning here too would put the two halves
+                # in disagreement and fill the journal with unactionable noise,
+                # so this case is INFO — no WARNING at all.
+                capture.records.clear()
+                empty_response = await delete_endpoint(
+                    DeleteMessagesRequest(dst="OE0NONE-1", own_call="DK5EN", read_key="OE0NONE")
+                )
+                results.append(
+                    (
+                        "delete of a conversation with no stored rows deletes 0",
+                        empty_response.get("deleted") == 0,
+                    )
+                )
+                results.append(
+                    (
+                        "already-empty conversation logs no warning (not journal noise)",
+                        not [r for r in capture.records if r.levelno == logging.WARNING],
+                    )
+                )
+                results.append(
+                    (
+                        "already-empty conversation is still reported at INFO",
+                        any(
+                            "no stored conversation" in r.getMessage()
+                            for r in capture.records
+                            if r.levelno == logging.INFO
+                        ),
+                    )
+                )
+
+                # Regression guard: group / '*' / 'Time' deletes are
+                # unaffected by the own_call normalization fix — dst is
+                # deliberately left un-normalized (see
+                # DeleteMessagesRequest._normalize_own_call's docstring: 'Time'
+                # and '*' are exact-case sentinels and dst is never
+                # operator-typed, unlike own_call).
+                group_response = await delete_endpoint(
+                    DeleteMessagesRequest(dst="232", own_call="", read_key="232")
+                )
+                results.append(
+                    (
+                        "group delete ('232') is unaffected by the own_call fix",
+                        group_response.get("deleted") == 1,
+                    )
+                )
+
+                star_response = await delete_endpoint(
+                    DeleteMessagesRequest(dst="*", own_call="", read_key="*")
+                )
+                results.append(
+                    (
+                        "'*' delete is unaffected by the own_call fix and skips the {CET} row",
+                        star_response.get("deleted") == 1,
+                    )
+                )
+
+                time_response = await delete_endpoint(
+                    DeleteMessagesRequest(dst="Time", own_call="", read_key="Time")
+                )
+                results.append(
+                    (
+                        (
+                            "'Time' delete still matches the legacy {CET} row verbatim"
+                            " (dst not uppercased)"
+                        ),
+                        time_response.get("deleted") == 1,
+                    )
+                )
+            finally:
+                prefs_logger.removeHandler(capture)
+                prefs_logger.setLevel(prev_prefs_log_level)
+        finally:
+            await storage.close()
+
+    # 3. D10a: _get_event_type mapping-table coverage — every entry in every
+    # mapping table, plus the BLE/resolve-ip branches, the response-fallback,
+    # and the final default fallback.
+    event_type_cases: list[tuple[str, dict[str, Any], str]] = [
+        # _SIMPLE_TYPE_MAP
+        ("type=connected -> system:connected", {"type": "connected"}, "system:connected"),
+        ("type=ping -> system:ping", {"type": "ping"}, "system:ping"),
+        ("type=msg_status -> msg:status", {"type": "msg_status"}, "msg:status"),
+        # _MHEARD_MSG_MAP (checked ahead of the response branch so type=response
+        # doesn't swallow these as mesh:message)
+        (
+            "msg='mheard progress' (type=response) -> mheard:progress",
+            {"type": "response", "msg": "mheard progress"},
+            "mheard:progress",
+        ),
+        (
+            "msg='mheard stats' (type=progress) -> mheard:stats",
+            {"type": "progress", "msg": "mheard stats"},
+            "mheard:stats",
+        ),
+        (
+            "msg='mheard progress monthly' -> mheard:progress-monthly",
+            {"type": "response", "msg": "mheard progress monthly"},
+            "mheard:progress-monthly",
+        ),
+        (
+            "msg='mheard stats monthly' -> mheard:stats-monthly",
+            {"type": "response", "msg": "mheard stats monthly"},
+            "mheard:stats-monthly",
+        ),
+        (
+            "msg='mheard progress yearly' -> mheard:progress-yearly",
+            {"type": "response", "msg": "mheard progress yearly"},
+            "mheard:progress-yearly",
+        ),
+        (
+            "msg='mheard stats yearly' -> mheard:stats-yearly",
+            {"type": "response", "msg": "mheard stats yearly"},
+            "mheard:stats-yearly",
+        ),
+        # response-map entries: type=response
+        (
+            "msg=smart_initial -> proxy:initial",
+            {"type": "response", "msg": "smart_initial"},
+            "proxy:initial",
+        ),
+        (
+            "msg=summary -> proxy:summary",
+            {"type": "response", "msg": "summary"},
+            "proxy:summary",
+        ),
+        (
+            "msg=read_counts -> proxy:read_counts",
+            {"type": "response", "msg": "read_counts"},
+            "proxy:read_counts",
+        ),
+        (
+            "msg=hidden_destinations -> proxy:hidden_destinations",
+            {"type": "response", "msg": "hidden_destinations"},
+            "proxy:hidden_destinations",
+        ),
+        (
+            "msg=blocked_texts -> proxy:blocked_texts",
+            {"type": "response", "msg": "blocked_texts"},
+            "proxy:blocked_texts",
+        ),
+        (
+            "msg=mheard_sidebar -> proxy:mheard_sidebar",
+            {"type": "response", "msg": "mheard_sidebar"},
+            "proxy:mheard_sidebar",
+        ),
+        (
+            "msg=wx_sidebar -> proxy:wx_sidebar",
+            {"type": "response", "msg": "wx_sidebar"},
+            "proxy:wx_sidebar",
+        ),
+        (
+            "msg=messages_page -> proxy:messages_page",
+            {"type": "response", "msg": "messages_page"},
+            "proxy:messages_page",
+        ),
+        # response branch fallback: unmapped msg -> mesh:message
+        (
+            "type=response with unmapped msg -> mesh:message (response fallback)",
+            {"type": "response", "msg": "something_unmapped"},
+            "mesh:message",
+        ),
+        # BLE branch: requires src_type in (BLE, ble_remote) AND a TYP key
+        (
+            "src_type=BLE with TYP -> ble:status",
+            {"src_type": "BLE", "TYP": "blueZ"},
+            "ble:status",
+        ),
+        (
+            "src_type=ble_remote with TYP -> ble:status",
+            {"src_type": "ble_remote", "TYP": "blueZ"},
+            "ble:status",
+        ),
+        (
+            "src_type=BLE without TYP falls through to default mesh:message",
+            {"src_type": "BLE"},
+            "mesh:message",
+        ),
+        # resolve-ip branch
+        (
+            "command=resolve-ip -> proxy:resolve_ip",
+            {"command": "resolve-ip"},
+            "proxy:resolve_ip",
+        ),
+        # final default fallback
+        ("unrecognized payload -> mesh:message (default fallback)", {}, "mesh:message"),
+    ]
+    for label, data, expected in event_type_cases:
+        actual = SSEManager._get_event_type(data)  # noqa: SLF001 - white-box startup test
+        results.append((f"_get_event_type: {label}", actual == expected))
+
+    # 4. D10b: bounded per-client queue overflow (real enqueue path).
+    overflow_client = SSEClient("overflow-client")
+    for i in range(SSE_CLIENT_QUEUE_SIZE):
+        overflow_client.queue.put_nowait(f"filler-{i}\n\n")
+
+    raised_queue_full = False
+    try:
+        await overflow_client.send("one-too-many\n\n")
+    except asyncio.QueueFull:
+        raised_queue_full = True
+    results.append(
+        (
+            "SSEClient.send raises QueueFull and disconnects the client on overflow",
+            raised_queue_full and not overflow_client.connected,
+        )
+    )
+    results.append(
+        (
+            "overflow does not grow the queue past SSE_CLIENT_QUEUE_SIZE",
+            overflow_client.queue.qsize() == SSE_CLIENT_QUEUE_SIZE,
+        )
+    )
+
+    # broadcaster must not be blocked/raise when fanning out to a full client,
+    # and must still deliver to a healthy client alongside it.
+    broadcast_manager = SSEManager(host="127.0.0.1", port=0, message_router=None)
+    full_client = SSEClient("full-client")
+    for i in range(SSE_CLIENT_QUEUE_SIZE):
+        full_client.queue.put_nowait(f"filler-{i}\n\n")
+    healthy_client = SSEClient("healthy-client")
+    broadcast_manager.clients[full_client.client_id] = full_client
+    broadcast_manager.clients[healthy_client.client_id] = healthy_client
+
+    await broadcast_manager.broadcast_event("test:overflow", {"n": 1})
+
+    results.append(
+        (
+            "broadcast_event disconnects the full/slow client instead of blocking",
+            not full_client.connected,
+        )
+    )
+    results.append(
+        (
+            "broadcast_event still delivers to a healthy client alongside a full one",
+            not healthy_client.queue.empty(),
+        )
+    )
+    if not healthy_client.queue.empty():
+        delivered = healthy_client.queue.get_nowait()
+        results.append(
+            (
+                "healthy client's delivered event carries the correct SSE event type",
+                "event: test:overflow" in delivered,
+            )
+        )
+
+    # reachable_runner_host: the update-runner stream URL must use the host the
+    # CLIENT reached us on, never the loopback bind address (regression: a
+    # 127.0.0.1 stream_url made the browser connect to its own machine).
+    results.append(
+        (
+            "reachable_runner_host prefers the client's Host header",
+            reachable_runner_host("mcapp.local", "127.0.0.1") == "mcapp.local",
+        )
+    )
+    results.append(
+        (
+            "reachable_runner_host strips the port from the Host header",
+            reachable_runner_host("mcapp.local:80", "127.0.0.1") == "mcapp.local",
+        )
+    )
+    results.append(
+        (
+            "reachable_runner_host ignores a loopback Host, falls back to bind addr",
+            reachable_runner_host("localhost", "192.168.1.5") == "192.168.1.5",
+        )
+    )
+    results.append(
+        (
+            "reachable_runner_host maps a 0.0.0.0 bind fallback to localhost",
+            reachable_runner_host(None, "0.0.0.0") == "localhost",  # noqa: S104 - test fixture string, not a bind
+        )
+    )
+
+    for label, ok in results:
+        print(f"    {'✅ PASS' if ok else '❌ FAIL'} | {label}")
+
+    return all(ok for _, ok in results)

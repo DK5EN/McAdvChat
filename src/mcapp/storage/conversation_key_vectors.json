@@ -1,0 +1,187 @@
+{
+  "description": "MeshCom conversation-key contract, shared by two independent implementations: MCProxy's compute_conversation_key (src/mcapp/storage/constants.py -- the authoritative function; conversation history, pagination and delete are all keyed on its output) and the webapp, which never recomputes a server key from scratch but consumes and locally re-derives one via three helpers in src/utils/callsignUtils.ts: effectiveDst (the via-routed-dst 'last comma component' extraction), makePairKey (the SSID-stripped, sorted DM pair, joined with the webapp's LOCAL PAIR_SEPARATOR '~' instead of this contract's SERVER_PAIR_SEPARATOR '<>'), and translateServerSummaryKey (translates a raw '<>'-joined server key -- exactly this contract's server_key -- into the webapp's local sidebar key). mc-chat mirrors compute_conversation_key in meshcom_mock/storage.py and replays these vectors from its vendored copy. `server_key` below is the exact return value of compute_conversation_key(src, dst); null when it returns None (no conversation key at all). Pins: (1) group/'TEST'/'*' dst -> the last via-routed comma component, VERBATIM, with no SSID stripping -- exactly effectiveDst's output; (2) DMs -> both sides' SSID-stripped base callsigns, sorted, joined '<>' -- exactly makePairKey's sort, modulo separator translation ('<>' vs '~'). CHANGED IN v2 (drift-resolution campaign 2026-07-27, webapp docs/code-simpl-v2.md): the group branch no longer buckets ANY digit string verbatim -- it delegates to the unified group predicate (group_dst_vectors.json: ASCII digits with integer value 1..99999, or 'TEST' case-insensitively). An all-ASCII-digit target OUTSIDE 1..99999 ('0', '100000') now yields NO conversation key (null) instead of a verbatim degenerate bucket; storage callers fall back to their existing COALESCE(conversation_key, dst) path. Leading-zero in-range targets remain groups and keep their RAW string as the key ('00232' -> '00232', deliberately string-preserving). Non-digit, non-callsign garbage is NOT pinned here and keeps its previous DM-branch behavior. Does NOT pin: SSID-shape/plausibility validation for DM members. compute_conversation_key sorts and joins unconditionally, with no notion of 'is this a real callsign'; the webapp's makePairKey/isValidPairMember layer still returns null when either SSID-stripped base is not a plausible callsign -- that remaining asymmetry is deliberate and stays unpinned. RESOLVED IN v3 (Wave C, drift-resolution campaign 2026-07-27, webapp docs/code-simpl-v2.md decision D4): the historical self-DM divergence is gone. The maintainer chose to adopt self-pairs in the webapp: makePairKey no longer rejects a pair whose two SSID-stripped bases are identical and derives the degenerate 'X~X' (server 'X<>X') like any other pair, so a self-DM (a station messaging its own callsign -- 'note to self'; observed in production: DG7RJ<>DG7RJ, DD7MH<>DD7MH) gets a stable webapp bucket matching the server's storage bucket. The webapp's OWN self-DM stays keyed under the own callsign (the translateServerSummaryKey own-side check runs before pair derivation); the pair form covers THIRD-PARTY self-DMs, which previously had no webapp bucket at all. The self-DM vectors below replay identically on both sides modulo separator translation. Also not pinned: character case. compute_conversation_key never uppercases src/dst (real wire traffic is always uppercase already); the webapp's normalizeCallsign forcibly uppercases. No vector below exercises lowercase input, so this asymmetry is never triggered here -- it would need its own vectors (and a decision on which side is 'right') before being pinned. SYNC RULE: canonical source is THIS file (compute_conversation_key is authoritative and lives in this repo). The vendored copies at webapp/src/utils/__tests__/conversation_key_vectors.json and mc-chat/tests/fixtures/conversation_key_vectors.json must stay parse-equal -- the webapp's Prettier reformats its copy, so whitespace/quoting differences are expected and fine; only content drift is a failure. v4 adds the hashtag branch: a '#TAG' destination keys on the resolved tag VERBATIM, exactly like the numeric-group branch, and is evaluated BEFORE the DM fallback. Previously a hashtag fell into the DM branch and was split on its first hyphen, so '#OE-SOTA' and '#OE-FIELD' collapsed into one bucket while a single tag fragmented into one bucket per sender. A malformed '#' destination yields None (no bucket) rather than a degenerate DM pair.",
+  "canonical": "MCProxy/src/mcapp/storage/conversation_key_vectors.json",
+  "version": 4,
+  "vectors": [
+    {
+      "name": "group numeric dst",
+      "src": "DK5EN-9",
+      "dst": "20",
+      "server_key": "20"
+    },
+    {
+      "name": "TEST dst",
+      "src": "DK5EN-9",
+      "dst": "TEST",
+      "server_key": "TEST"
+    },
+    {
+      "name": "wildcard broadcast dst",
+      "src": "DK5EN-9",
+      "dst": "*",
+      "server_key": "*"
+    },
+    {
+      "name": "DM forward",
+      "src": "OE5HWN-12",
+      "dst": "DK5EN-15",
+      "server_key": "DK5EN<>OE5HWN"
+    },
+    {
+      "name": "DM reverse (symmetry: same key as forward)",
+      "src": "DK5EN-15",
+      "dst": "OE5HWN-12",
+      "server_key": "DK5EN<>OE5HWN"
+    },
+    {
+      "name": "via-routed dst, one hop, group",
+      "src": "DK5EN-9",
+      "dst": "OE1KBC-12,232",
+      "server_key": "232"
+    },
+    {
+      "name": "via-routed dst, two hops, group",
+      "src": "DK5EN-9",
+      "dst": "OE1KBC-12,OE3XYZ-5,20",
+      "server_key": "20"
+    },
+    {
+      "name": "via-routed dst, DM (target extracted before SSID-strip/sort)",
+      "src": "DK5EN-9",
+      "dst": "OE1KBC-12,OE5HWN-3",
+      "server_key": "DK5EN<>OE5HWN"
+    },
+    {
+      "name": "via-routed src (relay path; first component is the sender), DM",
+      "src": "OE5HWN-3,OE1KBC-12",
+      "dst": "DK5EN-9",
+      "server_key": "DK5EN<>OE5HWN"
+    },
+    {
+      "name": "dst without SSID -> base callsign used as-is",
+      "src": "DK5EN-9",
+      "dst": "OE5HWN",
+      "server_key": "DK5EN<>OE5HWN"
+    },
+    {
+      "name": "src without SSID -> base callsign used as-is",
+      "src": "OE5HWN",
+      "dst": "DK5EN-9",
+      "server_key": "DK5EN<>OE5HWN"
+    },
+    {
+      "name": "self-DM, degenerate pair (same base callsign, different SSID)",
+      "src": "DK5EN-9",
+      "dst": "DK5EN-15",
+      "server_key": "DK5EN<>DK5EN"
+    },
+    {
+      "name": "different DM partner -> distinct key from the OE5HWN pair",
+      "src": "DK5EN-9",
+      "dst": "OE9XYZ-1",
+      "server_key": "DK5EN<>OE9XYZ"
+    },
+    {
+      "name": "different group number -> distinct key from group '20'",
+      "src": "DK5EN-9",
+      "dst": "21",
+      "server_key": "21"
+    },
+    {
+      "name": "empty dst -> no conversation key at all",
+      "src": "DK5EN-9",
+      "dst": "",
+      "server_key": null
+    },
+    {
+      "name": "out-of-range numeric dst '0' -> no key (v2: unified group range)",
+      "src": "DK5EN-9",
+      "dst": "0",
+      "server_key": null
+    },
+    {
+      "name": "out-of-range numeric dst '100000' -> no key (v2: unified group range)",
+      "src": "DK5EN-9",
+      "dst": "100000",
+      "server_key": null
+    },
+    {
+      "name": "leading-zeros in-range dst stays a group; key preserves the raw string (v2)",
+      "src": "DK5EN-9",
+      "dst": "00232",
+      "server_key": "00232"
+    },
+    {
+      "name": "via-routed out-of-range numeric target -> no key (v2)",
+      "src": "DK5EN-9",
+      "dst": "OE1KBC-12,0",
+      "server_key": null
+    },
+    {
+      "name": "self-DM without SSIDs (production shape: DG7RJ<>DG7RJ) (v3)",
+      "src": "DG7RJ",
+      "dst": "DG7RJ",
+      "server_key": "DG7RJ<>DG7RJ"
+    },
+    {
+      "name": "via-routed self-DM: relay path stripped from src, target from dst (v3)",
+      "src": "DD7MH-1,RELAY-1",
+      "dst": "OE1KBC-12,DD7MH-5",
+      "server_key": "DD7MH<>DD7MH"
+    },
+    {
+      "name": "hashtag dst keys on the tag itself",
+      "src": "DK5EN-9",
+      "dst": "#OE-SOTA",
+      "server_key": "#OE-SOTA"
+    },
+    {
+      "name": "same hashtag from a DIFFERENT sender keys the same (was: fragmented per sender)",
+      "src": "OE3ABC-1",
+      "dst": "#OE-SOTA",
+      "server_key": "#OE-SOTA"
+    },
+    {
+      "name": "two tags sharing a prefix stay DISTINCT (was: collapsed by the hyphen split)",
+      "src": "DK5EN-9",
+      "dst": "#OE-FIELD",
+      "server_key": "#OE-FIELD"
+    },
+    {
+      "name": "hashtag without a hyphen",
+      "src": "DK5EN-9",
+      "dst": "#EMCOM",
+      "server_key": "#EMCOM"
+    },
+    {
+      "name": "via-routed hashtag resolves to the tag",
+      "src": "DK5EN-9",
+      "dst": "RELAY-1,#OE-SOTA",
+      "server_key": "#OE-SOTA"
+    },
+    {
+      "name": "multi-hop via-routed hashtag",
+      "src": "DK5EN-9",
+      "dst": "R1-1,R2-2,#EMCOM",
+      "server_key": "#EMCOM"
+    },
+    {
+      "name": "hashtag is string-preserving, like the group branch (case split is open decision 10)",
+      "src": "DK5EN-9",
+      "dst": "#oe-sota",
+      "server_key": "#oe-sota"
+    },
+    {
+      "name": "malformed hashtag gets no bucket",
+      "src": "DK5EN-9",
+      "dst": "#OE_SOTA",
+      "server_key": null
+    },
+    {
+      "name": "bare hash gets no bucket",
+      "src": "DK5EN-9",
+      "dst": "#",
+      "server_key": null
+    }
+  ]
+}

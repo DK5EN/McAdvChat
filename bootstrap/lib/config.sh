@@ -17,6 +17,12 @@ readonly LAT_MAX=90
 readonly LON_MIN=-180
 readonly LON_MAX=180
 
+# Length of a freshly generated BLE_API_KEY (see generate_ble_api_key()).
+# migrate_config() uses this as the "looks weak/placeholder" threshold: any
+# existing key shorter than this is rotated, anything at least this long is
+# assumed already generated and left alone.
+readonly BLE_API_KEY_LENGTH=16
+
 #──────────────────────────────────────────────────────────────────
 # INPUT PROMPTS
 #──────────────────────────────────────────────────────────────────
@@ -211,7 +217,11 @@ get_config_value() {
 
 # Collect all configuration values
 collect_config() {
-  local state="$1"
+  # $1 is the detected install state (fresh/incomplete/upgrade/migrate). It is
+  # accepted for symmetry with the other phase functions in mcapp.sh but is
+  # deliberately unused: the prompt flow is identical for every state, since
+  # get_config_value() already returns "" for anything missing or templated.
+  # (Was `local state="$1"`, which shellcheck correctly flagged as SC2034.)
 
   # Get current values (empty if fresh/template)
   local current_callsign
@@ -302,6 +312,19 @@ collect_config() {
   log_ok "Configuration saved to ${CONFIG_FILE}"
 }
 
+# Generate a random BLE API key (BLE_API_KEY_LENGTH chars: upper, lower,
+# digits, specials). Shared by write_config() (fresh installs / --reconfigure)
+# and migrate_config() (rotating a weak/placeholder key found at upgrade
+# time) so there is a single implementation of "what a generated key looks
+# like".
+generate_ble_api_key() {
+  python3 -c "
+import secrets, string
+alphabet = string.ascii_letters + string.digits + '!@#%^&*_+-='
+print(''.join(secrets.choice(alphabet) for _ in range(${BLE_API_KEY_LENGTH})))
+"
+}
+
 # Write configuration file atomically
 write_config() {
   local callsign="$1"
@@ -314,13 +337,9 @@ write_config() {
   # Ensure config directory exists
   mkdir -p "$CONFIG_DIR"
 
-  # Generate random BLE API key (16 chars: upper, lower, digits, specials)
+  # Generate random BLE API key
   local ble_api_key
-  ble_api_key=$(python3 -c "
-import secrets, string
-alphabet = string.ascii_letters + string.digits + '!@#%^&*_+-='
-print(''.join(secrets.choice(alphabet) for _ in range(16)))
-")
+  ble_api_key=$(generate_ble_api_key)
 
   # Generate config from template or create new
   local tmp_config
@@ -398,6 +417,10 @@ migrate_config() {
     ["PRUNE_HOURS_ACK"]=192
   )
 
+  # `key` MUST be declared local: config.sh is sourced into mcapp.sh's shell,
+  # so an undeclared loop variable leaks into every caller's scope and silently
+  # clobbers any `key` they were holding across the deploy_app() call.
+  local key
   for key in "${!defaults[@]}"; do
     local value="${defaults[$key]}"
     local current
@@ -415,6 +438,54 @@ migrate_config() {
       updated=true
     fi
   done
+
+  # Rotate a weak/placeholder BLE_API_KEY. This is separate from the
+  # missing-fields loop above because it isn't "add if absent" — it must
+  # also replace a key that IS present but too weak to have been generated
+  # by generate_ble_api_key() (e.g. the hand-written "test-dev-key"
+  # placeholder that predates that code and would otherwise survive every
+  # upgrade forever, since the loop above only fills in what's missing).
+  #
+  # Rotation criteria: missing, OR shorter than BLE_API_KEY_LENGTH (covers
+  # both "" and any hand-typed short/weak value). A key that is already
+  # BLE_API_KEY_LENGTH chars or longer is assumed to already be a generated
+  # key and is left untouched — rotating a good key on every deploy would be
+  # a silent, recurring BLE outage, which is exactly the failure mode this
+  # migration exists to prevent, not reintroduce.
+  #
+  # Decision on "disabled" vs "" (both make _api_key_valid() treat auth as
+  # off): only the literal string "disabled" is exempted from rotation.
+  # Nobody ends up with "disabled" by accident — an operator has to type it
+  # on purpose to intentionally run the BLE service unauthenticated, and
+  # silently rotating that into an enforcing key would break their working
+  # setup on the next deploy. An empty string has no such deliberate-choice
+  # signal — it's just what an unset/blank field collapses to — so it is
+  # treated the same as "missing" and IS rotated.
+  local current_ble_key
+  current_ble_key=$(jq -r '.BLE_API_KEY // "__MISSING__"' "$tmp_config" 2>/dev/null)
+
+  if [[ "$current_ble_key" != "disabled" ]] && {
+       [[ "$current_ble_key" == "__MISSING__" ]] || [[ "${#current_ble_key}" -lt "$BLE_API_KEY_LENGTH" ]]
+     }; then
+    # Generate FIRST and only commit a key of exactly the promised length.
+    # generate_ble_api_key() shells out to python3; if that ever fails, an
+    # empty value would be worse than the weak key it replaced — ble_service
+    # reads an empty BLE_SERVICE_API_KEY as "auth off" (see _api_key_valid),
+    # and "" is again shorter than BLE_API_KEY_LENGTH, so the rotation would
+    # re-arm and thrash on every subsequent deploy. Keep the old key instead.
+    # (`local` is on its own line on purpose: `local x=$(cmd)` swallows cmd's
+    # exit status, so the `||` below would never see a failure.)
+    local new_ble_key
+    new_ble_key=$(generate_ble_api_key) || new_ble_key=""
+    if [[ "${#new_ble_key}" -ne "$BLE_API_KEY_LENGTH" ]]; then
+      log_warn "  Could not generate a BLE_API_KEY (python3 unavailable?) — keeping the existing value"
+    else
+      log_info "  Rotating weak/placeholder BLE_API_KEY"
+      jq --arg key "$new_ble_key" '.BLE_API_KEY = $key' "$tmp_config" > "${tmp_config}.new" \
+        && mv "${tmp_config}.new" "$tmp_config"
+      updated=true
+    fi
+  fi
 
   if [[ "$updated" == "true" ]]; then
     cp "$CONFIG_FILE" "${CONFIG_FILE}.bak"

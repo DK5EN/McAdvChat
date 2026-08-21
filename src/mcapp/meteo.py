@@ -5,33 +5,183 @@ DWD BrightSky als Primärquelle + OpenMeteo für fehlende Parameter
 Intelligente Daten-Fusion für optimale Genauigkeit
 """
 
-import logging
 import math
 import sys
+import threading
 import time
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime
+from http import HTTPStatus
 from typing import Any
+from zoneinfo import ZoneInfo
 
 import httpx
 
-VERSION = "v0.46.0"
+from .logging_setup import get_logger
 
-# Logging Setup
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-    handlers=[
-        logging.StreamHandler(sys.stdout)
-    ]
+_RAIN_REPORT_MIN_MM = 0.1
+_MAX_LORA_MSG_LEN = 149
+
+HTTP_TIMEOUT_S = 10
+MAX_RETRIES = 2
+RETRY_DELAY_S = 1
+
+# The 4xx codes that are TRANSIENT, i.e. the identical request can succeed a
+# second later. Everything else in the 4xx band is a permanent statement about
+# the request itself (404 for coordinates outside DWD coverage, 403, 400) and
+# is failed fast — see `_make_request`. Both upstreams here (api.brightsky.dev,
+# api.open-meteo.com) are free public APIs that rate-limit; a 429 that is never
+# retried simply means no weather, which is worse than a one-second wait.
+_RETRYABLE_4XX = frozenset({HTTPStatus.REQUEST_TIMEOUT, HTTPStatus.TOO_MANY_REQUESTS})
+
+# Upper bound on a server-supplied `Retry-After`. `_make_request` runs in a
+# worker thread, but it does so while `get_weather_data` holds `_cache_lock`,
+# so every waiting REST caller is parked in the shared default executor behind
+# it — the ~96 s stall `update_location`'s docstring documents. A hybrid fetch
+# issues up to 3 requests (2 BrightSky endpoints + Open-Meteo) with up to
+# MAX_RETRIES sleeps each, so this cap bounds the added wait at 3*2*5 = 30 s,
+# inside that already-documented envelope. A rate-limit ban asking for 60 s is
+# deliberately truncated rather than honoured: the caller gets the
+# negative-cached error immediately and the next 5-minute cycle retries anyway,
+# which is far cheaper than holding a thread and the cache lock for a minute.
+RETRY_AFTER_MAX_S = 5.0
+WEATHER_CACHE_TTL_S = 300  # SSE-06: 5 min — matches typical weather-update cadence
+# Negative cache: error results are cached briefly so an API outage doesn't make
+# every queued waiter run its own full ~96 s fetch serially under _cache_lock
+# (each parking a thread in the shared default executor).
+WEATHER_ERROR_CACHE_TTL_S = 60
+
+_MAGNUS_A = 17.27
+_MAGNUS_B = 237.7
+_MAGNUS_E0_HPA = 6.112
+
+_PERCENT_PER_OKTA = 12.5
+_CALM_WIND_KMH = 1
+_ERROR_PREVIEW_LEN = 25
+
+# Data-quality ladder: (threshold %, label). Highest threshold first.
+_QUALITY_LADDER = (
+    (100, "Exzellent (alle Parameter)"),
+    (80, "Sehr gut (fast alle Parameter)"),
+    (60, "Gut (wichtigste Parameter)"),
+    (40, "Ausreichend (Grundparameter)"),
 )
-logger = logging.getLogger('weather_service')
 
-has_console = sys.stdout.isatty()
+_BERLIN_TZ = ZoneInfo("Europe/Berlin")
+
+
+def _messzeitpunkt_to_utc(timestamp_str: str) -> datetime:
+    """Parse a messzeitpunkt string to an aware UTC datetime.
+
+    Bright Sky returns offset-aware ISO timestamps; Open-Meteo returns naive ISO
+    timestamps in the requested "Europe/Berlin" timezone (the API request pins
+    "timezone": "Europe/Berlin") — interpreting those as a fixed UTC+1/+2 offset
+    is wrong for half the year, so this uses zoneinfo for DST-aware conversion.
+    """
+    parsed = datetime.fromisoformat(timestamp_str)
+    if parsed.tzinfo is not None:
+        return parsed.astimezone(UTC)
+    return parsed.replace(tzinfo=_BERLIN_TZ).astimezone(UTC)
+
+
+def _solar_altitude_deg(lat: float, lon: float, dt_utc: datetime) -> float:
+    """Altitude of the sun above the horizon, in degrees, at a location and UTC
+    time. NOAA low-precision solar-position algorithm — accurate to a few
+    arc-minutes, far beyond what a day/night label needs. A value > 0 means the
+    sun is up (daytime). Replaces the old fixed clock window, which mislabelled
+    dark winter evenings (e.g. 17:00) as daytime -> "sonnig" at night.
+    """
+    day_of_year = dt_utc.timetuple().tm_yday
+    hour = dt_utc.hour + dt_utc.minute / 60 + dt_utc.second / 3600
+    gamma = 2 * math.pi / 365 * (day_of_year - 1 + (hour - 12) / 24)
+    eqtime = 229.18 * (
+        0.000075
+        + 0.001868 * math.cos(gamma)
+        - 0.032077 * math.sin(gamma)
+        - 0.014615 * math.cos(2 * gamma)
+        - 0.040849 * math.sin(2 * gamma)
+    )
+    decl = (
+        0.006918
+        - 0.399912 * math.cos(gamma)
+        + 0.070257 * math.sin(gamma)
+        - 0.006758 * math.cos(2 * gamma)
+        + 0.000907 * math.sin(2 * gamma)
+        - 0.002697 * math.cos(3 * gamma)
+        + 0.00148 * math.sin(3 * gamma)
+    )
+    true_solar_min = hour * 60 + eqtime + 4 * lon  # lon east-positive
+    hour_angle = math.radians(true_solar_min / 4 - 180)
+    lat_rad = math.radians(lat)
+    cos_zenith = math.sin(lat_rad) * math.sin(decl) + math.cos(lat_rad) * math.cos(decl) * math.cos(
+        hour_angle
+    )
+    cos_zenith = max(-1.0, min(1.0, cos_zenith))
+    return 90.0 - math.degrees(math.acos(cos_zenith))
+
+
+logger = get_logger(__name__)
+
+
+def is_valid_position(lat: float | None, lon: float | None) -> bool:
+    """True iff `lat`/`lon` represent a real GPS fix.
+
+    Two "no position" sentinels exist in the wild and both must be treated as
+    absent: `None` (nothing received yet — e.g. no config.json seed and no
+    GPS fix) and the literal `0.0/0.0` pair a disconnected/no-fix GPS module
+    reports. Historically only the `None` check was applied (here and in
+    `sse_routes/weather.py`/`main.py`'s `_cache_gps`), so a `0/0` position
+    was treated as a real coordinate and silently fetched as weather for the
+    Gulf of Guinea. Checked as a PAIR (`lat == 0 and lon == 0`), not
+    individually — a real station can legitimately sit exactly on the
+    equator or the prime meridian on its own; only both at once is the
+    sentinel.
+
+    DELIBERATE TRADE-OFF, not an oversight: this makes Null Island
+    unaddressable. A station genuinely at 0.0000/0.0000 — open Atlantic
+    ~600 km off Ghana, i.e. a ship, and one whose GPS rounded to exactly
+    four zeroed decimals in both axes at that instant — gets "waiting for
+    GPS" instead of weather. That is accepted because the alternative,
+    honouring 0/0, silently mislocates EVERY node whose GPS has no fix yet:
+    a no-fix module reports exactly this pair, MeshCom firmware ships
+    `node_lat = 0.0` as its factory default, and the whole point of this
+    module's Wave 3 changes is to stop serving confidently wrong weather.
+    A no-fix reading is orders of magnitude more common than a mid-Atlantic
+    ham, and the failure mode is honest rather than plausible.
+    """
+    if lat is None or lon is None:
+        return False
+    return not (lat == 0 and lon == 0)
+
+
+def _retry_delay_s(response: httpx.Response) -> float:
+    """How long to wait before retrying `response`'s request.
+
+    Defaults to RETRY_DELAY_S. A `Retry-After` header is honoured when the
+    server asks for LONGER than that (asking for less does not license
+    hammering harder than our own floor), clamped to RETRY_AFTER_MAX_S so a
+    hostile or careless header can never park a worker thread — and, behind
+    `_cache_lock`, every queued weather caller — for an unbounded time.
+
+    Only the delta-seconds form is parsed. RFC 9110 also allows an HTTP-date,
+    but both upstreams here send delta-seconds, and an HTTP-date would need
+    clock-skew handling to be safe; an unparseable value falls back to the
+    fixed delay rather than guessing.
+    """
+    raw = response.headers.get("Retry-After")
+    if not raw:
+        return float(RETRY_DELAY_S)
+    try:
+        requested = float(raw.strip())
+    except (TypeError, ValueError):
+        return float(RETRY_DELAY_S)
+    if not math.isfinite(requested) or requested <= 0:
+        return float(RETRY_DELAY_S)
+    return min(max(requested, float(RETRY_DELAY_S)), RETRY_AFTER_MAX_S)
 
 
 class WeatherServiceError(Exception):
     """Custom Exception für Wetter-Service Fehler"""
-    pass
+
 
 class WeatherService:
     """
@@ -54,12 +204,28 @@ class WeatherService:
         self.max_age_minutes = max_age_minutes
 
         # Request timeout und retry config
-        self.timeout = 10
-        self.max_retries = 2
+        self.timeout = HTTP_TIMEOUT_S
+        self.max_retries = MAX_RETRIES
+
+        # SSE-06: TTL cache + single-flight guard. get_weather_data() runs via
+        # asyncio.to_thread() from multiple concurrent REST requests, so this is a
+        # real threading.Lock (not asyncio.Lock) — held across the whole fetch when
+        # the cache is stale, so concurrent callers block on the one in-flight
+        # fetch instead of each hitting the weather APIs.
+        self._cache: dict[str, Any] | None = None
+        self._cache_time: float = 0.0
+        self._cache_lock = threading.Lock()
+        # Monotonic location generation. Bumped by update_location() WITHOUT taking
+        # _cache_lock (see that method for why) and compared here so a cache entry
+        # — or an in-flight fetch — that belongs to a superseded location is discarded.
+        self._cache_generation: int = 0
+        self._cached_generation: int = -1
 
         logger.info(
             "WeatherService initialisiert für %s %s/%s, Hybrid-Modus: DWD + OpenMeteo",
-            self.stat_name, self.lat, self.lon,
+            self.stat_name,
+            self.lat,
+            self.lon,
         )
 
     def update_location(self, lat: float, lon: float, stat_name: str | None = None) -> None:
@@ -68,15 +234,59 @@ class WeatherService:
         self.lon = lon
         if stat_name:
             self.stat_name = stat_name
+        # A stale cache would otherwise keep serving weather for the old location.
+        #
+        # Deliberately LOCK-FREE: this method is synchronous and is called directly
+        # on the asyncio thread (main.py's `_cache_gps` ble_notification subscriber
+        # and sse_routes/weather.py's `/api/weather` handler), while
+        # get_weather_data() holds `_cache_lock` across the whole blocking
+        # `_fetch_weather_data()` — up to ~96 s when the weather APIs are slow, the
+        # documented degraded state on a Pi with no internet. Acquiring the lock
+        # here froze the entire event loop for that long: SSE heartbeats stopped,
+        # UDP ingest stalled, BLE notifications queued. Bumping a counter instead
+        # invalidates the cache in O(1) and never blocks; the writer is always the
+        # single event-loop thread, the reader is the worker thread.
+        self._cache_generation += 1
 
-    def get_weather_data(self) -> dict[str, Any]:
+    def get_weather_data(self, *, bypass_cache: bool = False) -> dict[str, Any]:
+        """Cached hybrid weather fetch (SSE-06).
+
+        `bypass_cache=True` is for the mesh `!wx` command (weather_command.py)
+        — a ham operator asking for weather over LoRa expects a live reading,
+        not a REST-poll-driven cache. REST callers (sse_routes/weather.py's
+        `/api/weather` and `/api/weather/preview`) use the default cached path.
+        Error responses (no GPS, all APIs down) are cached too, but only for
+        WEATHER_ERROR_CACHE_TTL_S (negative caching): waiters queued behind the
+        first failing fetch get the cached error back immediately instead of
+        each running their own full fetch serially, while a transient failure
+        still can't outlive its cause by more than the short TTL.
+        """
+        if bypass_cache:
+            return self._fetch_weather_data()
+
+        with self._cache_lock:
+            generation = self._cache_generation
+            if self._cache is not None and self._cached_generation == generation:
+                ttl = WEATHER_ERROR_CACHE_TTL_S if "error" in self._cache else WEATHER_CACHE_TTL_S
+                if (time.monotonic() - self._cache_time) < ttl:
+                    return self._cache
+            data = self._fetch_weather_data()
+            # Only publish the result if the location didn't move while we fetched —
+            # otherwise this would re-cache weather for the superseded coordinates.
+            if self._cache_generation == generation:
+                self._cache = data
+                self._cache_time = time.monotonic()
+                self._cached_generation = generation
+            return data
+
+    def _fetch_weather_data(self) -> dict[str, Any]:  # noqa: PLR0912, PLR0915 - complex handler kept intact
         """
         Hybrid-Methode: DWD primär, OpenMeteo für fehlende Parameter
         """
-        if self.lat is None or self.lon is None:
+        if not is_valid_position(self.lat, self.lon):
             return {
                 "error": "Keine GPS-Position verfügbar (warte auf Gerät)",
-                "timestamp": datetime.now(timezone.utc).isoformat(),
+                "timestamp": datetime.now(UTC).isoformat(),
             }
         logger.debug("Starte Hybrid-Wetterabfrage...")
 
@@ -89,25 +299,24 @@ class WeatherService:
             # Zeitvalidierung für DWD
             age_check = self._validate_data_age(dwd_data)
             if age_check["valid"]:
-
                 if not self._has_valid_core_data(dwd_data):
                     logger.warning("❌ DWD liefert None für Kernparameter → Fallback auf OpenMeteo")
                     dwd_data = None  # DWD verwerfen
                 else:
                     logger.debug(
                         "✅ DWD-Daten verfügbar und aktuell (%.1f Min alt)",
-                        age_check['age_minutes'],
+                        age_check["age_minutes"],
                     )
 
             elif not self._has_valid_core_data(dwd_data):
                 logger.debug("⚠️  DWD liefert None-Werte → Fallback auf OpenMeteo")
                 dwd_data = None
             else:
-                logger.debug(f"⚠️  DWD-Daten zu alt: {age_check['reason']}")
+                logger.debug("⚠️  DWD-Daten zu alt: %s", age_check["reason"])
                 dwd_data = None  # Verwerfe alte DWD-Daten
 
         except Exception as e:
-            logger.warning(f"❌ DWD BrightSky nicht verfügbar: {e}")
+            logger.warning("❌ DWD BrightSky nicht verfügbar: %s", e)
             dwd_data = None
 
         # 2. Lade OpenMeteo Daten (immer als Backup/Ergänzung)
@@ -117,7 +326,7 @@ class WeatherService:
             openmeteo_data = self._get_openmeteo_weather()
             logger.debug("✅ OpenMeteo-Daten verfügbar")
         except Exception as e:
-            logger.warning(f"❌ OpenMeteo nicht verfügbar: {e}")
+            logger.warning("❌ OpenMeteo nicht verfügbar: %s", e)
             openmeteo_data = None
 
         # 3. Daten-Fusion: Bestes aus beiden Welten
@@ -125,30 +334,34 @@ class WeatherService:
             # Kompletter Fehler
             return {
                 "error": "Alle Wetter-APIs nicht verfügbar",
-                "timestamp": datetime.now(timezone.utc).isoformat(),
-                "location": f"{self.lat}/{self.lon}"
+                "timestamp": datetime.now(UTC).isoformat(),
+                "location": f"{self.lat}/{self.lon}",
             }
-        elif dwd_data is None:
+        if dwd_data is None:
             # Nur OpenMeteo verfügbar (openmeteo_data is not None at this point)
             logger.debug("🔄 Nutze ausschließlich OpenMeteo")
-            assert openmeteo_data is not None
+            if openmeteo_data is None:
+                raise RuntimeError("openmeteo_data is unexpectedly None")
             openmeteo_data["data_source"] = "OpenMeteo (Fallback)"
-            openmeteo_data["timestamp"] = datetime.now(timezone.utc).isoformat()
+            openmeteo_data["timestamp"] = datetime.now(UTC).isoformat()
             return openmeteo_data
-        elif openmeteo_data is None:
+        if openmeteo_data is None:
             # Nur DWD verfügbar (dwd_data is not None at this point)
             logger.debug("🔄 Nutze ausschließlich DWD (OpenMeteo nicht verfügbar)")
-            assert dwd_data is not None
+            if dwd_data is None:
+                raise RuntimeError("dwd_data is unexpectedly None")
             dwd_data["data_source"] = "DWD_BrightSky (ohne Ergänzung)"
-            dwd_data["timestamp"] = datetime.now(timezone.utc).isoformat()
+            dwd_data["timestamp"] = datetime.now(UTC).isoformat()
             return dwd_data
-        else:
-            # Beide verfügbar - FUSION!
-            logger.debug("🔄 Führe Daten-Fusion durch: DWD primär + OpenMeteo Ergänzung")
-            assert dwd_data is not None and openmeteo_data is not None
-            fused_data = self._fuse_weather_data(dwd_data, openmeteo_data)
-            fused_data["timestamp"] = datetime.now(timezone.utc).isoformat()
-            return fused_data
+        # Beide verfügbar - FUSION!
+        logger.debug("🔄 Führe Daten-Fusion durch: DWD primär + OpenMeteo Ergänzung")
+        if dwd_data is None:
+            raise RuntimeError("dwd_data is unexpectedly None")
+        if openmeteo_data is None:
+            raise RuntimeError("openmeteo_data is unexpectedly None")
+        fused_data = self._fuse_weather_data(dwd_data, openmeteo_data)
+        fused_data["timestamp"] = datetime.now(UTC).isoformat()
+        return fused_data
 
     def _has_valid_core_data(self, weather_data: dict[str, Any]) -> bool:
         """
@@ -156,10 +369,7 @@ class WeatherService:
         Wenn DWD None für Kernparameter liefert → Fallback auf OpenMeteo
         """
         # Definiere kritische Kernparameter
-        core_params = [
-            ("temperatur_celsius", "Temperatur"),
-            ("luftdruck_hpa", "Luftdruck")
-        ]
+        core_params = [("temperatur_celsius", "Temperatur"), ("luftdruck_hpa", "Luftdruck")]
 
         invalid_params = []
 
@@ -167,24 +377,24 @@ class WeatherService:
             value = weather_data.get(param)
             if value is None:
                 invalid_params.append(param_name)
-                logger.debug(f"❌ DWD {param_name}: None")
+                logger.debug("❌ DWD %s: None", param_name)
             else:
-                logger.debug(f"✅ DWD {param_name}: {value}")
+                logger.debug("✅ DWD %s: %s", param_name, value)
 
         if invalid_params:
             logger.debug(
                 "❌ DWD liefert None für kritische Parameter: %s",
-                ', '.join(invalid_params),
+                ", ".join(invalid_params),
             )
             return False
 
         logger.debug("✅ DWD Kernparameter sind gültig")
         return True
 
-
-
     def _fuse_weather_data(
-        self, dwd_data: dict[str, Any], openmeteo_data: dict[str, Any],
+        self,
+        dwd_data: dict[str, Any],
+        openmeteo_data: dict[str, Any],
     ) -> dict[str, Any]:
         """
         Intelligente Daten-Fusion: DWD hat Priorität, OpenMeteo ergänzt fehlende Werte
@@ -216,14 +426,14 @@ class WeatherService:
                 # DWD hat keinen Wert, OpenMeteo ergänzt
                 fused[param] = openmeteo_value
                 supplemented_params.append(param_name)
-                logger.debug(f"  ➕ {param_name}: {openmeteo_value} (von OpenMeteo ergänzt)")
+                logger.debug("  ➕ %s: %s (von OpenMeteo ergänzt)", param_name, openmeteo_value)
             elif dwd_value is not None:
                 # DWD-Wert behalten
                 kept_dwd_params.append(f"{param_name}: {dwd_value}")
-                logger.debug(f"  ✅ {param_name}: {dwd_value} (DWD behalten)")
+                logger.debug("  ✅ %s: %s (DWD behalten)", param_name, dwd_value)
             else:
                 # Beide None
-                logger.debug(f"  ⚠️  {param_name}: Nicht verfügbar")
+                logger.debug("  ⚠️  %s: Nicht verfügbar", param_name)
 
         # Datenquellen-Info zusammenstellen
         if supplemented_params:
@@ -250,28 +460,24 @@ class WeatherService:
         """
         # Kritische Parameter prüfen
         critical_params = [
-            "temperatur_celsius", "luftfeuchtigkeit_prozent", "luftdruck_hpa",
-            "windgeschwindigkeit_kmh", "wolkenbedeckung_prozent"
+            "temperatur_celsius",
+            "luftfeuchtigkeit_prozent",
+            "luftdruck_hpa",
+            "windgeschwindigkeit_kmh",
+            "wolkenbedeckung_prozent",
         ]
 
         available_critical = sum(
-            1 for param in critical_params
-            if weather_data.get(param) is not None
+            1 for param in critical_params if weather_data.get(param) is not None
         )
         total_critical = len(critical_params)
 
         quality_score = (available_critical / total_critical) * 100
 
-        if quality_score >= 100:
-            return "Exzellent (alle Parameter)"
-        elif quality_score >= 80:
-            return "Sehr gut (fast alle Parameter)"
-        elif quality_score >= 60:
-            return "Gut (wichtigste Parameter)"
-        elif quality_score >= 40:
-            return "Ausreichend (Grundparameter)"
-        else:
-            return "Unvollständig (kritische Parameter fehlen)"
+        for threshold, label in _QUALITY_LADDER:
+            if quality_score >= threshold:
+                return label
+        return "Unvollständig (kritische Parameter fehlen)"
 
     def _validate_data_age(self, weather_data: dict[str, Any]) -> dict[str, Any]:
         """Validierung des Datenalters"""
@@ -280,20 +486,13 @@ class WeatherService:
         if not messzeitpunkt_str or messzeitpunkt_str == "unbekannt":
             return {
                 "valid": False,
-                "age_minutes": float('inf'),
-                "reason": "Kein Messzeitpunkt verfügbar"
+                "age_minutes": float("inf"),
+                "reason": "Kein Messzeitpunkt verfügbar",
             }
 
         try:
-            if messzeitpunkt_str.endswith('+00:00'):
-                measurement_time = datetime.fromisoformat(messzeitpunkt_str)
-            elif 'T' in messzeitpunkt_str and len(messzeitpunkt_str) == 16:
-                naive_time = datetime.fromisoformat(messzeitpunkt_str)
-                measurement_time = naive_time.replace(tzinfo=timezone.utc) - timedelta(hours=2)
-            else:
-                measurement_time = datetime.fromisoformat(messzeitpunkt_str.replace('Z', '+00:00'))
-
-            now = datetime.now(timezone.utc)
+            measurement_time = _messzeitpunkt_to_utc(messzeitpunkt_str)
+            now = datetime.now(UTC)
             age_delta = now - measurement_time
             age_minutes = age_delta.total_seconds() / 60
 
@@ -301,7 +500,7 @@ class WeatherService:
                 return {
                     "valid": False,
                     "age_minutes": abs(age_minutes),
-                    "reason": f"Daten sind {abs(age_minutes):.1f} Min in der Zukunft (Forecast)"
+                    "reason": f"Daten sind {abs(age_minutes):.1f} Min in der Zukunft (Forecast)",
                 }
 
             is_valid = age_minutes <= self.max_age_minutes
@@ -311,26 +510,28 @@ class WeatherService:
                 "reason": (
                     f"Daten sind {age_minutes:.1f} Min alt"
                     + ("" if is_valid else f" (> {self.max_age_minutes} Min)")
-                )
+                ),
             }
 
         except (ValueError, TypeError) as e:
             return {
                 "valid": False,
-                "age_minutes": float('inf'),
-                "reason": f"Ungültiger Messzeitpunkt: {e}"
+                "age_minutes": float("inf"),
+                "reason": f"Ungültiger Messzeitpunkt: {e}",
             }
 
     def _calculate_humidity_from_dewpoint(
-        self, temperature_c: float, dewpoint_c: float,
+        self,
+        temperature_c: float,
+        dewpoint_c: float,
     ) -> int | None:
         """Berechne relative Luftfeuchtigkeit aus Temperatur und Taupunkt"""
         try:
-            a, b = 17.27, 237.7
+            a, b = _MAGNUS_A, _MAGNUS_B
             alpha_temp = (a * temperature_c) / (b + temperature_c)
-            es_temp = 6.112 * math.exp(alpha_temp)
+            es_temp = _MAGNUS_E0_HPA * math.exp(alpha_temp)
             alpha_dew = (a * dewpoint_c) / (b + dewpoint_c)
-            es_dew = 6.112 * math.exp(alpha_dew)
+            es_dew = _MAGNUS_E0_HPA * math.exp(alpha_dew)
             relative_humidity = (es_dew / es_temp) * 100
             return round(max(0, min(100, relative_humidity)))
         except (ValueError, ZeroDivisionError, OverflowError):
@@ -342,18 +543,18 @@ class WeatherService:
             {
                 "url": "https://api.brightsky.dev/current_weather",
                 "params": {"lat": self.lat, "lon": self.lon},
-                "name": "current_weather"
+                "name": "current_weather",
             },
             {
                 "url": "https://api.brightsky.dev/weather",
                 "params": {
                     "lat": self.lat,
                     "lon": self.lon,
-                    "date": datetime.now().strftime("%Y-%m-%d"),
-                    "last": 24
+                    "date": datetime.now().astimezone().strftime("%Y-%m-%d"),
+                    "last": 24,
                 },
-                "name": "weather_recent"
-            }
+                "name": "weather_recent",
+            },
         ]
 
         for endpoint in urls_to_try:
@@ -382,7 +583,7 @@ class WeatherService:
                     return result
 
             except Exception as e:
-                logger.debug(f"BrightSky {endpoint['name']} fehlgeschlagen: {e}")
+                logger.debug("BrightSky %s fehlgeschlagen: %s", endpoint["name"], e)
                 continue
 
         raise WeatherServiceError("Alle BrightSky Endpunkte fehlgeschlagen")
@@ -395,21 +596,23 @@ class WeatherService:
             return None
 
         try:
+
             def parse_timestamp(record: dict[str, Any]) -> datetime:
                 ts_str = record.get("timestamp", "")
                 if ts_str:
-                    return datetime.fromisoformat(ts_str.replace('Z', '+00:00'))
-                return datetime.min.replace(tzinfo=timezone.utc)
+                    return datetime.fromisoformat(ts_str)
+                return datetime.min.replace(tzinfo=UTC)
 
             sorted_records = sorted(weather_records, key=parse_timestamp, reverse=True)
-            now = datetime.now(timezone.utc)
+            now = datetime.now(UTC)
 
             for record in sorted_records:
                 try:
                     record_time = parse_timestamp(record)
                     if record_time <= now:
                         return record
-                except Exception:
+                except Exception as e:
+                    logger.debug("Skipping unparsable weather record: %s", e)
                     continue
 
             return sorted_records[0] if sorted_records else None
@@ -439,7 +642,7 @@ class WeatherService:
         elif temperature is not None and dewpoint is not None:
             luftfeuchtigkeit = self._calculate_humidity_from_dewpoint(temperature, dewpoint)
 
-        result = {
+        return {
             "temperatur_celsius": temperature,
             "luftfeuchtigkeit_prozent": luftfeuchtigkeit,
             "luftdruck_hpa": self._safe_float(current.get("pressure_msl")),
@@ -451,10 +654,8 @@ class WeatherService:
             "bedingung": current.get("condition", "unbekannt"),
             "dwd_station": station_name,
             "messzeitpunkt": current.get("timestamp", "unbekannt"),
-            "taupunkt_celsius": dewpoint
+            "taupunkt_celsius": dewpoint,
         }
-
-        return result
 
     def _get_openmeteo_weather(self) -> dict[str, Any]:
         """Open-Meteo API"""
@@ -467,14 +668,13 @@ class WeatherService:
                 "cloud_cover,wind_speed_10m,wind_direction_10m,"
                 "wind_gusts_10m,visibility,precipitation"
             ),
-            "timezone": "Europe/Berlin"
+            "timezone": "Europe/Berlin",
         }
 
         response = self._make_request(url, params)
         data = response.json()
 
-        if has_console:
-            print("openmeteo debug:",data)
+        logger.debug("openmeteo response: %s", data)
 
         if "current" not in data:
             raise WeatherServiceError("Keine aktuellen Open-Meteo-Daten verfügbar")
@@ -493,25 +693,49 @@ class WeatherService:
             "niederschlag_mm": self._safe_float(current.get("precipitation")),
             "bedingung": "N/A",
             "dwd_station": "Open-Meteo Modell",
-            "messzeitpunkt": current.get("time", "unbekannt")
+            "messzeitpunkt": current.get("time", "unbekannt"),
         }
 
     def _make_request(self, url: str, params: dict[str, Any]) -> httpx.Response:
         """Robuste HTTP-Request mit Retry-Logic"""
         for attempt in range(self.max_retries + 1):
             try:
-                response = httpx.get(url, params=params, timeout=self.timeout,
-                                     headers={"User-Agent": "HamRadio-WeatherService/1.0"})
+                response = httpx.get(
+                    url,
+                    params=params,
+                    timeout=self.timeout,
+                    headers={"User-Agent": "HamRadio-WeatherService/1.0"},
+                )
                 response.raise_for_status()
-                return response
-            except httpx.TimeoutException:
+            except httpx.TimeoutException as e:
                 if attempt == self.max_retries:
-                    raise WeatherServiceError("Request Timeout")
-                time.sleep(1)
+                    raise WeatherServiceError("Request Timeout") from e
+                time.sleep(RETRY_DELAY_S)
+            except httpx.HTTPStatusError as e:
+                status = e.response.status_code
+                if (
+                    HTTPStatus.BAD_REQUEST <= status < HTTPStatus.INTERNAL_SERVER_ERROR
+                    and status not in _RETRYABLE_4XX
+                ):
+                    # PERMANENT 4xx (e.g. the observed 404 for coordinates
+                    # outside DWD coverage): the request is wrong for this
+                    # endpoint/params, and retrying an UNCHANGED request
+                    # against an unchanged endpoint cannot succeed. Fail fast
+                    # instead of burning 2 more attempts + 2*RETRY_DELAY_S of
+                    # blocking sleep on every fetch — BrightSky alone tries two
+                    # endpoints, twice per weather cycle (live + negative-cache
+                    # refetch). 408/429 are excluded from this fast-fail: they
+                    # say "not right now", not "not ever" — see _RETRYABLE_4XX.
+                    raise WeatherServiceError(f"HTTP-Fehler (4xx, kein Retry): {e}") from e
+                if attempt == self.max_retries:
+                    raise WeatherServiceError(f"HTTP-Fehler: {e}") from e
+                time.sleep(_retry_delay_s(e.response))
             except httpx.HTTPError as e:
                 if attempt == self.max_retries:
-                    raise WeatherServiceError(f"HTTP-Fehler: {e}")
-                time.sleep(1)
+                    raise WeatherServiceError(f"HTTP-Fehler: {e}") from e
+                time.sleep(RETRY_DELAY_S)
+            else:
+                return response
         raise WeatherServiceError("Request failed after retries")
 
     def _safe_float(self, value: Any) -> float | None:
@@ -529,45 +753,56 @@ class WeatherService:
             return None
 
     def _is_daytime(self, timestamp_str: str | None) -> bool:
-        """Bestimme ob es Tag oder Nacht ist anhand des Messzeitpunkts"""
-        if not timestamp_str or timestamp_str == "unbekannt":
-            # Default: Tag annehmen
+        """True if the sun is above the horizon at the station location and the
+        reference time — real sunrise/sunset, not a fixed clock window (which
+        labelled dark winter evenings as day -> "sonnig" at night). Reference
+        time is the measurement timestamp when parseable, else now; without a
+        location we cannot compute it and assume day.
+        """
+        # The `is None` checks are redundant with is_valid_position()'s own None
+        # check, but kept explicit here (unlike _fetch_weather_data's guard) so
+        # mypy narrows self.lat/self.lon to `float` below — _solar_altitude_deg
+        # requires non-Optional floats and a bare `not is_valid_position(...)`
+        # guard doesn't narrow through an opaque function call.
+        if self.lat is None or self.lon is None or not is_valid_position(self.lat, self.lon):
             return True
-        try:
-            ts = datetime.fromisoformat(timestamp_str.replace('Z', '+00:00'))
-            # Konvertiere zu lokaler Zeit (CET/CEST = UTC+1/+2)
-            local_hour = (ts.hour + 1) % 24  # Grobe CET-Annäherung
-            return 6 <= local_hour < 20
-        except (ValueError, TypeError):
-            return True
+        ref: datetime | None = None
+        if timestamp_str and timestamp_str != "unbekannt":
+            try:
+                ref = _messzeitpunkt_to_utc(timestamp_str)
+            except (ValueError, TypeError):
+                ref = None
+        if ref is None:
+            ref = datetime.now(UTC)
+        return _solar_altitude_deg(self.lat, self.lon, ref) > 0.0
 
     def _calculate_cloud_coverage_description(
-        self, cloud_percent: int | None,
+        self,
+        cloud_percent: float | None,
         timestamp_str: str | None = None,
     ) -> str:
         """Berechne Wolkenbedeckung in Achteln (/8) und Beschreibung"""
         if cloud_percent is None:
             return "unbekannt"
 
-        eighths = round(cloud_percent / 12.5)
+        eighths = round(cloud_percent / _PERCENT_PER_OKTA)
         eighths = max(0, min(8, eighths))
         is_day = self._is_daytime(timestamp_str)
 
         if eighths == 0:
             return "sonnig" if is_day else "klar"
-        elif eighths <= 1:
+        if eighths <= 1:
             return f"{eighths}/8 (heiter)" if is_day else f"{eighths}/8 (überwiegend klar)"
-        elif eighths <= 3:
+        if eighths <= 3:  # noqa: PLR2004 - okta ladder
             return f"{eighths}/8 (aufgelockert bewölkt)"
-        elif eighths <= 6:
+        if eighths <= 6:  # noqa: PLR2004 - okta ladder
             return f"{eighths}/8 (teilweise bewölkt)"
-        else:
-            return "bewölkt"
+        return "bewölkt"
 
     def format_for_lora(self, weather_data: dict[str, Any], prefix_text: str = "") -> str:
         """Ham Radio optimiertes LoRa-Format"""
         if "error" in weather_data:
-            return f"WX ERR: {weather_data['error'][:25]}"
+            return f"WX ERR: {weather_data['error'][:_ERROR_PREVIEW_LEN]}"
 
         temp = weather_data.get("temperatur_celsius", 0)
         humid = weather_data.get("luftfeuchtigkeit_prozent", 0)
@@ -581,30 +816,31 @@ class WeatherService:
             logger.debug("⚠️  Luftfeuchtigkeit None → 0")
         if press is None:
             press = 0.0
-            logger.debug("⚠️  Luftdruck None → 0.0" )
+            logger.debug("⚠️  Luftdruck None → 0.0")
 
         # Wind
         wind_speed = weather_data.get("windgeschwindigkeit_kmh", 0) or 0
         wind_dir = weather_data.get("windrichtung_grad")
 
-        if wind_speed >= 1:
-           wind_compass = self._wind_direction_to_compass(wind_dir)
-           if wind_compass:
-               wind_info = f"Wind {wind_speed:.1f}km/h {wind_compass}"
-           else:
-               wind_info = f"Wind {wind_speed:.1f}km/h"
+        if wind_speed >= _CALM_WIND_KMH:
+            wind_compass = self._wind_direction_to_compass(wind_dir)
+            if wind_compass:
+                wind_info = f"Wind {wind_speed:.1f}km/h {wind_compass}"
+            else:
+                wind_info = f"Wind {wind_speed:.1f}km/h"
         else:
-           wind_info = "windstill"
+            wind_info = "windstill"
 
         # Wolkenbedeckung
         clouds_percent = weather_data.get("wolkenbedeckung_prozent")
         cloud_desc = self._calculate_cloud_coverage_description(
-            clouds_percent, weather_data.get("messzeitpunkt"),
+            clouds_percent,
+            weather_data.get("messzeitpunkt"),
         )
 
-        # Niederschlag (optional)
+        # Niederschlag ist optional
         rain_mm = weather_data.get("niederschlag_mm", 0) or 0
-        rain_info = f", {rain_mm:.1f}mm rain" if rain_mm > 0.1 else ""
+        rain_info = f", {rain_mm:.1f}mm rain" if rain_mm > _RAIN_REPORT_MIN_MM else ""
 
         # Personal text prefix
         prefix = f"{prefix_text} " if prefix_text else ""
@@ -614,7 +850,7 @@ class WeatherService:
             f" {press:.1f}hPa, {wind_info}, {cloud_desc}{rain_info}"
         )
 
-        if len(lora_msg) > 149:
+        if len(lora_msg) > _MAX_LORA_MSG_LEN:
             lora_msg = (
                 f"{prefix}WX {self.stat_name}: {temp:.1f}C {humid}%rF"
                 f" {press:.1f}hPa {wind_info} {cloud_desc}{rain_info}"
@@ -635,10 +871,22 @@ class WeatherService:
 
         # 16 Himmelsrichtungen für präzise Angabe
         directions = [
-            "N",   "NNE", "NE",  "ENE",
-            "E",   "ESE", "SE",  "SSE",
-            "S",   "SSW", "SW",  "WSW",
-            "W",   "WNW", "NW",  "NNW"
+            "N",
+            "NNE",
+            "NE",
+            "ENE",
+            "E",
+            "ESE",
+            "SE",
+            "SSE",
+            "S",
+            "SSW",
+            "SW",
+            "WSW",
+            "W",
+            "WNW",
+            "NW",
+            "NNW",
         ]
 
         # Jede Richtung umfasst 22.5° (360° / 16)
@@ -653,9 +901,9 @@ class WeatherService:
             return f"❌ FEHLER: {weather_data['error']}"
 
         # Basis-Info
-        temp = weather_data.get('temperatur_celsius', 'N/A')
-        humid = weather_data.get('luftfeuchtigkeit_prozent', 'N/A')
-        press = weather_data.get('luftdruck_hpa', 'N/A')
+        temp = weather_data.get("temperatur_celsius", "N/A")
+        humid = weather_data.get("luftfeuchtigkeit_prozent", "N/A")
+        press = weather_data.get("luftdruck_hpa", "N/A")
 
         # Wind-Info
         wind_speed = weather_data.get("windgeschwindigkeit_kmh")
@@ -670,16 +918,14 @@ class WeatherService:
         # Wolken-Info
         clouds_percent = weather_data.get("wolkenbedeckung_prozent")
         cloud_desc = self._calculate_cloud_coverage_description(
-            clouds_percent, weather_data.get("messzeitpunkt"),
+            clouds_percent,
+            weather_data.get("messzeitpunkt"),
         )
-        cloud_text = (
-            f"{clouds_percent}% ({cloud_desc})"
-            if clouds_percent is not None else "N/A"
-        )
+        cloud_text = f"{clouds_percent}% ({cloud_desc})" if clouds_percent is not None else "N/A"
 
         # Fusion-Info
         fusion_info = ""
-        if "supplemented_parameters" in weather_data and weather_data["supplemented_parameters"]:
+        if weather_data.get("supplemented_parameters"):
             supplemented = ", ".join(weather_data["supplemented_parameters"])
             fusion_info = f"🔗 Fusion:         {supplemented} von OpenMeteo ergänzt\n"
 
@@ -700,7 +946,7 @@ class WeatherService:
         rain_info = f"🌧️  Niederschlag:   {rain_mm:.1f} mm\n" if rain_mm > 0 else ""
 
         report = f"""
-🌤️  {self.stat_name} {self.lat}/{self.lon} - {weather_data.get('timestamp', 'N/A')[:19]}
+🌤️  {self.stat_name} {self.lat}/{self.lon} - {weather_data.get("timestamp", "N/A")[:19]}
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 🌡️  Temperatur:     {temp}°C
@@ -708,26 +954,24 @@ class WeatherService:
 {extra_info}🔽  Luftdruck:      {press} hPa
 💨  Wind:           {wind_text}
 ☁️  Wolkenbedeckung: {cloud_text}
-👁️  Sichtweite:     {weather_data.get('sichtweite_meter', 'N/A')} m
-{rain_info}🏢  Station:        {weather_data.get('dwd_station', 'N/A')}
-📡  Quelle:         {weather_data.get('data_source', 'N/A')}
-{fusion_info}{quality_info}⏰  Messzeitpunkt:  {weather_data.get('messzeitpunkt', 'N/A')[:19]}
+👁️  Sichtweite:     {weather_data.get("sichtweite_meter", "N/A")} m
+{rain_info}🏢  Station:        {weather_data.get("dwd_station", "N/A")}
+📡  Quelle:         {weather_data.get("data_source", "N/A")}
+{fusion_info}{quality_info}⏰  Messzeitpunkt:  {weather_data.get("messzeitpunkt", "N/A")[:19]}
 
 📻 LoRa Format: {self.format_for_lora(weather_data)}
         """
         return report.strip()
 
+
 def main() -> None:
     """Produktions-Version"""
-    #Freising
-    stat_name="Freising"
+    # Freising
+    stat_name = "Freising"
     lat = 48.4031
     lon = 11.7497
 
-    #Leonding, OÖ
-    #stat_name="Leonding"
-    #lat = 48.279331
-    #lon = 14.248746
+    # Alternative Station: Leonding, OÖ — 48.279331 N, 14.248746 E
 
     print("🚀 Ham Radio Wetter-Service - HYBRID VERSION")
     print("🔗 DWD BrightSky primär + OpenMeteo Ergänzung")
@@ -748,9 +992,13 @@ def main() -> None:
 
     except KeyboardInterrupt:
         print("\n🛑 Test durch Benutzer abgebrochen")
-    except Exception as e:
-        logger.error(f"Unerwarteter Fehler: {e}")
+    except Exception:
+        logger.exception("Unerwarteter Fehler")
         sys.exit(1)
 
+
 if __name__ == "__main__":
+    from .logging_setup import setup_logging
+
+    setup_logging()
     main()

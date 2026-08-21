@@ -6,10 +6,18 @@ useful for testing non-BLE features or running without Bluetooth hardware.
 """
 
 import logging
-import time
-from typing import Any, Callable
+from collections.abc import Callable
+from typing import Any
 
-from .ble_client import BLEClientBase, BLEDevice, BLEMode, ConnectionState
+from .ble_client import (
+    MESHCOM_NAME_PREFIX,
+    BLEClientBase,
+    BLEDevice,
+    BLEMode,
+    BLEStatus,
+    ConnectionState,
+)
+from .util import now_ms
 
 logger = logging.getLogger(__name__)
 
@@ -34,38 +42,34 @@ class BLEClientDisabled(BLEClientBase):
         self._status.mode = BLEMode.DISABLED
         self._status.state = ConnectionState.DISCONNECTED
 
-    async def _publish_status(
-        self, command: str, result: str, msg: str
-    ) -> None:
+    async def _publish_status(self, command: str, result: str, msg: str) -> None:
         """Publish BLE status through message router"""
         if self.message_router:
-            await self.message_router.publish('ble', 'ble_status', {
-                'src_type': 'BLE',
-                'TYP': 'disabled',
-                'command': command,
-                'result': result,
-                'msg': msg,
-                'timestamp': int(time.time() * 1000)
-            })
+            await self.message_router.publish(
+                "ble",
+                "ble_status",
+                {
+                    "src_type": "BLE",
+                    "TYP": "disabled",
+                    "command": command,
+                    "result": result,
+                    "msg": msg,
+                    "timestamp": now_ms(),
+                },
+            )
 
-    async def scan(self, timeout: float = 5.0, prefix: str = "MC-") -> list[BLEDevice]:
+    async def scan(
+        self, _timeout: float = 5.0, _prefix: str = MESHCOM_NAME_PREFIX
+    ) -> list[BLEDevice]:
         """No-op scan - returns empty list"""
         logger.info("BLE disabled - scan skipped")
-        await self._publish_status(
-            'scan BLE',
-            'info',
-            'BLE disabled - scan not available'
-        )
+        await self._publish_status("scan BLE", "info", "BLE disabled - scan not available")
         return []
 
     async def connect(self, mac: str) -> bool:
         """No-op connect - always returns False"""
         logger.info("BLE disabled - connect to %s skipped", mac)
-        await self._publish_status(
-            'connect BLE',
-            'info',
-            f'BLE disabled - cannot connect to {mac}'
-        )
+        await self._publish_status("connect BLE", "info", f"BLE disabled - cannot connect to {mac}")
         return False
 
     async def disconnect(self) -> bool:
@@ -76,11 +80,7 @@ class BLEClientDisabled(BLEClientBase):
     async def pair(self, mac: str) -> bool:
         """No-op pair - always returns False"""
         logger.info("BLE disabled - pair with %s skipped", mac)
-        await self._publish_status(
-            'pair BLE',
-            'info',
-            f'BLE disabled - cannot pair with {mac}'
-        )
+        await self._publish_status("pair BLE", "info", f"BLE disabled - cannot pair with {mac}")
         return False
 
     async def unpair(self, mac: str) -> bool:
@@ -122,14 +122,30 @@ class BLEClientDisabled(BLEClientBase):
         """Start the disabled client (no-op)"""
         logger.info("BLE client disabled - no Bluetooth operations will be performed")
         await self._publish_status(
-            'start BLE',
-            'info',
-            'BLE disabled mode - Bluetooth operations not available'
+            "start BLE", "info", "BLE disabled mode - Bluetooth operations not available"
         )
 
     async def stop(self) -> None:
         """Stop the disabled client (no-op)"""
         logger.info("BLE client (disabled) stopped")
+
+    async def cancel_reconnect(self) -> bool:
+        """No-op cancel reconnect - nothing is ever reconnecting (BLE-09)"""
+        logger.debug("BLE disabled - cancel reconnect skipped")
+        return True
+
+    async def get_activity(self) -> list[dict[str, Any]]:
+        """No-op activity log - always empty (BLE-09)"""
+        return []
+
+    async def set_ble_pin(self, _pin: int) -> bool:
+        """No-op set PIN - nothing to configure (BLE-09)"""
+        logger.debug("BLE disabled - set PIN skipped")
+        return False
+
+    async def refresh_status(self) -> BLEStatus:
+        """No-op refresh - status never changes on its own (BLE-09)"""
+        return self._status
 
     @property
     def is_connected(self) -> bool:

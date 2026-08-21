@@ -68,6 +68,7 @@ Hash input: the PIN formatted as a zero-padded 6-digit ASCII decimal string.
 
 ```python
 import hashlib
+
 digest = hashlib.sha256(f"{pin:06d}".encode()).digest()
 ```
 
@@ -126,7 +127,7 @@ def build_hello_bytes(pin: int) -> bytes:
     if pin > 0:
         digest = hashlib.sha256(f"{pin:06d}".encode()).digest()
         return bytes([0x24, 0x10, 0x20, 0x30]) + digest
-    return b'\x04\x10\x20\x30'
+    return b"\x04\x10\x20\x30"
 ```
 
 `BLEAdapter.hello_bytes` is read on every `send_hello()` call — mutating it
@@ -141,7 +142,7 @@ when it rewrites the file on every connect.
 
 **Startup** (inside `lifespan`):
 ```python
-_ble_pin = _load_ble_pin() or _BLE_PIN_ENV   # persisted state beats env var
+_ble_pin = _load_ble_pin() or _BLE_PIN_ENV  # persisted state beats env var
 ble_adapter = BLEAdapter(
     notification_callback=notification_callback,
     hello_bytes=build_hello_bytes(_ble_pin),

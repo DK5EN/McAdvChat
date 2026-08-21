@@ -11,6 +11,8 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING, Any
 
+from .types import DIRECTED_DST_PATTERN
+
 if TYPE_CHECKING:
     from .types import StorageProtocol
 
@@ -135,7 +137,23 @@ DEFAULT_RULES: list[dict[str, Any]] = [
         "extra_tags": ["beacon"],
     },
     {
-        # Matches: "🌙WX nördl.🌲¼ ▫️Temp.: 8.3 °C ▫️Feuchte: 57 % ▫️Wind: 3 km/h"
+        # Matches DWD pollen beacons: "Roggen: keine [2/2]", "Gräser: gering",
+        # "Birke: mittel bis hoch". The generic "WX pollen" rule only matches
+        # the word "pollenwetter/pollenvorhersage", not these species:level
+        # lines, so they previously fell through to "other".
+        "priority": 27,
+        "name": "WX pollen species",
+        "scope": "msg",
+        "pattern": (
+            r"(?i)\b(Roggen|Gr(ä|ae)ser|Beifu(ß|ss)|Ambrosia|Birke|Erle|"
+            r"Esche|Hasel|Ulme|Pappel|Weide|Eiche|Linde)\s*:\s*"
+            r"(keine|gering|mittel|hoch)(\s+bis\s+(gering|mittel|hoch))?\b"
+        ),
+        "category": "wx_beacon",
+        "extra_tags": ["beacon"],
+    },
+    {
+        # Example: 🌙WX nördl.🌲¼ ▫️Temp.: 8.3 °C ▫️Feuchte: 57 % ▫️Wind: 3 km/h
         # No hPa/QNH — uses Feuchte/Regen/Wind/Solar instead.
         "priority": 28,
         "name": "WX German no-hPa",
@@ -145,7 +163,7 @@ DEFAULT_RULES: list[dict[str, Any]] = [
         "extra_tags": ["beacon"],
     },
     {
-        # Matches: "JO44qp 1,3 Grad C, Wind NE 5 km/h, 1028 hPa. QAM 73, Timo"
+        # Example: JO44qp 1,3 Grad C, Wind NE 5 km/h, 1028 hPa. QAM 73, Timo
         # Locator-style manual WX reports with Grad C/F + hPa.
         "priority": 29,
         "name": "WX Grad hPa",
@@ -348,12 +366,21 @@ DEFAULT_RULES: list[dict[str, Any]] = [
         "extra_tags": [],
     },
     {
+        # Routing, not content. This rule sits LAST on purpose: a directed
+        # message that also says something ("73", "Hello", "-ping") should
+        # keep the more specific CONTENT category. Because `category` is
+        # single-valued and first-match-wins, that used to silently lose the
+        # directedness entirely -- which is why directedness is now carried
+        # by the `directed` extra_tag as well. extra_tags accumulate across
+        # ALL matching rules (see rules.match_rules), so the tag survives no
+        # matter which content rule won the category slot; consumers that
+        # need "is this a DM?" must read the TAG, not the category.
         "priority": 90,
         "name": "Direct callsign",
         "scope": "dst",
-        "pattern": r"^[A-Z0-9]+-\d+$",
+        "pattern": DIRECTED_DST_PATTERN,
         "category": "directed",
-        "extra_tags": [],
+        "extra_tags": ["directed"],
     },
 ]
 
@@ -373,7 +400,7 @@ def _needs_update(existing: dict[str, Any], default: dict[str, Any]) -> bool:
     return existing_tags != default_tags
 
 
-async def seed_defaults(storage: "StorageProtocol") -> tuple[int, int]:
+async def seed_defaults(storage: StorageProtocol) -> tuple[int, int]:
     """Upsert DEFAULT_RULES by name.
 
     Returns ``(inserted, updated)``.  User-created rules (``builtin=0``)

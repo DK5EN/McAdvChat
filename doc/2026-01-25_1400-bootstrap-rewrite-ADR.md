@@ -43,7 +43,6 @@ bootstrap/
 │   ├── deploy.sh        # Webapp + Python deployment
 │   └── health.sh        # Health checks & diagnostics
 ├── templates/           # Configuration templates
-├── requirements.txt     # Python dependencies (minimum versions)
 └── README.md           # User documentation
 ```
 

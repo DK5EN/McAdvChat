@@ -2,13 +2,48 @@
 
 from __future__ import annotations
 
+import contextlib
 import re
-from typing import Any, Callable
+from collections.abc import Callable
+from typing import Any
 
-from .constants import CALLSIGN_TARGET_PATTERN
+from ..util import strip_ack_suffix
+from .constants import CALLSIGN_TARGET_RE
+
+_MAX_GROUP_NUM = 99999
+
+# Quarantine group for blocked-callsign traffic. Group/broadcast messages from a
+# blocked callsign are redirected here on the live SSE path — kept out of normal
+# views but still inspectable — while personal/position traffic is dropped
+# outright. Mirrors the frontend spec (README: "Spam and illegal messages are
+# assigned to group 9999").
+SPAM_GROUP = "9999"
+
+# Commands whose `text:` argument is GREEDY: everything after it is free text, never a
+# positional target and never another key:value argument. Single source of truth for both
+# `parse_command`'s dispatch and `extract_target_callsign`'s scan window — they disagreed
+# while the tuple was hand-inlined in each. `topic` also takes a free-text argument but
+# never has a target at all (it returns early below), so it does not belong here.
+#
+# The deeper fix is a `greedy_text_arg` field on the COMMANDS TypedDict in handler.py,
+# so a new free-text command needs no edit here; that also requires updating
+# contract/command_contract.json (which currently enshrines "text: cutoff is
+# wx/weather-only") in mc-chat and re-syncing the subtree.
+GREEDY_TEXT_COMMANDS = ("WX", "WEATHER")
 
 
-def extract_target_callsign(msg: str) -> str | None:
+def strip_relay_path(src_raw: str) -> str:
+    """Strip a MeshCom relay-path suffix (comma-separated hops) from a raw src
+    field, returning just the originating callsign, upper-cased and stripped.
+    """
+    return (
+        src_raw.split(",", maxsplit=1)[0].strip().upper()
+        if "," in src_raw
+        else src_raw.strip().upper()
+    )
+
+
+def extract_target_callsign(msg: str) -> str | None:  # noqa: PLR0911, PLR0912 - complex handler kept intact
     """Extract target callsign from command message.
 
     Priority:
@@ -23,7 +58,7 @@ def extract_target_callsign(msg: str) -> str | None:
     msg_upper = msg.upper().strip()
     parts = msg_upper.split()
 
-    if len(parts) < 2:
+    if len(parts) < 2:  # noqa: PLR2004 - token count check
         return None
 
     command = parts[0][1:]  # Remove ! prefix
@@ -32,29 +67,59 @@ def extract_target_callsign(msg: str) -> str | None:
     if command in ["GROUP", "KB", "TOPIC"]:
         return None
 
+    # Truncate at a greedy `text:` argument BEFORE either priority runs: everything
+    # after it is free text (mirrors _parse_wx), so neither a positional callsign nor a
+    # `target:` token in there is a remote target. A personal-message signature like
+    # `!wx text:73 de DK5EN` or `!wx text:73 de OE1ABC target:DK5EN` must resolve
+    # locally, not be forwarded RAW to the mesh.
+    #
+    # The cutoff used to be applied only to the positional fallback, so Priority 1 —
+    # which scans EVERY token — still picked up a `target:` inside the signature and
+    # re-opened the exact raw-leak this guard exists to prevent.
+    scan = parts[1:]
+    if command in GREEDY_TEXT_COMMANDS:
+        for i, part in enumerate(scan):
+            if part.startswith("TEXT:"):
+                scan = scan[:i]
+                break
+
     # Priority 1: Explicit target:CALLSIGN parameter (scanned anywhere)
-    for part in parts[1:]:
+    for part in scan:
         if part.startswith("TARGET:"):
             potential = part[7:]  # Remove 'TARGET:' prefix
             if potential in ["LOCAL", ""]:
                 return None  # Explicit local execution
-            if re.match(CALLSIGN_TARGET_PATTERN, potential):
+            if CALLSIGN_TARGET_RE.match(potential):
                 return potential
             return None  # Invalid target format
 
     # Priority 2: Positional fallback (right-to-left, skip key:value pairs)
-    for part in reversed(parts[1:]):
+    for part in reversed(scan):
         if ":" in part:
             continue  # Skip key:value arguments
         potential = part.strip()
-        if re.match(CALLSIGN_TARGET_PATTERN, potential):
+        if CALLSIGN_TARGET_RE.match(potential):
             return potential
 
     return None
 
 
 def is_group(dst: str) -> bool:
-    """Check if destination is a group."""
+    """Check if destination is a group.
+
+    Unified cross-repo predicate (drift-resolution campaign 2026-07-27): dst is
+    a group iff it equals 'TEST' case-insensitively, OR it is a non-empty
+    all-ASCII-digit string whose integer value is 1..99999 (leading zeros
+    allowed: '00232' is group 232). Contract: ./group_dst_vectors.json —
+    canonical HERE, vendored parse-equal and replayed by mc-chat
+    (tests/fixtures/) and the webapp (src/utils/__tests__/).
+
+    The isascii() gate before isdigit() is load-bearing: str.isdigit() accepts
+    non-ASCII digits that int() happily parses ('٣' == 3, '１２３' == 123 —
+    group ids the webapp's ASCII-only regex rejects) and even some int()
+    rejects ('²' raises ValueError). After the gate only ASCII '0'-'9' remain,
+    int() cannot raise, so the former try/except ValueError guard is gone.
+    """
     if not dst:
         return False
 
@@ -62,20 +127,79 @@ def is_group(dst: str) -> bool:
     if dst.upper() == "TEST":
         return True
 
-    # Numeric groups: 1-99999
-    if dst.isdigit():
-        try:
-            group_num = int(dst)
-            return 1 <= group_num <= 99999
-        except ValueError:
-            return False
-
+    # Numeric groups: 1-99999, ASCII digits only
+    if dst.isascii() and dst.isdigit():
+        return 1 <= int(dst) <= _MAX_GROUP_NUM
     return False
+
+
+# A hashtag destination is the MeshCom FW 4.36 RfC's "#TAG" addressing token
+# carried in the destination field. Contract: ./hashtag_dst_vectors.json —
+# canonical HERE, vendored and replayed by mc-chat and the webapp.
+#
+# Deliberately NOT length-bounded, and deliberately case-insensitive. Both are
+# load-bearing: the defect this predicate exists to fix is a "#"-prefixed dst
+# falling through to the personal-DM branch, where compute_conversation_key
+# split it on its first hyphen. An over-long or lowercase tag that failed this
+# test would fall back into exactly that branch. The RfC's 9-char cap and its
+# uppercase-on-send rule are SEND-side grammar, enforced at the API boundary —
+# never here, where the only job is "do not mistake this for a callsign".
+_HASHTAG_DST_RE = re.compile(r"^#[A-Za-z0-9-]+$")
+
+
+def resolve_dst_target(dst: str) -> str:
+    """Resolve a via-routed destination to its real target.
+
+    Wire form is 'VIA[,VIA2],TARGET' — the real target is the LAST comma
+    component (the src field carries the relay path the other way round, first
+    component = sender). Safe for hashtags specifically because the RfC forbids
+    ',' inside a tag, so there is no ambiguity.
+
+    Single definition. This idiom was hand-rolled in four places before
+    (storage/constants.py, classifier/types.py's regex anchor, push_delivery.py
+    and implicitly in storage/query.py); a fifth copy is how they drift.
+    """
+    return dst.rsplit(",", maxsplit=1)[-1].strip()
+
+
+def is_hashtag(dst: str) -> bool:
+    """Check if destination is a hashtag channel (RfC FW 4.36 '#TAG')."""
+    if not dst:
+        return False
+    return _HASHTAG_DST_RE.match(resolve_dst_target(dst)) is not None
+
+
+def dst_kind(dst: str) -> str:
+    """Classify a destination: broadcast | group | hashtag | direct | unknown.
+
+    Rules apply IN ORDER; see hashtag_dst_vectors.json for the pinned corpus.
+    The '#'-but-malformed -> 'unknown' rule at step 5 is load-bearing: such a
+    destination addresses nobody and must not fall through to 'direct', because
+    treating it as a personal DM is the original defect and a malformed tag is
+    the case most likely to arrive from a buggy or hostile sender. 'unknown'
+    means do not deliver, do not key a conversation, do not ack.
+    """
+    target = resolve_dst_target(dst)
+    if not target:
+        return "unknown"
+    if target.upper() in ("*", "ALL"):
+        return "broadcast"
+    if is_group(target):
+        return "group"
+    if is_hashtag(target):
+        return "hashtag"
+    # Both of these address nobody, and neither may fall through to "direct":
+    # a "#"-prefixed value that failed the tag charset, and an all-ASCII-digit
+    # value outside the 1..99999 group range.
+    if target.startswith("#") or (target.isascii() and target.isdigit()):
+        return "unknown"
+    return "direct"
 
 
 # ---------------------------------------------------------------------------
 # Dispatch-based command parser
 # ---------------------------------------------------------------------------
+
 
 def _collect_kv(parts: list[str]) -> dict[str, Any]:
     """Collect key:value pairs from parts[1:]."""
@@ -89,13 +213,13 @@ def _collect_kv(parts: list[str]) -> dict[str, Any]:
 
 def _has_positional(parts: list[str]) -> bool:
     """True if parts[1] exists and is not a key:value pair."""
-    return len(parts) >= 2 and ":" not in parts[1]  # noqa: PLR0911
+    return len(parts) >= 2 and ":" not in parts[1]  # noqa: PLR2004 - token count check
 
 
 def _parse_wx(parts: list[str], msg_text: str) -> dict[str, Any]:
     """wx/weather: TEXT: captures everything after it."""
     kwargs: dict[str, Any] = {}
-    remaining = msg_text[len(parts[0]):].strip()
+    remaining = msg_text[len(parts[0]) :].strip()
     if remaining:
         text_match = re.search(r"TEXT:(.*)", remaining, re.IGNORECASE)
         if text_match:
@@ -123,10 +247,8 @@ def _parse_stats(parts: list[str]) -> dict[str, Any]:
     """stats: first positional arg is hours (int)."""
     kwargs = _collect_kv(parts)
     if "hours" not in kwargs and _has_positional(parts):
-        try:
+        with contextlib.suppress(ValueError):
             kwargs["hours"] = int(parts[1])
-        except ValueError:
-            pass
     return kwargs
 
 
@@ -168,23 +290,21 @@ def _parse_ctcping(parts: list[str]) -> dict[str, Any]:
 
 def _parse_topic(parts: list[str]) -> dict[str, Any]:
     """topic: group + text + interval."""
-    if len(parts) < 2:
+    if len(parts) < 2:  # noqa: PLR2004 - token count check
         return {}
 
-    if parts[1].upper() == "DELETE" and len(parts) >= 3:
+    if parts[1].upper() == "DELETE" and len(parts) >= 3:  # noqa: PLR2004 - token count check
         return {"action": "delete", "group": parts[2].upper()}
 
     kwargs: dict[str, Any] = {"group": parts[1].upper()}
-    if len(parts) < 3:
+    if len(parts) < 3:  # noqa: PLR2004 - token count check
         return kwargs
 
     text_parts: list[str] = []
     for part in parts[2:]:
         if part.lower().startswith("interval:"):
-            try:
+            with contextlib.suppress(ValueError, IndexError):
                 kwargs["interval"] = int(part.split(":", 1)[1])
-            except (ValueError, IndexError):
-                pass
             break
         text_parts.append(part)
 
@@ -192,7 +312,7 @@ def _parse_topic(parts: list[str]) -> dict[str, Any]:
         kwargs["text"] = " ".join(text_parts)
 
     # Fallback: last part is a bare number → treat as interval
-    if "interval" not in kwargs and len(parts) >= 4 and parts[-1].isdigit():
+    if "interval" not in kwargs and len(parts) >= 4 and parts[-1].isdigit():  # noqa: PLR2004 - token count check
         kwargs["interval"] = int(parts[-1])
         if text_parts and text_parts[-1] == parts[-1]:
             text_parts = text_parts[:-1]
@@ -203,7 +323,7 @@ def _parse_topic(parts: list[str]) -> dict[str, Any]:
 
 def _parse_kb(parts: list[str]) -> dict[str, Any]:
     """kb: callsign + optional action."""
-    if len(parts) < 2:
+    if len(parts) < 2:  # noqa: PLR2004 - token count check
         return {}
 
     first_arg = parts[1].upper()
@@ -212,7 +332,7 @@ def _parse_kb(parts: list[str]) -> dict[str, Any]:
         return {"callsign": first_arg.lower()}
 
     kwargs: dict[str, Any] = {"callsign": first_arg}
-    if len(parts) >= 3 and parts[2].upper() == "DEL":
+    if len(parts) >= 3 and parts[2].upper() == "DEL":  # noqa: PLR2004 - token count check
         kwargs["action"] = "del"
     return kwargs
 
@@ -245,15 +365,13 @@ def normalize_unified(message_data: dict[str, Any], context: str = "command") ->
     """
     src_default = "UNKNOWN" if context == "command" else ""
     src_raw = message_data.get("src", src_default)
-    src = (
-        src_raw.split(",")[0].strip().upper()
-        if "," in src_raw
-        else src_raw.strip().upper()
-    )
+    src = strip_relay_path(src_raw)
     dst = message_data.get("dst", "").strip().upper()
     msg = message_data.get("msg", "").strip()
-    # Strip MeshCom message ID suffix ({NNN) before any routing decisions
-    msg = re.sub(r"\{\d+$", "", msg).strip()
+    # Strip MeshCom message ID suffix ({NNN) before any routing decisions.
+    # Shared definition (util.strip_ack_suffix) -- this used to carry its own
+    # `\d`-spelled literal, which also matched non-ASCII Unicode digits.
+    msg = strip_ack_suffix(msg)
 
     result = message_data.copy()
     result.update({"src": src, "dst": dst, "msg": msg})
@@ -262,7 +380,7 @@ def normalize_unified(message_data: dict[str, Any], context: str = "command") ->
 
 def parse_command(msg_text: str) -> tuple[str, dict[str, Any]] | None:
     """Dispatch-based command parser."""
-    from .handler import COMMANDS
+    from .handler import COMMANDS  # noqa: PLC0415 - circular import avoidance
 
     if not msg_text.startswith("!"):
         return None
@@ -275,8 +393,9 @@ def parse_command(msg_text: str) -> tuple[str, dict[str, Any]] | None:
     if cmd not in COMMANDS:
         return None
 
-    # wx/weather needs the raw msg_text for TEXT: capture
-    if cmd in ("wx", "weather"):
+    # The greedy-text commands need the raw msg_text for TEXT: capture. Same set that
+    # extract_target_callsign truncates its scan at — keep them derived from one constant.
+    if cmd.upper() in GREEDY_TEXT_COMMANDS:
         return cmd, _parse_wx(parts, msg_text)
 
     parser = _COMMAND_PARSERS.get(cmd, _parse_generic)

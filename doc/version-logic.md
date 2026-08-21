@@ -4,10 +4,10 @@ Reference document for version numbering and release workflow.
 
 ## 1. Version Format
 
-| Channel | Format | Example | Where Used |
-|---------|--------|---------|------------|
-| Stable (production) | `vMAJOR.MINOR.PATCH` | `v1.4.0` | `main` branch, GitHub release |
-| Dev (pre-release) | `vMAJOR.MINOR.PATCH-dev.N` | `v1.4.1-dev.3` | `development` branch, GitHub pre-release |
+| Channel             | Format                     | Example        | Where Used                               |
+| ------------------- | -------------------------- | -------------- | ---------------------------------------- |
+| Stable (production) | `vMAJOR.MINOR.PATCH`       | `v1.4.0`       | `main` branch, GitHub release            |
+| Dev (pre-release)   | `vMAJOR.MINOR.PATCH-dev.N` | `v1.4.1-dev.3` | `development` branch, GitHub pre-release |
 
 - `pyproject.toml` always contains the **next target version** (bare, no `v` prefix): e.g., `version = "1.4.1"`
 - Git tags carry the `v` prefix: `v1.4.0`, `v1.4.1-dev.1`
@@ -49,25 +49,25 @@ flowchart TD
 
 ### Patch Cycle: v1.4.0 → v1.4.1
 
-| Step | Branch | Action | `pyproject.toml` | Git Tags (both repos) | GitHub Release |
-|------|--------|--------|-------------------|-----------------------|----------------|
-| 1 | `main` | v1.4.0 just released | `1.4.0` | `v1.4.0` in McApp + webapp | McApp v1.4.0 |
-| 2 | `development` | Post-release prep: bump to next patch | **`1.4.1`** | — | — |
-| 3 | `development` | Dev work, run `release.sh` | `1.4.1` | `v1.4.1-dev.1` in both repos | McApp v1.4.1-dev.1 (pre-release) |
-| 4 | `development` | More work, run `release.sh` again | `1.4.1` | `v1.4.1-dev.2` in both repos | McApp v1.4.1-dev.2 (pre-release) |
-| 5 | `development` | Run `release.sh`, choose Production | `1.4.1` | **`v1.4.1`** in both repos | McApp v1.4.1 |
-| 6 | `development` | Post-release prep (automatic): bump to `1.4.2` | **`1.4.2`** | — | — |
+| Step | Branch        | Action                                         | `pyproject.toml` | Git Tags (both repos)        | GitHub Release                   |
+| ---- | ------------- | ---------------------------------------------- | ---------------- | ---------------------------- | -------------------------------- |
+| 1    | `main`        | v1.4.0 just released                           | `1.4.0`          | `v1.4.0` in McApp + webapp   | McApp v1.4.0                     |
+| 2    | `development` | Post-release prep: bump to next patch          | **`1.4.1`**      | —                            | —                                |
+| 3    | `development` | Dev work, run `release.sh`                     | `1.4.1`          | `v1.4.1-dev.1` in both repos | McApp v1.4.1-dev.1 (pre-release) |
+| 4    | `development` | More work, run `release.sh` again              | `1.4.1`          | `v1.4.1-dev.2` in both repos | McApp v1.4.1-dev.2 (pre-release) |
+| 5    | `development` | Run `release.sh`, choose Production            | `1.4.1`          | **`v1.4.1`** in both repos   | McApp v1.4.1                     |
+| 6    | `development` | Post-release prep (automatic): bump to `1.4.2` | **`1.4.2`**      | —                            | —                                |
 
 ### Minor Cycle: v1.4.1 → v1.5.0
 
-| Step | Branch | Action | `pyproject.toml` | Git Tags (both repos) | GitHub Release |
-|------|--------|--------|-------------------|-----------------------|----------------|
-| 1 | `main` | v1.4.1 just released | `1.4.1` | `v1.4.1` in McApp + webapp | McApp v1.4.1 |
-| 2 | `development` | Post-release prep: bump to next minor | **`1.5.0`** | — | — |
-| 3 | `development` | Dev work, run `release.sh` | `1.5.0` | `v1.5.0-dev.1` in both repos | McApp v1.5.0-dev.1 (pre-release) |
-| 4 | `development` | More work, run `release.sh` again | `1.5.0` | `v1.5.0-dev.2` in both repos | McApp v1.5.0-dev.2 (pre-release) |
-| 5 | `development` | Run `release.sh`, choose Production | `1.5.0` | **`v1.5.0`** in both repos | McApp v1.5.0 |
-| 6 | `development` | Post-release prep (automatic): bump to `1.5.1` | **`1.5.1`** | — | — |
+| Step | Branch        | Action                                         | `pyproject.toml` | Git Tags (both repos)        | GitHub Release                   |
+| ---- | ------------- | ---------------------------------------------- | ---------------- | ---------------------------- | -------------------------------- |
+| 1    | `main`        | v1.4.1 just released                           | `1.4.1`          | `v1.4.1` in McApp + webapp   | McApp v1.4.1                     |
+| 2    | `development` | Post-release prep: bump to next minor          | **`1.5.0`**      | —                            | —                                |
+| 3    | `development` | Dev work, run `release.sh`                     | `1.5.0`          | `v1.5.0-dev.1` in both repos | McApp v1.5.0-dev.1 (pre-release) |
+| 4    | `development` | More work, run `release.sh` again              | `1.5.0`          | `v1.5.0-dev.2` in both repos | McApp v1.5.0-dev.2 (pre-release) |
+| 5    | `development` | Run `release.sh`, choose Production            | `1.5.0`          | **`v1.5.0`** in both repos   | McApp v1.5.0                     |
+| 6    | `development` | Post-release prep (automatic): bump to `1.5.1` | **`1.5.1`**      | —                            | —                                |
 
 The **developer chooses** patch vs minor at step 2, when setting `pyproject.toml` after a release. The automatic post-release prep always bumps patch; for a minor bump, manually edit `pyproject.toml` before the next dev cycle.
 
@@ -76,12 +76,16 @@ The **developer chooses** patch vs minor at step 2, when setting `pyproject.toml
 ### Current Implementation
 
 The webapp (`useVersionCheck.ts`) fetches the 20 most recent GitHub releases and finds:
+
 - `latestStable`: first non-prerelease tag
 - `latestPrerelease`: first prerelease tag
 
 Then computes:
+
 ```typescript
-const hasUpdate = computed(() => hasStableUpdate.value || hasPrereleaseUpdate.value)
+const hasUpdate = computed(
+  () => hasStableUpdate.value || hasPrereleaseUpdate.value,
+);
 ```
 
 ### The Bug
@@ -92,18 +96,18 @@ This OR logic means a **stable** user gets alerted about dev pre-releases, and a
 
 ### Correct Logic
 
-| Installed Version | Alert When |
-|-------------------|------------|
-| Stable (`v1.4.0`) | Newer **stable** release exists (e.g., `v1.4.1`, `v1.5.0`) |
-| Dev (`v1.4.1-dev.2`) | Newer **dev pre-release** exists (e.g., `v1.4.1-dev.3`) |
+| Installed Version    | Alert When                                                 |
+| -------------------- | ---------------------------------------------------------- |
+| Stable (`v1.4.0`)    | Newer **stable** release exists (e.g., `v1.4.1`, `v1.5.0`) |
+| Dev (`v1.4.1-dev.2`) | Newer **dev pre-release** exists (e.g., `v1.4.1-dev.3`)    |
 
 ```typescript
 // Correct
 const hasUpdate = computed(() => {
-  const v = parseVersion(local.value)
-  if (!v) return false
-  return v.isDev ? hasPrereleaseUpdate.value : hasStableUpdate.value
-})
+  const v = parseVersion(local.value);
+  if (!v) return false;
+  return v.isDev ? hasPrereleaseUpdate.value : hasStableUpdate.value;
+});
 ```
 
 ## 5. Release Script Workflow
@@ -215,6 +219,7 @@ Before a production release, the script prints a prompt with commits from both r
 ### Failure Recovery
 
 The `on_failure()` trap handler:
+
 - Removes local artifacts (tarball, checksum, staging dir)
 - Deletes GitHub release if created
 - Deletes tags from **both repos** (local and remote)
@@ -228,3 +233,79 @@ The `on_failure()` trap handler:
 - Allow release without clean working trees in both repos
 - Allow release from any branch other than `development`
 - Tag only one repo — both repos are always tagged together
+
+## 6. Piped Install Pinning (Bootstrap Install-Ref Resolution)
+
+A piped install (`curl … | sudo bash`, `bootstrap/mcapp.sh`) resolves one
+release ref before it sources any bootstrap library, and pins the whole run
+to it: bootstrap libs, templates, and the app all come from the same tag.
+The same command run again later, on the same tag, produces the same box.
+Design rationale and the bug this closes:
+[`2026-08-09_1600-bootstrap-tag-pinning-plan.md`](2026-08-09_1600-bootstrap-tag-pinning-plan.md).
+
+### Resolving the ref
+
+`resolve_install_ref()` in `bootstrap/mcapp.sh` sets two values before
+`source_libs()` runs — `MCAPP_INSTALL_REF` (what the bootstrap tree, i.e.
+libs + templates, is fetched from) and `MCAPP_INSTALL_APP_VERSION` (what
+`deploy_app()` installs):
+
+| Flag / env                          | App version                                                               | Bootstrap tree ref                                                  | API calls                          |
+| ----------------------------------- | ------------------------------------------------------------------------- | ------------------------------------------------------------------- | ---------------------------------- |
+| `--tag TAG`                         | `TAG`                                                                     | `TAG` (unless `--ref` overrides it)                                 | 0                                  |
+| `--dev`                             | highest `-dev.N` tag (`GET /releases?per_page=100`, parsed without `jq`)  | same tag                                                            | 1                                  |
+| default                             | latest stable tag (`GET /releases/latest`)                                | same tag                                                            | 1                                  |
+| `--ref REF` / `MCAPP_BOOTSTRAP_REF` | still resolved by the rules above — `--ref` never affects the app version | forced to `REF` (any branch or tag), independent of the app version | as above (0 combined with `--tag`) |
+
+The ref is resolved exactly once and exported, so a release cut mid-run
+cannot land libs on one tag and the app on another. `--ref` is for
+developing bootstrap changes without cutting a release, and doubles as a
+one-line field rollback: `--ref development` reproduces the pre-pinning
+branch-tip behavior for libs and templates.
+
+The bootstrap tree itself is fetched as one tarball (`fetch_bootstrap_tree()`
+in `mcapp.sh`) — the checksummed release asset
+(`mcapp-<ref>.tar.gz`/`.sha256`) when the ref is a tag, falling back to an
+unverified codeload archive (warned) for a tag without assets or for a
+branch ref. Raw-URL fallbacks used by the sourced libs (template lookups,
+the legacy webapp download) are rebased on the resolved ref too, so even
+that cold path stays pinned.
+
+### When the GitHub API is unreachable
+
+| Situation                                                            | App version                                                     | Bootstrap tree ref                                                   |
+| -------------------------------------------------------------------- | --------------------------------------------------------------- | -------------------------------------------------------------------- |
+| `--tag` given                                                        | not affected — `--tag` never calls the API                      |                                                                      |
+| Fresh install (no `/etc/mcapp/config.json`), API unreachable         | **aborts**, printing a copy-paste `--tag <version>` retry hint  | n/a — the run exits before `source_libs()`                           |
+| Existing install (repair / `--skip` / `--converge`), API unreachable | left `"unknown"` — `deploy_app()` leaves the current slot as-is | **warns loudly**, falls back to `main` (`development` under `--dev`) |
+
+A fresh install has nothing to salvage if it cannot name a version, so it
+refuses to silently become "whatever a branch tip happens to be today." An
+existing install is the one case where finishing beats staying pinned, and
+it is the case where an operator is watching the output.
+
+### Script/lib skew guard
+
+After sourcing whatever bootstrap tree was resolved, `mcapp.sh` verifies
+(`declare -F`, against `REQUIRED_LIB_FUNCTIONS`) that the libs actually
+define every function the running script's `main()` calls. A tag old enough
+to predate one of those functions — e.g. `ensure_web_frontend` or
+`caddy_config_marker`, added with Caddy/system-epoch support — aborts
+cleanly instead of running with a mismatched pair:
+
+```
+ERROR: v1.5.1's bootstrap libs do not provide: ensure_web_frontend caddy_config_marker
+       Run that release's own installer instead:
+       curl -fsSL https://raw.githubusercontent.com/DK5EN/McApp/v1.5.1/bootstrap/mcapp.sh \
+         | sudo bash -s -- --tag v1.5.1
+```
+
+That suggested remedy assumes the target tag's own `mcapp.sh` already has
+this pinning fix. For a tag old enough to predate the fix itself (e.g.
+`v1.6.13`), the tag's own script still has the original bug — it pulls
+bootstrap libs from the `development` branch tip unconditionally — so piping
+from it does not reproduce that tag's historical libs either. Reproducing a
+pre-fix tag's exact original state still requires installing from that tag's
+own tree non-piped (fetch its tarball/codeload archive, run
+`bootstrap/mcapp.sh` locally). `doc/update-converge.md` (Step 1) is a worked
+example for `v1.6.13`.

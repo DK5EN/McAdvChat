@@ -9,7 +9,25 @@
 install_packages() {
   install_apt_deps
   install_uv
+  ensure_web_frontend
+}
+
+# Idempotent install + configuration of the web front door.
+#
+# ORDER MATTERS: install_lighttpd (→ configure_lighttpd) moves lighttpd off
+# :80 onto 127.0.0.1:8082 and full-restarts it, freeing :80 BEFORE
+# install_caddy (→ configure_caddy) binds :80/:443. Both are idempotent —
+# command -v guards + version markers mean steady-state is a no-op with no
+# restart — so calling this repeatedly (and from more than one code path) is
+# safe.
+#
+# This exists as its own function because the web-updater path
+# (update-runner.py → `mcapp.sh --skip`) never runs install_packages(), so
+# without a second call site the :80→8082 move + Caddy install would never
+# reach production upgrades. See the --skip call site in mcapp.sh.
+ensure_web_frontend() {
   install_lighttpd
+  install_caddy
 }
 
 #──────────────────────────────────────────────────────────────────
@@ -181,8 +199,14 @@ install_uv() {
 }
 
 #──────────────────────────────────────────────────────────────────
-# LIGHTTPD (Static File Server)
+# LIGHTTPD (Static File Server, backend behind Caddy)
 #──────────────────────────────────────────────────────────────────
+
+# Version marker bumped whenever the generated 99-mcapp.conf content
+# changes, so upgraded installs actually pick up the new config (see
+# configure_lighttpd() below for why this replaced a "contains
+# Cache-Control" substring check).
+readonly LIGHTTPD_MCAPP_CONF_VERSION=3
 
 install_lighttpd() {
   log_info "Installing lighttpd..."
@@ -206,6 +230,7 @@ configure_lighttpd() {
 
   local conf_file="/etc/lighttpd/conf-available/99-mcapp.conf"
   local main_conf="/etc/lighttpd/lighttpd.conf"
+  local version_marker="mcapp-lighttpd-config-version: ${LIGHTTPD_MCAPP_CONF_VERSION}"
 
   # Migrate old installations: if lighttpd.conf has McApp directives baked in,
   # replace it with the clean template to avoid duplicate module conflicts
@@ -231,18 +256,59 @@ configure_lighttpd() {
     log_info "  Replaced customized lighttpd.conf (backup: $backup)"
   fi
 
-  # Check if already configured (must include mod_proxy for API/SSE reverse proxy)
-  if [[ -f "$conf_file" ]] && grep -q "mod_proxy" "$conf_file" 2>/dev/null; then
-    log_info "  lighttpd already configured"
+  # Move the (single) listen socket to 127.0.0.1:8082 in the BASE conf. It MUST
+  # live here and not in 99-mcapp.conf: the stock/template lighttpd.conf
+  # consumes server.port in `include_shell use-ipv6.pl + server.port` BEFORE it
+  # includes conf-enabled/*.conf, so server.port may be defined exactly once,
+  # up in the base. A stock Debian base ships `server.port = 80` and is NOT
+  # caught by the "webapp" migration above, which is exactly how an install ends
+  # up with server.port declared in both files → lighttpd's "Duplicate config
+  # variable ... server.port" → lighttpd AND Caddy both fail to start. Runs
+  # before the version-marker early-return so it reconciles the base regardless
+  # of 99-mcapp.conf state. Idempotent: no-ops once the base already reads 8082.
+  if [[ -f "$main_conf" ]]; then
+    sed -i -E 's/^(server\.port[[:space:]]*=[[:space:]]*)80([[:space:]]*)$/\18082\2/' "$main_conf"
+    if ! grep -qE '^[[:space:]]*server\.bind[[:space:]]*=' "$main_conf"; then
+      sed -i -E '/^server\.port[[:space:]]*=/a server.bind                 = "127.0.0.1"' "$main_conf"
+    fi
+  fi
+
+  # Idempotency: rewrite only when the version marker is missing or stale.
+  #
+  # Previously this only checked whether the file contained the literal
+  # string "Cache-Control" — which meant header-policy updates (e.g. adding
+  # manifest.webmanifest/version.html to the no-cache set, or the :80 -> 8082
+  # port move below) never reached already-upgraded installs: any config
+  # that already had *some* Cache-Control directive was considered "done"
+  # forever. A version marker that bumps on every content change fixes that.
+  if [[ -f "$conf_file" ]] && grep -qF "$version_marker" "$conf_file" 2>/dev/null; then
+    log_info "  lighttpd already configured (version ${LIGHTTPD_MCAPP_CONF_VERSION})"
     return 0
   fi
 
   # Create McApp-specific config
+  # (heredoc is quoted to protect lighttpd's $HTTP[...] syntax from shell
+  # expansion — the version marker is interpolated afterwards via sed)
   cat > "$conf_file" << 'EOF'
 # McApp SPA rewrite + redirect + API proxy configuration
 # Enables Vue.js SPA routing, root redirect, and reverse proxy to FastAPI
+#
+# mcapp-lighttpd-config-version: __LIGHTTPD_MCAPP_CONF_VERSION__
+#
+# lighttpd runs as the backend behind Caddy. Caddy owns the public-facing
+# ports 80/443 (see install_caddy()/configure_caddy() below and
+# bootstrap/templates/caddy/Caddyfile.mcapp) and passes headers through
+# unchanged — Cache-Control policy is owned here, not in Caddy.
 
 server.modules += ("mod_rewrite", "mod_redirect", "mod_proxy", "mod_setenv")
+
+# NOTE: the listen socket (server.bind = "127.0.0.1", server.port = 8082 — put
+# lighttpd behind Caddy, which owns the public :80/:443) is declared in the
+# BASE lighttpd.conf, NOT here. lighttpd forbids re-declaring server.port, and
+# the base consumes it (include_shell use-ipv6.pl + server.port) before it
+# includes this file — declaring it again here fails the whole config with
+# "Duplicate config variable ... server.port". port 8081 is reserved by
+# mcapp-ble.service's uvicorn — do not reuse it.
 
 # Enable streaming for SSE (Server-Sent Events) — prevents buffering
 server.stream-response-body = 2
@@ -259,6 +325,17 @@ $HTTP["url"] =~ "^/webapp/" {
     )
 }
 
+# index.html, sw.js, manifest.webmanifest, version.html must always
+# revalidate so new hashed bundles / PWA manifest / version marker are
+# picked up on deploy
+$HTTP["url"] =~ "/webapp/(index\.html|sw\.js|manifest\.webmanifest|version\.html)$" {
+    setenv.add-response-header += ( "Cache-Control" => "no-cache" )
+}
+# content-hashed assets are safe to cache hard
+$HTTP["url"] =~ "/webapp/assets/" {
+    setenv.add-response-header += ( "Cache-Control" => "public, max-age=31536000, immutable" )
+}
+
 # Reverse proxy: SSE event stream + REST API → FastAPI on port 2981
 $HTTP["url"] =~ "^/events" {
     proxy.server = ("" => (("host" => "127.0.0.1", "port" => 2981)))
@@ -273,15 +350,367 @@ $HTTP["url"] =~ "^/health" {
 }
 EOF
 
+  sed -i "s/__LIGHTTPD_MCAPP_CONF_VERSION__/${LIGHTTPD_MCAPP_CONF_VERSION}/" "$conf_file"
+
   # Enable the config (idempotent)
   if [[ ! -L /etc/lighttpd/conf-enabled/99-mcapp.conf ]]; then
     ln -sf "$conf_file" /etc/lighttpd/conf-enabled/99-mcapp.conf
   fi
 
-  # Test config before reloading
+  # Test config, then FULL restart (not reload).
+  #
+  # We only reach here when the config was actually (re)written — the version
+  # marker check above early-returns on no-op runs, preserving idempotency.
+  # A restart (not reload) is REQUIRED: this run changes server.bind/server.port
+  # (moving lighttpd from :80 to 127.0.0.1:8082), and lighttpd does NOT rebind
+  # its listen sockets on `reload` — only a restart re-opens them on the new
+  # address. The old `reload || restart` was doubly wrong: reload returns 0 so
+  # the restart fallback never fired, leaving lighttpd stuck on :80 and Caddy
+  # unable to bind it. Freeing :80 here (before configure_caddy runs, next in
+  # install_packages) is what lets Caddy take the port on the first run.
   if lighttpd -t -f /etc/lighttpd/lighttpd.conf 2>/dev/null; then
-    systemctl reload lighttpd 2>/dev/null || systemctl restart lighttpd
+    if systemctl restart lighttpd 2>/dev/null; then
+      log_ok "  lighttpd restarted (now bound to 127.0.0.1:8082)"
+    else
+      log_error "  lighttpd failed to restart — check: systemctl status lighttpd"
+    fi
   else
     log_warn "  lighttpd config test failed — check $main_conf and $conf_file for conflicts"
   fi
+}
+
+#──────────────────────────────────────────────────────────────────
+# CADDY (TLS-terminating front door — LAN-HTTPS default)
+#──────────────────────────────────────────────────────────────────
+
+# Version marker bumped whenever the generated Caddyfile content changes,
+# so upgraded installs actually pick up the new config (same scheme as
+# LIGHTTPD_MCAPP_CONF_VERSION above). Keep this number in sync with the
+# "mcapp-caddy-config-version:" comment in
+# bootstrap/templates/caddy/Caddyfile.mcapp.
+readonly CADDY_CONFIG_VERSION=3
+
+# Short hostname the Caddyfile template is rendered with (@@HOST@@). Falls back
+# to "mcapp" when `hostname -s` is empty or is not a valid DNS label: an empty
+# render would emit the bogus site address ".local:443" and `caddy validate`
+# would reject the whole config, taking the front door down over a cosmetic
+# hostname problem.
+caddy_render_host() {
+  local h=""
+  h=$(hostname -s 2>/dev/null || true)
+  if [[ ! "$h" =~ ^[A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?$ ]]; then
+    h="mcapp"
+  fi
+  echo "$h"
+}
+
+# The full marker line written into (and grepped back out of) the Caddyfile.
+# It carries the HOSTNAME as well as the version, so renaming the box makes the
+# installed config stale and triggers a re-render. Before v3 the marker was
+# version-only and the site addresses were the hard-coded literal "mcapp.local",
+# so a renamed Pi kept serving a name nobody could resolve — and every request
+# under the real name fell through to Caddy's empty-200 no-site-matched reply.
+caddy_config_marker() {
+  echo "mcapp-caddy-config-version: ${CADDY_CONFIG_VERSION} host=$(caddy_render_host)"
+}
+
+# The version marker a Caddyfile (template or installed copy) declares itself,
+# or "" if the file is missing/unmarked. Used to refuse a template that does not
+# belong to the code about to render it — see pick_caddy_template().
+caddy_template_version() {
+  local file="$1"
+  [[ -f "$file" ]] || return 0
+  sed -n 's/^# *mcapp-caddy-config-version: *\([0-9][0-9]*\).*/\1/p' "$file" | head -1
+}
+
+# Echo the path of a template whose OWN version matches CADDY_CONFIG_VERSION,
+# or "" if no local candidate qualifies (caller then downloads).
+#
+# The version and the content MUST come from the same release. The marker line
+# is written from the constant in THIS file while the body comes from the
+# template, so a mismatched pair writes old content under a new marker claim:
+# the staleness check then never matches again and every subsequent run
+# rewrites the config and restarts Caddy, forever.
+#
+# INSTALL_DIR is checked LAST and only when it matches, never preferred. During
+# an upgrade configure_caddy() runs from install_packages(), BEFORE deploy_app()
+# swaps the slot symlink, so INSTALL_DIR still points at the PREVIOUS release —
+# the one source guaranteed to be stale. Preferring it is exactly how v3 shipped
+# and silently did not take effect: the v2 template was rendered and installed
+# while the log reported the v3 marker.
+pick_caddy_template() {
+  local candidate
+  for candidate in \
+    "${SCRIPT_DIR:+${SCRIPT_DIR}/templates/caddy/Caddyfile.mcapp}" \
+    "${INSTALL_DIR:+${INSTALL_DIR}/bootstrap/templates/caddy/Caddyfile.mcapp}"; do
+    [[ -n "$candidate" && -f "$candidate" ]] || continue
+    if [[ "$(caddy_template_version "$candidate")" == "$CADDY_CONFIG_VERSION" ]]; then
+      echo "$candidate"
+      return 0
+    fi
+  done
+  echo ""
+}
+
+install_caddy() {
+  log_info "Installing Caddy..."
+
+  # The Caddyfile template uses a modern post-quantum TLS curve
+  # (x25519mlkem768) that needs Caddy >= 2.9. Debian's packaged caddy (trixie
+  # ships 2.6.2) is too old — `caddy validate` rejects the curve and Caddy
+  # never starts. Install from Caddy's official apt repo to get a current
+  # release (matches rpizero's 2.11.x). Skip if a new-enough caddy is present.
+  local caddy_minor=0
+  if command -v caddy &>/dev/null; then
+    caddy_minor=$(caddy version 2>/dev/null | grep -oE '2\.[0-9]+' | head -1 | cut -d. -f2)
+    caddy_minor=${caddy_minor:-0}
+  fi
+
+  if command -v caddy &>/dev/null && [[ "$caddy_minor" -ge 9 ]]; then
+    log_info "  Caddy already installed ($(caddy version 2>/dev/null | head -1))"
+  else
+    if command -v caddy &>/dev/null; then
+      log_info "  Caddy $(caddy version 2>/dev/null | head -1) too old (need >= 2.9) — installing current from official repo"
+    fi
+    if [[ ! -f /etc/apt/sources.list.d/caddy-stable.list ]]; then
+      apt-get install -y -qq debian-keyring debian-archive-keyring apt-transport-https curl gnupg
+      curl -1sLf 'https://dl.cloudsmith.io/public/caddy/stable/gpg.key' \
+        | gpg --dearmor --yes -o /usr/share/keyrings/caddy-stable-archive-keyring.gpg
+      curl -1sLf 'https://dl.cloudsmith.io/public/caddy/stable/debian.deb.txt' \
+        > /etc/apt/sources.list.d/caddy-stable.list
+      apt-get update -qq
+    fi
+    # --force-confold: keep our already-written /etc/caddy/Caddyfile on upgrade
+    apt-get install -y -qq -o Dpkg::Options::="--force-confold" caddy
+    log_ok "  Caddy installed ($(caddy version 2>/dev/null | head -1))"
+  fi
+
+  configure_caddy
+}
+
+configure_caddy() {
+  log_info "  Configuring Caddy..."
+
+  if ! command -v caddy &>/dev/null; then
+    log_warn "  caddy binary not found — skipping Caddy configuration"
+    return 0
+  fi
+
+  local caddy_conf="/etc/caddy/Caddyfile"
+  local version_marker
+  version_marker=$(caddy_config_marker)
+
+  mkdir -p /etc/caddy
+
+  # If ssl-tunnel-setup.sh has already claimed Caddy for public-domain TLS
+  # (it sets TLS_ENABLED=true in config.json via update_mcapp_config() and
+  # overwrites this same /etc/caddy/Caddyfile path with a provider-specific
+  # template that carries no version marker), do NOT treat that as "stale"
+  # and rewrite it back to the LAN-HTTPS default here. Without this guard,
+  # every routine upgrade run (e.g. via mcapp-update) would silently revert
+  # a working public TLS setup back to LAN-only on each bootstrap run.
+  if [[ -f "$CONFIG_FILE" ]] && command -v jq &>/dev/null; then
+    local tls_enabled
+    tls_enabled=$(jq -r '.TLS_ENABLED // false' "$CONFIG_FILE" 2>/dev/null)
+    if [[ "$tls_enabled" == "true" ]]; then
+      log_info "  ssl-tunnel-setup.sh owns Caddy (TLS_ENABLED in config.json) — leaving Caddyfile as-is"
+      return 0
+    fi
+  fi
+
+  # Idempotency via version marker (same scheme as configure_lighttpd) —
+  # rewrite only when the marker is missing or stale, skip otherwise. This
+  # also means ssl-tunnel-setup.sh's provider Caddyfiles (which carry no
+  # such marker) are never silently overwritten by a plain upgrade run —
+  # only an explicit `caddy validate` failure or removal brings this
+  # default back, see remove_tls() in ssl-tunnel-setup.sh.
+  local rewrote=false
+  if [[ -f "$caddy_conf" ]] && grep -qF "$version_marker" "$caddy_conf" 2>/dev/null; then
+    log_info "  Caddyfile already up to date (${version_marker})"
+  else
+    # Find a template that BELONGS to this code (see pick_caddy_template);
+    # otherwise fall through to the GitHub copy, which is the same tree the
+    # piped installer itself was fetched from.
+    local tmpl
+    tmpl=$(pick_caddy_template)
+
+    # Render @@HOST@@ -> `hostname -s` into a STAGING file and validate that,
+    # rather than writing straight to $caddy_conf. The old flow overwrote the
+    # live Caddyfile first and only then validated: a bad template left the good
+    # config destroyed on disk while the running Caddy kept serving from memory,
+    # so the box died at the next restart instead of at install time.
+    local render_host staged
+    render_host=$(caddy_render_host)
+    staged=$(mktemp) || {
+      log_warn "  Could not create temp file — skipping Caddy configuration"
+      return 0
+    }
+
+    if [[ -n "$tmpl" ]]; then
+      log_info "  Using Caddyfile template ${tmpl}"
+      sed "s|@@HOST@@|${render_host}|g" "$tmpl" > "$staged"
+    else
+      # No local template matches this code — piped mode, or an upgrade where
+      # the deployed slot still carries the previous release. Download from the
+      # same tree this installer came from (set -o pipefail makes a failed curl
+      # fail the pipeline, so a truncated download cannot reach $caddy_conf).
+      log_info "  No local template at version ${CADDY_CONFIG_VERSION} — downloading"
+      if ! curl -fsSL "${GITHUB_RAW_BASE}/bootstrap/templates/caddy/Caddyfile.mcapp" \
+        | sed "s|@@HOST@@|${render_host}|g" > "$staged"; then
+        rm -f "$staged"
+        log_warn "  Could not download Caddyfile template — leaving Caddy config as-is"
+        return 0
+      fi
+    fi
+
+    # Refuse to install content that does not carry the marker we are about to
+    # claim. Without this the mismatch is invisible: the success line is built
+    # from the constant, not from the file, so it reports a version the file
+    # does not contain and the next run rewrites all over again.
+    if ! grep -qF "$version_marker" "$staged"; then
+      log_warn "  Rendered Caddyfile declares version $(caddy_template_version "$staged"), expected ${CADDY_CONFIG_VERSION}"
+      log_warn "  Template/code version skew — keeping the existing config"
+      rm -f "$staged"
+      return 0
+    fi
+
+    # HOME=/root is pinned so `caddy validate` provisions its throwaway
+    # `tls internal` PKI CA under /root (not whatever $HOME the caller set):
+    # with HOME=/home/<user> it would MkdirAll a root-owned 0700 ~/.local/share
+    # into that user's home and break the later `sudo -u <user> uv sync`
+    # (defense-in-depth; the update-runner already forces HOME=root's home).
+    if ! HOME=/root caddy validate --config "$staged" --adapter caddyfile &>/dev/null; then
+      log_warn "  Rendered Caddyfile failed validation — keeping the existing config"
+      log_warn "  Debug: caddy validate --config ${staged} --adapter caddyfile"
+      return 0
+    fi
+
+    install -m 644 "$staged" "$caddy_conf"
+    rm -f "$staged"
+    rewrote=true
+    log_info "  Caddyfile written to ${caddy_conf} (${version_marker})"
+  fi
+
+  # Re-validate what is actually on disk before (re)starting — a bad config must
+  # never take down a previously-working Caddy instance (mirrors the lighttpd -t
+  # guard above). On the rewrite path this re-checks the file just installed; on
+  # the up-to-date path it is the only check an already-present config gets.
+  if ! HOME=/root caddy validate --config "$caddy_conf" --adapter caddyfile &>/dev/null; then
+    log_warn "  Caddy config validation failed — leaving caddy service as-is"
+    log_warn "  Run: caddy validate --config ${caddy_conf} --adapter caddyfile"
+    return 0
+  fi
+
+  # enable is idempotent — always ensure Caddy starts on boot
+  systemctl enable caddy &>/dev/null || true
+
+  # Restart when the config changed OR when Caddy isn't currently up. The
+  # second clause matters on a RECOVERY re-run: if a previous run wrote a valid
+  # Caddyfile but Caddy failed to start (e.g. it was an older build that
+  # rejected the config, now upgraded), the marker already matches so
+  # rewrote=false — without the is-active guard we'd validate happily and leave
+  # a down service down.
+  if [[ "$rewrote" == "true" ]] || ! systemctl is-active --quiet caddy; then
+    # FULL restart (not reload) and CHECK the result. Ordering: this runs
+    # AFTER configure_lighttpd() (earlier in install_packages) has already
+    # done its full restart to free :80, so Caddy can bind :80/:443 here on
+    # the very first run — no second bootstrap pass needed. Restart (not
+    # reload-first) so a fresh apt-installed Caddy still holding :80 with its
+    # default Caddyfile is fully replaced.
+    if systemctl restart caddy 2>/dev/null && systemctl is-active --quiet caddy; then
+      log_ok "  Caddy (re)started — serving :80 + :443"
+    else
+      log_error "  Caddy failed to start / bind :80/:443 (is another server on :80?)"
+      log_error "  Check: systemctl status caddy ; journalctl -u caddy -n 30"
+      journalctl -u caddy --no-pager -n 20 2>/dev/null || true
+      return 1
+    fi
+  else
+    log_info "  Caddy config unchanged and already running — not restarting (idempotent no-op)"
+  fi
+
+  # Publish Caddy's internal-CA root cert to the path Caddyfile.mcapp serves
+  # at /root.crt. Runs every bootstrap (cheap insurance) — see helper.
+  publish_caddy_root_crt
+
+  log_ok "  Caddy configured"
+}
+
+# Resolve the hostname Caddy actually terminates TLS for. Used by the HTTPS
+# health probe and the CA-warmup nudge so both target the SNI Caddy can answer
+# — Caddy has NO certificate for "localhost", so probing localhost:443 fails the
+# handshake permanently. LAN default: the :443 site is a literal name in
+# /etc/caddy/Caddyfile (from Caddyfile.mcapp). Public-TLS Caddyfiles
+# (ssl-tunnel-setup.sh) instead use a `{$TLS_HOSTNAME}` env placeholder with no
+# literal :443, so fall back to the TLS_HOSTNAME recorded in config.json, then
+# to $(hostname).local.
+caddy_site() {
+  local site=""
+  # Take the FIRST "<name>:443" token on the first site-address line (the line
+  # opening a block, i.e. ending in "{"). Since v3 the LAN default lists several
+  # comma-separated addresses — "mcapp.local:443, mcapp.fritz.box:443, ... {" —
+  # and the old `-F:` + `^name:443[[:space:]]*{` pattern matched none of them,
+  # which silently sent the HTTPS probe and the CA warm-up to the $(hostname).local
+  # fallback. First in the list is the .local name, which is the one avahi can
+  # actually resolve, so it stays the right probe target.
+  site=$(awk '/:443/ && /\{[[:space:]]*$/ {
+    if (match($0, /[A-Za-z0-9._-]+:443/)) {
+      s = substr($0, RSTART, RLENGTH); sub(/:443$/, "", s); print s; exit
+    }
+  }' /etc/caddy/Caddyfile 2>/dev/null)
+  local cfg="${CONFIG_FILE:-/etc/mcapp/config.json}"
+  if [[ -z "$site" && -f "$cfg" ]] && command -v jq &>/dev/null; then
+    site=$(jq -r '.TLS_HOSTNAME // ""' "$cfg" 2>/dev/null)
+  fi
+  echo "${site:-$(hostname).local}"
+}
+
+# Copy Caddy's `tls internal` CA root certificate to /var/lib/caddy/root.crt,
+# which Caddyfile.mcapp serves at GET /root.crt so LAN clients can install and
+# trust it. Caddy writes the CA lazily under its data dir on first internal-TLS
+# use, so we nudge it with an HTTPS request, poll for the source, then copy.
+# Idempotent: refreshes the served copy on every run. Never hard-fails — if the
+# CA isn't there yet it warns; the next run / health check picks it up.
+publish_caddy_root_crt() {
+  local ca_dst="/var/lib/caddy/root.crt"
+  local ca_src="/var/lib/caddy/.local/share/caddy/pki/authorities/local/root.crt"
+
+  # Nudge Caddy into provisioning the internal CA + issuing the site leaf (both
+  # lazy on first TLS use). Must target the site Caddy actually serves (see
+  # caddy_site) — it has no cert for "localhost", so an https://localhost
+  # handshake fails and does not warm the site leaf.
+  local site
+  site=$(caddy_site)
+  curl -skf --resolve "${site}:443:127.0.0.1" --connect-timeout 3 \
+    "https://${site}/health" &>/dev/null || true
+
+  local attempts=5
+  local i
+  for ((i=1; i<=attempts; i++)); do
+    if [[ -f "$ca_src" ]]; then
+      if install -m 644 "$ca_src" "$ca_dst" 2>/dev/null; then
+        log_ok "  Published Caddy internal CA → ${ca_dst} (served at /root.crt)"
+      else
+        log_warn "  Could not write ${ca_dst}"
+      fi
+      return 0
+    fi
+    sleep 2
+  done
+
+  # Fallback: the data dir location can vary with the caddy user's HOME/XDG —
+  # search for the authorities/local root.crt anywhere under /var/lib/caddy.
+  local found
+  found=$(find /var/lib/caddy -type f -name root.crt -path '*authorities/local*' 2>/dev/null | head -1)
+  if [[ -n "$found" ]]; then
+    if install -m 644 "$found" "$ca_dst" 2>/dev/null; then
+      log_ok "  Published Caddy internal CA → ${ca_dst} (served at /root.crt)"
+    else
+      log_warn "  Could not write ${ca_dst}"
+    fi
+    return 0
+  fi
+
+  log_warn "  Caddy internal CA not generated yet — /root.crt will be published on the next run or by the health check"
+  return 0
 }

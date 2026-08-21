@@ -1,0 +1,180 @@
+{
+  "version": 7,
+  "description": "MeshCom Web Push wire contract. Shared by mc-chat and MCProxy via the `contract/` git subtree (mc-chat is upstream); each repo's test suite implements these vectors. Frontend mirrors match_vectors + eligibility for its foreground-sound predicate. Edit in mc-chat and re-sync — never edit MCProxy's copy in place. v2 (2026-07-17) adds via-routed dst resolution, push eligibility, dedup, and payload_vectors after a cross-backend parity audit found the two backends diverging on all four. v3 (2026-07-17) adds a blocklist push-path gate: a message whose resolved source is on the node's GLOBAL blocked_callsigns set produces zero pushes (checked together with eligibility, BEFORE dedup/matching) — closing a bug where the push dispatcher bypassed the blocklist every other path enforces. v4 (2026-07-26) moves to the subtree (this file previously lived outside it at mc-chat's tests/fixtures/, kept byte-identical by hand) and adds eligibility clause (c): text ACKs and {CET} time broadcasts are not push-eligible, closing a bug where every message the operator sent produced an ':ackNNN' notification. v5 (2026-08-17) adds eligibility clause (d): firmware link-check protocol frames ({ping} prefix / {pong}{token}) are not push-eligible — closing a bug where MCProxy's link-check feature pushed raw '{pong}{...}' notifications for frames its storage guard keeps out of message history. v6 (2026-08-18) adds a normative client-side ordering clause to endpoints.subscribe.semantics: a subscribe POST replaces the stored filter wholesale, so a client MUST NOT send a filter its own preference store has not yet supplied — closing a bug where a re-POST issued before local prefs finished loading silently wiped a live subscription's group list, and pinning that servers MUST NOT try to detect that case heuristically. v7 (2026-08-19) strips the firmware's trailing ack-request suffix from `payload_schema.text` (see payload_ack_suffix_semantics) — closing a bug where every DM notification ended in a raw '{461', text that every conversation view has always hidden.",
+  "endpoints": {
+    "vapid_public_key": {
+      "method": "GET",
+      "path": "/api/push/vapid-public-key",
+      "response": { "publicKey": "<base64url-encoded VAPID application server public key>" }
+    },
+    "subscribe": {
+      "method": "POST",
+      "path": "/api/push/subscribe",
+      "request_example": {
+        "subscription": {
+          "endpoint": "https://web.push.apple.com/example-endpoint-aaa",
+          "keys": { "p256dh": "BExample_p256dh_key", "auth": "ExampleAuthSecret" }
+        },
+        "filter": { "dm": true, "groups": ["232", "9999"], "broadcast": false }
+      },
+      "response": { "ok": true },
+      "semantics": "Upsert by subscription.endpoint. Re-POSTing the same endpoint with a new filter overwrites the stored filter (this is how a pref change persists — there is no separate prefs endpoint). A malformed or missing filter field is coerced to filter_defaults; groups:null must be treated as [] and never crash the matcher. The overwrite is WHOLESALE: the request body is the complete new state of that subscription's filter, never a patch to be merged. That places an ordering obligation on the CLIENT — a client MUST NOT send a filter its own preference store has not yet supplied. A subscribe issued before local prefs finish loading carries filter_defaults, and server-side that is indistinguishable from a deliberate 'clear my groups': it silently wipes a live subscription's group list (observed in production as an endpoint row whose created_at was weeks old while its stored filter had gone to groups:[]). Servers MUST NOT try to tell the two apart heuristically — ignoring or merging a filter that merely looks like the defaults would break clearing groups on purpose and would diverge the two backends. Enforcing the ordering is the client's job alone: resolve stored prefs first, POST second."
+    },
+    "unsubscribe": {
+      "method": "POST",
+      "path": "/api/push/unsubscribe",
+      "request_example": { "endpoint": "https://web.push.apple.com/example-endpoint-aaa" },
+      "response": { "ok": true },
+      "semantics": "Delete the row whose endpoint matches. Idempotent: unsubscribing a missing endpoint still returns ok:true."
+    }
+  },
+  "filter_defaults": { "dm": true, "groups": [], "broadcast": false },
+  "own_callsign_for_vectors": "DK5EN-99",
+  "dst_resolution": "A via-routed destination is 'VIA[,VIA2],TARGET' — the real target is the LAST comma-separated component, trimmed (mirrors each backend's compute_conversation_key / _resolve_target: e.g. 'OE1KBC-12,232' -> '232', 'OE1KBC-12,DK5EN-99' -> 'DK5EN-99'). A dst with no comma is its own target. On a LoRa mesh, relay-hopped frames are the COMMON case, so this resolution is required, not an edge case. Both backends AND the frontend foreground-sound predicate MUST resolve dst identically before matching.",
+  "src_resolution": "A src carries the relay path the OTHER way round — the FIRST comma-separated component is the real sender (e.g. 'DK5EN-99,OE1KBC-12' -> 'DK5EN-99'). SSID is kept.",
+  "eligibility": "Checked ONCE per message, BEFORE per-subscription matching. A message is push-eligible IFF: (a) it is a chat text message — exclude telemetry (type:'tele'), position beacons (type:'pos'), and any non-text/no-text frame; AND (b) its resolved source (first comma-component of src) is NOT equal to the node's own callsign — never push the user's own outbound sends or mesh-echoes of them; AND (c) it is not a text ACK and not a {CET} time broadcast; AND (d) it is not a link-check protocol frame (see eligibility_linkcheck_semantics). An ineligible message produces zero pushes and does not open or feed a coalesce window.",
+  "eligibility_noise_semantics": "Clause (c) detail, evaluated on the SAME text extraction as clause (a) (msg-or-text fallback). A frame is noise iff that text CONTAINS the substring ':ack' OR STARTS WITH '{CET}'. Both are type:'msg' frames, so clause (a) cannot catch them. Text ACK: the mesh answers every outbound message with a '<CALL>  :ackNNN' frame addressed back to the sender, so with the default filter.dm=true the operator got one notification per message they sent. The substring test is deliberately as BROAD as the exclusion MCProxy's message queries already apply (`msg NOT LIKE '%:ack%'`): a push must never announce a message that no conversation view will show, and matching the query exactly is what keeps the two consistent. The known cost is that a chat message legitimately containing ':ack' is silent — accepted, because such a message is equally invisible in the message list. {CET}: a periodic network time broadcast; MCProxy's storage layer refuses to even persist these, yet every broadcast:true subscriber was notified for each one.",
+  "eligibility_linkcheck_semantics": "Clause (d) detail, evaluated on the SAME text extraction as clauses (a) and (c) (msg-or-text fallback). A frame is a link-check protocol frame iff that text STARTS WITH '{ping}' OR matches the anchored pattern ^\\{pong\\}\\{-?[0-9]{1,10}\\}. These are the firmware's v4.35p {ping}/{pong} link-check exchange: the on-air ping gains an unterminated ACK suffix ('{ping}{087'), so ping recognition is a prefix check never equality, and roughly half the fleet emits the pong token negative ('{pong}{-427408969}'), hence the optional sign. They are protocol frames, not chat: MCProxy's storage guard refuses to persist them into message history (mirroring the {CET} precedent; mc-chat has no link-check engine but MUST apply the same push exclusion so a subscribed browser behaves identically on both backends). The predicate must stay semantically identical to MCProxy's storage-side linkcheck.is_link_check_payload so push and history agree — a push must never announce a message that no conversation view will show. Known accepted cost, identical to the {CET} rule: a chat message legitimately starting with '{ping}' is push-silent AND history-invisible.",
+  "dedup": "A logical message may reach the backend more than once (multiple gateways, UDP retransmits) — this is why storage dedups on a ~60-min window. Push must fire AT MOST ONCE per logical message. Dedup key: msg_id within the dedup window when msg_id is truthy, else the tuple (resolved-src, resolved-dst, text). A duplicate must neither produce a second immediate push NOR increment a coalesce summary count.",
+  "blocklist": "Checked ONCE per message, together with eligibility and BEFORE dedup/matching. If the message's resolved source (src_resolution, case-insensitive) is an element of the node's blocked_callsigns set, produce ZERO pushes and do not open or feed any coalesce window. blocked_callsigns is the node's GLOBAL blocklist (admin kickban + curated sperrliste), NOT a per-subscription field. A message merely RELAYED THROUGH a blocked node (blocked callsign appears as a via-hop, not the first comma-component) is NOT suppressed.",
+  "match_semantics": "Given an incoming eligible message with destination `dst`, the node's own configured callsign `own`, and a subscription's stored `filter`: first resolve `dst` per dst_resolution to `target`. Push to that subscription IFF ( target == own AND filter.dm ) OR ( target == '*' AND filter.broadcast ) OR ( target is an element of filter.groups, compared as trimmed strings ). A DM whose target is any other callsign never pushes.",
+  "match_vectors": [
+    { "name": "dm-to-self, dm on", "msg": { "src": "OE1ABC-1", "dst": "DK5EN-99", "type": "msg", "text": "hi" }, "filter": { "dm": true, "groups": [], "broadcast": false }, "should_push": true },
+    { "name": "dm-to-self, dm off", "msg": { "src": "OE1ABC-1", "dst": "DK5EN-99", "type": "msg", "text": "hi" }, "filter": { "dm": false, "groups": ["232"], "broadcast": true }, "should_push": false },
+    { "name": "dm-to-other-call never pushes", "msg": { "src": "OE1ABC-1", "dst": "OE3XYZ-7", "type": "msg", "text": "not mine" }, "filter": { "dm": true, "groups": ["232"], "broadcast": true }, "should_push": false },
+    { "name": "broadcast, broadcast on", "msg": { "src": "OE1ABC-1", "dst": "*", "type": "msg", "text": "cq" }, "filter": { "dm": false, "groups": [], "broadcast": true }, "should_push": true },
+    { "name": "broadcast, broadcast off", "msg": { "src": "OE1ABC-1", "dst": "*", "type": "msg", "text": "cq" }, "filter": { "dm": true, "groups": ["232"], "broadcast": false }, "should_push": false },
+    { "name": "group in list", "msg": { "src": "OE1ABC-1", "dst": "232", "type": "msg", "text": "group msg" }, "filter": { "dm": false, "groups": ["232", "9999"], "broadcast": false }, "should_push": true },
+    { "name": "group not in list", "msg": { "src": "OE1ABC-1", "dst": "232", "type": "msg", "text": "group msg" }, "filter": { "dm": true, "groups": ["9999"], "broadcast": true }, "should_push": false },
+    { "name": "group with surrounding whitespace still matches", "msg": { "src": "OE1ABC-1", "dst": "9999", "type": "msg", "text": "spam grp" }, "filter": { "dm": false, "groups": [" 9999 "], "broadcast": false }, "should_push": true },
+    { "name": "via-routed dm-to-self resolves to own", "msg": { "src": "OE1KBC-12,OE1ABC-1", "dst": "OE1KBC-12,DK5EN-99", "type": "msg", "text": "relayed dm" }, "filter": { "dm": true, "groups": [], "broadcast": false }, "should_push": true },
+    { "name": "via-routed group resolves to target", "msg": { "src": "OE1KBC-12,OE1ABC-1", "dst": "OE1KBC-12,232", "type": "msg", "text": "relayed grp" }, "filter": { "dm": false, "groups": ["232"], "broadcast": false }, "should_push": true },
+    { "name": "via-routed broadcast resolves to star", "msg": { "src": "OE1KBC-12,OE1ABC-1", "dst": "OE1KBC-12,*", "type": "msg", "text": "relayed cq" }, "filter": { "dm": false, "groups": [], "broadcast": true }, "should_push": true },
+    { "name": "via-routed dm-to-other still never pushes", "msg": { "src": "OE1KBC-12,OE1ABC-1", "dst": "OE1KBC-12,OE3XYZ-7", "type": "msg", "text": "relayed to other" }, "filter": { "dm": true, "groups": ["232"], "broadcast": true }, "should_push": false }
+  ],
+  "eligibility_vectors": [
+    { "name": "inbound chat is eligible", "msg": { "src": "OE1ABC-1", "dst": "DK5EN-99", "type": "msg", "text": "hi" }, "eligible": true },
+    { "name": "own outbound send is NOT eligible", "msg": { "src": "DK5EN-99", "dst": "232", "type": "msg", "text": "my group post" }, "eligible": false },
+    { "name": "own mesh-echo (via-routed src resolves to own) is NOT eligible", "msg": { "src": "DK5EN-99,OE1KBC-12", "dst": "232", "type": "msg", "text": "echo of my post" }, "eligible": false },
+    { "name": "telemetry frame is NOT eligible", "msg": { "src": "OE1ABC-1", "dst": "*", "type": "tele", "text": "" }, "eligible": false },
+    { "name": "position beacon is NOT eligible", "msg": { "src": "OE1ABC-1", "dst": "*", "type": "pos" }, "eligible": false },
+    { "name": "text ACK addressed back to us is NOT eligible (clause c)", "msg": { "src": "OE1ABC-1", "dst": "DK5EN-99", "type": "msg", "text": "DK5EN-99  :ack753" }, "eligible": false },
+    { "name": "text ACK read from the msg key is NOT eligible (clause c)", "msg": { "src": "OE1ABC-1", "dst": "DK5EN-99", "type": "msg", "msg": "DK5EN-99  :ack12" }, "eligible": false },
+    { "name": "{CET} time broadcast is NOT eligible (clause c)", "msg": { "src": "OE1ABC-1", "dst": "*", "type": "msg", "text": "{CET}2026-07-26 14:03:00" }, "eligible": false },
+    { "name": "ordinary chat mentioning the word ack IS eligible - only ':ack' is noise", "msg": { "src": "OE1ABC-1", "dst": "DK5EN-99", "type": "msg", "text": "did you ack that?" }, "eligible": true },
+    { "name": "{CET} not at the start IS eligible - the marker is a prefix", "msg": { "src": "OE1ABC-1", "dst": "DK5EN-99", "type": "msg", "text": "time was {CET}12:00" }, "eligible": true },
+    { "name": "link-check ping with unterminated ACK suffix is NOT eligible (clause d)", "msg": { "src": "DL2JA-2", "dst": "DK5EN-99", "type": "msg", "text": "{ping}{087" }, "eligible": false },
+    { "name": "bare link-check ping payload is NOT eligible (clause d)", "msg": { "src": "OE1ABC-1", "dst": "DK5EN-99", "type": "msg", "text": "{ping}" }, "eligible": false },
+    { "name": "link-check pong is NOT eligible (clause d)", "msg": { "src": "DL2JA-2", "dst": "DK5EN-99", "type": "msg", "text": "{pong}{451010884}" }, "eligible": false },
+    { "name": "negative-token link-check pong is NOT eligible (clause d)", "msg": { "src": "OE1ABC-1", "dst": "DK5EN-99", "type": "msg", "text": "{pong}{-427408969}" }, "eligible": false },
+    { "name": "link-check pong read from the msg key is NOT eligible (clause d)", "msg": { "src": "OE1ABC-1", "dst": "DK5EN-99", "type": "msg", "msg": "{pong}{12345}" }, "eligible": false },
+    { "name": "chat mentioning {ping} mid-text IS eligible - the marker is a prefix", "msg": { "src": "OE1ABC-1", "dst": "DK5EN-99", "type": "msg", "text": "send a {ping} later" }, "eligible": true },
+    { "name": "{pong} without a numeric token IS eligible - not a protocol frame", "msg": { "src": "OE1ABC-1", "dst": "DK5EN-99", "type": "msg", "text": "{pong}{nope}" }, "eligible": true }
+  ],
+  "blocklist_vectors": [
+    { "name": "blocked DM sender -> no push", "msg": { "src": "OE9BLK-1", "dst": "DK5EN-99", "type": "msg", "text": "hi" }, "blocked": ["OE9BLK-1"], "sender_blocked": true },
+    { "name": "unblocked sender", "msg": { "src": "OE1ABC-1", "dst": "DK5EN-99", "type": "msg", "text": "hi" }, "blocked": ["OE9BLK-1"], "sender_blocked": false },
+    { "name": "case-insensitive match", "msg": { "src": "oe9blk-1", "dst": "DK5EN-99", "type": "msg", "text": "hi" }, "blocked": ["OE9BLK-1"], "sender_blocked": true },
+    { "name": "via-routed src resolves to real sender before block check", "msg": { "src": "OE9BLK-1,OE1KBC-12", "dst": "DK5EN-99", "type": "msg", "text": "relayed" }, "blocked": ["OE9BLK-1"], "sender_blocked": true },
+    { "name": "relay hop is NOT the sender - message via a blocked relay still pushes", "msg": { "src": "OE1ABC-1,OE9BLK-1", "dst": "DK5EN-99", "type": "msg", "text": "via blocked node" }, "blocked": ["OE9BLK-1"], "sender_blocked": false }
+  ],
+  "payload_schema": {
+    "type": "message type string, e.g. 'msg'",
+    "src": "sender callsign string, as received (raw, may carry the relay path)",
+    "dst": "destination string as received (raw, may carry the relay path) — NOT resolved in the payload",
+    "text": "chat text: the msg-or-text extraction str(msg.get('msg') or msg.get('text') or '') with the firmware's trailing ack-request suffix stripped (payload_ack_suffix_semantics), THEN truncated to <= 120 chars",
+    "msg_id": "number or string",
+    "ts": "epoch SECONDS (number). If the source timestamp is epoch milliseconds it MUST be divided by 1000; a non-numeric value passes through unchanged."
+  },
+  "payload_ack_suffix_semantics": "The firmware appends an ack-request suffix to every DM it SENDS: an opening brace plus the sender's message counter, '{NNN', with NO closing brace (MCProxy commands/parsing.py and mc-chat's append_ack_request both emit and expect exactly that shape). Group and broadcast sends never carry it. It is a transport artifact, not chat content — the message's identity already travels in `msg_id` — and every conversation view already hides it, so a push must not be the one surface that shows it. Strip the $-anchored pattern `\\{[0-9]+$`, then trim leading/trailing whitespace UNCONDITIONALLY, even when nothing matched (a suffix preceded by a space, 'Hello {042', must leave 'Hello', not 'Hello '). The pattern is deliberately STRICT in two ways. (i) No optional closing brace: there is no '{NNN}' variant on the wire and there never will be, so a trailing '{NNN}' is ordinary chat text and is left untouched. A looser `\\{\\d+\\}?$` helper exists in mc-chat (strip_ack_request) and the webapp (stripAckRequestSuffix) for optimistic-send echo matching; it is deliberately NOT reused here. (ii) `[0-9]`, not `\\d` — Python's `\\d` matches every Unicode Nd digit, which the firmware never emits (the same choice linkcheck.py and commands/ctcping.py already make). Two ordering rules are load-bearing. (1) Strip BEFORE the 120-char truncation, so the cap carries 120 chars of real text and a truncation can never split the suffix into a bare '{'. (2) Strip ONLY for the delivered payload text: eligibility (clauses c and d), the blocklist gate and dedup MUST all be evaluated on the UNSTRIPPED text. Three reasons, in order of how quietly they bite. A stripped '{ping}{087' becomes '{ping}', which clause (d) still catches ONLY because ping recognition is a prefix check and not an equality test — the gate would then depend on an implementation detail of a different clause. The strict pattern above leaves a bracketed '{pong}{451010884}' alone, but the looser `\\{\\d+\\}?$` helper named earlier does NOT: substituting it here — an easy 'reuse the shared helper' refactor — turns that frame into '{pong}', which clause (d) does not recognise (eligibility_linkcheck_semantics requires the bracketed token), silently re-opening the v5 bug. Neither backend's eligibility_vectors can see any of this, because both suites drive is_eligible on the RAW vector dict while production drives it on whatever the dispatcher hands it. And stripping before dedup widens the msg_id-less dedup triple (src, dst, text) into a key that collapses two distinct messages whose only difference was the ack counter. mc-chat satisfies (2) by construction (its dispatcher gates on the raw message and builds the payload last); MCProxy must build a gate-only view first and the delivered payload after the gates.",
+  "payload_vectors": [
+    {
+      "name": "ms timestamp converts to epoch seconds; text from msg field",
+      "raw": { "type": "msg", "src": "A-1", "dst": "DK5EN-99", "msg": "hi", "msg_id": 7, "timestamp": 1700000000000 },
+      "expected_payload": { "type": "msg", "src": "A-1", "dst": "DK5EN-99", "text": "hi", "msg_id": 7, "ts": 1700000000.0 }
+    },
+    {
+      "name": "text falls back to the text key and truncates at 120 chars",
+      "raw": { "type": "msg", "src": "A-1", "dst": "*", "text": "0123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890123456789", "msg_id": 8, "timestamp": 0 },
+      "expected_payload": { "type": "msg", "src": "A-1", "dst": "*", "text": "012345678901234567890123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890123456789", "msg_id": 8, "ts": 0.0 }
+    },
+    {
+      "name": "null msg coerces to empty string, not the literal 'None'",
+      "raw": { "type": "msg", "src": "A-1", "dst": "DK5EN-99", "msg": null, "msg_id": 9, "timestamp": 0 },
+      "expected_payload": { "type": "msg", "src": "A-1", "dst": "DK5EN-99", "text": "", "msg_id": 9, "ts": 0.0 }
+    },
+    {
+      "name": "the firmware ack-request suffix is stripped from the payload text",
+      "raw": { "type": "msg", "src": "DJ8MEH-8", "dst": "DK5EN-99", "msg": "Schade - neugierig wie ich bin{455", "msg_id": 11, "timestamp": 1700000000000 },
+      "expected_payload": { "type": "msg", "src": "DJ8MEH-8", "dst": "DK5EN-99", "text": "Schade - neugierig wie ich bin", "msg_id": 11, "ts": 1700000000.0 }
+    },
+    {
+      "name": "a space before the suffix is trimmed away with it",
+      "raw": { "type": "msg", "src": "A-1", "dst": "DK5EN-99", "msg": "Hello {042", "msg_id": 12, "timestamp": 0 },
+      "expected_payload": { "type": "msg", "src": "A-1", "dst": "DK5EN-99", "text": "Hello", "msg_id": 12, "ts": 0.0 }
+    },
+    {
+      "name": "a trailing BRACED group is not a firmware suffix and is left untouched",
+      "raw": { "type": "msg", "src": "A-1", "dst": "DK5EN-99", "msg": "set filter {42}", "msg_id": 13, "timestamp": 0 },
+      "expected_payload": { "type": "msg", "src": "A-1", "dst": "DK5EN-99", "text": "set filter {42}", "msg_id": 13, "ts": 0.0 }
+    },
+    {
+      "name": "a mid-text brace-digit run is left untouched (the pattern is $-anchored)",
+      "raw": { "type": "msg", "src": "A-1", "dst": "DK5EN-99", "msg": "hallo {12 welt", "msg_id": 14, "timestamp": 0 },
+      "expected_payload": { "type": "msg", "src": "A-1", "dst": "DK5EN-99", "text": "hallo {12 welt", "msg_id": 14, "ts": 0.0 }
+    },
+    {
+      "name": "the suffix is stripped BEFORE the 120-char truncation, so no truncation can split it",
+      "raw": { "type": "msg", "src": "A-1", "dst": "DK5EN-99", "msg": "0123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890123456789012345678901234567{461", "msg_id": 15, "timestamp": 0 },
+      "expected_payload": { "type": "msg", "src": "A-1", "dst": "DK5EN-99", "text": "0123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890123456789012345678901234567", "msg_id": 15, "ts": 0.0 }
+    }
+  ],
+  "coalesce": {
+    "window_seconds": 5,
+    "semantics": "Per-subscription rate limit. On an eligible+matching+non-duplicate message: if no window is open for this subscription, push it immediately (single-message payload) and open a 5s window. Messages that match while a window is open are buffered (not pushed). When the window closes, if the buffer is non-empty, emit exactly ONE summary push { count: len(buffer), latest: <payload of the last buffered message> } and close the window. The next matching message after the window is closed opens a fresh window with an immediate push. Uses an injectable now() clock in tests — never real wall-clock. Recommend a monotonic clock in production so an NTP step cannot stretch or collapse the window.",
+    "scenarios": [
+      {
+        "name": "two matching messages within the 5s window -> immediate + one summary",
+        "own_callsign": "DK5EN-99",
+        "filter": { "dm": true, "groups": [], "broadcast": false },
+        "events": [
+          [0.0, { "src": "A-1", "dst": "DK5EN-99", "type": "msg", "text": "one", "msg_id": 1, "ts": 0 }],
+          [2.0, { "src": "B-1", "dst": "DK5EN-99", "type": "msg", "text": "two", "msg_id": 2, "ts": 2 }]
+        ],
+        "expected_pushes": [
+          { "at_s": 0.0, "payload": { "type": "msg", "src": "A-1", "dst": "DK5EN-99", "text": "one", "msg_id": 1, "ts": 0 } },
+          { "at_s": 5.0, "summary": { "count": 1, "latest": { "type": "msg", "src": "B-1", "dst": "DK5EN-99", "text": "two", "msg_id": 2, "ts": 2 } } }
+        ]
+      },
+      {
+        "name": "single message -> one immediate push, no summary",
+        "own_callsign": "DK5EN-99",
+        "filter": { "dm": true, "groups": [], "broadcast": false },
+        "events": [
+          [0.0, { "src": "A-1", "dst": "DK5EN-99", "type": "msg", "text": "solo", "msg_id": 1, "ts": 0 }]
+        ],
+        "expected_pushes": [
+          { "at_s": 0.0, "payload": { "type": "msg", "src": "A-1", "dst": "DK5EN-99", "text": "solo", "msg_id": 1, "ts": 0 } }
+        ]
+      },
+      {
+        "name": "a duplicate (same msg_id) within the window neither re-pushes nor increments the summary count",
+        "own_callsign": "DK5EN-99",
+        "filter": { "dm": true, "groups": [], "broadcast": false },
+        "events": [
+          [0.0, { "src": "A-1", "dst": "DK5EN-99", "type": "msg", "text": "one", "msg_id": 1, "ts": 0 }],
+          [1.0, { "src": "A-1", "dst": "DK5EN-99", "type": "msg", "text": "one", "msg_id": 1, "ts": 0 }],
+          [2.0, { "src": "B-1", "dst": "DK5EN-99", "type": "msg", "text": "two", "msg_id": 2, "ts": 2 }]
+        ],
+        "expected_pushes": [
+          { "at_s": 0.0, "payload": { "type": "msg", "src": "A-1", "dst": "DK5EN-99", "text": "one", "msg_id": 1, "ts": 0 } },
+          { "at_s": 5.0, "summary": { "count": 1, "latest": { "type": "msg", "src": "B-1", "dst": "DK5EN-99", "text": "two", "msg_id": 2, "ts": 2 } } }
+        ]
+      }
+    ]
+  },
+  "prune_status_codes": [401, 403, 404, 410],
+  "prune_semantics": "When pywebpush delivery to a subscription returns any of these HTTP status codes, delete that subscription row. 401/403 catch stale-VAPID subscriptions after a key regeneration; 404/410 catch expired endpoints. Keep the subscription on any other status (e.g. 500) or a transient connection error. Pruning only on 404/410 would leave a dead-VAPID subscription failing forever.",
+  "execution_isolation": "The mesh-message ingest handler MUST NOT await push delivery. It only enqueues to an in-process queue; a background task drains the queue and calls pywebpush via asyncio.to_thread with explicit connect (~3s) and read (~5s) timeouts. The SSE broadcast of the message happens independently of, and never blocks on, push delivery. Delivery tasks/coroutines must be strongly referenced until done (never fire-and-forget an unreferenced create_task — it can be GC-dropped mid-flight).",
+  "vapid": "Keypair generated once per install at first use, persisted OUTSIDE the repo (mc-chat: ~/.meshcom-mock/vapid.json; MCProxy: /var/lib/mcapp/vapid.json), never committed."
+}

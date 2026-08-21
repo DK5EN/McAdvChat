@@ -428,7 +428,7 @@ except ValueError:
 
 except Exception as e:
     logger.error("Operation failed: %s", e)
-    await self._publish_status('operation', 'error', f"❌ Failed: {e}")
+    await self._publish_status("operation", "error", f"❌ Failed: {e}")
     raise
 ```
 
@@ -519,19 +519,19 @@ All timing constants are centralized:
 
 **`ble_handler.py`:**
 ```python
-BLE_CONNECT_TIMEOUT = 10.0           # Connection timeout
-BLE_SERVICES_CHECK_INTERVAL = 0.5    # Service polling interval
-BLE_KEEPALIVE_INTERVAL = 30.0        # Keep-alive frequency
-BLE_HELLO_DELAY = 1.0                # Post-hello delay
-BLE_DISCONNECT_DELAY = 2.0           # Pre-disconnect delay
+BLE_CONNECT_TIMEOUT = 10.0  # Connection timeout
+BLE_SERVICES_CHECK_INTERVAL = 0.5  # Service polling interval
+BLE_KEEPALIVE_INTERVAL = 30.0  # Keep-alive frequency
+BLE_HELLO_DELAY = 1.0  # Post-hello delay
+BLE_DISCONNECT_DELAY = 2.0  # Pre-disconnect delay
 ```
 
 **`main.py`:**
 ```python
-BLE_HELLO_WAIT = 1.0                 # Wait after hello
-BLE_QUERY_DELAY_STANDARD = 0.8       # Standard query delay
-BLE_QUERY_DELAY_MULTIPART = 1.2      # Multi-part query delay
-BLE_RETRY_BASE_DELAY = 0.5           # Retry backoff base
+BLE_HELLO_WAIT = 1.0  # Wait after hello
+BLE_QUERY_DELAY_STANDARD = 0.8  # Standard query delay
+BLE_QUERY_DELAY_MULTIPART = 1.2  # Multi-part query delay
+BLE_RETRY_BASE_DELAY = 0.5  # Retry backoff base
 ```
 
 ---

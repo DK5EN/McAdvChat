@@ -2,21 +2,46 @@
 
 from __future__ import annotations
 
-from typing import Any
+import asyncio
+from typing import Any, TypedDict
 
+import httpx
+
+from ..logging_setup import get_logger
 from .admin_commands import AdminCommandsMixin
-from .constants import has_console
 from .ctcping import CTCPingMixin
 from .data_commands import DataCommandsMixin
 from .dedup import DedupMixin
+from .linkcheck import LinkCheckMixin
 from .response import ResponseMixin
 from .routing import RoutingMixin
 from .simple_commands import SimpleCommandsMixin
 from .topic_beacon import TopicBeaconMixin
 from .weather_command import WeatherCommandMixin
 
+# Curated global blocklist, maintained in the McApp repo. Loaded server-side on
+# startup (V9.4) so the whole deployment shares one list — the webapp used to
+# fetch this directly from the browser, which failed silently on a LAN-only Pi
+# and never covered the oevsv.at internet firehose.
+SPERRLISTE_URL = "https://raw.githubusercontent.com/DK5EN/McApp/main/sperrliste.json"
+
+# V9.5: retry ladder for the sperrliste background loop while offline-at-boot
+# (30s → 5min, capped), and the refresh cadence once the first fetch succeeds.
+SPERRLISTE_RETRY_LADDER_S: tuple[float, ...] = (30.0, 60.0, 120.0, 300.0)
+SPERRLISTE_REFRESH_INTERVAL_S = 24 * 60 * 60  # 24h
+
+
+class CommandSpec(TypedDict):
+    """Metadata for one entry in the COMMANDS registry."""
+
+    handler: str  # method name on CommandHandler, resolved via getattr in routing
+    args: list[str]  # accepted keyword arg names
+    format: str  # human-readable usage string (also drives !help)
+    description: str  # short help text
+
+
 # Command registry with handler functions and metadata
-COMMANDS = {
+COMMANDS: dict[str, CommandSpec] = {
     "search": {
         "handler": "handle_search",
         "args": ["call", "days"],
@@ -115,6 +140,8 @@ COMMANDS = {
     },
 }
 
+logger = get_logger(__name__)
+
 
 class CommandHandler(
     RoutingMixin,
@@ -125,13 +152,15 @@ class CommandHandler(
     WeatherCommandMixin,
     AdminCommandsMixin,
     CTCPingMixin,
+    LinkCheckMixin,
     TopicBeaconMixin,
 ):
-    def __init__(
+    def __init__(  # noqa: PLR0913 - signature fixed by call sites
         self,
         message_router: Any = None,
         storage_handler: Any = None,
         my_callsign: str = "DK0XXX",
+        *,
         lat: float | None = None,
         lon: float | None = None,
         stat_name: str = "",
@@ -142,7 +171,11 @@ class CommandHandler(
         self.message_router = message_router
         self.storage_handler = storage_handler
         self.my_callsign = my_callsign.upper()
-        self.admin_callsign_base = my_callsign.split("-")[0]
+        # Derive from the already-normalized form: admin_commands.handle_kickban
+        # compares it against an upper-cased callsign, so splitting the raw argument
+        # let a lower/mixed-case CALL_SIGN slip past the "cannot block own callsign"
+        # guard — and the resulting self-block is persisted across restarts.
+        self.admin_callsign_base = self.my_callsign.split("-", maxsplit=1)[0]
         self.lat = lat
         self.lon = lon
         self.stat_name = stat_name
@@ -154,8 +187,10 @@ class CommandHandler(
         # Initialize subsystems
         self._init_topic_beacon()
         self._init_ctcping()
+        self._init_linkcheck()
         self._init_dedup()
         self._init_weather()
+        self._init_response()
 
         # GPS caching is handled centrally in main.py via _cache_gps
 
@@ -164,22 +199,156 @@ class CommandHandler(
             message_router.subscribe("mesh_message", self._message_handler)
             message_router.subscribe("ble_notification", self._message_handler)
 
-        if has_console:
-            print(f"CommandHandler: Initialized with {len(COMMANDS)} commands")
-            print(f"🐛 CommandHandler: Listening for commands to '{self.my_callsign}'")
-            print(f"🐛 CommandHandler: Weather service initialized for {self.lat}/{self.lon}")
+        logger.debug("CommandHandler: Initialized with %d commands", len(COMMANDS))
+        logger.debug("CommandHandler: Listening for commands to '%s'", self.my_callsign)
+        logger.debug("CommandHandler: Weather service initialized for %s/%s", self.lat, self.lon)
 
     async def run_all_tests(self) -> bool:
         """Run complete test suite for CommandHandler"""
-        from .tests import run_all_tests
+        from .tests import run_all_tests  # noqa: PLC0415 - test suite loaded on demand
 
         return await run_all_tests(self)
 
+    async def load_persisted_kickbans(self) -> None:
+        """Load admin-originated kickbans persisted in SQLite (V9.5) into
+        blocked_callsigns. Called once at startup, before (or independent of)
+        load_sperrliste — main.py calls this synchronously while wiring up the
+        app, well before the SSE server starts accepting connections, so the
+        very first connect burst already reflects restart-surviving kickbans.
+        Best-effort: no storage_handler, or a query failure, just leaves this
+        source empty for the run (admins can always re-kickban).
+        """
+        if self.storage_handler is None:
+            return
+        try:
+            persisted = await self.storage_handler.get_kickban_callsigns()
+        except Exception:
+            logger.exception("Could not load persisted admin kickbans")
+            return
+        if persisted:
+            self.blocked_callsigns.update(persisted)
+            logger.info("Loaded %d persisted admin kickban(s)", len(persisted))
 
-def create_command_handler(
+    async def _fetch_sperrliste(self, url: str) -> set[str] | None:
+        """One HTTP round-trip: fetch + validate the curated sperrliste. Returns
+        the uppercased callsign set on success, or None on any failure (already
+        logged as a warning) — never raises.
+        """
+        try:
+            async with httpx.AsyncClient(timeout=httpx.Timeout(10.0)) as client:
+                response = await client.get(url)
+            response.raise_for_status()
+            data: Any = response.json()
+        except (httpx.HTTPError, ValueError) as exc:
+            logger.warning("Could not load sperrliste from %s: %s", url, exc)
+            return None
+
+        if not isinstance(data, list) or not all(isinstance(item, str) for item in data):
+            logger.warning("Sperrliste from %s has an unexpected format; ignoring", url)
+            return None
+
+        return {item.upper() for item in data}
+
+    async def _merge_sperrliste(self, data: set[str], log_prefix: str) -> None:
+        """Union-merge a fetched sperrliste into blocked_callsigns and broadcast
+        only if it actually changed the set (avoids a pointless SSE push on an
+        unchanged daily refresh).
+        """
+        added = data - self.blocked_callsigns
+        self.blocked_callsigns.update(data)
+        logger.info(
+            "%s: %d entries (%d new); blocklist now %d callsign(s)",
+            log_prefix,
+            len(data),
+            len(added),
+            len(self.blocked_callsigns),
+        )
+        if added:
+            await self._broadcast_blocked_callsigns()
+
+    async def load_sperrliste(
+        self, url: str = SPERRLISTE_URL, stop_event: asyncio.Event | None = None
+    ) -> None:
+        """Background loop (V9.4/V9.5): fetch the curated global blocklist and
+        merge it into blocked_callsigns. Started once from main.py's
+        `_start_background_tasks` via a single `asyncio.create_task`; this
+        method owns its own retry/refresh scheduling.
+
+        Resilient to an offline-at-boot Pi: retries with a capped backoff
+        ladder (SPERRLISTE_RETRY_LADDER_S, 30s → 5min) until the first
+        successful fetch, then refreshes every SPERRLISTE_REFRESH_INTERVAL_S
+        (24h). Always union-merge, same as before — an entry removed from the
+        upstream sperrliste is never un-blocked here; that only takes effect
+        after a restart re-fetches and rebuilds the set from scratch (full
+        reconciliation is out of scope). Best-effort throughout: a fetch/parse
+        failure just logs a warning and leaves the current set untouched.
+
+        `stop_event`, when given, lets shutdown exit this loop promptly
+        (mirrors `_nightly_prune`/`_classifier_stats_broadcast` in main.py). A
+        bare `load_sperrliste()` call with no stop_event still works — it just
+        never gets an early-exit signal.
+        """
+        wait_event = stop_event or asyncio.Event()
+
+        # Phase 1: retry with backoff until the first successful fetch.
+        retry_idx = 0
+        fetched = False
+        while not wait_event.is_set() and not fetched:
+            data = await self._fetch_sperrliste(url)
+            if data is not None:
+                await self._merge_sperrliste(data, log_prefix="Loaded sperrliste")
+                fetched = True
+                break
+            delay = SPERRLISTE_RETRY_LADDER_S[min(retry_idx, len(SPERRLISTE_RETRY_LADDER_S) - 1)]
+            retry_idx += 1
+            logger.warning("Sperrliste fetch failed; retrying in %.0fs", delay)
+            try:
+                await asyncio.wait_for(wait_event.wait(), timeout=delay)
+                break  # stop_event was set during the retry wait
+            except TimeoutError:
+                pass  # backoff elapsed — retry
+
+        if not fetched:
+            return  # stop_event was set before any fetch succeeded
+
+        # Phase 2: refresh every 24h for as long as the app runs.
+        while not wait_event.is_set():
+            try:
+                await asyncio.wait_for(wait_event.wait(), timeout=SPERRLISTE_REFRESH_INTERVAL_S)
+                break  # stop_event was set
+            except TimeoutError:
+                pass  # 24h elapsed — refresh
+
+            if wait_event.is_set():
+                break
+
+            data = await self._fetch_sperrliste(url)
+            if data is not None:
+                await self._merge_sperrliste(data, log_prefix="Refreshed sperrliste")
+
+    async def _broadcast_blocked_callsigns(self) -> None:
+        """Push the current blocked_callsigns set to all SSE clients as
+        proxy:blocked_callsigns (V9.4). No-op if the SSE transport isn't wired.
+        Called on startup load and after every admin kickban/unblock mutation.
+        """
+        sse = self.message_router.get_protocol("sse") if self.message_router else None
+        if sse is None or not hasattr(sse, "broadcast_event"):
+            return
+        await sse.broadcast_event(
+            "proxy:blocked_callsigns",
+            {
+                "type": "response",
+                "msg": "blocked_callsigns",
+                "data": sorted(self.blocked_callsigns),
+            },
+        )
+
+
+def create_command_handler(  # noqa: PLR0913 - signature fixed by call sites
     message_router: Any,
     storage_handler: Any,
     call_sign: str,
+    *,
     lat: float | None = None,
     lon: float | None = None,
     stat_name: str = "",
@@ -187,5 +356,11 @@ def create_command_handler(
 ) -> CommandHandler:
     """Factory function to create and integrate CommandHandler"""
     return CommandHandler(
-        message_router, storage_handler, call_sign, lat, lon, stat_name, user_info_text
+        message_router,
+        storage_handler,
+        call_sign,
+        lat=lat,
+        lon=lon,
+        stat_name=stat_name,
+        user_info_text=user_info_text,
     )

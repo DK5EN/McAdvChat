@@ -16,12 +16,18 @@ health_check() {
   # Check services
   if ! check_service "mcapp"; then all_passed=false; fi
   if ! check_service "lighttpd"; then all_passed=false; fi
+  if ! check_service "caddy"; then all_passed=false; fi
 
   # Check endpoints
   if ! check_webapp_endpoint; then all_passed=false; fi
   if ! check_udp_port; then all_passed=false; fi
   if ! check_sse_endpoint; then all_passed=false; fi
   if ! check_lighttpd_proxy; then all_passed=false; fi
+
+  # Caddy HTTPS probe is advisory only (does NOT flip all_passed) — on first
+  # boot Caddy's `tls internal` CA/leaf generation can lag a few seconds, and
+  # we don't want that transient state to hard-abort the whole bootstrap.
+  check_caddy_https || true
 
   # Check data
   if ! check_sqlite_db; then all_passed=false; fi
@@ -103,13 +109,51 @@ check_sse_endpoint() {
 
 check_lighttpd_proxy() {
   # Verify lighttpd proxies /api/ and /events to FastAPI on port 2981
-  # Uses /health endpoint which exists on both direct and proxied paths
-  if curl -fsSL --connect-timeout 3 "http://localhost/health" &>/dev/null; then
+  # Uses /health endpoint which exists on both direct and proxied paths.
+  # lighttpd is now the backend on 127.0.0.1:8082 (Caddy owns :80/:443),
+  # so probe the backend port directly rather than :80.
+  if curl -fsSL --connect-timeout 3 "http://127.0.0.1:8082/health" &>/dev/null; then
     printf "  %-20s ${GREEN}[OK]${NC} proxying to FastAPI\n" "lighttpd proxy:"
     return 0
   fi
 
   printf "  %-20s ${RED}[FAIL]${NC} proxy not working\n" "lighttpd proxy:"
+  return 1
+}
+
+check_caddy_https() {
+  # Verify Caddy terminates TLS on :443 and proxies /health through to FastAPI.
+  #
+  # Probe the site Caddy ACTUALLY serves — NOT localhost. `tls internal` mints a
+  # leaf for the configured site name only, so Caddy has no certificate for
+  # "localhost" and https://localhost fails the TLS handshake every time — this
+  # is not a CA-timing issue and retrying never helps (it produced a permanent
+  # false WARN). caddy_site() (packages.sh) resolves the real site — the
+  # Caddyfile :443 name, else config.json TLS_HOSTNAME (public-TLS), else
+  # $(hostname).local — and we probe it on the loopback via --resolve so the
+  # check is independent of external DNS/mDNS. -k because the LAN default uses a
+  # self-signed internal CA the probe may not trust.
+  #
+  # NOTE: loopback-only — proves Caddy answers HTTPS locally but canNOT detect a
+  # firewall-blocked :443 for external clients; that external contract is
+  # verified separately by scripts/pwa-smoke.sh <host>.
+  #
+  # Advisory only (caller uses || true): on a cold boot the internal leaf can
+  # take a moment to issue, so retry a few times, then WARN rather than FAIL so
+  # a cold start doesn't abort bootstrap.
+  local site
+  site=$(caddy_site)
+
+  local attempts=5
+  for ((i=1; i<=attempts; i++)); do
+    if curl -skf --resolve "${site}:443:127.0.0.1" --connect-timeout 3 "https://${site}/health" &>/dev/null; then
+      printf "  %-20s ${GREEN}[OK]${NC} HTTPS responding\n" "caddy https:"
+      return 0
+    fi
+    sleep 2
+  done
+
+  printf "  %-20s ${YELLOW}[WARN]${NC} Caddy HTTPS not responding on ${site}:443\n" "caddy https:"
   return 1
 }
 
@@ -198,8 +242,35 @@ check_versions() {
 # NETWORK NAME DETECTION
 #──────────────────────────────────────────────────────────────────
 
+# Does this host:scheme pair actually serve McApp, i.e. is it a real access
+# point rather than a name that merely resolves?
+#
+# The answer must be the /health JSON. "Any HTTP response" is not good enough,
+# and neither is `curl -f` on its own: when Caddy's front door does not
+# recognise a Host header it replies with an EMPTY 200 — no body, no
+# content-type. curl -f sees 200 and reports success, so a check built on exit
+# status alone happily advertises a URL that renders a blank page in the
+# browser. Matching the "status" key in the body is what separates a genuinely
+# proxied answer from a name the front door does not serve. See
+# scripts/caddy_config_tests.py, which pins exactly that distinction.
+#
+# Deliberately array-free so it stays runnable under bash 3.2 (macOS) for the
+# regression suite; the rest of this installer is bash-4-only by design.
+probe_access_point() {
+  local host="$1" scheme="$2" body=""
+  if [[ "$scheme" == "https" ]]; then
+    # LAN HTTPS uses Caddy's internal CA, which is not in the local trust store
+    body=$(curl -fsSk --connect-timeout 2 --max-time 4 "https://${host}/health" 2>/dev/null) || return 1
+  else
+    body=$(curl -fsS --connect-timeout 2 --max-time 4 "http://${host}/health" 2>/dev/null) || return 1
+  fi
+  [[ "$body" == *'"status"'* ]]
+}
+
 # Populates NETWORK_URLS[] and NETWORK_LABELS[] with verified access points.
-# Uses getent hosts as the sole verification mechanism (always available on Debian).
+# Two-stage verification: `getent hosts` (cheap, weeds out names that do not
+# resolve at all) and then a real HTTP probe of the candidate — see
+# probe_access_point for why name resolution alone was never enough.
 # Sets AVAHI_RUNNING to true/false for the mDNS warning.
 detect_network_names() {
   NETWORK_URLS=()
@@ -215,13 +286,18 @@ detect_network_names() {
   # Associative array for deduplication (requires Bash 4+)
   declare -A seen_hosts
 
-  # Helper: add a URL if the host hasn't been seen yet
+  # Helper: add a URL if the host hasn't been seen yet AND it passes the probe
   _add_url() {
     local host="$1" scheme="$2" label="$3"
     if [[ -z "$host" || -n "${seen_hosts[$host]+x}" ]]; then
       return
     fi
+    # Mark as seen before probing, so a candidate that fails here is not
+    # retried by a later rule that happens to derive the same name.
     seen_hosts["$host"]=1
+    if ! probe_access_point "$host" "$scheme"; then
+      return
+    fi
     NETWORK_URLS+=("${scheme}://${host}/webapp")
     NETWORK_LABELS+=("$label")
   }
@@ -287,9 +363,20 @@ detect_network_names() {
     done
   fi
 
-  # 7. IP address (always added, no verification needed)
+  # 7. IP address — probed like every other candidate. It used to be added
+  # unconditionally ("no verification needed"), which is precisely how the
+  # summary ended up printing a blank-page URL: before the :80 catch-all in
+  # Caddyfile.mcapp v3, a request by IP matched no site and got the empty 200.
   if [[ -n "$ip_addr" ]]; then
     _add_url "$ip_addr" "http" "IP"
+  fi
+
+  # Nothing passed. Rather than print an empty Access Points box, fall back to
+  # the IP and label it plainly as unverified — this is the honest outcome when
+  # Caddy is down or still restarting, and it must not read as a working install.
+  if [[ ${#NETWORK_URLS[@]} -eq 0 && -n "$ip_addr" ]]; then
+    NETWORK_URLS+=("http://${ip_addr}/webapp")
+    NETWORK_LABELS+=("IP, UNVERIFIED")
   fi
 
   unset -f _add_url

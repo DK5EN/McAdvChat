@@ -1,0 +1,63 @@
+name: tests
+
+on:
+  push:
+    branches: [development, main]
+  pull_request:
+    branches: [development, main]
+  workflow_dispatch:
+
+concurrency:
+  group: tests-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: lint + types + startup test suites
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install uv
+        # setup-uv stopped publishing moving major/minor tags at v8 (supply-chain
+        # hardening) — @v10 does not exist; pin the exact release.
+        #
+        # v10's breaking change only affects `enable-cache: auto`, which it now
+        # turns off for pull_request_target / workflow_run / release (cache
+        # poisoning). The cache is enabled explicitly below and this workflow
+        # triggers on none of those events, so the bump is a no-op for us.
+        uses: astral-sh/setup-uv@v10.0.1
+        with:
+          enable-cache: true
+
+      - name: Pin Python 3.11
+        run: uv python install 3.11
+
+      # Ruff is PINNED. Unpinned, `uvx ruff` resolves the newest release at run
+      # time, so a ruff release could turn a green branch red with no change of
+      # ours — and new rules land in the `RUF`/`PL`/`S` prefixes this repo selects
+      # wholesale. Commit 23b37b5 ("clear ruff 0.16 fallout") was exactly that.
+      # Bump deliberately, and in lockstep with mc-chat + ble_service, which must
+      # lint the shared classifier/ and contract/ subtrees under identical rules.
+      - name: Ruff lint
+        run: uvx ruff@0.16.0 check .
+
+      - name: Ruff format check
+        run: uvx ruff@0.16.0 format --check .
+
+      # --all-packages is load-bearing: the root package does NOT depend on the
+      # ble_service workspace member, so a plain sync leaves its deps (dbus-next,
+      # …) uninstalled and mypy reports import errors across ble_service/src.
+      - name: Sync workspace (all members)
+        run: uv sync --all-packages
+
+      # Must run through the project env, never uvx/pipx — mypy parses with the
+      # running interpreter's grammar, and an ephemeral runner can pull a
+      # different Python and emit bogus [syntax] errors on version-gated stubs.
+      - name: Mypy (strict)
+        run: uv run mypy src/mcapp ble_service/src
+
+      # scripts/run_startup_tests.py is the canonical, exit-code-gated runner.
+      # It is fully offline (weather is stubbed) and needs no /etc/mcapp config.
+      - name: Startup test suites
+        run: uv run python scripts/run_startup_tests.py

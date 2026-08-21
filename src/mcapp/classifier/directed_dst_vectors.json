@@ -1,0 +1,108 @@
+{
+  "description": "Canonical vectors for the DIRECTED-destination predicate, shared by two independent implementations: the backends' DIRECTED_DST_PATTERN (meshcom_mock/classifier/types.py, vendored into MCProxy as src/mcapp/classifier/types.py by the classifier subtree — this fixture rides the same subtree, so both backends always replay the copy that sits beside the pattern they compile) and the webapp's isDirectedDst (src/utils/callsignUtils.ts, which composes classifyDst + effectiveDst instead of a regex). A message is DIRECTED when its destination resolves to a personal callsign rather than to a group, a broadcast, or the time channel; it is a property of the ROUTING, never of the message text.\n\nSemantics: resolve the dst to its effective target FIRST (via-routed dst is 'VIA[,VIA2],TARGET' — the target is the last comma component, surrounding whitespace ignored), then the target is directed iff it contains at least one ASCII letter, consists only of [A-Z0-9./-], and is not one of the reserved aliases 'ALL' (broadcast), 'TEST' (group, per group_dst_vectors.json) or 'TIME' (time channel) — all three matched case-INSENSITIVELY. Requiring a letter is what rejects every numeric group id without needing the 1..99999 range test: an out-of-range numeric like '100000' is not a group AND not a person. '*' is rejected by the character class.\n\nHISTORY (2026-07-27): this predicate replaced a bare /^[A-Z0-9]+-\\d+$/ that ran only as a classifier CATEGORY rule. That old form had three holes, each pinned by vectors below: it required an SSID (a DM to a bare 'DL1EEN' was never directed), it was anchored against the raw dst (a via-routed DM 'DJ8MEH-82,DJ8MEH-8' was never directed), and — the root cause of the missing DIRECTED badge — 'directed' occupied the single-valued `category` slot, where the priority-90 routing rule lost first-match-wins to any lower-priority CONTENT rule, so a DM whose text merely started with '73' or 'Hello' was classified 'greeting' and silently stopped being directed. Directedness is now ALSO emitted as the `directed` extra_tag, which accumulates independently of the category slot.\n\nSYNC RULE: canonical source is THIS file at mc-chat/meshcom_mock/classifier/directed_dst_vectors.json (mc-chat is the subtree upstream). MCProxy receives it verbatim through `git subtree pull --prefix=src/mcapp/classifier`. The webapp vendors a parse-equal copy at webapp/src/utils/__tests__/directed_dst_vectors.json (Prettier may reformat it; only content drift is a failure). Every repo replays every vector against its own implementation, and sibling drift-checks self-skip when the sibling checkout is absent.",
+  "canonical": "mc-chat/meshcom_mock/classifier/directed_dst_vectors.json",
+  "version": 1,
+  "vectors": [
+    { "name": "empty string", "dst": "", "is_directed": false },
+    { "name": "callsign with SSID", "dst": "DK5EN-99", "is_directed": true },
+    {
+      "name": "bare callsign, no SSID (old ^[A-Z0-9]+-\\d+$ rule missed this)",
+      "dst": "DL1EEN",
+      "is_directed": true
+    },
+    {
+      "name": "lowercase callsign matches case-insensitively",
+      "dst": "dk5en-99",
+      "is_directed": true
+    },
+    {
+      "name": "multi-digit SSID",
+      "dst": "OE1GCA-14",
+      "is_directed": true
+    },
+    {
+      "name": "digit-leading callsign still has a letter",
+      "dst": "1A-3",
+      "is_directed": true
+    },
+    {
+      "name": "portable suffix stays on the person side",
+      "dst": "DK5EN/P",
+      "is_directed": true
+    },
+    { "name": "broadcast star", "dst": "*", "is_directed": false },
+    { "name": "ALL broadcast alias", "dst": "ALL", "is_directed": false },
+    { "name": "lowercase all broadcast alias", "dst": "all", "is_directed": false },
+    {
+      "name": "ALLE is not the ALL alias (anchored exclusion)",
+      "dst": "ALLE",
+      "is_directed": true
+    },
+    { "name": "TEST is a group", "dst": "TEST", "is_directed": false },
+    { "name": "lowercase test is a group", "dst": "test", "is_directed": false },
+    {
+      "name": "TESTER is not the TEST group (anchored exclusion)",
+      "dst": "TESTER",
+      "is_directed": true
+    },
+    { "name": "Time channel", "dst": "Time", "is_directed": false },
+    { "name": "lowercase time channel", "dst": "time", "is_directed": false },
+    { "name": "minimum group id", "dst": "1", "is_directed": false },
+    { "name": "typical group", "dst": "232", "is_directed": false },
+    { "name": "wide group", "dst": "20899", "is_directed": false },
+    { "name": "zero-padded group", "dst": "00232", "is_directed": false },
+    {
+      "name": "numeric above the group range is still not a person",
+      "dst": "100000",
+      "is_directed": false
+    },
+    { "name": "negative number", "dst": "-1", "is_directed": false },
+    {
+      "name": "via-routed personal dst resolves to its target (old rule missed this)",
+      "dst": "DJ8MEH-82,DJ8MEH-8",
+      "is_directed": true
+    },
+    {
+      "name": "via-routed personal dst, bare-callsign target",
+      "dst": "OE1KBC-12,OE3GXW-1",
+      "is_directed": true
+    },
+    {
+      "name": "via-routed group dst is not directed despite the letters in the relay",
+      "dst": "OE1KBC-12,232",
+      "is_directed": false
+    },
+    {
+      "name": "via-routed wide group dst",
+      "dst": "F6CQU-19,20899",
+      "is_directed": false
+    },
+    {
+      "name": "via-routed TEST group",
+      "dst": "RELAY-1,TEST",
+      "is_directed": false
+    },
+    {
+      "name": "via-routed ALL broadcast",
+      "dst": "RELAY-1,ALL",
+      "is_directed": false
+    },
+    {
+      "name": "two relays then a personal target",
+      "dst": "RELAY-1,RELAY-2,DK5EN-99",
+      "is_directed": true
+    },
+    {
+      "name": "whitespace around a via-routed target is ignored",
+      "dst": "RELAY-1, DK5EN-99",
+      "is_directed": true
+    },
+    { "name": "leading whitespace", "dst": " DK5EN-99", "is_directed": true },
+    { "name": "trailing whitespace", "dst": "DK5EN-99 ", "is_directed": true },
+    {
+      "name": "a sidebar pair key is never a directed dst",
+      "dst": "DG0OPK~DG0OPK",
+      "is_directed": false
+    }
+  ]
+}

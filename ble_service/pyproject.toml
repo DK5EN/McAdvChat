@@ -1,6 +1,6 @@
 [project]
 name = "mcapp-ble-service"
-version = "1.6.13"
+version = "2.0.0"
 description = "Remote BLE service for McApp MeshCom gateway"
 readme = "README.md"
 requires-python = ">=3.11"
@@ -10,7 +10,7 @@ authors = [
 ]
 dependencies = [
     "fastapi>=0.109.0",
-    "uvicorn[standard]>=0.47.0",
+    "uvicorn[standard]>=0.52.3",
     "sse-starlette>=3.4.4",
     "dbus-next>=0.2.3",
     "pydantic>=2.0.0",
@@ -34,12 +34,73 @@ build-backend = "hatchling.build"
 [tool.hatch.build.targets.wheel]
 packages = ["src"]
 
+# NOTE: Keep all [tool.ruff*] sections identical across MCProxy, ble_service and
+# mc-chat — src/mcapp/classifier is a git subtree shared with mc-chat and must
+# lint clean under the same rules in both repos.
 [tool.ruff]
 line-length = 100
 target-version = "py311"
 
 [tool.ruff.lint]
-select = ["E", "F", "I", "W"]
+select = [
+    "A",      # builtins shadowing
+    "ARG",    # unused arguments
+    "ASYNC",  # async pitfalls
+    "B",      # bugbear
+    "C4",     # comprehensions
+    "DTZ",    # naive datetime
+    "E",      # pycodestyle errors
+    "ERA",    # commented-out code
+    "F",      # pyflakes
+    "FURB",   # modernization
+    "G",      # logging format
+    "I",      # import sorting
+    "ISC",    # implicit str concat
+    "LOG",    # logging misuse
+    "N",      # naming
+    "PERF",   # performance
+    "PGH",    # blanket noqa/type-ignore
+    "PIE",    # misc
+    "PL",     # pylint
+    "PT",     # pytest style
+    "PTH",    # pathlib
+    "RET",    # return style
+    "RSE",    # raise style
+    "RUF",    # ruff-specific
+    "S",      # security (bandit)
+    "SIM",    # simplification
+    "SLF",    # private member access
+    "T10",    # debugger leftovers
+    "TRY",    # exception handling
+    "UP",     # pyupgrade
+    "W",      # pycodestyle warnings
+    "YTT",    # sys.version misuse
+]
+ignore = [
+    "ISC001",   # conflicts with ruff format
+    "TRY003",   # exception messages inline at the raise site are fine
+    "PLW0603",  # module-level state via `global` is an established pattern here
+    "RUF001",   # German typography + emojis in user-facing strings
+    "RUF002",
+    "RUF003",
+]
+
+[tool.ruff.lint.flake8-bugbear]
+extend-immutable-calls = [
+    "fastapi.Depends", "fastapi.Query", "fastapi.Header",
+    "fastapi.Body", "fastapi.Path", "fastapi.Cookie",
+]
+
+[tool.ruff.lint.per-file-ignores]
+# Test code: asserts, magic values, private access, fixture args are fine
+"**/tests/**" = ["S101", "PLR2004", "SLF001", "ARG", "S105", "S106", "PLC0415"]
+"**/test_*.py" = ["S101", "PLR2004", "SLF001", "ARG", "S105", "S106", "PLC0415"]
+# `*_tests.py` is MCProxy's dominant test naming (push_tests.py, router_tests.py,
+# udp_parsing_tests.py, ...): in-package suites run by scripts/run_startup_tests.py.
+# It matched NONE of the patterns above, so those files carried hand-written
+# `# noqa: S101` markers to say what this line now says once.
+"**/*_tests.py" = ["S101", "PLR2004", "SLF001", "ARG", "S105", "S106", "PLC0415"]
+"**/tests.py" = ["S101", "PLR2004", "SLF001", "ARG", "PLC0415"]
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"

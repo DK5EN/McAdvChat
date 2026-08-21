@@ -158,10 +158,10 @@ message_router.subscribe("ble_notification", _cache_gps)
 
 # 4. Protocol handlers
 command_handler = create_command_handler(message_router, storage_handler, ...)
-message_router.register_protocol('commands', command_handler)
+message_router.register_protocol("commands", command_handler)
 
 udp_handler = UDPHandler(..., message_router=message_router)
-message_router.register_protocol('udp', udp_handler)
+message_router.register_protocol("udp", udp_handler)
 
 # 5. SSE manager (REST API + Server-Sent Events), BLE client (local/remote/disabled)
 ```

@@ -1,0 +1,1963 @@
+{
+  "version": 1,
+  "canonical": "MCProxy/src/mcapp/aprs_symbol_vectors.json",
+  "description": "Canonical APRS symbol vectors, shared between MCProxy (src/mcapp/aprs_symbol_tests.py) and the webapp's vendored copy. Pins how a symbol TABLE ID (aprs_symbol_group) and a symbol CODE (aprs_symbol) must survive every ingress, the SQLite round trip, the SSE serialization boundary and the sprite resolver.\n\nWhy this file exists: every suite in both repos used to stop at a seam. MCProxy's end-to-end stopped at router.publish (a Python dict); the webapp's tests began from an already-decoded JS object. No test could therefore see a value that is correct on one side of the serialization boundary and wrong on the other — which is exactly where a one-versus-two backslash lives.\n\nThis file is MCProxy-canonical and vendored to webapp/src/utils/__tests__/aprs_symbol_vectors.json. The vendored copy may differ in WHITESPACE ONLY (Prettier reformats it); drift is checked parsed, never byte-for-byte. Deliberately NOT placed in src/mcapp/contract/ — that directory is a git subtree with mc-chat upstream, so an in-place edit there is reverted by the next subtree pull, and mc-chat has no APRS symbol surface to hold in parity.",
+  "sha256": "Both sides pin sha256(json.dumps(parsed, sort_keys=True, separators=(',', ':'))) of THIS document as a constant in their own suite (MCProxy: _EXPECTED_CORPUS_SHA256 in src/mcapp/aprs_symbol_tests.py). The hash lives in the suites rather than in this file because a document cannot contain its own digest. Hashing the PARSE-NORMALIZED text (not the raw bytes) is what makes Prettier's reformatting of the vendored copy invisible while a content change stays visible. Changing one vector therefore requires a commit in BOTH repos — that is the barrier.",
+  "encoding_rules": {
+    "values": "Every APRS symbol VALUE is a {kind} record, never a JSON string literal. kind='chars' carries `codepoints` (int array) plus a redundant `len`; both sides build the string from the codepoints and MUST assert the built length equals `len` before any behavioural assertion. No backslash literal appears in any value field of this file: [92] versus [92,92] is countable, \"\\\\\" versus \"\\\\\\\\\" is not, and that ambiguity is exactly where this bug class hides. kind='absent' means the wire key is not present at all. kind='null' and kind='non_string' carry a literal `json` value.",
+    "wire": "`sse.data_line` IS a readable JSON string and DOES contain backslashes — encoding a 90-character line as codepoints would be unreadable, and unreadable fixtures rot. It is guarded instead: `sse.backslash_count` and `sse.char_len` must both be asserted against the decoded line BEFORE the line is used for anything.",
+    "per_route": "`canonical` is the value after the route's INGRESS normalizer (what MCProxy publishes on `udp`, what the webapp stores on `wss`). `ble` and `store` carry route-local expectations where they differ; see `routes` below."
+  },
+  "routes": {
+    "udp": "node -> MCProxy udp_handler._process_received_message -> router.publish. The datagram is built from `input`; the published dict must match `canonical`. This is the ONE ingress that undoubles the firmware's escape.",
+    "ble": "node -> MCProxy ble_protocol.parse_aprs_position (via transform_pos). The APRS text is built as !4814.72N<group>01122.16E<code> from `input`. `ble.parses` says whether the whole position parses at all — a rejected table id costs the frame its COORDINATES, not just its symbol. When it parses, the emitted fields equal `input` verbatim: the BLE path has no normalizer and must not grow one (its single backslash is already canonical and a second pass would corrupt it).",
+    "store": "`canonical` -> MCProxy storage.store_message -> station_positions -> query._build_position_dict. The read-back must match `store`. Falsy column values produce an ABSENT key, not an empty one.",
+    "sse": "MCProxy sse_handler.SSEManager.format_sse_event -> webapp useSSEClient JSON.parse. The payload is built from `canonical` in the literal key order type, src, aprs_symbol, aprs_symbol_group (absent kinds omit their key) with event type 'mesh:message'. MCProxy asserts it PRODUCES `sse.data_line` byte for byte; the webapp asserts it CONSUMES it. Neither side can move alone.",
+    "wss": "oevsv.at -> webapp websocket.ts parseMessage -> processDataElement.",
+    "cache": "webapp offlineCache.hydratePositions -> position store (bypasses processDataElement).",
+    "render": "webapp resolveSymbol / PositionListPanel. `render.resolves` is the load-bearing expectation; `render.overlay` is the character painted over the glyph ('' for the two real tables). Sprite sheet names and pixel offsets are deliberately NOT pinned here: MCProxy cannot verify them, and an unverified pin in the canonical file would fail the vendored side for a reason this repo never tested."
+  },
+  "wire_field_names": {
+    "mcproxy": {
+      "group": "aprs_symbol_group",
+      "code": "aprs_symbol"
+    },
+    "oevsv": {
+      "group": "aprs_sym_grp",
+      "code": "aprs_sym"
+    },
+    "store": {
+      "group": "aprs_sym_grp",
+      "code": "aprs_sym"
+    }
+  },
+  "route_coverage_floor": {
+    "udp": 8,
+    "ble": 6,
+    "store": 6,
+    "sse": 6,
+    "wss": 6,
+    "cache": 4,
+    "render": 10
+  },
+  "non_scalar_guard": {
+    "description": "Field-level vectors for udp_handler._strip_non_scalar_fields, which runs at the same ingress choke point as the symbol normalizer. `dropped` is whether the top-level key survives the guard. `extras` is the single allowlisted container key: storage/ingest.store_telemetry merges it when it is a dict.",
+    "vectors": [
+      {
+        "name": "dict value on a symbol field is dropped",
+        "field": "aprs_symbol_group",
+        "value_json": {},
+        "dropped": true
+      },
+      {
+        "name": "list value on a symbol field is dropped",
+        "field": "aprs_symbol",
+        "value_json": [
+          1
+        ],
+        "dropped": true
+      },
+      {
+        "name": "dict value on an arbitrary field is dropped",
+        "field": "firmware",
+        "value_json": {
+          "a": 1
+        },
+        "dropped": true
+      },
+      {
+        "name": "extras is allowlisted: a dict survives",
+        "field": "extras",
+        "value_json": {
+          "CO2": 412.0
+        },
+        "dropped": false
+      },
+      {
+        "name": "string scalar survives",
+        "field": "src",
+        "value_json": "DL2JA-2",
+        "dropped": false
+      },
+      {
+        "name": "int scalar survives",
+        "field": "hw_id",
+        "value_json": 3,
+        "dropped": false
+      },
+      {
+        "name": "float scalar survives",
+        "field": "lat",
+        "value_json": 48.2,
+        "dropped": false
+      },
+      {
+        "name": "bool scalar survives",
+        "field": "gw",
+        "value_json": true,
+        "dropped": false
+      },
+      {
+        "name": "null survives (JSON null is a scalar)",
+        "field": "alt",
+        "value_json": null,
+        "dropped": false
+      }
+    ]
+  },
+  "vectors": [
+    {
+      "name": "primary table '/' with symbol code '-' — the untouched baseline",
+      "why": "Every normalizer on every route must be a no-op here. A vector that only covers the broken values cannot tell 'the fix works' from 'the fix rewrites everything'.",
+      "routes": [
+        "udp",
+        "ble",
+        "store",
+        "sse",
+        "wss",
+        "cache",
+        "render"
+      ],
+      "input": {
+        "group": {
+          "kind": "chars",
+          "codepoints": [
+            47
+          ],
+          "len": 1
+        },
+        "code": {
+          "kind": "chars",
+          "codepoints": [
+            45
+          ],
+          "len": 1
+        }
+      },
+      "canonical": {
+        "group": {
+          "kind": "chars",
+          "codepoints": [
+            47
+          ],
+          "len": 1
+        },
+        "code": {
+          "kind": "chars",
+          "codepoints": [
+            45
+          ],
+          "len": 1
+        }
+      },
+      "ble": {
+        "parses": true
+      },
+      "store": {
+        "group": {
+          "kind": "chars",
+          "codepoints": [
+            47
+          ],
+          "len": 1
+        },
+        "code": {
+          "kind": "chars",
+          "codepoints": [
+            45
+          ],
+          "len": 1
+        }
+      },
+      "sse": {
+        "data_line": "data: {\"type\": \"pos\", \"src\": \"DL2JA-2\", \"aprs_symbol\": \"-\", \"aprs_symbol_group\": \"/\"}",
+        "backslash_count": 0,
+        "char_len": 85
+      },
+      "render": {
+        "resolves": true,
+        "overlay": ""
+      }
+    },
+    {
+      "name": "alternate table, correct 1-char backslash — the value every route converges on",
+      "why": "One character (0x5C) decoded, TWO 0x5C bytes on the SSE wire. That asymmetry is the whole bug class: a test that stops before serialization cannot see it.",
+      "routes": [
+        "udp",
+        "ble",
+        "store",
+        "sse",
+        "wss",
+        "cache",
+        "render"
+      ],
+      "input": {
+        "group": {
+          "kind": "chars",
+          "codepoints": [
+            92
+          ],
+          "len": 1
+        },
+        "code": {
+          "kind": "chars",
+          "codepoints": [
+            45
+          ],
+          "len": 1
+        }
+      },
+      "canonical": {
+        "group": {
+          "kind": "chars",
+          "codepoints": [
+            92
+          ],
+          "len": 1
+        },
+        "code": {
+          "kind": "chars",
+          "codepoints": [
+            45
+          ],
+          "len": 1
+        }
+      },
+      "ble": {
+        "parses": true
+      },
+      "store": {
+        "group": {
+          "kind": "chars",
+          "codepoints": [
+            92
+          ],
+          "len": 1
+        },
+        "code": {
+          "kind": "chars",
+          "codepoints": [
+            45
+          ],
+          "len": 1
+        }
+      },
+      "sse": {
+        "data_line": "data: {\"type\": \"pos\", \"src\": \"DL2JA-2\", \"aprs_symbol\": \"-\", \"aprs_symbol_group\": \"\\\\\"}",
+        "backslash_count": 2,
+        "char_len": 86
+      },
+      "render": {
+        "resolves": true,
+        "overlay": ""
+      }
+    },
+    {
+      "name": "firmware double-escape: a 2-char GROUP collapses to 1 at the Extern-UDP ingress",
+      "why": "MeshCom's sendExtern() hand-escapes the backslash (extudp_functions.cpp:379/385) and then lets ArduinoJson escape it again, so :1799 delivers two characters where one is meant. Converges on the same wire bytes as the vector above.",
+      "routes": [
+        "udp",
+        "store",
+        "sse"
+      ],
+      "input": {
+        "group": {
+          "kind": "chars",
+          "codepoints": [
+            92,
+            92
+          ],
+          "len": 2
+        },
+        "code": {
+          "kind": "chars",
+          "codepoints": [
+            45
+          ],
+          "len": 1
+        }
+      },
+      "canonical": {
+        "group": {
+          "kind": "chars",
+          "codepoints": [
+            92
+          ],
+          "len": 1
+        },
+        "code": {
+          "kind": "chars",
+          "codepoints": [
+            45
+          ],
+          "len": 1
+        }
+      },
+      "store": {
+        "group": {
+          "kind": "chars",
+          "codepoints": [
+            92
+          ],
+          "len": 1
+        },
+        "code": {
+          "kind": "chars",
+          "codepoints": [
+            45
+          ],
+          "len": 1
+        }
+      },
+      "sse": {
+        "data_line": "data: {\"type\": \"pos\", \"src\": \"DL2JA-2\", \"aprs_symbol\": \"-\", \"aprs_symbol_group\": \"\\\\\"}",
+        "backslash_count": 2,
+        "char_len": 86
+      }
+    },
+    {
+      "name": "firmware double-escape in the symbol CODE field (the symmetric hand-escape)",
+      "why": "escape_symbol() at extudp_functions.cpp:379 carries the identical hand-escape, so a backslash symbol CODE is structurally exposed to the same bug. No station transmits one today — this vector is what stops the field being dropped for lack of a failing sample.",
+      "routes": [
+        "udp",
+        "store",
+        "sse"
+      ],
+      "input": {
+        "group": {
+          "kind": "chars",
+          "codepoints": [
+            92
+          ],
+          "len": 1
+        },
+        "code": {
+          "kind": "chars",
+          "codepoints": [
+            92,
+            92
+          ],
+          "len": 2
+        }
+      },
+      "canonical": {
+        "group": {
+          "kind": "chars",
+          "codepoints": [
+            92
+          ],
+          "len": 1
+        },
+        "code": {
+          "kind": "chars",
+          "codepoints": [
+            92
+          ],
+          "len": 1
+        }
+      },
+      "store": {
+        "group": {
+          "kind": "chars",
+          "codepoints": [
+            92
+          ],
+          "len": 1
+        },
+        "code": {
+          "kind": "chars",
+          "codepoints": [
+            92
+          ],
+          "len": 1
+        }
+      },
+      "sse": {
+        "data_line": "data: {\"type\": \"pos\", \"src\": \"DL2JA-2\", \"aprs_symbol\": \"\\\\\", \"aprs_symbol_group\": \"\\\\\"}",
+        "backslash_count": 4,
+        "char_len": 87
+      }
+    },
+    {
+      "name": "oevsv.at alias 'KFR' in the GROUP field normalizes to a 1-char backslash",
+      "why": "Route C only (oevsv.at -> webapp WSS). MCProxy never sees this alias; the webapp's normalizeAprsSymbolField owns it.",
+      "routes": [
+        "wss",
+        "cache",
+        "render"
+      ],
+      "input": {
+        "group": {
+          "kind": "chars",
+          "codepoints": [
+            75,
+            70,
+            82
+          ],
+          "len": 3
+        },
+        "code": {
+          "kind": "chars",
+          "codepoints": [
+            45
+          ],
+          "len": 1
+        }
+      },
+      "canonical": {
+        "group": {
+          "kind": "chars",
+          "codepoints": [
+            92
+          ],
+          "len": 1
+        },
+        "code": {
+          "kind": "chars",
+          "codepoints": [
+            45
+          ],
+          "len": 1
+        }
+      },
+      "render": {
+        "resolves": true,
+        "overlay": ""
+      }
+    },
+    {
+      "name": "oevsv.at alias 'KFR' in the SYMBOL CODE field (observed live on DO1RL-13)",
+      "why": "The renderers normalize the group but historically not the code, so this is the pin for the other half of that asymmetry.",
+      "routes": [
+        "wss",
+        "cache",
+        "render"
+      ],
+      "input": {
+        "group": {
+          "kind": "chars",
+          "codepoints": [
+            92
+          ],
+          "len": 1
+        },
+        "code": {
+          "kind": "chars",
+          "codepoints": [
+            75,
+            70,
+            82
+          ],
+          "len": 3
+        }
+      },
+      "canonical": {
+        "group": {
+          "kind": "chars",
+          "codepoints": [
+            92
+          ],
+          "len": 1
+        },
+        "code": {
+          "kind": "chars",
+          "codepoints": [
+            92
+          ],
+          "len": 1
+        }
+      },
+      "render": {
+        "resolves": true,
+        "overlay": ""
+      }
+    },
+    {
+      "name": "'KFR' on the Extern-UDP ingress is NOT rewritten — the alias never reaches :1799",
+      "why": "Same three characters as the two vectors above, opposite expectation, because the route differs. Pins MCProxy's normalizer as exact-match-on-doubled-backslash only: adding a KFR branch here would be dead code on a socket that never carries it.",
+      "routes": [
+        "udp",
+        "store"
+      ],
+      "input": {
+        "group": {
+          "kind": "chars",
+          "codepoints": [
+            75,
+            70,
+            82
+          ],
+          "len": 3
+        },
+        "code": {
+          "kind": "chars",
+          "codepoints": [
+            45
+          ],
+          "len": 1
+        }
+      },
+      "canonical": {
+        "group": {
+          "kind": "chars",
+          "codepoints": [
+            75,
+            70,
+            82
+          ],
+          "len": 3
+        },
+        "code": {
+          "kind": "chars",
+          "codepoints": [
+            45
+          ],
+          "len": 1
+        }
+      },
+      "store": {
+        "group": {
+          "kind": "chars",
+          "codepoints": [
+            75,
+            70,
+            82
+          ],
+          "len": 3
+        },
+        "code": {
+          "kind": "chars",
+          "codepoints": [
+            45
+          ],
+          "len": 1
+        }
+      }
+    },
+    {
+      "name": "overlay id 'G' — the alternate table with the character painted over the glyph",
+      "why": "The firmware's --symid accepts / \\ 0-9 A-Z. A parser that accepts only / and \\ does not merely lose the symbol: the table id sits mid-pattern, so the whole match fails and the frame loses its coordinates.",
+      "routes": [
+        "udp",
+        "ble",
+        "store",
+        "sse",
+        "wss",
+        "render"
+      ],
+      "input": {
+        "group": {
+          "kind": "chars",
+          "codepoints": [
+            71
+          ],
+          "len": 1
+        },
+        "code": {
+          "kind": "chars",
+          "codepoints": [
+            45
+          ],
+          "len": 1
+        }
+      },
+      "canonical": {
+        "group": {
+          "kind": "chars",
+          "codepoints": [
+            71
+          ],
+          "len": 1
+        },
+        "code": {
+          "kind": "chars",
+          "codepoints": [
+            45
+          ],
+          "len": 1
+        }
+      },
+      "ble": {
+        "parses": true
+      },
+      "store": {
+        "group": {
+          "kind": "chars",
+          "codepoints": [
+            71
+          ],
+          "len": 1
+        },
+        "code": {
+          "kind": "chars",
+          "codepoints": [
+            45
+          ],
+          "len": 1
+        }
+      },
+      "sse": {
+        "data_line": "data: {\"type\": \"pos\", \"src\": \"DL2JA-2\", \"aprs_symbol\": \"-\", \"aprs_symbol_group\": \"G\"}",
+        "backslash_count": 0,
+        "char_len": 85
+      },
+      "render": {
+        "resolves": true,
+        "overlay": "G"
+      }
+    },
+    {
+      "name": "overlay id '0' — lower bound of the firmware's 0-9 accept set",
+      "why": "Boundary vector. Kills an off-by-one in the character class.",
+      "routes": [
+        "udp",
+        "ble",
+        "store",
+        "render"
+      ],
+      "input": {
+        "group": {
+          "kind": "chars",
+          "codepoints": [
+            48
+          ],
+          "len": 1
+        },
+        "code": {
+          "kind": "chars",
+          "codepoints": [
+            45
+          ],
+          "len": 1
+        }
+      },
+      "canonical": {
+        "group": {
+          "kind": "chars",
+          "codepoints": [
+            48
+          ],
+          "len": 1
+        },
+        "code": {
+          "kind": "chars",
+          "codepoints": [
+            45
+          ],
+          "len": 1
+        }
+      },
+      "ble": {
+        "parses": true
+      },
+      "store": {
+        "group": {
+          "kind": "chars",
+          "codepoints": [
+            48
+          ],
+          "len": 1
+        },
+        "code": {
+          "kind": "chars",
+          "codepoints": [
+            45
+          ],
+          "len": 1
+        }
+      },
+      "render": {
+        "resolves": true,
+        "overlay": "0"
+      }
+    },
+    {
+      "name": "overlay id '9' — upper bound of the firmware's 0-9 accept set",
+      "why": "Boundary vector.",
+      "routes": [
+        "ble",
+        "render"
+      ],
+      "input": {
+        "group": {
+          "kind": "chars",
+          "codepoints": [
+            57
+          ],
+          "len": 1
+        },
+        "code": {
+          "kind": "chars",
+          "codepoints": [
+            45
+          ],
+          "len": 1
+        }
+      },
+      "canonical": {
+        "group": {
+          "kind": "chars",
+          "codepoints": [
+            57
+          ],
+          "len": 1
+        },
+        "code": {
+          "kind": "chars",
+          "codepoints": [
+            45
+          ],
+          "len": 1
+        }
+      },
+      "ble": {
+        "parses": true
+      },
+      "render": {
+        "resolves": true,
+        "overlay": "9"
+      }
+    },
+    {
+      "name": "overlay id 'A' — lower bound of the firmware's A-Z accept set",
+      "why": "Boundary vector.",
+      "routes": [
+        "ble",
+        "render"
+      ],
+      "input": {
+        "group": {
+          "kind": "chars",
+          "codepoints": [
+            65
+          ],
+          "len": 1
+        },
+        "code": {
+          "kind": "chars",
+          "codepoints": [
+            45
+          ],
+          "len": 1
+        }
+      },
+      "canonical": {
+        "group": {
+          "kind": "chars",
+          "codepoints": [
+            65
+          ],
+          "len": 1
+        },
+        "code": {
+          "kind": "chars",
+          "codepoints": [
+            45
+          ],
+          "len": 1
+        }
+      },
+      "ble": {
+        "parses": true
+      },
+      "render": {
+        "resolves": true,
+        "overlay": "A"
+      }
+    },
+    {
+      "name": "overlay id 'Z' — upper bound of the firmware's A-Z accept set",
+      "why": "Boundary vector.",
+      "routes": [
+        "ble",
+        "render"
+      ],
+      "input": {
+        "group": {
+          "kind": "chars",
+          "codepoints": [
+            90
+          ],
+          "len": 1
+        },
+        "code": {
+          "kind": "chars",
+          "codepoints": [
+            45
+          ],
+          "len": 1
+        }
+      },
+      "canonical": {
+        "group": {
+          "kind": "chars",
+          "codepoints": [
+            90
+          ],
+          "len": 1
+        },
+        "code": {
+          "kind": "chars",
+          "codepoints": [
+            45
+          ],
+          "len": 1
+        }
+      },
+      "ble": {
+        "parses": true
+      },
+      "render": {
+        "resolves": true,
+        "overlay": "Z"
+      }
+    },
+    {
+      "name": "lowercase 'g' marks the COMPRESSED position format — must not parse, must not render",
+      "why": "APRS uses a lowercase table id to signal the compressed format, which this uncompressed parser cannot decode and which the firmware refuses to transmit. Widening the accept set to [0-9A-Za-z] would make MCProxy decode compressed coordinates as if they were degrees and minutes.",
+      "routes": [
+        "ble",
+        "render"
+      ],
+      "input": {
+        "group": {
+          "kind": "chars",
+          "codepoints": [
+            103
+          ],
+          "len": 1
+        },
+        "code": {
+          "kind": "chars",
+          "codepoints": [
+            45
+          ],
+          "len": 1
+        }
+      },
+      "canonical": {
+        "group": {
+          "kind": "chars",
+          "codepoints": [
+            103
+          ],
+          "len": 1
+        },
+        "code": {
+          "kind": "chars",
+          "codepoints": [
+            45
+          ],
+          "len": 1
+        }
+      },
+      "ble": {
+        "parses": false
+      },
+      "render": {
+        "resolves": false,
+        "overlay": ""
+      }
+    },
+    {
+      "name": "lowercase 'a' — lower bound of the excluded a-z range",
+      "why": "Boundary vector for the exclusion.",
+      "routes": [
+        "ble"
+      ],
+      "input": {
+        "group": {
+          "kind": "chars",
+          "codepoints": [
+            97
+          ],
+          "len": 1
+        },
+        "code": {
+          "kind": "chars",
+          "codepoints": [
+            45
+          ],
+          "len": 1
+        }
+      },
+      "canonical": {
+        "group": {
+          "kind": "chars",
+          "codepoints": [
+            97
+          ],
+          "len": 1
+        },
+        "code": {
+          "kind": "chars",
+          "codepoints": [
+            45
+          ],
+          "len": 1
+        }
+      },
+      "ble": {
+        "parses": false
+      }
+    },
+    {
+      "name": "lowercase 'z' — upper bound of the excluded a-z range",
+      "why": "Boundary vector for the exclusion.",
+      "routes": [
+        "ble"
+      ],
+      "input": {
+        "group": {
+          "kind": "chars",
+          "codepoints": [
+            122
+          ],
+          "len": 1
+        },
+        "code": {
+          "kind": "chars",
+          "codepoints": [
+            45
+          ],
+          "len": 1
+        }
+      },
+      "canonical": {
+        "group": {
+          "kind": "chars",
+          "codepoints": [
+            122
+          ],
+          "len": 1
+        },
+        "code": {
+          "kind": "chars",
+          "codepoints": [
+            45
+          ],
+          "len": 1
+        }
+      },
+      "ble": {
+        "parses": false
+      }
+    },
+    {
+      "name": "'.' (0x2E) sits one codepoint below '/' — must not parse",
+      "why": "Kills a character class widened downwards from '/'.",
+      "routes": [
+        "ble"
+      ],
+      "input": {
+        "group": {
+          "kind": "chars",
+          "codepoints": [
+            46
+          ],
+          "len": 1
+        },
+        "code": {
+          "kind": "chars",
+          "codepoints": [
+            45
+          ],
+          "len": 1
+        }
+      },
+      "canonical": {
+        "group": {
+          "kind": "chars",
+          "codepoints": [
+            46
+          ],
+          "len": 1
+        },
+        "code": {
+          "kind": "chars",
+          "codepoints": [
+            45
+          ],
+          "len": 1
+        }
+      },
+      "ble": {
+        "parses": false
+      }
+    },
+    {
+      "name": "':' (0x3A) sits one codepoint above '9' — must not parse",
+      "why": "Kills a class written as [0-:] or a range that swallows the ASCII punctuation between the digits and the uppercase letters.",
+      "routes": [
+        "ble"
+      ],
+      "input": {
+        "group": {
+          "kind": "chars",
+          "codepoints": [
+            58
+          ],
+          "len": 1
+        },
+        "code": {
+          "kind": "chars",
+          "codepoints": [
+            45
+          ],
+          "len": 1
+        }
+      },
+      "canonical": {
+        "group": {
+          "kind": "chars",
+          "codepoints": [
+            58
+          ],
+          "len": 1
+        },
+        "code": {
+          "kind": "chars",
+          "codepoints": [
+            45
+          ],
+          "len": 1
+        }
+      },
+      "ble": {
+        "parses": false
+      }
+    },
+    {
+      "name": "'@' (0x40) sits one codepoint below 'A' — must not parse",
+      "why": "Kills a class written as [@-Z].",
+      "routes": [
+        "ble"
+      ],
+      "input": {
+        "group": {
+          "kind": "chars",
+          "codepoints": [
+            64
+          ],
+          "len": 1
+        },
+        "code": {
+          "kind": "chars",
+          "codepoints": [
+            45
+          ],
+          "len": 1
+        }
+      },
+      "canonical": {
+        "group": {
+          "kind": "chars",
+          "codepoints": [
+            64
+          ],
+          "len": 1
+        },
+        "code": {
+          "kind": "chars",
+          "codepoints": [
+            45
+          ],
+          "len": 1
+        }
+      },
+      "ble": {
+        "parses": false
+      }
+    },
+    {
+      "name": "'[' (0x5B) sits one codepoint below the backslash — must not parse",
+      "why": "Kills a class written as a range that spans the backslash.",
+      "routes": [
+        "ble"
+      ],
+      "input": {
+        "group": {
+          "kind": "chars",
+          "codepoints": [
+            91
+          ],
+          "len": 1
+        },
+        "code": {
+          "kind": "chars",
+          "codepoints": [
+            45
+          ],
+          "len": 1
+        }
+      },
+      "canonical": {
+        "group": {
+          "kind": "chars",
+          "codepoints": [
+            91
+          ],
+          "len": 1
+        },
+        "code": {
+          "kind": "chars",
+          "codepoints": [
+            45
+          ],
+          "len": 1
+        }
+      },
+      "ble": {
+        "parses": false
+      }
+    },
+    {
+      "name": "']' (0x5D) sits one codepoint above the backslash — must not parse",
+      "why": "Same, from the other side.",
+      "routes": [
+        "ble"
+      ],
+      "input": {
+        "group": {
+          "kind": "chars",
+          "codepoints": [
+            93
+          ],
+          "len": 1
+        },
+        "code": {
+          "kind": "chars",
+          "codepoints": [
+            45
+          ],
+          "len": 1
+        }
+      },
+      "canonical": {
+        "group": {
+          "kind": "chars",
+          "codepoints": [
+            93
+          ],
+          "len": 1
+        },
+        "code": {
+          "kind": "chars",
+          "codepoints": [
+            45
+          ],
+          "len": 1
+        }
+      },
+      "ble": {
+        "parses": false
+      }
+    },
+    {
+      "name": "absent symbol CODE: the key is OMITTED, never defaulted to '?'",
+      "why": "'?' is itself a valid APRS symbol code (info kiosk / file server), so defaulting to it published 'we don't know' as a confident specific answer — and, because the station_positions UPSERT keeps the stored symbol only while the incoming one is NULL or '', that synthesised '?' also overwrote a correctly reported symbol.",
+      "routes": [
+        "ble",
+        "store",
+        "sse",
+        "wss",
+        "cache",
+        "render"
+      ],
+      "input": {
+        "group": {
+          "kind": "chars",
+          "codepoints": [
+            92
+          ],
+          "len": 1
+        },
+        "code": {
+          "kind": "absent"
+        }
+      },
+      "canonical": {
+        "group": {
+          "kind": "chars",
+          "codepoints": [
+            92
+          ],
+          "len": 1
+        },
+        "code": {
+          "kind": "absent"
+        }
+      },
+      "ble": {
+        "parses": true
+      },
+      "store": {
+        "group": {
+          "kind": "chars",
+          "codepoints": [
+            92
+          ],
+          "len": 1
+        },
+        "code": {
+          "kind": "absent"
+        }
+      },
+      "sse": {
+        "data_line": "data: {\"type\": \"pos\", \"src\": \"DL2JA-2\", \"aprs_symbol_group\": \"\\\\\"}",
+        "backslash_count": 2,
+        "char_len": 66
+      },
+      "render": {
+        "resolves": false,
+        "overlay": ""
+      }
+    },
+    {
+      "name": "a genuine '?' symbol code is captured, not mistaken for 'unknown'",
+      "why": "The other half of the vector above: a station that really does beacon '?' must keep it. A fix that maps '?' to absence would pass the absent-code vector and break this one.",
+      "routes": [
+        "udp",
+        "ble",
+        "store",
+        "sse",
+        "wss",
+        "render"
+      ],
+      "input": {
+        "group": {
+          "kind": "chars",
+          "codepoints": [
+            47
+          ],
+          "len": 1
+        },
+        "code": {
+          "kind": "chars",
+          "codepoints": [
+            63
+          ],
+          "len": 1
+        }
+      },
+      "canonical": {
+        "group": {
+          "kind": "chars",
+          "codepoints": [
+            47
+          ],
+          "len": 1
+        },
+        "code": {
+          "kind": "chars",
+          "codepoints": [
+            63
+          ],
+          "len": 1
+        }
+      },
+      "ble": {
+        "parses": true
+      },
+      "store": {
+        "group": {
+          "kind": "chars",
+          "codepoints": [
+            47
+          ],
+          "len": 1
+        },
+        "code": {
+          "kind": "chars",
+          "codepoints": [
+            63
+          ],
+          "len": 1
+        }
+      },
+      "sse": {
+        "data_line": "data: {\"type\": \"pos\", \"src\": \"DL2JA-2\", \"aprs_symbol\": \"?\", \"aprs_symbol_group\": \"/\"}",
+        "backslash_count": 0,
+        "char_len": 85
+      },
+      "render": {
+        "resolves": true,
+        "overlay": ""
+      }
+    },
+    {
+      "name": "a genuine ' ' (space) symbol code is captured — the APRS class [ -~] includes 0x20",
+      "why": "Pins that the BLE parser's optional trailing group really is 'space through tilde', and that a space survives the store's `!= ''` guard. Tightening the class to [!-~] would silently drop it.",
+      "routes": [
+        "ble",
+        "store"
+      ],
+      "input": {
+        "group": {
+          "kind": "chars",
+          "codepoints": [
+            47
+          ],
+          "len": 1
+        },
+        "code": {
+          "kind": "chars",
+          "codepoints": [
+            32
+          ],
+          "len": 1
+        }
+      },
+      "canonical": {
+        "group": {
+          "kind": "chars",
+          "codepoints": [
+            47
+          ],
+          "len": 1
+        },
+        "code": {
+          "kind": "chars",
+          "codepoints": [
+            32
+          ],
+          "len": 1
+        }
+      },
+      "ble": {
+        "parses": true
+      },
+      "store": {
+        "group": {
+          "kind": "chars",
+          "codepoints": [
+            47
+          ],
+          "len": 1
+        },
+        "code": {
+          "kind": "chars",
+          "codepoints": [
+            32
+          ],
+          "len": 1
+        }
+      }
+    },
+    {
+      "name": "empty-string GROUP: kept verbatim on the wire, but the store read-back OMITS the key",
+      "why": "query.py guards with `if row[...]`, so '' becomes an ABSENT key, not an empty one. That is the correct fail-closed shape and it must be pinned as such — consumers treat absent and '' identically only by accident.",
+      "routes": [
+        "udp",
+        "store",
+        "sse",
+        "wss",
+        "cache",
+        "render"
+      ],
+      "input": {
+        "group": {
+          "kind": "chars",
+          "codepoints": [],
+          "len": 0
+        },
+        "code": {
+          "kind": "chars",
+          "codepoints": [
+            45
+          ],
+          "len": 1
+        }
+      },
+      "canonical": {
+        "group": {
+          "kind": "chars",
+          "codepoints": [],
+          "len": 0
+        },
+        "code": {
+          "kind": "chars",
+          "codepoints": [
+            45
+          ],
+          "len": 1
+        }
+      },
+      "store": {
+        "group": {
+          "kind": "absent"
+        },
+        "code": {
+          "kind": "chars",
+          "codepoints": [
+            45
+          ],
+          "len": 1
+        }
+      },
+      "sse": {
+        "data_line": "data: {\"type\": \"pos\", \"src\": \"DL2JA-2\", \"aprs_symbol\": \"-\", \"aprs_symbol_group\": \"\"}",
+        "backslash_count": 0,
+        "char_len": 84
+      },
+      "render": {
+        "resolves": false,
+        "overlay": ""
+      }
+    },
+    {
+      "name": "absent GROUP key: MCProxy never invents one — fail closed, never a fabricated backslash",
+      "why": "The historical failure: a consumer defaulting a missing group to a backslash paints an alternate-table icon the operator never transmitted. Absence must stay absence the whole way down.",
+      "routes": [
+        "udp",
+        "store",
+        "sse",
+        "wss",
+        "cache",
+        "render"
+      ],
+      "input": {
+        "group": {
+          "kind": "absent"
+        },
+        "code": {
+          "kind": "chars",
+          "codepoints": [
+            45
+          ],
+          "len": 1
+        }
+      },
+      "canonical": {
+        "group": {
+          "kind": "absent"
+        },
+        "code": {
+          "kind": "chars",
+          "codepoints": [
+            45
+          ],
+          "len": 1
+        }
+      },
+      "store": {
+        "group": {
+          "kind": "absent"
+        },
+        "code": {
+          "kind": "chars",
+          "codepoints": [
+            45
+          ],
+          "len": 1
+        }
+      },
+      "sse": {
+        "data_line": "data: {\"type\": \"pos\", \"src\": \"DL2JA-2\", \"aprs_symbol\": \"-\"}",
+        "backslash_count": 0,
+        "char_len": 59
+      },
+      "render": {
+        "resolves": false,
+        "overlay": ""
+      }
+    },
+    {
+      "name": "both symbol keys absent (the mHeard-shaped pos frame)",
+      "why": "The commonest real frame on the live box. Neither key may be conjured into being at any hop.",
+      "routes": [
+        "udp",
+        "store",
+        "sse",
+        "render"
+      ],
+      "input": {
+        "group": {
+          "kind": "absent"
+        },
+        "code": {
+          "kind": "absent"
+        }
+      },
+      "canonical": {
+        "group": {
+          "kind": "absent"
+        },
+        "code": {
+          "kind": "absent"
+        }
+      },
+      "store": {
+        "group": {
+          "kind": "absent"
+        },
+        "code": {
+          "kind": "absent"
+        }
+      },
+      "sse": {
+        "data_line": "data: {\"type\": \"pos\", \"src\": \"DL2JA-2\"}",
+        "backslash_count": 0,
+        "char_len": 39
+      },
+      "render": {
+        "resolves": false,
+        "overlay": ""
+      }
+    },
+    {
+      "name": "explicit JSON null GROUP survives the ingress and reads back as an absent key",
+      "why": "dict.get() compared against a string constant tolerates None without raising, which matters because :1799 is unauthenticated.",
+      "routes": [
+        "udp",
+        "store"
+      ],
+      "input": {
+        "group": {
+          "kind": "null",
+          "json": null
+        },
+        "code": {
+          "kind": "chars",
+          "codepoints": [
+            45
+          ],
+          "len": 1
+        }
+      },
+      "canonical": {
+        "group": {
+          "kind": "null",
+          "json": null
+        },
+        "code": {
+          "kind": "chars",
+          "codepoints": [
+            45
+          ],
+          "len": 1
+        }
+      },
+      "store": {
+        "group": {
+          "kind": "absent"
+        },
+        "code": {
+          "kind": "chars",
+          "codepoints": [
+            45
+          ],
+          "len": 1
+        }
+      }
+    },
+    {
+      "name": "non-string int GROUP is a JSON scalar: kept on the wire, coerced to TEXT '7' by SQLite",
+      "why": "The column has TEXT affinity, so 7 lands as the string '7' — which is itself a VALID overlay id. Attacker-shaped input off an unauthenticated socket therefore renders a plausible icon. Pinned as observed behaviour, not endorsed.",
+      "routes": [
+        "udp",
+        "store"
+      ],
+      "input": {
+        "group": {
+          "kind": "non_string",
+          "json": 7
+        },
+        "code": {
+          "kind": "chars",
+          "codepoints": [
+            45
+          ],
+          "len": 1
+        }
+      },
+      "canonical": {
+        "group": {
+          "kind": "non_string",
+          "json": 7
+        },
+        "code": {
+          "kind": "chars",
+          "codepoints": [
+            45
+          ],
+          "len": 1
+        }
+      },
+      "store": {
+        "group": {
+          "kind": "chars",
+          "codepoints": [
+            55
+          ],
+          "len": 1
+        },
+        "code": {
+          "kind": "chars",
+          "codepoints": [
+            45
+          ],
+          "len": 1
+        }
+      }
+    },
+    {
+      "name": "non-string bool GROUP is a JSON scalar: kept, coerced to TEXT '1' by SQLite",
+      "why": "bool is a JSON scalar and must not be swept up by the non-scalar guard; SQLite's TEXT affinity then makes it '1'.",
+      "routes": [
+        "udp",
+        "store"
+      ],
+      "input": {
+        "group": {
+          "kind": "non_string",
+          "json": true
+        },
+        "code": {
+          "kind": "chars",
+          "codepoints": [
+            45
+          ],
+          "len": 1
+        }
+      },
+      "canonical": {
+        "group": {
+          "kind": "non_string",
+          "json": true
+        },
+        "code": {
+          "kind": "chars",
+          "codepoints": [
+            45
+          ],
+          "len": 1
+        }
+      },
+      "store": {
+        "group": {
+          "kind": "chars",
+          "codepoints": [
+            49
+          ],
+          "len": 1
+        },
+        "code": {
+          "kind": "chars",
+          "codepoints": [
+            45
+          ],
+          "len": 1
+        }
+      }
+    },
+    {
+      "name": "dict GROUP is not a JSON scalar: the FIELD is dropped at the ingress, the frame lives",
+      "why": "A nested object used to travel down into store_message and die on the SQLite bind AFTER _ingest_signal had committed, leaving the station row half-populated (rssi/snr, no coordinates, no symbol). Dropping the field keeps the position.",
+      "routes": [
+        "udp",
+        "store"
+      ],
+      "input": {
+        "group": {
+          "kind": "non_string",
+          "json": {}
+        },
+        "code": {
+          "kind": "chars",
+          "codepoints": [
+            45
+          ],
+          "len": 1
+        }
+      },
+      "canonical": {
+        "group": {
+          "kind": "absent"
+        },
+        "code": {
+          "kind": "chars",
+          "codepoints": [
+            45
+          ],
+          "len": 1
+        }
+      },
+      "store": {
+        "group": {
+          "kind": "absent"
+        },
+        "code": {
+          "kind": "chars",
+          "codepoints": [
+            45
+          ],
+          "len": 1
+        }
+      }
+    },
+    {
+      "name": "list GROUP is not a JSON scalar: dropped the same way",
+      "why": "json.loads can only produce a dict or a list on top of the wire format's scalars, so both container shapes need a vector.",
+      "routes": [
+        "udp",
+        "store"
+      ],
+      "input": {
+        "group": {
+          "kind": "non_string",
+          "json": [
+            92
+          ]
+        },
+        "code": {
+          "kind": "chars",
+          "codepoints": [
+            45
+          ],
+          "len": 1
+        }
+      },
+      "canonical": {
+        "group": {
+          "kind": "absent"
+        },
+        "code": {
+          "kind": "chars",
+          "codepoints": [
+            45
+          ],
+          "len": 1
+        }
+      },
+      "store": {
+        "group": {
+          "kind": "absent"
+        },
+        "code": {
+          "kind": "chars",
+          "codepoints": [
+            45
+          ],
+          "len": 1
+        }
+      }
+    },
+    {
+      "name": "a longer string that merely CONTAINS two backslashes is never rewritten",
+      "why": "Pins the exact-equality choice over str.replace(). The same value in a message BODY is what the backfill must leave byte-identical.",
+      "routes": [
+        "udp",
+        "store"
+      ],
+      "input": {
+        "group": {
+          "kind": "chars",
+          "codepoints": [
+            112,
+            114,
+            101,
+            92,
+            92,
+            112,
+            111,
+            115,
+            116
+          ],
+          "len": 9
+        },
+        "code": {
+          "kind": "chars",
+          "codepoints": [
+            45
+          ],
+          "len": 1
+        }
+      },
+      "canonical": {
+        "group": {
+          "kind": "chars",
+          "codepoints": [
+            112,
+            114,
+            101,
+            92,
+            92,
+            112,
+            111,
+            115,
+            116
+          ],
+          "len": 9
+        },
+        "code": {
+          "kind": "chars",
+          "codepoints": [
+            45
+          ],
+          "len": 1
+        }
+      },
+      "store": {
+        "group": {
+          "kind": "chars",
+          "codepoints": [
+            112,
+            114,
+            101,
+            92,
+            92,
+            112,
+            111,
+            115,
+            116
+          ],
+          "len": 9
+        },
+        "code": {
+          "kind": "chars",
+          "codepoints": [
+            45
+          ],
+          "len": 1
+        }
+      }
+    },
+    {
+      "name": "junk: a bare space GROUP keeps failing symbol resolution",
+      "why": "Junk must fail visibly. Mapping it to something plausible is how a silent wrong icon gets shipped.",
+      "routes": [
+        "udp",
+        "store",
+        "sse",
+        "wss",
+        "render"
+      ],
+      "input": {
+        "group": {
+          "kind": "chars",
+          "codepoints": [
+            32
+          ],
+          "len": 1
+        },
+        "code": {
+          "kind": "chars",
+          "codepoints": [
+            45
+          ],
+          "len": 1
+        }
+      },
+      "canonical": {
+        "group": {
+          "kind": "chars",
+          "codepoints": [
+            32
+          ],
+          "len": 1
+        },
+        "code": {
+          "kind": "chars",
+          "codepoints": [
+            45
+          ],
+          "len": 1
+        }
+      },
+      "store": {
+        "group": {
+          "kind": "chars",
+          "codepoints": [
+            32
+          ],
+          "len": 1
+        },
+        "code": {
+          "kind": "chars",
+          "codepoints": [
+            45
+          ],
+          "len": 1
+        }
+      },
+      "sse": {
+        "data_line": "data: {\"type\": \"pos\", \"src\": \"DL2JA-2\", \"aprs_symbol\": \"-\", \"aprs_symbol_group\": \" \"}",
+        "backslash_count": 0,
+        "char_len": 85
+      },
+      "render": {
+        "resolves": false,
+        "overlay": ""
+      }
+    },
+    {
+      "name": "junk: U+FFFD GROUP survives the ingress untouched and must not resolve",
+      "why": "Also the one vector whose SSE line carries a \\u escape: format_sse_event uses json.dumps' default ensure_ascii=True, while get_smart_initial_with_summary uses ensure_ascii=False. Two serializers, two encodings, one value.",
+      "routes": [
+        "udp",
+        "store",
+        "sse",
+        "wss",
+        "render"
+      ],
+      "input": {
+        "group": {
+          "kind": "chars",
+          "codepoints": [
+            65533
+          ],
+          "len": 1
+        },
+        "code": {
+          "kind": "chars",
+          "codepoints": [
+            45
+          ],
+          "len": 1
+        }
+      },
+      "canonical": {
+        "group": {
+          "kind": "chars",
+          "codepoints": [
+            65533
+          ],
+          "len": 1
+        },
+        "code": {
+          "kind": "chars",
+          "codepoints": [
+            45
+          ],
+          "len": 1
+        }
+      },
+      "store": {
+        "group": {
+          "kind": "chars",
+          "codepoints": [
+            65533
+          ],
+          "len": 1
+        },
+        "code": {
+          "kind": "chars",
+          "codepoints": [
+            45
+          ],
+          "len": 1
+        }
+      },
+      "sse": {
+        "data_line": "data: {\"type\": \"pos\", \"src\": \"DL2JA-2\", \"aprs_symbol\": \"-\", \"aprs_symbol_group\": \"\\ufffd\"}",
+        "backslash_count": 1,
+        "char_len": 90
+      },
+      "render": {
+        "resolves": false,
+        "overlay": ""
+      }
+    }
+  ]
+}

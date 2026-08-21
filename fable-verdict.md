@@ -1,0 +1,1499 @@
+# Fable Verdict — MCProxy Code Quality Audit
+
+**Date:** 2026-07-05
+**Auditor:** Claude Fable 5 (six parallel full-file reviews + independent verification of all CRITICAL findings)
+**Scope:** `src/mcapp/` (incl. `classifier/` subtree), `ble_service/`, `scripts/` — ~19,600 lines of Python
+**Goals (per Martin):** no magic numbers, easy to understand, logically structured, easy to extend, maintainable, not overly complex, performant on Raspberry Pi Zero 2W (4×Cortex-A53, 512 MB RAM)
+
+**Intended workflow:** a Sonnet coding agent fixes this in waves (Section 7); after each wave an
+Opus agent reviews the implementation for issues, bugs, shortcomings, and model drift (Section 8).
+
+**Integrated feature track:** the UDP 2.0 Extern-UDP RSSI/SNR integration
+(`doc/UDP-2.0-impl.md`, waves U1–U4) is folded into this pipeline as **Track U** — see the
+master sequence at the top of Section 7. That document stays the authoritative spec for the
+feature (wire format, design principles, per-wave acceptance); this verdict governs ordering
+and the consistency couplings between feature and quality work.
+
+**Verification legend:**
+- `✓F` — independently verified by Fable against the source (quote and line confirmed)
+- unmarked — found by a full-file review pass; high confidence, but **the fix agent must re-read
+  the cited code before changing it** (line numbers will drift as waves land; quotes are the anchors)
+
+---
+
+## 0. Session Handoff (2026-07-06, end of session — READ THIS FIRST)
+
+**The full wave plan (Section 7) is DONE.** Waves 1-7, Track U (UDP 2.0), Track M (classifier),
+and Track D (docs) are all implemented, adversarially Opus-reviewed, and committed on
+`development`. Every commit passed the gates in Section 8's preamble (ruff check, ruff format
+--check, `run_startup_tests.py` exit 0) and an independent review before landing — see
+"Discovered during waves" (end of file) for the full per-wave outcome log, including every
+defect a reviewer caught and how it was fixed.
+
+**Commit log, in order:**
+| Commit | What |
+|---|---|
+| `03db743` | Wave 1 — critical fixes (C-01..C-08, ST-11, BLE-07, SCR-02, CO-14) |
+| `edab1a3`/`4d03f28`/`0e007ba` | Track U waves U1-U4 — UDP-lora signal routing → v19 migration → SSE/backfill → docs |
+| `34d01c1` | Wave 2 — magic numbers → named constants |
+| `89cc26b` | Wave 3 — dead code removal |
+| `575bd7d` | Wave 4 — logging unification |
+| `57e218a` + `7f40d04` | Wave 5 — duplication consolidation (ST-03/13/14/18, CO-02/03/11, SSE-02/03/04/07, CMD-05/07/10, BLE-02/04/08/15/16) |
+| `0ec876f`..`057b145` | Wave 6, 5 sub-commits — storage mixins, sse_routes split, main.py decomposition, ctcping dataclasses, ble_service ServiceState |
+| `a908c85` | SCR-04 follow-up (update-runner slot-meta bug + EventBus/queue bounding) |
+| `5ccf85e` | Wave 7 — performance (ST-07/08/09/18, SSE-05/06, CO-08/10/22, BLE-12, CMD-10) |
+| `d82e29d` | Legibility/complexity audit fixes (ctcping invariants + dead code, BLE `_RetryProfile`) — a standalone pass triggered mid-session by a maintainer concern that structural refactoring might have become hard to follow; verdict was ~90% genuine improvement, one file needed cleanup |
+| `409dca2`/`57cdf64`/`fe3fa42` | Track M — classifier fixes (CLS-01..05) in mc-chat, subtree-synced, MCProxy-side `ms_to_zulu`/startup-test wiring |
+| `3841048` | Track D — `doc/tech-debt.md` refreshed against Waves 1-7 outcomes |
+
+**What's left, if anyone picks this up again:** everything in Section 7 is done. Remaining
+possibilities are things explicitly deferred as non-blocking along the way (search "Deferred" /
+"not fixed" in "Discovered during waves") — e.g. Wave 7's ST-02 (connection-reuse, needs real Pi
+hardware measurement), and the deferred wire-format items in Section 7's closing paragraph
+(BLE-14, SSE-07's `matches` rename, ST-12) that need coordinated webapp changes. (Wave 6.4's
+flagged latent double-`del self.active_pings[ack_id]`/`KeyError` bug is no longer open — it was
+fixed by the legibility-audit pass's M3, see `d82e29d`.) None of these were requested by any
+wave's acceptance criteria; treat this document as the audit trail, not a new backlog.
+
+---
+
+## 1. Executive summary
+
+The codebase is functional, recently lint-hardened (strict ruff, zero warnings), and parts of it
+are genuinely good (see Section 6). The dominant problems, in order of impact:
+
+1. **A handful of real bugs** — a UDP listen loop that dies permanently on the first unexpected
+   exception, an SSE generator in ble_service that silently drops same-millisecond notifications,
+   a page-limit with no lower bound (negative → unbounded table dump), two contradictory hardcoded
+   timezone offsets in meteo.py, an update-runner that can deploy over the *active* slot, and a
+   12-second sleep that freezes the entire inbound message pipeline during chunked responses.
+2. **Duplication at scale** — ~400 lines of 5×-copy-pasted chart/gap-marker code in
+   sqlite_storage.py; two ~80-line near-identical reconnect loops in ble_service; 8× copy-pasted
+   GATT frame building; ~90 % identical `_udp_message_handler`/`_ble_message_handler`;
+   5× duplicated SQL in sse_handler.py reaching into `storage._execute()`.
+3. **God objects** — `SQLiteStorage` (3712 lines, ~90 methods, 8 concerns), `_create_app()`
+   (~900 lines, ~30 inline endpoints), `main()` (~410 lines, 6 nested background closures).
+   The repeated `# noqa: PLR0912/PLR0915 - complex handler kept intact` markers are a map of
+   exactly these hotspots.
+4. **Magic numbers** — mostly in argument/default position where ruff's PLR2004 doesn't look:
+   timeouts, retry ladders, protocol bytes, frame offsets, queue sizes, retention windows.
+   Full inventory in Section 5.
+5. **Consistency drift** — 8 divergent per-module `VERSION` constants, `int(time.time() * 1000)`
+   ~45× across the repo, three independent `has_console` computations, two logging systems
+   (logger vs `has_console`-gated `print`), four different callsign-regex notions, `0.3048`
+   (ft→m) defined three times, `hasattr` guards against the project's own storage API.
+6. **Performance debt for the Pi** — full-table scans on every web-client connect, Python-side
+   aggregation of what SQL can GROUP BY, a 60 s stats broadcast that runs DB scans with zero SSE
+   clients connected, per-query `sqlite3.connect` with no busy timeout colliding with nightly
+   VACUUM, per-node D-Bus introspection recursion during GATT discovery, and no cache in front
+   of external weather APIs.
+
+Roughly 100 findings total: 8 CRITICAL, ~40 MAJOR, ~50 MINOR. None of this requires a rewrite —
+the fixes are surgical or mechanical, which is why the wave plan works.
+
+On top of the quality work, the **UDP 2.0 feature** (route Extern-UDP RSSI/SNR into the signal
+architecture, `doc/UDP-2.0-impl.md`) is scheduled as Track U directly after Wave 1: the feature
+*depends on* two Wave-1 fixes (C-01 — a UDP-only deployment cannot tolerate a listen loop that
+dies permanently; C-08 — signal ingestion adds a write per lora packet, so the missing busy
+timeout would bite harder), and it *pulls forward* one quality finding (ST-10 — the bucket
+accumulator leak scales with the number of heard stations, which UDP ingestion multiplies).
+
+---
+
+## 2. Ground rules for all fix agents (read before every wave)
+
+1. **Package management:** `uv` only. Never pip/venv.
+2. **Lint/format are gates:** `uvx ruff check` and `uvx ruff format --check .` must be clean
+   after every wave (run from repo root; covers ble_service too). Keep all `[tool.ruff*]`
+   sections identical across `pyproject.toml`, `ble_service/pyproject.toml`, and mc-chat.
+   New `# noqa` needs a trailing reason and should be rare — the goal of this effort is to
+   *remove* the "complex handler kept intact" noqas by actually fixing the complexity.
+3. **Tests:** no pytest. Run `uv run python scripts/run_startup_tests.py` after every wave
+   (exit 0 = pass; needs network for weather APIs). If a wave touches tested behavior, extend
+   `commands/tests.py` / `test_suppression_logic` in the same wave.
+4. **Classifier subtree:** `src/mcapp/classifier/` is a git subtree from mc-chat
+   (`meshcom_mock/classifier/`). **Never edit those files in this repo.** All findings tagged
+   `[SUBTREE→mc-chat]` are fixed in `/Users/martinwerner/WebDev/mc-chat`, then synced via
+   `git subtree pull` (recipe in CLAUDE.md). Track M in the wave plan.
+5. **Wire-format stability:** the Vue webapp (`/Users/martinwerner/WebDev/webapp`) consumes the
+   SSE events and REST responses. Do not rename event names, JSON fields, or response shapes
+   unless the finding explicitly says "coordinate with webapp" AND the webapp is changed in the
+   same effort. When in doubt, preserve the wire format and fix only internals.
+6. **Timestamps are milliseconds** everywhere in the DB. `datetime.fromtimestamp(ts / 1000)`.
+7. **Migration blocks** in `sqlite_storage.initialize()` are historical record — never rewrite
+   old `current_version < N` blocks. New schema changes = new block + version bump.
+8. **Preserve exact constant values** when extracting magic numbers. Extraction is a rename,
+   not a retune. If a value looks wrong (e.g. the two contradictory timezone offsets), that is a
+   separate correctness finding — do not "fix" values silently during extraction.
+9. **Commits:** one commit per wave, format `[type] description` (fix/refactor/perf/chore/docs),
+   only after the Opus verification of that wave passes.
+10. **Scope discipline:** fix what the wave lists, nothing else. If you spot something new,
+    append it to the "Discovered during waves" section at the bottom of this file instead of
+    fixing it inline. (This is the primary "model drift" the Opus agent will check for.)
+
+---
+
+## 3. Critical findings (all independently verified — Wave 1)
+
+- **C-01 `✓F` [reliability]** `src/mcapp/udp_handler.py:150-164` — The `try/except Exception`
+  wraps the **entire** `while self._running` listen loop; any exception escaping
+  `_process_received_message` permanently kills UDP reception (only trace: a `print`).
+  **Fix:** move try/except *inside* the loop body, `logger.exception(...)`, `continue`;
+  re-raise `asyncio.CancelledError`.
+
+- **C-02 `✓F` [bug]** `src/mcapp/main.py:516` — `limit = min(params.get("limit", 20), 100)` has
+  no lower bound; a client-supplied negative limit reaches SQLite where `LIMIT -1` means
+  *unlimited* → full message-table dump into RAM on a 512 MB Pi. Non-int input also TypeErrors.
+  **Fix:** `limit = max(1, min(int(params.get("limit", DEFAULT_PAGE_LIMIT)), MAX_PAGE_LIMIT))`
+  with try/except around the int coercion.
+
+- **C-03 `✓F` [data loss]** `ble_service/src/main.py:1050-1058` — SSE generator drops queued
+  notifications whose timestamp equals the previous one (`if notification["timestamp"] > last_sent:`
+  after `popleft()` — the popped event is gone). Two BLE notifications in the same millisecond
+  (D-Bus burst, multi-part `SE`+`S1` responses) → second mesh message permanently lost. The shared
+  module-level deque also means a second SSE consumer (curl debugging) steals events round-robin.
+  **Fix:** delete the `last_sent` filter (popleft already guarantees exactly-once for one
+  consumer); document the single-consumer contract or give each client its own queue.
+
+- **C-04 `✓F` [correctness]** `src/mcapp/meteo.py:296-298 and 552` — Two contradictory hardcoded
+  timezone offsets: `_validate_data_age` assumes fixed UTC+2 (CEST), `_is_daytime` assumes fixed
+  UTC+1 (CET). The age check is wrong by 1 h half the year against `max_age_minutes=30`, so fresh
+  data is discarded / stale data accepted; day/night flips at the wrong hour in summer.
+  **Fix:** one shared helper using `zoneinfo.ZoneInfo("Europe/Berlin")` (the API request already
+  pins `"timezone": "Europe/Berlin"`); use it in both places.
+
+- **C-05 `✓F` [deploy safety]** `scripts/update-runner.py:154-170` — `get_oldest_slot()`'s
+  "prefer empty" loop does **not** skip the active slot (the second loop does). If the active
+  slot's meta file is missing/empty (`status == "empty"` or no `version`), the runner deploys
+  **over the running installation** with no rollback target. Note `active` is computed at :156
+  and unused until the second loop.
+  **Fix:** `if i == active: continue` in the first loop too.
+
+- **C-06 `✓F` [pipeline stall]** `src/mcapp/commands/response.py:106-108` +
+  `src/mcapp/main.py:278-280` — `send_response` sleeps 12 s between response chunks, and
+  `MessageRouter.publish` awaits subscribers **sequentially**, and the UDP listen loop awaits
+  `_process_received_message` inline. Net effect: any multi-chunk command response freezes the
+  entire inbound pipeline (UDP processing, storage, SSE broadcast of new messages) for 12 s per
+  extra chunk (~24 s for a 3-chunk response).
+  **Fix:** send chunks from a background task (same `add_done_callback` pattern as
+  ctcping.py:157-159), preserving chunk order and the 12 s spacing (LoRa airtime constraint)
+  within the task. Use the existing-but-unused `MSG_DELAY` constant (rename to
+  `CHUNK_SEND_DELAY_SECONDS`) instead of the literal `12`.
+
+- **C-07 `✓F` [bug]** `src/mcapp/main.py:1110-1141` — Two related defects: (a)
+  `_handle_outgoing_message(self, message_data, _protocol_type="udp")` receives the protocol but
+  never forwards it — `_create_synthetic_message(message_data)` falls back to `"udp"`, so BLE
+  self-messages are stored/routed with `src_type: "udp"`. The underscore rename silenced the
+  unused-arg warning that pointed at the defect. (b) Synthetic `msg_id = f"{current_time:08X}"`
+  has 1-second resolution — two local commands in the same second collide and dedup drops the second.
+  **Fix:** pass `_protocol_type` through (rename back to `protocol_type`); derive msg_id from
+  ms + counter or `uuid4().hex[:8].upper()`.
+
+- **C-08 `✓F` [data loss risk]** `src/mcapp/sqlite_storage.py:1096-1123 + 1889` — Every
+  `_execute`/`_execute_many` opens a fresh `sqlite3.connect(self.db_path)` with the default 5 s
+  busy timeout and no `PRAGMA busy_timeout`; the nightly prune runs `VACUUM` which on a ~1 GB DB
+  on a Pi Zero holds the DB far longer than 5 s → concurrent `store_message` raises unhandled
+  `sqlite3.OperationalError: database is locked` and inbound messages are silently lost.
+  **Fix (minimal, Wave 1):** `sqlite3.connect(self.db_path, timeout=60)` (named constant) in both
+  helpers, plus try/except+log around the write path in `store_message`. Deeper connection-reuse
+  work is Wave 7 (ST-02).
+
+---
+
+## 4. Findings by area (MAJOR unless noted)
+
+### 4.1 Core — main.py, udp_handler.py, config_loader.py, logging_setup.py, schemas.py
+
+- **CO-01 [silent degradation]** `main.py:36-41` — `try: from .sse_handler import ... except
+  ImportError: SSE_AVAILABLE = False` swallows *any* transitive ImportError (a typo inside
+  sse_handler after a refactor) and silently disables the whole REST/SSE API; the later warning
+  ("FastAPI/Uvicorn not installed", :1328) misdiagnoses the cause. Fix: import sse_handler
+  unconditionally; if a guard is wanted, guard the fastapi/uvicorn imports narrowly and log the
+  actual exception. Related: sse_handler.py:46-79 `FASTAPI_AVAILABLE`/`UVICORN_AVAILABLE`
+  fallbacks and `create_sse_manager`'s None-return path are legacy defensive code for hard
+  dependencies declared in pyproject — remove together.
+- **CO-02 [duplication]** `main.py:950-1049 vs 1051-1101` — `_udp_message_handler` and
+  `_ble_message_handler` are ~90 % identical. Fix: one `_handle_outbound(routed_message,
+  protocol, send)` parameterized by a send callable; deletes ~70 lines.
+- **CO-03 [duplication]** `main.py:529-599` — three mheard dump handlers identical except three
+  strings and the storage method. Fix: one parameterized handler driven by a small table.
+- **CO-04 [structure]** `main.py:1212-1622` — `main()` is ~410 lines mixing storage init,
+  migration, classifier wiring, six nested background closures, signal handling, stdin reader,
+  startup tests, and a 4-step shutdown ladder. Fix: extract `build_app()` wiring, move background
+  jobs (`_nightly_prune`, `_maybe_backfill_classifier`, `_classifier_stats_broadcast`, caches) to
+  module-level functions taking explicit deps, extract `shutdown()`. `main()` → ~40 lines.
+- **CO-05 [structure]** `main.py:150-223` — 74-line `test_suppression_logic` lives inside the
+  production `MessageRouter`. Keep the startup-test design; move the suite next to the other test
+  modules and call it from there (keep `router.test_suppression_logic()` as a thin delegate so
+  `run_startup_tests.py` keeps working, or update that script in the same wave).
+- **CO-06 [config]** `main.py:78-81 + 249-255` — hardcoded `block_list = ["response",
+  "OE0XXX-99"]` in source **and** a second independent blocklist (`command_handler.
+  blocked_callsigns` via `hasattr`). Two sources of truth. Fix: one blocklist from config/DB
+  injected into both paths. (Decision D-3, Section 9.)
+- **CO-07 [API honesty]** pervasive `hasattr(self.storage_handler, ...)` guards
+  (`main.py:418,458,469,480,491,1238,1243,1551`, same pattern in sse_handler) against the
+  project's own `SQLiteStorage`. Fix: type the attribute as a `Protocol`/concrete class, drop the
+  guards — a missing method should be a loud failure, not a silent 503/skip.
+- **CO-08 [perf/DoS]** `udp_handler.py:87-99` — `try_repair_json` deletes one byte per
+  `JSONDecodeError` and re-parses: up to ~1024 parses per malformed 1 KB datagram on the event
+  loop. Fix: cap repair attempts (e.g. 10), then log once and drop.
+- **CO-09 [consistency]** `udp_handler.py:83,124,148,160` — transport layer uses `print()`
+  instead of the logging system; invalid RF characters double-reported at ERROR level (log spam).
+  Fix: logger only; demote routine RF noise to DEBUG.
+- **CO-10 [perf]** `udp_handler.py:235-252` — new socket per outgoing datagram plus executor
+  round-trip; latent NameError in `finally` if `socket.socket()` itself raised. Fix: one
+  long-lived send socket created in `__init__`, direct `sendto` (UDP send doesn't block).
+- **CO-11 [duplication]** `config_loader.py:37/52-55 vs 134/147-150` — every default duplicated
+  between dataclass fields and `_from_dict`'s `data.get(key, <copy>)`. Fix: build kwargs only for
+  keys present in the file and let dataclass defaults be the single source.
+- **CO-12 [dead code]** `config_loader.py:169-190` — `to_dict()`/`save()` have no callers and the
+  round-trip silently drops `BLE_MODE` (would corrupt config if ever used). Fix: delete.
+- **CO-13 (MINOR, grouped) [dead code]** `main.py:69-75` `debug_signal_handler` never registered;
+  `main.py:56,1630` global `has_console` write-only; `logging_setup.py:103-114` `console_print`
+  zero callers; `udp_handler.py:108,222-223` `message_callback` always None. Fix: delete all.
+- **CO-14 (MINOR) [bug risk]** `main.py:241` — `message_data.get("src", "").split(...)` crashes
+  if `src` is present but `None`. Fix: `(message_data.get("src") or "")`.
+- **CO-15 (MINOR)** `main.py:88 vs 236` — `self.storage_handler` (object) vs
+  `self._storage_handler` (coroutine method) differ by one underscore. Fix: rename the method to
+  `_store_routed_message`.
+- **CO-16 (MINOR)** `logging_setup.py:33-38` — `EmojiFormatter.format` mutates the shared
+  `record.msg` (handler-order dependent, prefix stacking risk). Fix: build the prefixed string
+  without mutating the record.
+- **CO-17 (MINOR)** `schemas.py:16-28` — `SendMessageRequest` is a grab-bag for several
+  endpoints (send + BLE pairing + pagination + client_id). Fix: split per endpoint.
+- **CO-18 (MINOR)** `__init__.py:5-25` — `git describe` subprocess at import time of the package.
+  Fix: lazy `__getattr__` version lookup.
+- **CO-19 (MINOR)** `main.py:1011-1014` — comment claims firmware accepts only
+  `type,dst,msg,src` but code strips only `src_type`. Fix: explicit whitelist dict or fix comment.
+- **CO-20 (MINOR)** `main.py:749` — `_handle_ble_pair_command` silently drops `BLE_Pin`
+  (`client.pair(MAC)`); the noqa claims "pin used by BLE service". Verify against
+  `ble_client_remote.pair` signature; forward the pin or document where PIN entry happens.
+- **CO-21 (OPTIONAL — prior decision)** `main.py:296-392` — `route_command` is a 95-line if/elif
+  chain with order-dependent prefix matching. `doc/tech-debt.md` (2026-02-27) analyzed it and
+  ruled "Kein Problem, bleibt so". A dispatch dict + ordered prefix table would still improve
+  extensibility. Decision D-6, Section 9 — default: leave as-is.
+- **CO-22 [perf]** `main.py:1544-1567` — the 60 s stats broadcaster runs
+  `classifier.collect_stats()` + `count_blocked_text_hits_24h()` (DB scans) even with zero SSE
+  clients connected — steady background CPU/IO on the Pi for nobody. Fix: skip the work when
+  `sse_manager.get_client_count() == 0`.
+
+### 4.2 Storage — sqlite_storage.py
+
+- **ST-01 `✓F` [dead code + misleading docs]** `:199,513-520,1125-1133,3697-3703` — the
+  "persistent read connection" `_read_conn` is opened at startup and closed at shutdown but **no
+  query ever uses it**; `_ensure_read_conn()` has zero callers; the docstring of
+  `get_smart_initial_with_summary` claims "all queries share the persistent read connection"
+  while the code opens a fresh connection. Fix: delete `_read_conn`/`_ensure_read_conn` and fix
+  the docstring (or actually implement connection reuse — that's ST-02/Wave 7; don't do both).
+- **ST-02 [perf]** `_execute` opens a new connection per query (see C-08 for the Wave-1 hotfix).
+  Wave 7: introduce a real shared read connection (with a lock — `to_thread` may interleave) or
+  a tiny pool; measure before/after on the Pi.
+- **ST-03 [duplication, ~400 lines]** `:2225-2397, 2399-2513, 2515-2629, 2664-2736, 2738-2815` —
+  the "sort entries → emit gap-marker dict → emit stats entry → sort by (callsign, ts)" block is
+  copy-pasted **five times**; `process_mheard_yearly`/`_monthly` are byte-identical except
+  `ONE_YEAR_MS` vs `ONE_MONTH_MS` (incl. verbatim-duplicated UNION-ALL SQL at 2408-2424 vs
+  2524-2540). Fix: one `_build_chart_series(...)` helper + one parameterized window query;
+  yearly/monthly become 3-line wrappers. ~400 → ~80 lines.
+- **ST-04 [structure]** god class (~90 methods, 8 concerns). Fix: split into mixins along the
+  existing seams — `storage/migrations.py`, `storage/ingest.py` (store_message/store_telemetry/
+  bucketing), `storage/mheard_stats.py`, `storage/prefs.py`, `storage/classifier_api.py` —
+  assembled into `SQLiteStorage` as a facade (same pattern as `commands/handler.py`), so callers
+  don't change.
+- **ST-05 [structure]** `store_message` (`:1135-1451`) is 317 lines handling filtering, field
+  extraction, ACKs, echo-id, mheard dual-write, throttling, dedup, classification, INSERT.
+  Fix: extract `_handle_ack()`, `_store_mheard()`, `_store_position()`, `_insert_message_row()`;
+  the PLR0912/PLR0915 noqas then go away.
+- **ST-06 [API design]** `_execute` returns `list | int`, forcing ~25 `cast()` calls and ~9
+  `isinstance`-raise blocks (two inconsistent idioms for the same problem). Fix: split into
+  `_query(...) -> list[dict]` and `_mutate(...) -> int`; delete all casts/guards.
+- **ST-07 [perf]** `:2064-2103` — `get_smart_initial_with_summary` runs `ROW_NUMBER() OVER
+  (PARTITION BY ...)` over **all** `type='msg'` rows + a whole-table GROUP BY with an unindexable
+  `msg NOT LIKE '%:ack%'`, on **every web-client connect**. Fix: bound with
+  `AND timestamp >= ?` (now − retention window) and/or cache the summary.
+- **ST-08 [perf]** `:3638-3661` — `count_blocked_text_hits_24h` pulls every message of the last
+  24 h into Python for substring matching — and it runs from the 60 s stats broadcast. Fix: SQL
+  `LIKE`-count per blocked text, or compute incrementally; combined with CO-22 (skip when no SSE
+  clients are connected).
+- **ST-09 [perf]** `:2817-2845, 2847-2877` — `get_stats` and `get_mheard_stations` fetch raw rows
+  and aggregate in Python; both are single GROUP-BY queries. Fix: push aggregation into SQL.
+- **ST-10 [leak]** `:943-968, 2631-2662` — `_accumulate_signal` evicts old buckets only for the
+  *same callsign*; a station that goes silent leaves its bucket in `_bucket_accumulators`
+  forever (unbounded on 512 MB) and `_flush_all_accumulators` re-flushes it on every stats run.
+  Fix: evict/remove flushed buckets older than the current window regardless of callsign.
+  **Scheduled in Track U wave U2** — UDP signal ingestion multiplies accumulator load.
+- **ST-11 `✓F` [bug]** `:2960-2965` — `get_positions` compares `UPPER(src) LIKE ?` against
+  `f"%{callsign}%"` **without uppercasing the parameter** (unlike `get_search_summary:2892`);
+  lowercase input returns zero rows. Also `%`/`_` in input act as wildcards. Fix:
+  `callsign.upper()` + escape LIKE metacharacters.
+- **ST-12 `✓F` [API honesty]** `:2847` — `get_mheard_stations(self, _limit, _msg_type)` accepts
+  and silently ignores both params; caller `commands/data_commands.py:99` passes real values.
+  Hardcodes `LIMIT 4000`. Fix: honor the params (limit default as named constant) or change the
+  signature and call sites explicitly.
+- **ST-13 [duplication]** `:3243-3268 vs 3270-3295; 3171-3205 vs 3207-3241` — sidebar get/set
+  pairs and hidden/blocked trios identical except table name. Fix: private helpers with table
+  names from a fixed whitelist.
+- **ST-14 [duplication + inconsistent errors]** `:3329-3334, 3379-3381, 3419-3421` —
+  classifier-rule row post-processing (JSON decode + bool coercion) 3×, once with try/except and
+  twice without. Fix: one `_normalize_rule_row(row)`.
+- **ST-15 [magic numbers in SQL]** literal `3600000` inside five SQL strings although
+  `HOURLY_BUCKET_MS` exists (`:1917-1918, 2415, 2423, 2531, 2539, 1840`); `3600` gap offsets at
+  `:2470, 2587`. Fix: parameterize/interpolate the constant.
+- **ST-16 [dead/parallel code]** `:1943-1986 vs 2044-2117` — `get_initial_payload` and
+  `get_smart_initial_with_summary` are two parallel initial-payload implementations with
+  divergent paging semantics. Verify callers; delete or delegate.
+- **ST-17 [OOM risk]** `:2218-2223, 3043-3057` — `get_full_dump`/`save_dump` materialize the
+  entire messages table (+ JSON copies) in RAM. Fix: stream in chunks.
+- **ST-18 (MINOR, grouped)** dead `mheard_cache` table (`:113-121`, `✓F` no readers/writers);
+  `min_cutoff_ms` holds a max (`:1794`); `process_mheard_store_parallel` contains no parallelism
+  (rename); `aggregate_hourly_buckets` always `return 0`; permanently-NULL `qnh` threaded through
+  writes (`:1573-1577`); telemetry dedup `recent_list[0]` without ORDER BY (`:1586-1593`);
+  `src_type == "BLE"` uppercase vs lowercase everywhere else (`:1726`) — **resolve in Track U
+  wave U1**, the new signal gate needs one casing contract; legacy fallback credits
+  measurement to every relay-path callsign vs primary path crediting first only (`:2372-2382`);
+  filter strings duplicated between filter and prune (`:1734-1736 vs 1812-1815`); `BucketTuple`
+  10-field positional tuple built identically in two places → NamedTuple; "exact" search does
+  substring match (`:2893-2895`); N+1 UPDATE loop in `clear_stale_auto_beacons` (`:3507-3547`);
+  `VERSION` app constant living in the storage module (`:27`).
+
+### 4.3 SSE/REST — sse_handler.py
+
+- **SSE-01 [structure]** `:148-1044` — `_create_app` is ~900 lines with ~30 nested endpoint
+  closures and the ~200-line `event_generator` triple-nested inside (three PLR0915 noqas).
+  Fix: split into `APIRouter` modules (prefs/sidebar, classifier, update/deploy,
+  weather/telemetry, stream) + extract initial-snapshot yields into `_initial_events()`.
+- **SSE-02 [layering]** `:300-304, 776-780, 807-811, 858-862, 888-892` — identical
+  classifier-rules SELECT duplicated 5×, executed via private `storage._execute()` with
+  `# noqa: SLF001` (raw SQL in the transport layer). Same for templates (`:956-991`) and rule
+  CRUD (`:787-885`). Fix: move the SQL into storage methods (note: `get_classifier_rules`,
+  `insert_classifier_rule`, `update_classifier_rule` etc. **already exist** in sqlite_storage —
+  the endpoints just don't use them; reconcile and use them). Kills all SLF001 noqas.
+- **SSE-03 [duplication]** `:805-816 vs 856-867 vs 886-897` — rule-mutation postlude (bump
+  version → `classifier.load()` → re-SELECT → broadcast) copy-pasted 3× in create/patch/delete.
+  Fix: one `_after_rule_mutation()` helper.
+- **SSE-04 [duplication]** 15 endpoints repeat the storage-guard idiom
+  (`storage = ... if self.message_router else None` + `hasattr` + 503) while the `_storage()`
+  helper (`:762`) exists and is used only by classifier routes. Fix: use `_storage()` (or a
+  FastAPI dependency) everywhere; drop `hasattr` (see CO-07).
+- **SSE-05 [perf]** `:1070-1073` — blocking `socket.connect_ex` (1 s timeout) directly in an
+  async endpoint stalls the event loop and all SSE streams. Fix:
+  `asyncio.wait_for(asyncio.open_connection(...), 1.0)`.
+- **SSE-06 [perf]** meteo has no result cache — every `/api/weather(/preview)` runs up to
+  2 external APIs × 3 attempts × 10 s timeout + `time.sleep(1)` retries in a thread, per request.
+  Fix: TTL cache (~5 min) + single-flight guard inside `WeatherService`; preview reuses it.
+- **SSE-07 (MINOR, grouped)** `broadcast_message`/`broadcast_event` near-identical and the
+  `asyncio.gather` over never-awaiting `send()` coroutines allocates tasks per client per message
+  (misleading "fan out in parallel" comment) — plain loop + implement one via the other;
+  `/api/send` if/elif chain → dispatch dict (`:452-486`); initial-snapshot event names hardcoded
+  inline parallel to `_RESPONSE_EVENT_MAP` (`:224-295 vs 1154-1163`) → one ordered table;
+  `_start_time` via `getattr` (`:508,1306`) → init in `__init__`; `allow_origins=["*"]` +
+  `allow_credentials=True` is an invalid CORS combo (`:167-173`) → credentials False;
+  `stream_url` host fallback `"localhost"` wrong for remote clients (`:1096-1102`) → relative
+  URLs; log-level literal `10` (`:1218`) → `logging.DEBUG`; `matches`-bool vs `sample_matches`-
+  list naming inversion (`:933-936`, coordinate with webapp); cryptic
+  `time.tzname[time.daylight and ...]` idiom (`:686`); `_get_installed_version` (`:1048-1057`)
+  — verify callers, likely dead.
+
+### 4.4 Weather — meteo.py
+
+- **MET-01** = C-04 (timezone bugs, Wave 1).
+- **MET-02 [logging]** `:25-29` — library module calls `logging.basicConfig()` at import,
+  hijacking root-logger config for the whole app. Fix: delete; use `logging_setup.get_logger`;
+  CLI-mode logging setup moves into its `main()`.
+- **MET-03 [prod noise]** `:484-485` — `if has_console: print("openmeteo debug:", data)` dumps
+  full API responses in the production fetch path on TTY. Fix: `logger.debug`.
+- **MET-04 (MINOR, grouped)** three unreachable `raise RuntimeError` re-checks (`:135-156`);
+  `format_for_lora` substitutes fake zeros for missing sensor values (`:582-599`) → emit `-` or
+  omit; quality ladder as four PLR2004-noqa'd literals (`:272-280`) → data table (removes noqas);
+  Magnus-formula constants inline (`:338-341`); per-module `VERSION` drift (`:22`).
+
+### 4.5 Commands package
+
+- **CMD-01** = C-06 (12 s chunk sleep, Wave 1).
+- **CMD-02 [dead logic]** `routing.py:247-250 + dedup.py:136-161` — the whole abuse-protection
+  subsystem (failed attempts → 5-min user blocking) is effectively unreachable:
+  `execute_command` swallows all handler exceptions one level below the only
+  `_track_failed_attempt` call site; unknown commands return early without tracking. Users can
+  never accumulate 3 failed attempts. Decision D-1 (Section 9) — default: delete the subsystem
+  (~60 lines) rather than wire it up.
+- **CMD-03 [over-complexity]** `ctcping.py:261-278, 557-586` — two overlapping test-completion
+  mechanisms (event-based + 1 s polling monitor up to 300 s), each patched against the races the
+  other creates (idempotence checks, "over-completion detected" reconciliation, consistency
+  warnings); `_completion_events` holds `asyncio.Event`s that are set but never awaited.
+  Fix: keep the event-based path; monitor becomes a single deadline fallback; delete the
+  reconciliation code.
+- **CMD-04 [structure]** `ctcping.py:24-25` — dual dict-of-dicts state (`active_pings`,
+  `ping_tests`) with stringly-typed statuses and ad-hoc keys created via distant `setdefault`.
+  Fix: two small dataclasses (`ActivePing`, `PingTest`) + status enum; most defensive `.get`
+  checks collapse. This is why a ping command needs 704 lines.
+- **CMD-05 [drift]** `simple_commands.py:68-82 vs handler.py:19-116` — `handle_help` hardcodes
+  its own command list (already omits `!userinfo`/`!ctcping`, shows `user:` where the parser
+  accepts `call:`) while every `COMMANDS` entry carries unused `format`/`description`/`args`
+  metadata. Fix: generate help from `COMMANDS`; delete or start using the dead metadata fields.
+- **CMD-06 [consistency]** `topic_beacon.py, admin_commands.py, response.py,
+  weather_command.py` — these four files log exclusively via `if has_console: print(...)`
+  (~120 sites incl. error paths like the beacon-loop failure, invisible under systemd), while
+  routing/dedup/ctcping use `logger`. Fix: replace all gated prints with logger calls.
+- **CMD-07 [duplication]** `ctcping.py:443 and admin_commands.py:64` — identical strict callsign
+  regex duplicated, and it differs from `CALLSIGN_TARGET_PATTERN` in constants.py (three callsign
+  notions; suppression.py holds a fourth). Fix: named patterns in constants.py, one import; see
+  X-05.
+- **CMD-08 [dead code + magic]** `response.py:148-166` — `_pad_for_chunk_break` never called,
+  while `data_commands.py:137` re-implements the same padding inline with unexplained `138`
+  (= `MAX_RESPONSE_LENGTH - 2`). The two-line-response chunking contract spans two files with
+  zero documentation. Fix: use the helper (or delete it and name the constant), document the
+  contract at `_chunk_response`.
+- **CMD-09 [fail-loud]** `_base.py:58-91` — Protocol stubs are inherited as real no-op methods;
+  a dropped mixin or renamed method silently returns `None`. Fix: stub bodies
+  `raise NotImplementedError` (still valid for typing).
+- **CMD-10 (MINOR, grouped)** `COMMANDS` in handler.py forces deferred imports
+  (`# noqa: PLC0415` in parsing/routing) and aliases are full duplicate entries → move registry
+  to its own module with an `aliases` field; `_is_throttled` ignores its `_command` param yet
+  routing passes `cmd`, and the same message is throttle-checked twice with a mismatched error
+  text ("once per 5min" for 5 s-throttled commands) → keep the post-parse check only; dead:
+  `get_active_pings_info`, `cleanup_ping_tests` (or wire into shutdown), float-timestamp
+  backward-compat branch in dedup.py:184-190; over-defensive try/except + hasattr in
+  simple_commands.py:86-93/ctcping.py:449; path-header stripping duplicated
+  (ctcping.py:171 vs parsing.py:250) → one helper; inline regexes → module-level compiled
+  constants (`MSG_ID_SUFFIX_RE`, `ACK_RE`) — small perf, big naming win (ctcping.py:116's
+  `msg[:-4]` silently depends on the `\d{3}` convention); transport routing literals
+  (`response.py:81,85`) → frozensets in constants.py; `_send_ping_result` bypasses
+  `send_response` routing (ctcping.py:667-695); error texts hardcode limit values that exist as
+  constants (7 sites) → f-strings; `create_command_handler` is a pass-through factory whose
+  docstring overclaims.
+- **CMD-11 (MINOR) [tests]** `tests.py` — blocking "integration" test only asserts set
+  membership, never the enforcement path (`:1026-1096`); duplicate test tuple with contradictory
+  descriptions (`:1803-1822`); beacon length test uses drifted `201` vs limit 120 (`:1134`);
+  `parents[3]` fixture path deserves a comment (`:13`).
+
+### 4.6 BLE stack — mcapp clients + ble_service
+
+- **BLE-01** = C-03 (SSE same-ms drop, Wave 1).
+- **BLE-02 [duplication]** `ble_service/src/main.py:256-343 vs 345-443` — `_auto_reconnect` and
+  `_startup_auto_connect` are ~80-line near-duplicates (same `[5, 10, 20, 60]` delays literal
+  twice). Fix: one parameterized `_retry_connect(...)`; hoist `RECONNECT_DELAYS_S`.
+- **BLE-03 [structure]** `ble_service/src/main.py:44-60` — nine mutable module globals mutated
+  via scattered `global` statements; already caused a latent shadowing bug: `:449,456` assigns
+  `_ble_pin` in `lifespan` **without** `global`, so the module global stays `0` forever. Fix:
+  one `ServiceState` dataclass (or `app.state`); fixes the shadowing as a side effect.
+- **BLE-04 [extensibility]** `ble_adapter.py:753-977` — GATT frame layout
+  `len + type-byte + payload` copy-pasted into 8+ methods with inline type bytes
+  (`0xA0, 0x20, 0x50, 0x55, 0x70, 0x80, 0x90, 0x95, 0xF0`); save flag `0x0A/0x0B` triplicated.
+  Fix: `class MsgType(IntEnum)` + one `_frame(msg_type, payload=b"")` helper +
+  `SAVE_TO_FLASH`/`RAM_ONLY` constants.
+- **BLE-05 [understandability]** `ble_protocol.py:161-180` — `decode_binary_message` returns
+  `{k: v for k, v in locals().items() if k in [...]}` — renaming any local silently removes it
+  from the output; error returns are bare strings so callers isinstance-sniff `dict | str`.
+  Fix: build the dict explicitly; return `None` (or raise) for invalid frames. Also extract
+  `_decode_ack_frame`/`_decode_data_frame` (matches the open tech-debt.md item).
+- **BLE-06 [magic offsets]** `ble_protocol.py:74,82,141` — wire-format offsets unnamed
+  (`byte_msg[1:7]`, `calc_fcs(byte_msg[1:-11])`, `unpack("<BBBHBBBBI", byte_msg[-14:-1])`); the
+  `-11/-14/-1` relationship is underivable from code. Fix: named format strings/lengths + a
+  frame-layout comment block.
+- **BLE-07 [robustness]** `ble_client_remote.py:108` — `_request` parses JSON before checking
+  status, outside the retry-catch; a non-JSON error body (nginx 502 HTML) raises
+  `json.JSONDecodeError` which bypasses retry and the RuntimeError mapping. Fix: parse after
+  status handling, treat decode failure as retryable.
+- **BLE-08 [duplication + dead code]** `ble_client_remote.py:592-685` — `_transform_notification`
+  finalize block triplicated (`:620-624, 652-658, 665-671`), nesting 5 deep; the
+  `raw_bytes.startswith(b"D{")` binary branch (`:659`) is dead (service classifies `D{` as
+  json/raw, never binary — `ble_service/src/main.py:87-94`). Fix: extract `_finalize()`; delete
+  dead branch.
+- **BLE-09 [interface]** the `BLEClientBase` ABC is incomplete: `cancel_reconnect()`,
+  `get_activity()`, `set_ble_pin()`, `refresh_status()` exist only on `BLEClientRemote`; calling
+  them in disabled mode raises `AttributeError`. Fix: add to the ABC with no-op implementations
+  in `BLEClientDisabled`.
+- **BLE-10 [protocol governance]** SSE status wire-strings `"reconnecting"`,
+  `"reconnect_exhausted"`, `"disabled"` exist in no enum on either side
+  (`ble_service/src/main.py:279,332,389,432` + `ble_client_remote.py:695,724`). Fix: wire-state
+  constants on both sides + document the vocabulary in ble_service/README.
+- **BLE-11 [encapsulation]** `ble_service/src/main.py:198-205,609,819,842` — main.py resets
+  `ble_adapter.bus` by hand and checks `ble_adapter._operation_lock.locked()` in three endpoints
+  (each `# noqa: SLF001`). Fix: `BLEAdapter.is_busy` property + `reset_bus()` method.
+- **BLE-12 [perf]** `ble_adapter.py:511-540` — `_find_gatt_characteristic` recurses inside the
+  `except Exception` handler (swallowing real errors) and issues one D-Bus introspect round-trip
+  per tree node. Fix: one `GetManagedObjects()` call (scan() already uses it) filtered by UUID.
+- **BLE-13 [design]** `ble_client_remote.py:202` — error classification by substring-sniffing
+  (`if "reconnect" in error_str.lower() or "409" in error_str`). Fix: typed exception from
+  `_request` (status_code, reason) and branch on fields.
+- **BLE-14 [wire bloat]** `ble_protocol.py:352,368,431` — transformers spread `**input_dict`
+  into output, so events carry both raw and renamed fields (`message`+`msg`, `dest`+`dst`,
+  `path`+`via`). Fix: whitelist emitted fields. **Coordinate with webapp** — it may read the raw
+  names.
+- **BLE-15 [duplication]** `ble_client_remote.py:599-614 vs ble_protocol.py:457-470` — routine
+  JSON TYP list exists twice, drifted (client copy adds `"MH"`, `"CONFFIN"`). Fix: export from
+  ble_protocol, import in the client.
+- **BLE-16 (MINOR, grouped)** dead `hasattr(self, "_sse_backoff")` guard + backoff literals
+  (`ble_client_remote.py:483,536-547`); SSE field parsing by index (`:492-495`) →
+  `removeprefix`; `state_str → ConnectionState` mapping duplicated (`:749-752 vs 806-810`) →
+  `from_wire()`; open-hello bytes constant duplicated (`ble_adapter.py:86 vs 194`); API-key
+  check duplicated + non-constant-time compare (`ble_service/src/main.py:509-516,1018-1021`) →
+  `secrets.compare_digest` in one helper; `RequestConfirmation` auto-accepts pairing without a
+  comment saying it's intentional (`ble_adapter.py:170-171`); `_on_disconnect_detected` nulls the
+  props handler without unsubscribing (`:722`) → call `_unsubscribe_device_properties()`;
+  `calc_fcs`/`ascii_char`/unreachable payload-type branch/strptime-epoch simplifications
+  (`ble_protocol.py:32-129,369`); `uvicorn.run("main:app")` only resolves from `src/` CWD and
+  `[project.scripts]` points a console script at an ASGI object (`ble_service`); factory param
+  `device_mac` accepted and discarded (`ble_client.py:258`); CRC constants in decimal
+  (`4129`/`32768` = 0x1021/0x8000, `ble_service/src/main.py:69`).
+
+### 4.7 Classifier subtree — ALL fixes go to mc-chat, then subtree-sync (Track M)
+
+- **CLS-01 `✓F` [tests/docs]** `src/mcapp/classifier/tests.py` **does not exist** — in either
+  repo (checked mc-chat's `meshcom_mock/classifier/` too; no `run_all_tests` anywhere in
+  mc-chat). CLAUDE.md documents it as a startup suite and `run_startup_tests.py` never runs
+  classifier tests. The classifier has zero test coverage. Fix: create the suite in mc-chat
+  (ephemeral tempfile SQLite as documented), sync, wire into `run_startup_tests.py` and the
+  startup path, and fix CLAUDE.md.
+- **CLS-02 [SUBTREE→mc-chat] [layering]** `classify.py:36-42,152-158` — auto-beacon exemption
+  semantics live in three places (template.py steps, classify.py reclassify branch importing
+  template privates `_AUTO_BEACON_MIN_TOKENS`/`_tokenize_normalized`, and
+  `storage.clear_stale_auto_beacons` SQL). Fix: public `is_exempt(...)`/`check_only(...)` API in
+  template.py; classify.py uses only public Layer-2 API.
+- **CLS-03 [SUBTREE→mc-chat] [duplication/perf]** `template.py:62-101` — the 6-step
+  normalization pipeline is copy-pasted in `_tokenize_normalized` and `fingerprint`, and **both
+  run per inbound message** (double regex-normalization on the Pi). Fix: one `_normalize(text)`
+  source; normalize once in `update_and_check` and derive fingerprint + tokens from it; hoist
+  the two inline `re.sub` patterns to compiled module constants.
+- **CLS-04 [boundary]** `sqlite_storage.py:3443,3666` — host repo imports a private subtree
+  symbol: `from .classifier.types import _ms_to_zulu`. Any mc-chat rename breaks MCProxy
+  silently. Fix (allowed in MCProxy): copy the 3-line helper into sqlite_storage; better
+  (mc-chat): export publicly as `ms_to_zulu`.
+- **CLS-05 [SUBTREE→mc-chat] (MINOR, grouped)** hash length `[:12]` duplicated
+  (template.py:101, classify.py:57) → `TEMPLATE_HASH_LEN` in types.py; unnamed literals
+  (fallback score 0.5, stats windows 30d/24h/7d ms-math, `MS_PER_HOUR`, `_NEUTRAL_OFFSET` 0.5 in
+  score.py:110); score weight table documented in three places → one; `_MINIMAL_TOKEN_CAP` vs
+  `_AUTO_BEACON_MIN_TOKENS` encode the same idea as two unlinked constants → shared
+  `MIN_SIGNAL_TOKENS`; `EMOJI_RE` deliberately copied with a subtle semantic difference between
+  score.py and template.py → move both patterns to types.py; `CATEGORIES` tuple duplicates the
+  `MessageCategory` Literal → `typing.get_args`; reclassify progress can exceed 100 % (skipped
+  rows re-counted every batch, classify.py:287-304); `self._jobs` grows unboundedly and
+  `get_job()` has no MCProxy callers (classify.py:84,364-366); `_target(msg, rule.scope)`
+  recomputed per rule (~40×/message, rules.py:92-96) → precompute per-scope dict once per call.
+
+### 4.8 Scripts — update-runner.py, release.sh
+
+- **SCR-01** = C-05 (deploy-over-active-slot, Wave 1).
+- **SCR-02 [reliability]** `update-runner.py:574-588` — bootstrap timeout only fires when output
+  arrives (`for raw in process.stdout:` blocks indefinitely on silence; deadline check is inside
+  the read loop). A hung bootstrap blocks the runner forever. Fix: reader thread feeding a
+  `queue.Queue` with `q.get(timeout=...)` against the deadline, or a watchdog thread with
+  `process.wait(timeout=...)` + kill.
+- **SCR-03 [magic]** slot count `3` hardcoded 5× (`:142,159,165,244,778`) → `NUM_SLOTS`; note
+  `sse_handler.py:1123` hardcodes it too — keep the constant duplicated-but-named in both
+  processes (they don't share code), with a comment cross-referencing.
+- **SCR-04 (MINOR, grouped)** meta not written when bootstrap fails after slot activation →
+  slot excluded from rollback candidates (`:385-431`); `publish()` suppresses `queue.Full` on
+  unbounded queues and `_history` grows without bound (`:98-105`) → bound both; module globals
+  mutated in `main()` (`SLOTS_DIR`, lowercase `home`) → small `Paths` dataclass or consistent
+  naming; inline `http://localhost:2981/health`, SSE keepalive `30`, trigger path (`:268-270,
+  674,743`) → constants; release.sh `sed -i ''` is macOS-only (document or make portable),
+  stale `mkdir -p` at `:498`.
+
+### 4.9 Cross-cutting
+
+- **X-01 [versions]** 8 divergent per-module `VERSION` constants (v0.46.0…v0.61.0 across
+  sse_handler, meteo, udp_handler, config_loader, logging_setup, commands/constants,
+  sqlite_storage, main) while `mcapp/__init__.py.__version__` (git describe) is the real source.
+  Fix: delete all per-module VERSIONs; import `mcapp.__version__` where a version is actually
+  emitted. Verify nothing (webapp, release.sh) greps for these constants before deleting.
+- **X-02 [time]** `int(time.time() * 1000)` ~45× repo-wide. Fix: one `now_ms()` in a small
+  `mcapp/util.py` (or `logging_setup`-adjacent module); ble_service gets its own copy (separate
+  process, no shared code). Mechanical replace.
+- **X-03 [console]** `has_console`/isatty computed independently in `logging_setup.py`,
+  `commands/constants.py`, `meteo.py`, plus the write-only global in main.py. Fix: single source
+  in logging_setup, imported everywhere; then CMD-06/CO-09 (print → logger) eliminates most uses.
+- **X-04 [units]** `0.3048` (ft→m) defined 3× (`udp_handler.py:22`, `ble_protocol.py:230`,
+  `sqlite_storage.py:1345`). Fix: one `FEET_TO_METERS` constant in the shared util module.
+- **X-05 [callsigns]** four different callsign-regex notions: `suppression.py:33` (inline),
+  `constants.py:15` `CALLSIGN_TARGET_PATTERN`, and the strict pattern duplicated in
+  `ctcping.py:443`/`admin_commands.py:64`. Fix: named, compiled, documented patterns in one
+  place (`commands/constants.py` or the util module); each use site imports the semantically
+  right one. Do not merge patterns that are intentionally different — name them by intent
+  (`CALLSIGN_STRICT_RE`, `CALLSIGN_TARGET_RE`, `DST_CALLSIGN_RE`).
+
+### 4.10 Documentation drift (fix alongside waves)
+
+- **DOC-01 `✓F`** CLAUDE.md says "Current schema: v16"; code migrates to **v18** (and Track U
+  wave U2 bumps it to **v19** — state whatever is current at commit time; U4 re-checks).
+- **DOC-02 `✓F`** CLAUDE.md documents `classifier.run_all_tests()` in
+  `src/mcapp/classifier/tests.py` — the file doesn't exist anywhere (see CLS-01).
+- **DOC-03** `doc/tech-debt.md` is stale: shadow-logic removal listed as open is done;
+  `_udp_message_handler` print/logger item partially done. Refresh after Wave 4.
+- **DOC-04** `get_smart_initial_with_summary` docstring lies about connection reuse (ST-01).
+
+---
+
+## 5. Magic number inventory (Wave 2 work list)
+
+Extraction rule: module-level `UPPER_SNAKE` constants placed near the top of the owning module
+(or the module's existing constants block), **exact values preserved**, one commit. Where a value
+encodes a cross-service contract (marked ⚠), add a comment stating the invariant.
+
+### core
+| Value | Site(s) | Constant |
+|---|---|---|
+| 20 / 100 (page default/max) | main.py:516 | `DEFAULT_PAGE_LIMIT`, `MAX_PAGE_LIMIT` |
+| 3 (BLE cmd retries) | main.py:607 | `BLE_CMD_MAX_RETRIES` |
+| 4 (nightly prune hour) | main.py:1466 | `NIGHTLY_PRUNE_HOUR` |
+| 60.0 (stats interval) | main.py:1561 | `CLASSIFIER_STATS_INTERVAL_S` |
+| 5.0/5.0/3.0/3.0 (shutdown ladder) | main.py:1584-1613 | `SHUTDOWN_TIMEOUT_*` |
+| register-type tuple | main.py:1252 | `BLE_REGISTER_TYPES` |
+| 1024 (recv buffer) | udp_handler.py:156 | `UDP_RECV_BUFFER_BYTES` |
+| 10 (JSON repair cap — new) | udp_handler.py:87-99 | `MAX_JSON_REPAIR_ATTEMPTS` |
+| callsign regex | suppression.py:33 | `CALLSIGN_RE` (compiled) |
+
+### storage (all in sqlite_storage.py unless noted)
+| Value | Site(s) | Constant |
+|---|---|---|
+| 120_000 (mheard throttle) | :1363 | `MHEARD_THROTTLE_MS` |
+| 300_000 (ACK diag window) | :1240 | `ACK_DIAG_WINDOW_MS` |
+| 60_000 (telemetry dedup) | :1589,1631 | `TELEMETRY_DEDUP_WINDOW_MS` |
+| 0.0065 / 288.15 / 5.255 | :1575 | `BARO_LAPSE_RATE_K_PER_M`, `BARO_STD_TEMP_K`, `BARO_EXPONENT` |
+| 192 h (pos/ack retention) | :1758-1759 | `DEFAULT_POS_RETENTION_HOURS` |
+| 365 d / 30 d retention | :1820,1838,1845 | `LONG_RETENTION_DAYS`, `STATION_RETENTION_DAYS` |
+| 0.9 / 200 / 1000 (prune math) | :1862-1865 | `PRUNE_TARGET_FRACTION`, `EST_BYTES_PER_ROW`, `MIN_PRUNE_ROWS` |
+| 8-day rollup cutoff | :1907 | `EIGHT_DAYS_MS` (couple to retention constant) |
+| 1000/500/200 (payload limits) | :1949,1958,2092 | `INITIAL_MSG_LIMIT`, `INITIAL_POS_LIMIT`, `INITIAL_ACK_LIMIT` |
+| 20 (page size) | :2047,2119,2133 | `DEFAULT_PAGE_SIZE` (align with core's `DEFAULT_PAGE_LIMIT`) |
+| 3600000 in SQL (5×) | :1840,1917-1918,2415,2423,2531,2539 | reuse `HOURLY_BUCKET_MS` |
+| 3600 (gap offset s) | :2470,2587 | `HOURLY_BUCKET_S` |
+| 4000 (mheard scan) | :2852 | `MHEARD_STATION_SCAN_LIMIT` |
+| 86400 | :2886,2958 | `SECONDS_PER_DAY` |
+| 4×3600×1000 / 8760 | :3073,3070 | `TELEMETRY_BUCKET_MS`, `HOURS_PER_YEAR` |
+| 60 (new, C-08) | `_execute` | `SQLITE_BUSY_TIMEOUT_S` |
+
+### sse_handler
+| Value | Site(s) | Constant |
+|---|---|---|
+| 256 (queue bound) | :91 | `SSE_CLIENT_QUEUE_SIZE` |
+| 30.0 (keepalive) | :402 | `SSE_KEEPALIVE_SECONDS` |
+| 8 (client-id chars) | :183 | `CLIENT_ID_LENGTH` |
+| 744 (telemetry max hours) | :696 | `TELEMETRY_MAX_HOURS` |
+| 500 / 20 (rule-test scan, template caps) | :917,955,989 | `RULE_TEST_SCAN_LIMIT`, `TEMPLATE_LIST_MAX`, `TEMPLATE_PREVIEW_LIMIT` |
+| 2985 (update-runner port, 3×) ⚠ | :1072,1101,1102 | `UPDATE_RUNNER_PORT` |
+| update file paths | :1083-1084 | `UPDATE_ARGS_FILE`, `UPDATE_TRIGGER_FILE` |
+| 3 (slots) ⚠ | :1123 | `SLOT_COUNT` (cross-ref update-runner) |
+| 5.0 (shutdown), 2981 (port) | :1341,1358 | `SERVER_SHUTDOWN_TIMEOUT`, `DEFAULT_SSE_PORT` |
+
+### meteo
+| Value | Site(s) | Constant |
+|---|---|---|
+| 10 / 2 / 1 (HTTP timeout, retries, delay) | :60-61,521,525 | `HTTP_TIMEOUT_S`, `MAX_RETRIES`, `RETRY_DELAY_S` |
+| 17.27 / 237.7 / 6.112 (Magnus) | :338-341 | `_MAGNUS_A`, `_MAGNUS_B`, `_MAGNUS_E0_HPA` |
+| 12.5 (%/okta), 1 (calm km/h), 25 (preview len) | :568,605,585 | `_PERCENT_PER_OKTA`, `_CALM_WIND_KMH`, `_ERROR_PREVIEW_LEN` |
+| quality ladder 100/80/60/40 | :272-278 | `_QUALITY_LADDER` table (removes 4 noqas) |
+
+### commands
+| Value | Site(s) | Constant |
+|---|---|---|
+| 12 (chunk delay) | response.py:108 | rename dead `MSG_DELAY` → `CHUNK_SEND_DELAY_SECONDS`, use it |
+| 5×60 (msg-id TTL), 3, 5×throttle, [:8] | dedup.py:27,35,37,105 | `MSG_ID_TIMEOUT_SECONDS`, `MAX_FAILED_ATTEMPTS`, `BLOCK_DURATION_SECONDS`, `CONTENT_HASH_LENGTH` |
+| 30.0 / 20.0 / 300 / 1.0 (ping timings) | ctcping.py:26,521,561,577 | `PING_ACK_TIMEOUT_SECONDS`, `PING_INTERVAL_SECONDS`, `PING_TEST_MAX_WAIT_SECONDS` (poll removed by CMD-03) |
+| strict callsign regex (2×) | ctcping.py:443, admin_commands.py:64 | `CALLSIGN_STRICT_PATTERN` (X-05) |
+| 138 (padding target) | data_commands.py:137 | `MAX_RESPONSE_LENGTH - CHUNK_SEPARATOR_RESERVE` (CMD-08) |
+| defaults 5/24/1/7/30 (mheard, stats-h, search-d, position-d, beacon-min) | data_commands.py:93,69,18; simple_commands.py:101; topic_beacon.py:64 | `DEFAULT_*` constants |
+| 10 / 10 (beacon offset, floor) | topic_beacon.py:103-104 | `BEACON_EARLY_SEND_SECONDS`, `MIN_BEACON_INTERVAL_SECONDS` |
+| 50 (preview slice) | topic_beacon.py:94 | use existing `_STATUS_PREVIEW_CHARS` |
+| 30 (weather max age) | weather_command.py:18 | `WEATHER_MAX_AGE_MINUTES` |
+| limit values inside error texts (7 sites) | routing.py:97; ctcping.py:421,455,462,583; topic_beacon.py:76,81 | f-strings referencing the constants |
+
+### BLE (mcapp side)
+| Value | Site(s) | Constant |
+|---|---|---|
+| 45.0 ⚠ (= 3×10 s adapter attempts + slack) | ble_client_remote.py:241 | `CONNECT_REQUEST_TIMEOUT_S` |
+| 5/2/60 (SSE backoff) | :56,483,537,542,547 | `SSE_BACKOFF_INITIAL_S`, `_FACTOR`, `_MAX_S` |
+| 30/90 ⚠ (read must exceed server ping 30 s) | :473-478 | `SSE_READ_TIMEOUT_S` + invariant comment |
+| 15.0 / 2.0 / 2 / 1.5 / 4 | :54-55,84-85,424 | `CONNECT_COOLDOWN_S`, `SSE_DISCONNECT_GRACE_S`, `REQUEST_RETRIES`, `REQUEST_RETRY_DELAY_S`, `STARTUP_STATUS_RETRIES` |
+| frame offsets/masks | ble_protocol.py:74-146 | see BLE-06; plus `ACK_TYPE_NODE/GATEWAY`, bitmask constants |
+| "MC-" prefix (5×) | ble_client*.py, ble_adapter.py:248, ble_service main:605 | `MESHCOM_NAME_PREFIX` |
+
+### ble_service
+| Value | Site(s) | Constant |
+|---|---|---|
+| [5,10,20,60] (2×) | main.py:265,371 | `RECONNECT_DELAYS_S` (BLE-02 dedups the loops anyway) |
+| type bytes 0xA0…0xF0, 0x0A/0x0B | ble_adapter.py:753-977 | `MsgType(IntEnum)`, `SAVE_TO_FLASH`, `RAM_ONLY` (BLE-04) |
+| 4129/32768 (CRC, decimal!) | main.py:69 | `CRC16_POLY = 0x1021`, `CRC16_MSB = 0x8000` |
+| 1000 / 50 (deques) | main.py:46,60 | `NOTIFICATION_QUEUE_SIZE`, `ACTIVITY_LOG_SIZE` |
+| 30.0 ⚠ (SSE ping — client read timeout depends on it) | main.py:1042 | `SSE_PING_INTERVAL_S` |
+| 10.0/5.0/3.0/0.5/300/3600/2/0.8/1.0/0.2 (timeouts/settles) | ble_adapter.py various, main.py:210,921-923 | `CONNECT_TIMEOUT_S`, `WRITE_TIMEOUT_S`, `DISCONNECT_TIMEOUT_S`, `KEEPALIVE_INTERVAL_S`, `DST_CHECK_INTERVAL_S`, `POST_PAIR_SETTLE_S`, `REGISTER_QUERY_DELAY_S`, `POST_CONNECT_SETTLE_S`, `INTER_MESSAGE_DELAY_S` |
+| "hci0" (3×) | ble_adapter.py:241,266,1125 | `ADAPTER_PATH = "/org/bluez/hci0"` |
+| b"\x04\x10\x20\x30" (2×) | ble_adapter.py:85-86,194 | `OPEN_HELLO` |
+| wire strings "reconnecting"/"reconnect_exhausted"/"disabled" ⚠ | main.py + client | BLE-10 wire-state constants |
+
+### scripts + classifier: see SCR-03/SCR-04 and CLS-05 (classifier constants go to mc-chat).
+
+---
+
+## 6. What is already good — do not churn
+
+- `suppression.py` — pure, documented, testable. Leave alone (except the one regex constant).
+- Classifier 3-layer design maps 1:1 to files; thresholds (`AUTO_BEACON_RULES`) and score
+  weights already named with good comments. Layering fix (CLS-02) is the only structural item.
+- `commands/_base.py`'s Protocol explicitly documents every cross-mixin contract — the mixin
+  architecture here is navigable, keep it (just make the stubs fail loudly, CMD-09).
+- `commands/parsing.py` dispatch-table design (the v2 parser) — the pattern the rest should follow.
+- `release.sh` — trap-based rollback, disciplined. Only the two MINOR notes in SCR-04.
+- Recent SSE fixes (serialize-once broadcast, bounded client queues) — already landed, don't redo.
+- Migration chain + prefs tables extend cleanly.
+- BLE module headers document the wire format well; NUS UUIDs and several timing constants
+  already named.
+- Startup-test design (no pytest, suites run at boot / via `run_startup_tests.py`) is intentional
+  — extend it, don't replace it.
+
+---
+
+## 7. Wave plan for the Sonnet fix agent
+
+**Master sequence (quality waves + UDP 2.0 feature track):**
+
+1. **Wave 1** — critical fixes (below). Prerequisite for Track U (C-01, C-08).
+2. **Track U = UDP 2.0 waves U1–U4** per `doc/UDP-2.0-impl.md` — feature work lands on the
+   stabilized base, *before* the mechanical/structural quality waves reshape the files it
+   touches. Integration notes below.
+3. **Waves 2–7** — quality work as specified below. Wave 6's `store_message` extraction (ST-05)
+   then folds the U1 signal path in as an already-extracted helper.
+4. **Track M** (classifier via mc-chat) and **Track D** (docs) — parallel, as before.
+
+Every wave: read the listed findings, re-verify each against current code, implement, run the
+gates (Section 8 preamble), self-review the diff for scope creep, then stop for Opus review.
+If a finding turns out to be already fixed or wrong, note it in "Discovered during waves" below —
+never "fix" something that isn't broken.
+
+**Wave 1 — Surgical correctness fixes (small diffs, no refactoring)**
+Scope: C-01…C-08, ST-11, BLE-07, SCR-02, CO-14.
+Rules: minimal diffs; no renames beyond what the fix needs; each fix independently revertable.
+For C-06 preserve chunk order and 12 s spacing (LoRa airtime) inside the background task.
+For C-08 apply only the timeout+retry hotfix, not the connection redesign.
+Acceptance: gates pass; for C-01 a malformed-message injection no longer kills the loop (add a
+startup-test case if feasible); for C-04 add test cases with winter+summer timestamps to the
+command suite (weather validation is testable without network by calling the validators directly).
+
+**Track U — UDP 2.0 Extern-UDP signal integration (waves U1–U4, after Wave 1)**
+Authoritative spec: `doc/UDP-2.0-impl.md` (wire format §2, design principles §4, decisions §5
+with accepted defaults U-D1…U-D6, per-wave scope/acceptance §6). Consistency couplings with
+this verdict — binding for the fix agent:
+- **U1 × ST-05:** implement the new signal-ingestion path (`has_signal` predicate + signal_log
+  insert + `_accumulate_signal` + `_upsert_station_position(..., "signal")`) as an **extracted
+  helper** (e.g. `_ingest_signal(...)`) called from `store_message`, not as more inline lines in
+  the 317-line function. Wave 6 then keeps it untouched.
+- **U1 × ST-18 (`src_type == "BLE"` casing):** the new predicate compares src_type values —
+  resolve the uppercase-"BLE" inconsistency at `sqlite_storage.py:1726` in U1 (normalize at
+  ingestion, compare lowercase) so the gate has one casing contract.
+- **U2 × ST-10:** the bucket-accumulator leak (`_accumulate_signal` evicts only same-callsign
+  buckets; `_flush_all_accumulators` never removes flushed entries) is **pulled forward into U2**
+  — UDP ingestion multiplies the number of accumulated stations, turning a slow leak into a fast
+  one on 512 MB. ST-10 is thereby removed from quality Wave 7.
+- **U2 schema bump:** v18 → v19 (`signal_log.source`) via a new `current_version < 19` block —
+  never touch existing migration blocks (ground rule 7). DOC-01 (CLAUDE.md schema version)
+  states whatever is current at commit time: v18 if fixed during Wave 1, v19 after U2
+  (U4 re-checks it either way).
+- **U1/U2 values:** `VALID_RSSI_RANGE`/`VALID_SNR_RANGE`/`DEDUP_WINDOW_MS` are existing named
+  constants — reuse them, do not re-declare. New literals introduced by Track U (e.g. the
+  backfill batch size in U3) get named constants immediately (don't create Wave-2 work).
+- **U3 × SSE-01:** U3 verifies SSE emission for UDP-sourced signal *before* Wave 6 restructures
+  sse_handler into routers; Wave 6's acceptance therefore includes a regression check that
+  signal/mheard SSE events still fire (see Wave 6 below).
+- **U3 backfill × ST-07/ST-08 (Wave 7):** the backfill scans `messages` for lora rows — batch
+  it and bound it by the retention window (the spec already requires this); do not "optimize"
+  other queries while there (that's Wave 7).
+- Wire-format invariants the code must encode as comments where used: **no SNR re-scaling**
+  (firmware already ÷4), **0/0 is a sentinel** from `node`/`udp` (rejected by range check, but
+  gate on `src_type` explicitly), signal only from `src_type == "lora"` (UDP) or the BLE MHeard
+  path, capability detected by key presence (no protocol version field).
+- **U1 test harness gap (× CLS-01):** the UDP plan's test section assumes an ephemeral-tempfile-
+  DB storage test suite — **which does not exist yet** (neither do the classifier tests, see
+  CLS-01). U1 must bootstrap a minimal `storage` startup-test suite (ephemeral SQLite via
+  tempfile, mirroring the documented classifier-test pattern) and wire it into
+  `scripts/run_startup_tests.py`; Track M's classifier suite can later reuse that harness.
+
+**Wave 2 — Magic numbers → named constants**
+Scope: Section 5 inventories (except classifier — Track M), X-02 (`now_ms()`), X-04
+(`FEET_TO_METERS`), X-05 (callsign patterns), CMD-08's `138`, error-text f-strings.
+Rules: values preserved exactly; constants placed in the owning module (shared ones in a new
+small `src/mcapp/util.py`); ble_service gets its own copies (separate process); ⚠-marked
+constants get invariant comments. No behavior change.
+Acceptance: gates pass; `git diff` shows no changed literal *values* (Opus spot-checks this);
+grep confirms no orphaned literals for the extracted values in argument position.
+
+**Wave 3 — Dead code removal**
+Scope: ST-01 (read-conn trio + docstring), ST-16 (verify callers first), ST-18 dead items
+(`mheard_cache` decision: drop from `CREATE_SCHEMA_SQL` only — existing DBs keep the table,
+harmless), CO-12, CO-13, CMD-02 (per decision D-1 default: delete), CMD-10 dead items,
+BLE-08 dead branch, BLE-16 dead guard, SSE-07 legacy import-fallbacks + `_get_installed_version`
+(verify no external caller), X-01 (version constants — verify nothing greps for them).
+Rules: every deletion preceded by a caller-grep pasted into the commit message.
+Acceptance: gates pass; `grep -rn "_ensure_read_conn|console_print|_pad_for_chunk_break|debug_signal_handler|get_active_pings_info" src/ ble_service/` empty (adjust list to what was
+actually deleted vs wired-up).
+
+**Wave 4 — Logging unification**
+Scope: CO-09 (udp_handler prints), CMD-06 (four command files), MET-02 (basicConfig),
+MET-03 (debug print), X-03 (single has_console source), CO-16 (EmojiFormatter mutation).
+Rules: message content preserved (minus emojis where they were console-only decoration —
+keep emoji via EmojiFormatter, not in the message); levels: routine → DEBUG, real failures →
+WARNING/ERROR/exception. RF-noise (invalid chars) → DEBUG, reported once.
+Acceptance: gates pass; `grep -rn "if has_console" src/mcapp/commands src/mcapp/udp_handler.py src/mcapp/meteo.py` empty (except the logging_setup definition);
+startup tests still pass headless.
+
+**Wave 5 — Duplication consolidation (helpers, no architecture change)**
+Scope: ST-03 (chart builder — the big one), ST-13, ST-14, ST-18 BucketTuple/filter-strings,
+CO-02, CO-03, CO-11, SSE-02 (use existing storage methods; add the missing ones), SSE-03,
+SSE-04, SSE-07 broadcast unification + snapshot table + send-dispatch, CMD-05 (help from
+COMMANDS), CMD-07, CMD-10 helper items, BLE-02, BLE-04, BLE-08 finalize-extraction, BLE-15,
+BLE-16 mapping/API-key helpers.
+Rules: behavior-preserving; for ST-03 compare output JSON of old vs new implementation on a
+fixture DB before deleting the old code (write a throwaway comparison script in scratchpad).
+Acceptance: gates pass; `grep -c "noqa: SLF001" src/mcapp/sse_handler.py` = 0; the five
+chart-building copies reduced to one implementation + thin wrappers.
+
+**Wave 6 — Structural decomposition**
+Scope: SSE-01 (APIRouter split), CO-04 (main() decomposition), CO-05, CO-07 (Protocol typing,
+drop hasattr), ST-04 (storage mixin split), ST-05 (store_message extraction), ST-06
+(_query/_mutate), CMD-03, CMD-04 (ctcping dataclasses + single completion), CMD-09, BLE-03
+(ServiceState), BLE-05, BLE-06, BLE-09, BLE-10, BLE-11, BLE-13, SCR-04 structure items.
+Rules: one subsystem per commit within the wave (storage, sse, main, ctcping, ble_service —
+5 commits); public call surfaces preserved (`SQLiteStorage` facade, `create_sse_manager`
+signature, `router.test_suppression_logic()` delegate); the "complex handler kept intact" noqas
+removed as their functions shrink — target: zero PLR0912/PLR0915 noqas outside migrations.
+Acceptance: gates pass after **each** commit; startup tests after each commit; Opus reviews
+per-commit diffs. Regression check (post-Track-U): a synthetic lora `pos` datagram still
+produces the signal/mheard SSE updates U3 established — the sse_handler router split and the
+store_message extraction must not break the UDP signal path.
+
+**Wave 7 — Performance (measure, then fix)**
+Scope: ST-02 (connection reuse — after ST-06 made call sites uniform), ST-07, ST-08, ST-09,
+ST-17, ST-18 N+1 item, SSE-05, SSE-06 (weather TTL cache), CO-08, CO-10, CO-22 (stats broadcast
+skips work when `sse_manager.get_client_count() == 0`), BLE-12 (GetManagedObjects), CMD-10
+compiled regexes. (ST-10 was pulled forward into Track U wave U2.)
+Rules: for each DB-query change, capture EXPLAIN QUERY PLAN before/after in the PR notes; for
+ST-07/ST-08 verify result equivalence on a fixture DB; behavior-visible caches (weather) get a
+TTL constant and a bypass for the CLI path.
+Acceptance: gates pass; equivalence checks documented; no new indexes without a migration block.
+
+**Track M — Classifier (mc-chat repo) — can run parallel to Waves 2-7**
+Scope: CLS-01 (create tests!), CLS-02, CLS-03, CLS-05 in
+`/Users/martinwerner/WebDev/mc-chat/meshcom_mock/classifier/`; then subtree split + pull into
+MCProxy per CLAUDE.md recipe; then CLS-04 (switch MCProxy to the public `ms_to_zulu`) and wire
+classifier tests into `run_startup_tests.py`; fix DOC-02.
+Rules: mc-chat must lint clean under the identical ruff config; MCProxy-side edits only after
+the sync lands.
+
+**Track D — Docs (fold into nearest wave's commit)**
+DOC-01 with any Wave-1 commit; DOC-03 after Wave 4; DOC-04 with Wave 3 (ST-01).
+
+Deferred / coordinate-with-webapp (do NOT do in these waves): BLE-14 (field whitelisting),
+SSE-07 `matches` rename, ST-12 if the webapp depends on the 4000 default, TODO-E1…E9 from
+doc/code-audit.md (multi-node BLE), CO-21 (per prior decision).
+
+---
+
+## 8. Verification protocol for the Opus review agent (after every wave)
+
+Gates (hard, in order):
+1. `uvx ruff check` — zero findings.
+2. `uvx ruff format --check .` — clean.
+3. `uv run python scripts/run_startup_tests.py` — exit 0 (needs network; callsign context is
+   bare `DK5EN`).
+4. `git diff` review of the wave's commit(s) against the wave's scope list.
+
+Review checklist:
+- **Scope/model drift:** every hunk maps to a listed finding ID. Unlisted "improvements",
+  drive-by renames, comment rewrites, or formatting churn outside touched functions → reject the
+  hunk (move it to "Discovered during waves" instead). This is the #1 failure mode to watch for.
+- **Value preservation (Wave 2 especially):** extracted constants carry the exact original
+  values. Diff each literal against its constant definition. A "corrected" value is a defect
+  unless it implements a listed correctness finding.
+- **Wire-format stability:** no SSE event names, JSON field names, REST paths/shapes, BLE frame
+  bytes, or DB column semantics changed, except where a finding explicitly coordinates with the
+  webapp (none scheduled in Waves 1-7).
+- **Subtree discipline:** `git diff --stat` shows zero changes under `src/mcapp/classifier/`
+  in Waves 1-7 (Track M lands only via subtree pull commits).
+- **Deletion safety:** for every deleted symbol, the commit message contains the caller-grep
+  evidence; re-run the grep yourself.
+- **Noqa accounting:** count of `# noqa` markers must be monotonically non-increasing per wave;
+  any new one needs a trailing reason and a justification in the commit message.
+- **Async hygiene:** no new blocking calls (`time.sleep`, sync `sqlite3`/`socket`/`requests`)
+  in async paths; new background tasks are tracked (no fire-and-forget without
+  `add_done_callback`), shutdown still cancels them.
+- **Behavioral spot-checks per wave:** Wave 1 — exercise the fixed paths (malformed UDP JSON,
+  negative page limit via a crafted request, winter/summer timestamps through the meteo
+  validators, two same-ms BLE notifications through the queue logic). Wave 5/ST-03 — run the
+  old-vs-new chart comparison script. Wave 6 — start the app locally (`MCAPP_ENV=dev uv run
+  mcapp`), confirm SSE connect + initial snapshot + one command round-trip. Wave 7 — check
+  EXPLAIN QUERY PLAN notes and result-equivalence evidence exist.
+- **Ruff config sync:** if any `[tool.ruff*]` section changed, verify all three pyprojects
+  (root, ble_service, mc-chat) changed identically.
+- **Track U specifics (waves U1–U4):** verify against `doc/UDP-2.0-impl.md` §6 acceptance boxes,
+  plus these invariants line-by-line in the diff:
+  - **No SNR re-scaling** anywhere on the UDP path (firmware already ÷4) and **no RSSI scaling**
+    — grep the diff for `/ 4`, `* 4`, `snr /`, `rssi /`.
+  - `node`/`udp` src_types (0/0 sentinel) can never reach `signal_log` — the gate must check
+    `src_type` explicitly, not rely on the range check alone.
+  - `messages.rssi/snr` writes unchanged (raw values, validation only on the analytics path).
+  - BLE MHeard regression: the pre-existing MHeard signal path produces identical rows to
+    before (fixture comparison or targeted test case).
+  - U2 migration: new `current_version < 19` block only; older blocks byte-identical; startup
+    against a copied v18 DB succeeds; migration idempotent (run twice).
+  - U3 backfill: idempotence marker present (`signal_backfill_done:v1` pattern), batched, logs
+    a summary, re-run produces zero new rows.
+  - The signal-ingestion code landed as an extracted helper (U1 × ST-05), not inline growth of
+    `store_message`; the `PLR0912/PLR0915` noqa count on `store_message` did not grow.
+  - Per §6, after each U-wave the changelog table in `doc/UDP-2.0-impl.md` §9 is updated —
+    check it happened.
+- Report per wave: findings-addressed list, defects found (with file:line), verdict
+  (approve / fix-required), and any items moved to "Discovered during waves".
+
+---
+
+## 9. Open decisions (defaults chosen so the pipeline doesn't stall — Martin can override)
+
+- **D-1 (CMD-02) abuse-protection subsystem:** wire it up properly, or delete ~60 lines of
+  unreachable code? **Default: delete** — it never worked, nobody missed it, and mesh abuse is
+  mitigated by throttling already.
+- **D-2 (ST-12) `get_mheard_stations` params:** honor `limit`/`msg_type` (behavior change for
+  `!mheard`) or make the signature honest? **Default: honor the params** — the caller already
+  passes real values; verify `!mheard` output in tests.
+- **D-3 (CO-06) blocklist unification:** config file or DB? **Default: config.json key**
+  (`BLOCKED_CALLSIGNS`), loaded once — smallest change, and the DB already has a separate
+  blocked-texts mechanism.
+- **D-4 (ST-17) full-dump endpoints:** stream, cap, or leave (operator-only feature)?
+  **Default: stream in chunks** — mechanical and removes an OOM class.
+- **D-5 (BLE-14, SSE-07 `matches`) wire-format cleanups:** **Default: defer** until a
+  coordinated webapp change; keep on the deferred list.
+- **D-6 (CO-21) `route_command` dispatch table:** prior decision (tech-debt.md) says leave it.
+  **Default: leave as-is**; revisit only if Wave 6's main.py work makes it trivial.
+- **Track U decisions:** U-D1…U-D6 live in `doc/UDP-2.0-impl.md` §5 with recommended defaults
+  (same signal tables, msg packets count as observations, ingest both transports with `source`
+  tag, schema v19, one-time backfill, backend-only). **All defaults accepted** unless Martin
+  vetoes before U1 starts.
+
+---
+
+## Discovered during waves
+
+(Fix agents append here: `- [date] [finding] file:line — description — deferred because <reason>`)
+
+- [2026-07-05] Wave 1 complete (C-01…C-08, ST-11, BLE-07, SCR-02, CO-14). Gates green
+  (ruff check, ruff format --check, startup tests incl. new `udp_handler.run_startup_tests()`
+  C-01 regression test and `test_meteo_timezone_validators` C-04 winter/summer regression
+  tests). Opus review: **approved**. Review flagged one should-fix — C-06's new
+  `_response_bg_tasks` (background chunk-send tasks) were tracked but never cancelled on
+  shutdown — fixed in the same commit via `ResponseMixin.stop_pending_responses()`, wired
+  into `main.py`'s shutdown sequence alongside `stop_dedup_cleanup()`. Review also noted
+  (non-blocking, accepted tradeoff): making chunk-sends a background task means two
+  concurrent multi-chunk responses can now interleave their chunks on the LoRa air
+  interface (per-response order is still preserved) — inherent to the fix the verdict
+  requested, not a defect.
+
+- [2026-07-05] Track U waves U1+U2 complete (`doc/UDP-2.0-impl.md` §6 Wave 1/Wave 2 —
+  UDP-lora signal routing, dedup, `signal_log.source`, v18→v19 migration). Implemented
+  together since U2's dedup-reorder fix directly touches code U1 introduced. Gates green;
+  17 new storage regression cases in `sqlite_storage.run_startup_tests()`. Opus review:
+  **approved**. One item deliberately left as-is rather than fixed: `_ingest_signal`
+  (`sqlite_storage.py`) writes an out-of-range lora rssi/snr into
+  `station_positions.rssi/snr/signal_ts` even though it correctly excludes that
+  measurement from `signal_log`/`signal_buckets` — this is byte-for-byte the same
+  structure as the pre-existing BLE code it generalizes, no Track U acceptance criterion
+  requires gating `station_positions` on validity, and "fixing" it would make the lora
+  path diverge from the BLE path's established behavior. Deferred, not fixed — flag if a
+  future wave wants `station_positions` signal fields validated too.
+
+- [2026-07-05] Wave 2 complete (Section 5 magic-number inventories except classifier/Track M,
+  X-02 `now_ms()`, X-04 `FEET_TO_METERS`, X-05 named callsign regex patterns, CMD-08's `138`
+  padding constant, error-text f-strings). New `src/mcapp/util.py` holds the two genuinely
+  shared helpers; `ble_service/` (separate process) keeps its own independent copies
+  (`_now_ms()`, `MESHCOM_NAME_PREFIX`, etc.) rather than importing from `src/mcapp/`. Took two
+  implementation passes: the first covered core/commands/BLE/meteo/sse_handler but skipped the
+  entire storage-module table (~22 constants) and introduced two `S608` f-string LIMIT
+  interpolations in `sse_handler.py` where a `?`-bound parameter was already the sibling
+  endpoint's pattern; both gaps were completed in a second pass. Two independent Opus review
+  rounds: first approved everything except those two gaps (value preservation was flawless
+  across ~70 sampled constants); second round re-verified the completed storage table
+  (22 constants incl. `EIGHT_DAYS_MS` coupled to `SIGNAL_BACKFILL_WINDOW_HOURS`, `BARO_*`
+  algebraic equivalence, `DEFAULT_PAGE_SIZE` at all three call sites, ST-15's five raw
+  `3600000` SQL literals now reusing `HOURLY_BUCKET_MS`) and the S608 fix — **approved, no
+  defects**. X-05's three callsign patterns (`CALLSIGN_TARGET_RE`, `CALLSIGN_STRICT_RE`,
+  `DST_CALLSIGN_RE`) confirmed distinct and correctly mapped to call sites, none merged.
+  Gates green throughout (ruff check, ruff format --check, startup tests — 5 suites).
+
+- [2026-07-05] Wave 3 complete (ST-01, ST-16, ST-18's `mheard_cache` slice, CO-12, CO-13,
+  CMD-02 per decision D-1 default (delete), CMD-10's dead items, BLE-08's dead branch, BLE-16's
+  dead guard, SSE-07's `_get_installed_version`, X-01). 367 lines removed, 29 added, across 15
+  files — every deletion preceded by a caller-grep, independently re-derived by the Opus
+  reviewer (not just trusted from the implementation pass). Notable: `get_initial_payload`
+  (ST-16) had zero callers so it and its now-orphaned Wave-2 constants
+  (`INITIAL_MSG_LIMIT`/`INITIAL_POS_LIMIT`/`_INITIAL_PER_KEY_LIMIT`) were deleted outright, no
+  Wave 6 decision needed. `mheard_cache` removed from the base `CREATE_SCHEMA_SQL` only — no
+  migration block touched, schema stays at v19 (existing DBs keep the harmless empty table).
+  CMD-02's abuse-protection subsystem (~60 lines) reconfirmed unreachable (the coding agent's
+  trace and the Opus reviewer's independent trace agree: `execute_command` converts every
+  handler failure to a string return and never re-raises, so `_track_failed_attempt`'s one call
+  site can never fire) and deleted. BLE-08's dead branch removal cascaded into deleting
+  `ble_protocol.py`'s now-orphaned `decode_json_message` — re-verified safe (zero remaining
+  callers) rather than assumed. X-01: 6 of 7 divergent `VERSION` constants deleted outright
+  (zero external consumers); `sse_handler.py`'s was kept but fixed to `f"v{__version__}"` since
+  it's genuinely emitted externally (FastAPI app metadata + a status endpoint) — same emission
+  points, same format, now backed by the real package version instead of a stale hardcoded one.
+  Deliberately deferred (not a defect): SSE-07's `FASTAPI_AVAILABLE`/`UVICORN_AVAILABLE`
+  import-fallback + `create_sse_manager`'s None-return path — confirmed dead (fastapi/uvicorn
+  are hard deps, not optional) but removing it changes import-time/error-handling behavior
+  across three files, which exceeds a dead-code-only wave's scope; flagged for a future wave.
+  Opus review: **approved, zero defects** — every deletion's caller-grep independently
+  re-derived, migration blocks confirmed byte-identical, CMD-02 reachability re-traced from
+  scratch. Gates green (ruff check, ruff format --check, startup tests — 5 suites, 0 failures).
+
+- [2026-07-05] Wave 4 complete (CO-09, CMD-06, MET-02, MET-03, X-03, CO-16). `udp_handler.py`'s
+  RF-noise character rejection demoted ERROR→DEBUG (log-spam fix) and its duplicate report in
+  `strip_invalid_utf8` removed outright (the per-character log already fires once in
+  `is_allowed_char`). The four CMD-06 files (`topic_beacon.py`, `admin_commands.py`,
+  `response.py`, `weather_command.py`) had every `if has_console: print(...)` converted to
+  `logger.debug/warning/exception`, decorative-only emoji dropped, message content preserved.
+  `meteo.py` no longer calls `logging.basicConfig()` at import (MET-02 — was hijacking root
+  logging for the whole app); its openmeteo debug dump moved to `logger.debug` (MET-03). X-03:
+  `commands/constants.py`'s independent `has_console` computation now sources from
+  `logging_setup.has_console()` (Wave 3 had already removed the other two independent
+  computations). CO-16: `EmojiFormatter.format()` no longer mutates the shared `record.msg` —
+  saves/restores via a `finally` block instead. Caught and fixed one gap after the
+  implementation pass: `commands/handler.py:168` had the same invisible-under-systemd startup
+  banner as CMD-06's four named files (not itself one of them, but the wave's own acceptance
+  grep — `if has_console` across all of `src/mcapp/commands` — expects it gone too), converted
+  for consistency. Opus review caught nothing further, but I'd independently found and fixed
+  one content-preservation regression before sending it for review:
+  `weather_command.py`'s `except ImportError as e:` had been converted in a way that silently
+  dropped the exception detail (`logger.warning("Weather service unavailable")` instead of
+  including `{e}`) — fixed to `logger.warning("Weather service unavailable: %s", e)`. Review
+  independently re-checked every conversion for the same class of bug (info silently dropped,
+  or a needed `as e` binding dropped causing a latent `NameError`) and found none. Intentionally
+  left untouched: `commands/tests.py`'s ~70 `if has_console:` sites (the built-in test suite's
+  own console-reporting mechanism — a CLAUDE.md-documented, different, and still-correct
+  pattern, not the systemd-invisible-logging problem this wave targets) and all of
+  `ble_service/` (separate process, own already-intentional `logging.basicConfig` setup, outside
+  this wave's `src/mcapp/` scope). Opus review: **approved, zero defects**.
+
+- [2026-07-06] Wave 5 complete (ST-03, ST-13, ST-14, ST-18's BucketTuple/filter-string items,
+  CO-02, CO-03, CO-11, SSE-02/03/04/07, CMD-05, CMD-07, a CMD-10 fragment, BLE-02, BLE-04, BLE-08,
+  BLE-15, BLE-16's mapping/API-key items). Landed in two pieces reconciled into one reviewed
+  wave: `57e218a` (storage/main/sse_handler/config_loader/commands consolidation, ST-03's
+  ~450-line chart-builder dedup being the largest single change) plus a second pass adding the
+  five previously-untouched BLE items. ST-03 was verified with a fixture-DB comparison script
+  (old vs new chart methods on two populated DBs, all 6 combinations byte-identical JSON) before
+  the temporary old-implementation helper module was deleted; BLE-04's frame consolidation
+  (`MsgType(IntEnum)` + `_frame()` helper replacing 9 hand-built GATT frames) was independently
+  spot-checked byte-for-byte, including the `save_and_reboot` zero-payload case. BLE-02's
+  `_retry_connect` consolidates `_auto_reconnect`/`_startup_auto_connect` behind 13 keyword
+  params — correct and behavior-preserving (verified line-by-line: identical log wording,
+  activity-log actions, and timing for both callers) but dense; flagged as a Wave-6 candidate to
+  replace the kwargs with a small config dataclass once `ble_service`'s `ServiceState` (BLE-03)
+  work touches the same file. Opus review (adversarial, re-ran all gates independently) found one
+  **MAJOR, fix-required** regression: `sse_handler.py`'s `patch_classifier_rule` noop-guard
+  (`updatable = {"name","pattern","scope","category","priority","enabled"}`) omitted
+  `extra_tags`, so an extra_tags-only PATCH silently no-op'd instead of persisting (the old code
+  handled `extra_tags` as a separate clause) — a wire-facing REST regression the webapp's rule
+  editor would have hit. Fixed by adding `"extra_tags"` to the `updatable` set (one line);
+  `update_classifier_rule`'s own `allowed` set already covered it end-to-end. Gates re-run green
+  after the fix. Noted but deliberately not changed (non-blocking, doesn't affect reads):
+  `insert_classifier_rule` now stores empty `extra_tags` as SQL NULL vs the old code's `"[]"` —
+  normalized reads are identical either way; only the raw broadcast payload differs, and
+  builtin/legacy rows can already be null, so this is consistent with existing behavior. Also
+  noted: SSE-02's stated acceptance grep (`noqa: SLF001` count in sse_handler.py = 0) is
+  literally 1 post-wave — that one is `sse_handler.py:1304`'s pre-existing white-box startup-test
+  access (`manager._broadcast_handler`), not a raw-SQL violation; SSE-02's actual target (raw SQL
+  out of the transport layer) is fully met. Second Opus review after the D1 fix: **approved**.
+  Gates green throughout (ruff check, ruff format --check, startup tests — 5 suites, 0 failures);
+  `git diff --stat -- src/mcapp/classifier/` empty (subtree untouched).
+
+- [2026-07-06] Wave 6 sub-commit 1/5 complete (storage decomposition: ST-04, ST-05, ST-06).
+  `SQLiteStorage` (~4073 lines, ~90 methods, 8 concerns) split into a `src/mcapp/storage/`
+  package — `_base.py` (`StorageBase` Protocol, mirrors `commands/_base.py`'s existing mixin
+  pattern), `constants.py`, `migrations.py` (schema + all 18 `current_version < N` blocks,
+  v2-v19, moved byte-identical — independently AST-diffed, confirmed verbatim), `ingest.py`
+  (store_message/store_telemetry/signal-bucket accumulation), `query.py` (charts/stats/dump/
+  paging), `prefs.py`, `classifier_api.py` (classifier_rules/beacon_templates CRUD, with the
+  CLS-04 private-symbol imports' relative depth fixed `.classifier` → `..classifier` for the
+  deeper file location). `sqlite_storage.py` is now a ~540-line facade:
+  `SQLiteStorage(MigrationsMixin, IngestMixin, QueryMixin, PrefsMixin, ClassifierApiMixin)` plus
+  construction/`_query`/`_mutate`/`_execute_many`/`close`/`create_sqlite_storage`/
+  `run_startup_tests`. ST-06: `_execute(query, params, fetch=...) -> list | int` replaced by
+  `_query(...) -> list[dict]` / `_mutate(...) -> int` across all 90 call sites (mechanical
+  AST-based transform, independently reconciled by the reviewer: 90 → 51 `_query` + 39
+  `_mutate`, zero SQL-verb/function mismatches), deleting 9 now-dead
+  `isinstance(rows, list)` guards and ~25 leftover `X_raw = ...; X = X_raw` no-op alias lines
+  (collapsed during self-review before sending for Opus review). ST-05: extracted
+  `_handle_ack`/`_store_position`/`_store_mheard`/`_insert_message_row` from `store_message`
+  (325 → 199 lines); dedup-before-signal-ingestion ordering and the lora-`pos`-updates-both-
+  field-groups logic (UDP 2.0 Track U) independently verified preserved exactly, including every
+  early-return point. Public `SQLiteStorage` surface confirmed unchanged via a repo-wide
+  caller-grep (every `storage.<method>`/`storage_handler.<method>` call site still resolves
+  through the new mixin MRO). Opus review: **approved**, gates green
+  (ruff check, ruff format --check — 49 files, startup tests — 5 suites, 0 failures), noqa count
+  unchanged (74), classifier subtree untouched. One MINOR non-blocking note (not fixed, not a
+  listed finding — noting per ground rule 10 instead of scope-creeping the fix in):
+  `storage/ingest.py`'s `_insert_message_row`'s `OperationalError` diagnostic log now logs the
+  full `src` relay path instead of the normalized `callsign` the old inline code used — error-path-
+  only (fires only on a DB-locked INSERT failure), arguably more informative, but flagging in case
+  a future pass wants the log argument changed back to the normalized callsign.
+
+- [2026-07-06] Wave 6 sub-commit 2/5 complete (sse_handler decomposition: SSE-01, CO-07's
+  sse_handler half). `_create_app` (~900 lines, ~30 nested endpoint closures + a ~230-line
+  triple-nested `event_generator`) split into a new `src/mcapp/sse_routes/` package —
+  `stream.py` (`/events`, `/api/send`, `/api/status`, `/health`, `/api/time`), `prefs.py`
+  (read_counts/hidden_destinations/blocked_texts/delete_messages/mheard+wx sidebar/filter_prefs),
+  `classifier.py` (`/api/classifier/*`), `weather.py` (`/api/weather*`, `/api/telemetry*`,
+  `/api/timezone`), `deploy.py` (`/api/update/*`, `/api/ble/pin`) — each a
+  `build_<x>_router(manager, ...) -> APIRouter` closing over the `SSEManager` instance.
+  `_create_app` is now ~35 lines: FastAPI + CORS + five `include_router()` calls. The
+  ~180-line initial-snapshot section of `event_generator` extracted into
+  `SSEManager.initial_events()` (stays on the class, needs full instance state; consumed via
+  `async for` from `stream.py`). CO-07: every `hasattr(storage, "...")` guard removed —
+  `manager.require_storage()` now raises 503 only when storage itself isn't wired (storage is
+  typed as the concrete `SQLiteStorage`, no more `Any`); BLE-side `hasattr(ble, ...)` checks
+  deliberately left untouched (BLE-09, a different sub-commit). Several `SSEManager`
+  methods/attributes needed for the cross-module router contract were renamed to drop their
+  leading underscore (ruff's SLF001 flagged the alternative): `_storage`→`require_storage`,
+  `_classifier`→`require_classifier` (kept distinct from the `self.classifier` attribute to avoid
+  a name collision), `_after_rule_mutation`→`after_rule_mutation`, `_register_client`→
+  `register_client`, `_initial_events`→`initial_events`, `_format_sse_event`→`format_sse_event`,
+  `_launch_update_runner`→`launch_update_runner`, `_read_slot_info`→`read_slot_info`,
+  `_shutdown_event`→`shutdown_event`. Opus review independently re-extracted and diffed the full
+  REST-path set (37 routes) and SSE event-name literal set (20 names) between old and new —
+  **byte-identical, zero diff** — plus spot-checked JSON response shapes (sidebar fallback
+  values, rule-test response shape, update/slots body) and drove the rebuilt app with a
+  TestClient to confirm 200s on health/status/time/slots and 503s from `require_*` when deps
+  aren't wired. **Verdict: approve, zero defects.** Gates green (ruff check, ruff format
+  --check — 55 files, startup tests — 5 suites including the UDP-lora→SSE regression check),
+  noqa count unchanged (6), classifier subtree untouched, scope discipline confirmed (only
+  `sse_handler.py` + new `sse_routes/` touched).
+
+- [2026-07-06] Wave 6 sub-commit 3/5 complete (main.py decomposition: CO-04, CO-05, CO-07's
+  main.py half). `main()` (~424 lines: storage/classifier/message-router wiring, 3 tiny BLE-cache
+  event closures, command/UDP/SSE/BLE-client wiring, an inline `_ClassifierBus`, stdin-reader +
+  signal-handling closures, 4 background-task closures, a 4-step shutdown ladder) reduced to
+  ~54 lines. Extracted: `AppContext` dataclass; `_ClassifierBus` moved to module level (no
+  closure needed); `_wire_ble_caches(message_router)`; `build_app(cfg) -> AppContext` doing all
+  sequential wiring (order preserved exactly, including the documented "UDP listening before BLE
+  init" and "SSE server start after BLE init" constraints); `_start_stdin_reader`/
+  `_install_signal_handlers` (the latter's assign-then-fall-through became try/except/**else**
+  to satisfy ruff's TRY300 — behaviorally identical); the 4 background-task closures became free
+  functions taking explicit params; a `_BackgroundTasks` dataclass + `_start_background_tasks`
+  creates all four tasks, `main()` holds the dataclass for the app's lifetime;
+  `_cancel_background_tasks` cancels only `prune_task`/`classifier_stats_task` (the two backfill
+  tasks are deliberately left running as one-shots, matching the original — the old
+  `# noqa: F841, RUF006 - ref lives for app lifetime` markers on those two are now gone because
+  the references genuinely flow into the dataclass instead of a discarded local, so ruff no
+  longer needs to be told to trust it); `_shutdown_services` does the identical 4-step ladder
+  (beacons → BLE → UDP → SSE) with identical timeouts and the identical unwrapped
+  `stop_dedup_cleanup()`/`stop_pending_responses()` calls in between (not "fixed" — wasn't asked
+  for). CO-05: `test_suppression_logic`'s ~74-line body moved verbatim into a new
+  `src/mcapp/router_tests.py`'s `run_suppression_tests(router)`; `MessageRouter
+  .test_suppression_logic()` is now a 1-line delegate; the two `self._logger` calls in the moved
+  body now go through the module logger like every other line already did (cosmetic
+  `%(name)s` change only). CO-07 (main.py half): all 8 `hasattr(self.storage_handler, ...)` /
+  `hasattr(storage_handler, ...)` guards removed (5 in `_handle_smart_initial_command` — the
+  `get_smart_initial_with_summary`/`get_smart_initial`+`get_summary` two-branch collapsed to the
+  unconditional call, deleting only the dead `else`; 2 in `build_app` for
+  `set_classifier`/`set_message_router`; 1 in `_classifier_stats_broadcast` for
+  `count_blocked_text_hits_24h`); `MessageRouter.storage_handler` retyped `SQLiteStorage | None`.
+  `get_smart_initial` (the now-orphaned method) deliberately left in place — that's a separate
+  dead-code finding for a later wave, not this one's scope. Opus review independently re-derived
+  the full old-vs-new wiring order in `build_app`, traced the background-task reference lifetime
+  end-to-end (nothing can be GC'd early), and confirmed the noqa arithmetic (14 → 10 in main.py;
+  −2 moved to router_tests.py, −2 genuinely no-longer-needed, main()'s complexity noqa removed,
+  build_app's added — net 12 across both files, non-increasing) including independently
+  re-verifying `build_app`'s new `PLR0915` is load-bearing. **Verdict: approve, zero defects.**
+  Gates green (ruff check, ruff format --check, startup tests — 5 suites incl. `suppression:
+  PASS`), classifier subtree untouched, scope discipline confirmed (only `main.py` + new
+  `router_tests.py` touched). Noted (not fixed, out of CO-07's scope — `storage_handler` only):
+  `hasattr(sse_manager, "set_classifier")` and `hasattr(command_handler, "blocked_callsigns")`
+  (the latter is CO-06's blocklist-unification finding) remain; both defensible to leave for a
+  future pass.
+
+- [2026-07-06] Wave 6 sub-commit 4/5 complete (ctcping.py dataclasses + single completion:
+  CMD-03, CMD-04, CMD-09). CMD-04: `active_pings`/`ping_tests` (untyped dicts with ad-hoc keys
+  added later via bare assignment or `.setdefault`) converted to `dict[str, ActivePing]`/
+  `dict[str, PingTest]` — two new dataclasses plus a `PingStatus(StrEnum)`
+  (`WAITING_ACK/RUNNING/COMPLETING/COMPLETED/ERROR/TIMEOUT`); the dynamically-added `end_time`/
+  `send_times` keys promoted to real fields with defaults. `commands/_base.py`'s
+  `CommandHandlerBase` Protocol updated to match, importing `ActivePing`/`PingTest` under
+  `TYPE_CHECKING` (no runtime circular import — confirmed). CMD-03: the two overlapping
+  completion mechanisms (ACK/timeout-driven event path vs. a 1s-polling `_monitor_test_completion`
+  that also independently detected completion) consolidated — the event path
+  (`_record_ping_result` → `_trigger_completion_if_done` → `_check_test_completion`) is now
+  authoritative; `_monitor_test_completion` is a single `asyncio.sleep(PING_TEST_MAX_WAIT_SECONDS)`
+  deadline fallback that only acts if the test is still `RUNNING` when it wakes (i.e. the event
+  path never fired), and gets cancelled by `_complete_test` the moment the event path completes
+  a test. The "over-completion detected" reconciliation logic in `_check_test_completion` was
+  deleted as genuinely dead now that the monitor no longer increments any counters. The
+  `_completion_events: dict[str, asyncio.Event]` idempotence guard (an Event created and `.set()`
+  but never awaited — pure membership-testing) replaced with a plain `_completing_test_ids:
+  set[str]` doing the identical job. CMD-09: all 19 Protocol method stubs in `_base.py` changed
+  from bare `...` bodies (silently returning `None` if a mixin failed to override one) to
+  `raise NotImplementedError`. Opus review traced the concurrency properties end-to-end: proved
+  double-increment of `completed`/`timeouts` is now structurally impossible (only one increment
+  site, guarded by per-sequence idempotence on both the ACK and timeout paths, which are mutually
+  exclusive), proved the `_completing_test_ids` guard closes the same async gap the old
+  `asyncio.Event` dict did (no `await` between the check and the add — single-threaded asyncio
+  gives no interleaving point), proved `monitor_task` is cancelled before its deadline on both the
+  ACK-driven and timeout-driven completion paths, and proved the `_start_ping_test` error path
+  (sets `status=ERROR`, sends an error result) is byte-identical to before so no new stuck-RUNNING
+  case was introduced. Constructed a real `CommandHandler` and drove a live echo→ACK→completion
+  flow plus verified no path raises the new `NotImplementedError` (nothing was silently relying on
+  the old no-op behavior). **Verdict: approve, zero defects.** Gates green (ruff check, ruff
+  format --check, startup tests — 5 suites, `commands` suite meaningfully exercises the reviewed
+  ping-completion code), noqa counts unchanged (1 and 1), classifier subtree untouched, scope
+  discipline confirmed (only `ctcping.py` + `_base.py` touched; `commands/tests.py`'s
+  `active_pings`/`ping_tests` references are container-level ops — `.clear()`/`in`/`len()` — that
+  needed no changes). Flagged (pre-existing, NOT introduced by this sub-commit, byte-identical
+  control flow before and after — confirmed by the reviewer, out of scope to fix here): a latent
+  double-`del self.active_pings[ack_id]` on a genuine duplicate-sequence ACK — `_record_ack_result`
+  deletes the key and returns, then `_handle_ack_message` deletes it again, raising `KeyError`
+  that's silently swallowed by the outer `try/except Exception`. Worth a dedicated correctness
+  pass in a future wave.
+
+- [2026-07-06] Wave 6 sub-commit 5/5 complete (ble_service: BLE-03, BLE-05, BLE-06, BLE-09,
+  BLE-10, BLE-11, BLE-13) — **this was the last sub-commit of Wave 6.** BLE-03: ~10 module
+  globals in `ble_service/src/main.py` (`ble_adapter`, `_ble_pin`, `_reconnect_task`,
+  `_auto_connect_task`, `_user_disconnected`, `_last_connected_mac`, `_last_connected_name`,
+  `_reconnecting`, `_reconnect_attempt`, `_reconnect_max_attempts`) plus
+  `notification_queue`/`notification_event`/`_activity_log` consolidated into one
+  `@dataclass ServiceState` singleton (`state = ServiceState()`); every `global` statement in the
+  file removed. Fixes a real pre-existing latent bug as a side effect: `lifespan()`'s startup PIN
+  load used to do a bare `_ble_pin = ...` without `global`, silently shadowing instead of updating
+  the module global — the service always started with PIN disabled regardless of persisted/env
+  state. BLE-11: new `BLEAdapter.is_busy` property + `reset_bus()` method replace 3×
+  `ble_adapter._operation_lock.locked()  # noqa: SLF001` and a hand-rolled bus-reset block. BLE-10:
+  named `STATUS_*`/`REASON_BUSY` constants for the SSE status-event/409-reason wire vocabulary,
+  mirrored (not imported — separate processes) in `ble_client_remote.py`, documented in a new
+  "Status/reason wire vocabulary" section of `ble_service/README.md`. BLE-09: `BLEClientBase` ABC
+  gained 4 new abstract methods (`cancel_reconnect`/`get_activity`/`set_ble_pin`/`refresh_status`)
+  that previously existed only on `BLEClientRemote`, with no-op implementations added to
+  `BLEClientDisabled`; the now-redundant `hasattr(client, ...)` guards at call sites in
+  `main.py`/`sse_handler.py`/`sse_routes/deploy.py` were deliberately left alone (out of scope —
+  those files were finalized in earlier sub-commits). BLE-13: new `BLEServiceError(RuntimeError)`
+  carrying `status_code`/`reason` fields, raised by `ble_client_remote.py`'s `_request()` instead
+  of a plain `RuntimeError`, so `scan()` branches on typed fields instead of substring-sniffing the
+  exception message. BLE-05/06: `decode_binary_message` now returns `dict | None` instead of
+  `dict | str` (explicit `logger.warning()` + `None` instead of bare error strings); the
+  locals()-dict-comprehension return replaced with an explicit dict via two new extracted helpers
+  (`_decode_ack_frame`/`_decode_data_frame`); named constants
+  (`_HEADER_FORMAT`/`_HEADER_LEN`/`_FOOTER_FORMAT`/`_FOOTER_LEN`/`_FCS_EXCLUDED_TRAILER_LEN`) plus
+  a frame-layout comment block replace the magic byte offsets. The `None`-check at the one caller
+  (`ble_client_remote.py`'s `_transform_notification`) incidentally fixed a latent bug where
+  `dispatcher()` used to be called unconditionally via `cast(dict, decoded)` even when `decoded`
+  was an error string.
+
+  **Self-review caught and fixed three real bugs** introduced by a blind whole-file regex rename
+  used for the BLE-03 globals-to-dataclass conversion: (1) the rename also corrupted
+  `from .ble_adapter import ...` into `from .state.ble_adapter import ...`, which would have broken
+  the module at import time; (2) `_push_status_event(state: str, **kwargs)`'s parameter name
+  collided with the new module-level `state` singleton, so `state.notification_queue.append(...)`
+  inside that function would have tried calling `.notification_queue` on a plain string — fixed by
+  renaming the parameter to `conn_state`; (3) `_startup_auto_connect`'s local
+  `state = json.load(f)` similarly shadowed the singleton, so `state.last_connected_name =
+  state.get(...)` tried setting an attribute on a plain dict (silently swallowed by a broad except)
+  and a bare `state.last_connected_mac = mac` afterward would raise `UnboundLocalError` whenever the
+  state file didn't exist yet — fixed by renaming the local to `saved_state`. All three verified
+  fixed with live import/smoke tests before sending for review. BLE-05/06's equivalence was verified
+  with a scratchpad script comparing old-vs-new `decode_binary_message` output on synthetic ACK/msg/
+  pos frames (byte-identical). Opus review independently re-ran an AST-based shadowing scan across
+  all of `ble_service/src/main.py` looking for a fourth instance of the same bug class — found none,
+  but flagged one MINOR naming-trap: `_save_ble_state`/`_load_ble_state`/`_load_ble_pin`/
+  `_save_ble_pin` each kept a local variable literally named `state` (safe today — each is a
+  self-contained local dict that never touches the singleton — but inconsistent with the fix applied
+  to `_startup_auto_connect` and a foot-gun for a future edit); renamed all four to `saved_state` for
+  consistency before committing. Independently re-derived the BLE-05/06 equivalence check from
+  scratch (constructed ACK/msg/pos/malformed frames via `struct.pack`, diffed old vs new
+  byte-for-byte) and confirmed the `_decode_data_frame` `PLR0913` noqa is load-bearing. **Verdict:
+  approve.** Gates green (ruff check, ruff format --check, startup tests — 5 suites), noqa counts
+  accounted for (main.py 10→7, ble_protocol.py 3→4 with the one addition confirmed load-bearing,
+  others unchanged), classifier subtree untouched, scope discipline confirmed (only the 7
+  ble_service/ble-client-stack files touched).
+
+  **Wave 6 completeness note:** across all 5 sub-commits, Section 7's Wave 6 scope is covered
+  (ST-04/05/06, SSE-01, CO-04/05/07, CMD-03/04/09, BLE-03/05/06/09/10/11/13) **except "SCR-04
+  structure items"** (`scripts/update-runner.py`: module globals → a `Paths`-style dataclass;
+  `publish()`'s unbounded `queue.Full` suppression + unbounded `_history` growth) — confirmed via
+  `git diff --stat` that `update-runner.py` was never touched across Wave 6 (last touched in
+  Wave 1). This is a MINOR/grouped scripts-only item that doesn't fit any of the 5 sub-commit
+  boundaries (storage/sse/main/ctcping/ble_service) used for this wave. **Deferred, not forgotten**
+  — pick up alongside Wave 7 (which already works in the scripts/perf space) or as its own small
+  follow-up commit before Wave 7 starts.
+
+- [2026-07-06] SCR-04 follow-up complete (standalone commit, not part of any wave sub-commit —
+  `scripts/update-runner.py` only). Fixed a real correctness bug embedded in the finding: when
+  the bootstrap script exited non-zero but the target slot got activated anyway
+  (`get_active_slot() == target_slot`), the code logged a message and proceeded straight to
+  health checks without ever calling `set_slot_meta(...)` for that slot — so the now-live slot's
+  meta stayed stale/empty, meaning `get_rollback_slot()` (requires `version`+`deployed_at`) would
+  never recognize it as a valid rollback target, and `get_oldest_slot()` could treat it as
+  reusable/overwritable despite being the actively running deployment. Fixed by calling
+  `set_slot_meta(...)` in that branch too, mirroring the `if success:` branch's shape exactly
+  (verified `_read_version()` is fully defensive and never raises, even if the version file is
+  somehow missing). `EventBus._history` (unbounded `list`) and each SSE client's `queue.Queue`
+  (unbounded, `maxsize=0` — meaning `publish()`'s `suppress(queue.Full)` was dead code) both
+  bounded to 2000 entries; verified no deadlock in `subscribe()`'s blocking history-replay
+  (`EVENT_HISTORY_SIZE == CLIENT_QUEUE_SIZE` by construction — added a load-time `assert` to
+  harden that invariant per the reviewer's suggestion, since if it ever broke the blocking `put()`
+  under the bus lock would deadlock the whole EventBus) and confirmed `queue.Full` is now
+  reachable for a genuinely stalled client. Named 3 previously-inline constants
+  (`MCAPP_SSE_HEALTH_URL`, `SSE_KEEPALIVE_COMMENT_INTERVAL_S`, `UPDATE_TRIGGER_FILE` — the last
+  cross-checked byte-for-byte against `sse_handler.py`'s copy of the same path). Deliberately
+  **not** done: converting the `SLOTS_DIR`/`META_DIR`/`home` module globals into a `Paths`
+  dataclass — judged lower-value/higher-risk for a script that's hard to safely exercise
+  end-to-end in this sandboxed environment (real systemd/filesystem operations meant for a Pi),
+  especially right after this session's ble_service work demonstrated how a mechanical
+  globals-to-dataclass rename can introduce shadowing bugs; confirmed not silently half-done.
+  Opus review: **approved**. Gates green (ruff check, ruff format --check, startup tests — 5
+  suites; `update-runner.py` confirmed fully standalone, not imported by anything under
+  `src/mcapp/`), noqa count stable (17→17 before the hardening assert, 18 after — one new
+  justified `S101` on the module-load invariant check), scope discipline confirmed (only
+  `scripts/update-runner.py` touched).
+
+- [2026-07-06] Wave 7 (Performance) sub-commit 1 complete: ST-07, ST-08, ST-09, ST-18, SSE-05,
+  SSE-06, CO-08, CO-10, CO-22, BLE-12, CMD-10. Measured via `EXPLAIN QUERY PLAN` on a fixture DB
+  before changing anything (per the wave's "measure, then fix" methodology): the unbounded
+  `type='msg'` scans in `get_smart_initial_with_summary` (ST-07) already used
+  `idx_messages_type_timestamp`, but only via `type=?` — bounding both the window-function
+  messages query and the summary GROUP BY with `AND timestamp >= ?` (365-day
+  `LONG_RETENTION_DAYS` window — a safety backstop matching the app's own retention-horizon
+  concept, since actual configured `prune_hours` is normally far shorter) lets SQLite do a
+  `type=? AND timestamp>?` range seek instead. Verified via fixture-DB equivalence that NEW is a
+  byte-identical strict subset of OLD (every excluded item genuinely older than the cutoff, no
+  non-excluded item's count changed). ST-08: `count_blocked_text_hits_24h` now counts ASCII
+  blocked texts via SQL `LIKE ... ESCAPE '\'` (`COUNT(*)` pushed into SQLite instead of fetching
+  every message body into Python); texts containing non-ASCII characters still use the original
+  full-scan Python matching, because SQLite's `LIKE` only case-folds ASCII letters (verified live:
+  `LIKE '%ÜBER%'` does NOT match `'über'` in SQLite — the fallback is load-bearing, not
+  caution-for-its-own-sake). ST-09: `get_stats`'s `msg_count`/`pos_count` now via one grouped SQL
+  query; distinct `users` now fetches only `DISTINCT src` (not every row) before the
+  relay-path-split in Python, preserving the original's `type='msg'`-only restriction exactly.
+  `get_mheard_stations` deliberately left unchanged (already bounded by
+  `MHEARD_STATION_SCAN_LIMIT=4000`, not worth the SQL-rewrite risk for an already-small bounded
+  result). ST-18: `clear_stale_auto_beacons`'s N+1 per-hash `_mutate` loop batched into one
+  `_execute_many` call. ST-02 (connection reuse) and ST-17 (`get_full_dump`/`save_dump` streaming)
+  deliberately NOT done: ST-02 needs real Pi hardware measurement per the wave's own methodology;
+  ST-17's target methods turned out to have **zero callers anywhere in the codebase** — flagged as
+  dead-code-removal candidates for a future wave instead of "fixing" a performance property of
+  code nobody calls. SSE-05: blocking `socket.connect_ex()` in `launch_update_runner` replaced
+  with `asyncio.wait_for(asyncio.open_connection(...), timeout=1.0)`. SSE-06: `WeatherService
+  .get_weather_data()` split into a cached public wrapper (`WEATHER_CACHE_TTL_S=300`, a
+  `threading.Lock`-guarded single-flight cache — a real `threading.Lock` because the method runs
+  via `asyncio.to_thread` from multiple OS threads, not just multiple coroutines) and a renamed
+  `_fetch_weather_data()` holding the original body verbatim; error responses are never cached;
+  `update_location()` invalidates the cache; `weather_command.py`'s mesh `!wx` command passes
+  `bypass_cache=True` (a ham operator asking over LoRa expects a live reading) while the REST
+  endpoints get the cached path by default. CO-08: `try_repair_json`'s per-malformed-datagram
+  re-parse loop capped at `MAX_JSON_REPAIR_ATTEMPTS=10` (was unbounded, up to ~1024 re-parses for
+  a maximally-adversarial 1KB datagram). CO-10: `UDPHandler` now holds one long-lived
+  `send_socket` (created in `__init__`) instead of a fresh `socket.socket()` +
+  `run_in_executor` round-trip per outgoing datagram — UDP `sendto()` on a connectionless socket
+  doesn't block on the network the way TCP does, so no executor hop is needed; this also
+  structurally eliminates the old code's latent `NameError`-in-`finally` if `socket.socket()`
+  itself raised. CO-22: the 60s classifier-stats broadcaster now skips its DB scans entirely when
+  `sse_manager.get_client_count() == 0`. BLE-12: `_find_gatt_characteristic` replaced recursive
+  per-node `introspect()` calls with the same single `GetManagedObjects()` D-Bus call `scan()`
+  already uses, filtered by path prefix. CMD-10: 6 inline regex patterns in `ctcping.py` compiled
+  once at module level instead of per-call.
+
+  Opus review independently re-derived equivalence for ST-07/08/09/18 via its own fixture
+  construction (not trusting the implementer's scratchpad scripts), ran a live concurrency test
+  for SSE-06 proving true single-flight behavior (2 threads on a cold cache → exactly 1 fetch,
+  both receive the same object), confirmed `HTTPException`'s MRO doesn't intersect
+  `(OSError, TimeoutError)` for SSE-05, and reasoned through BLE-12's path-prefix filter against
+  `GetManagedObjects()`'s flat all-depths path list (explicitly noting hardware/D-Bus validation
+  is out of reach in this sandboxed environment — a structural review only for that one).
+  **Verdict: approve.** Two MINOR observations, both accepted as inherent to the design rather
+  than fixed: (1) SSE-06's lock is held across the entire blocking fetch (worst case ~60s under
+  a full DWD+OpenMeteo retry cascade), so a burst of concurrent cold-cache requests could park
+  several shared `to_thread` pool workers — inherent to any single-flight-across-threads design,
+  amortized by the TTL, narrow/rare on a small ham-radio proxy; (2) `send_socket` could leak if a
+  `UDPHandler` was constructed but `stop_listening()` called without ever starting it (the early
+  `if not self._running: return` guard used to skip the close) — this one **was** fixed before
+  commit (cheap, no behavior risk): `stop_listening()` now closes `send_socket` unconditionally
+  while keeping the listen-socket/log-message behavior gated on `self._running` exactly as
+  before. Gates green throughout (ruff check, ruff format --check — 56 files, startup tests — 5
+  suites), noqa counts unchanged across all 9 files, classifier subtree untouched, no new
+  indexes, scope discipline confirmed.
+
+- [2026-07-06] Legibility/complexity audit + fixes (standalone pass, not a wave sub-commit —
+  triggered by Martin's concern after watching the Wave 5/6/7 pipeline that recent structural
+  work might be "too complex to understand," separate from the correctness-only reviews every
+  wave already got). A dedicated Opus audit assumed correctness and asked only: could a solo,
+  non-professional maintainer reopen each file in six months and safely extend it? **Verdict:
+  ~90% of the recent work is a genuine legibility win, not over-engineering** — the storage
+  mixin split, `sse_routes/`, `ServiceState`, `_frame`/`MsgType`, and the chart-builder dedup are
+  all inherent-complexity reductions with discoverable conventions; explicitly do not churn them.
+  One file, `ctcping.py`, had real debt: its async completion state machine's safety invariants
+  lived only in this doc, not in the code, plus three small leftovers from CMD-04's
+  consolidation. One additional item outside `ctcping.py`: BLE-02's `_retry_connect` (Wave 5)
+  was supposed to get its 13 keyword args simplified when Wave 6.5 touched the same file for
+  `ServiceState` — that follow-up never happened.
+
+  Fixed (all documentation/dead-code/repackaging, zero behavior change, independently
+  re-verified by a second adversarial pass): **M1** — added an in-code "IDEMPOTENCE INVARIANT"
+  comment directly on `_trigger_completion_if_done` (no `await` may go between the
+  `_check_test_completion()` check and `_completing_test_ids.add()` — single-threaded asyncio
+  gives no interleaving point across those lines) plus a lifecycle comment on `PingTest.status`'s
+  legal transitions, so the proof lives next to the code a future edit would touch, not only in
+  this file. **M2** — deleted `ActivePing.status` (set once at construction, confirmed via
+  full-repo grep to never be reassigned or read anywhere) and the corresponding always-true dead
+  check in `_ping_timeout_task`; `ack_processed` remains the sole per-ping idempotence guard.
+  **M3** — fixed the split-ownership double-`del self.active_pings[ack_id]` that caused a
+  latent, silently-swallowed `KeyError` on a genuine duplicate-sequence ACK (flagged but deferred
+  in Wave 6.4's "Discovered during waves" entry, now actually fixed): `_record_ack_result` no
+  longer deletes; `_handle_ack_message` is the sole owner via `.pop(ack_id, None)`. **M4** —
+  deleted the dead "reconciliation" block in `_send_test_summary` that recomputed
+  success/timeout counts from `results` and warned on disagreement with
+  `test_summary.completed`/`.timeouts` — CMD-03's single-increment design already makes those two
+  counts equal by construction, so the block only ever told a reader "these can diverge" for a
+  case that can't happen; `test_summary.completed`/`.timeouts` are now used directly as the sole
+  source. **N1** — `ble_service/src/main.py`'s `_retry_connect` 13-kwarg signature replaced with
+  a frozen `_RetryProfile` dataclass (`_AUTO_RECONNECT_PROFILE`/`_STARTUP_CONNECT_PROFILE`
+  constants) carrying the exact same values; deliberately did NOT take the audit's alternate
+  "unify the cosmetic wording" suggestion after discovering `_log_activity`'s `action`/`level`
+  strings are wire-facing (the webapp's `BtActivityLog.vue` renders `action` as literal text and
+  color-codes rows by `level`) — unifying them would be a user-visible webapp-coordinated change,
+  not an internal refactor, so every field value was preserved verbatim per profile instead.
+  Second adversarial review independently re-confirmed the pre-existing double-KeyError bug is
+  gone (traced every path into `_record_ack_result`), that M2's field was genuinely dead
+  (full-repo grep), that N1's two profile constants match the old inline kwargs field-by-field,
+  and that the `delays` parameter's position-vs-keyword change breaks neither call site. One
+  harmless nit found and fixed before commit: a now-dead `results = test_summary.results`
+  assignment left over from M4's deletion. **Verdict: approve.** Gates green throughout (ruff
+  check, ruff format --check, startup tests — 5 suites including `commands`, which exercises the
+  reviewed ACK/timeout flows), noqa counts unchanged (ctcping.py: 1, ble_service/src/main.py: 7),
+  scope discipline confirmed (only these two files touched).
+
+- [2026-07-06] Track M complete (classifier fixes in mc-chat + subtree sync into MCProxy):
+  CLS-01, CLS-02, CLS-03, CLS-04, CLS-05. Implemented and committed in
+  `/Users/martinwerner/WebDev/mc-chat` first (`7fd6317`), since this package is subtree-synced,
+  then pulled into MCProxy via `git subtree split`/`pull` per CLAUDE.md's recipe (merge commit
+  ancestor of the MCProxy-side follow-up commit below). **CLS-01**: new `classifier/tests.py` —
+  a startup regression suite (rules/template/score/Classifier end-to-end, ephemeral tempfile
+  SQLite) that tries both mc-chat's and MCProxy's storage import path since the module is
+  subtree-synced into both; this closes a real pre-existing gap (the classifier had zero test
+  coverage despite CLAUDE.md documenting a suite that didn't exist — DOC-02). **CLS-02**:
+  `template.py` gained public `is_exempt()`/`check_only()` for the auto-beacon exemption
+  decision; `classify.py`'s reclassify path now uses it instead of its old private-import
+  reimplementation, which had drifted — **behavior change**: reclassify now also demotes
+  auto-beacon status for directed messages (dst is a callsign-SSID), matching the live-ingest
+  path, which it previously didn't. **CLS-03**: `template.py`'s normalization pipeline
+  consolidated into one `_normalize()`, run once per message; fingerprint and tokenization both
+  derive from that single result instead of each independently re-running the same 5-step regex
+  pipeline. **CLS-04**: `_ms_to_zulu` made public (`ms_to_zulu`) in mc-chat's `types.py`;
+  MCProxy's `storage/classifier_api.py` (both call sites, lines ~217-219 and ~454-456) switched
+  from the private-symbol import to the public one as the MCProxy-side follow-up. **CLS-05**:
+  `EMOJI_RE` unified into `types.py` as the one canonical definition — **behavior change (bug
+  fix)**: `score.py` previously carried a deliberately separate copy with a subtle semantic
+  drift (the variation-selector code point was inside the character class instead of an optional
+  suffix), which double-counted an emoji+selector as two matches in `emoji_density`, now
+  correctly one; `CATEGORIES` now derived from `MessageCategory` via `get_args()` instead of
+  duplicating the same 10 strings in a second literal; `TEMPLATE_HASH_LEN` replaces a bare
+  `[:12]` duplicated in two places; `rules.py`'s `match_rules()` now precomputes per-scope match
+  targets once per message instead of once per rule (~40x/message). Both behavior changes (CLS-02
+  and CLS-05) were flagged explicitly by review rather than silently absorbed. mc-chat side:
+  ruff/mypy clean, 164 classifier-related pytest cases pass (883 total, matching baseline).
+  MCProxy side (separate commit after the subtree pull): `storage/classifier_api.py`'s two
+  `_ms_to_zulu` imports switched to `ms_to_zulu`; `classifier.tests.run_all_tests` wired into
+  `scripts/run_startup_tests.py` as a new `classifier` suite (now 6 suites total). Opus review
+  (of the mc-chat-side work): **approved**, no defects. Gates green in both repos (MCProxy: ruff
+  check, ruff format --check — 57 files, startup tests — 6 suites incl. the new `classifier`
+  suite exercising all 3 layers + the orchestrator's live and reclassify paths).

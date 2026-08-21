@@ -1,0 +1,64 @@
+{
+  "_README": "SHARED command-interface contract between MCProxy (production) and the mc-chat mock. This file is DUPLICATED verbatim in both repos. Each repo runs its OWN implementation against these cases (MCProxy: contract_parity_tests.py; mc-chat: tests/test_contract_parity.py). If you change command routing/suppression/weather formatting in one repo, update this corpus AND sync the identical copy to the other repo; the other repo's parity test then fails until its implementation matches. This is what keeps the mock faithful to production so dev-rig HITL cannot give false confidence (the gap that shipped the !wx text: raw-leak).",
+  "my_callsign": "DK5EN",
+  "target_extraction": [
+    {"msg": "!wx", "target": null, "why": "no target -> local"},
+    {"msg": "!wx text:73 de OE1ABC", "target": null, "why": "callsign in text: is free text, NOT a target (the shipped bug)"},
+    {"msg": "!wx OE5HWN-12", "target": "OE5HWN-12", "why": "positional remote target"},
+    {"msg": "!wx target:OE5HWN-12", "target": "OE5HWN-12", "why": "explicit target: param"},
+    {"msg": "!wx target:LOCAL", "target": null, "why": "explicit local execution"},
+    {"msg": "!wx 2050", "target": null, "why": "group number is not a callsign target"},
+    {"msg": "!time", "target": null, "why": "no target -> local"},
+    {"msg": "!time OE5HWN-12", "target": "OE5HWN-12", "why": "positional remote target"},
+    {"msg": "!time text:hi OE1ABC", "target": "OE1ABC", "why": "text: cutoff is wx/weather-only; !time still scans positionally"},
+    {"msg": "!dice", "target": null, "why": "no target -> local"},
+    {"msg": "!help", "target": null, "why": "no target -> local"},
+    {"msg": "!weather text:hi OE1ABC", "target": null, "why": "weather alias: text: is free text"},
+    {"msg": "!wx DK5EN", "target": "DK5EN", "why": "positional callsign equal to us is still extracted (suppression decides local)"}
+  ],
+  "suppression": [
+    {"src": "DK5EN", "dst": "20", "msg": "!WX", "suppress": true, "why": "our command, no target -> local"},
+    {"src": "DK5EN", "dst": "20", "msg": "!WX TEXT:73 DE OE1ABC", "suppress": true, "why": "text: callsign is free text -> local (the shipped bug)"},
+    {"src": "DK5EN", "dst": "20", "msg": "!WX OE5HWN-12", "suppress": false, "why": "real remote target -> forward raw"},
+    {"src": "DK5EN", "dst": "*", "msg": "!WX OE5HWN-12", "suppress": true, "why": "invalid dst (*) always suppresses, even with a remote target"},
+    {"src": "DK5EN", "dst": "ALL", "msg": "!WX", "suppress": true, "why": "invalid dst (ALL) -> local"},
+    {"src": "DK5EN", "dst": "20", "msg": "Hallo Gruppe", "suppress": false, "why": "not a command -> forward"},
+    {"src": "OE5HWN-12", "dst": "20", "msg": "!WX", "suppress": false, "why": "not our message -> never suppress"},
+    {"src": "DK5EN", "dst": "DK5EN", "msg": "!WX", "suppress": true, "why": "direct to self, no target -> local"},
+    {"src": "DK5EN", "dst": "20", "msg": "!WX TARGET:OE5HWN-12", "suppress": false, "why": "explicit remote target -> forward raw"},
+    {"src": "DK5EN", "dst": "20", "msg": "!WX DK5EN", "suppress": true, "why": "target is us -> local"},
+    {"src": "DK5EN", "dst": "", "msg": "!WX", "suppress": true, "why": "empty dst is invalid -> local"}
+  ],
+  "format_for_lora": {
+    "stat_name": "DK5EN",
+    "lat": 48.15,
+    "lon": 11.58,
+    "cases": [
+      {
+        "why": "clouds unknown -> 'unbekannt', no prefix",
+        "weather_data": {"temperatur_celsius": 17.0, "luftfeuchtigkeit_prozent": 42, "luftdruck_hpa": 1013.0, "windgeschwindigkeit_kmh": 0, "windrichtung_grad": null, "wolkenbedeckung_prozent": null, "niederschlag_mm": 0},
+        "prefix": "",
+        "expected": "🌤️ WX DK5EN: 17.0C 42% rF, 1013.0hPa, windstill, unbekannt"
+      },
+      {
+        "why": "personal text prefix is prepended",
+        "weather_data": {"temperatur_celsius": 17.0, "luftfeuchtigkeit_prozent": 42, "luftdruck_hpa": 1013.0, "windgeschwindigkeit_kmh": 0, "windrichtung_grad": null, "wolkenbedeckung_prozent": null, "niederschlag_mm": 0},
+        "prefix": "73 de OE1ABC",
+        "expected": "73 de OE1ABC 🌤️ WX DK5EN: 17.0C 42% rF, 1013.0hPa, windstill, unbekannt"
+      },
+      {
+        "why": "clear sky, DAY (Dec 15 12:00 CET / 11:00 UTC, sun above horizon) -> 'sonnig'",
+        "weather_data": {"temperatur_celsius": 17.0, "luftfeuchtigkeit_prozent": 42, "luftdruck_hpa": 1013.0, "windgeschwindigkeit_kmh": 0, "windrichtung_grad": null, "wolkenbedeckung_prozent": 0, "niederschlag_mm": 0, "messzeitpunkt": "2026-12-15T11:00:00+00:00"},
+        "prefix": "",
+        "expected": "🌤️ WX DK5EN: 17.0C 42% rF, 1013.0hPa, windstill, sonnig"
+      },
+      {
+        "why": "clear sky, NIGHT (Dec 15 17:00 CET / 16:00 UTC, sun below horizon) -> 'klar' (the day/night bug fix)",
+        "weather_data": {"temperatur_celsius": 17.0, "luftfeuchtigkeit_prozent": 42, "luftdruck_hpa": 1013.0, "windgeschwindigkeit_kmh": 0, "windrichtung_grad": null, "wolkenbedeckung_prozent": 0, "niederschlag_mm": 0, "messzeitpunkt": "2026-12-15T16:00:00+00:00"},
+        "prefix": "",
+        "expected": "🌤️ WX DK5EN: 17.0C 42% rF, 1013.0hPa, windstill, klar"
+      }
+    ],
+    "error_case": {"weather_data": {"error": "boom"}, "expected": "WX ERR: boom"}
+  }
+}
