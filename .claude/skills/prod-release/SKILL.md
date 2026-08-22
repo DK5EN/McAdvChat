@@ -273,14 +273,39 @@ Production path, after `validate_tools` / `validate_on_development` / `validate_
 7. annotated tag `vX.Y.Z` in both repos
 8. push `main` + tag in both repos — **before** the release exists, so `gh` cannot invent its own
 9. sha256, `gh release create --verify-tag` (stable, not pre-release), upload both assets
-10. back to `development`, merge `main` back in **both** repos
-11. `post_release_prep`: bump both `pyproject.toml`s and the webapp's `package.json` /
+10. sha256 verified, artefacts cleaned up — **and `_RELEASE_SUCCESS=true` is set here**, because
+    from this point the release is published and irreversible
+11. post-publish housekeeping: back to `development`, merge `main` back in **both** repos, then
+    `post_release_prep` — bump both `pyproject.toml`s and the webapp's `package.json` /
     `package-lock.json` (via `npm version --no-git-tag-version`), commit in each, and push
     **both** repos' `development`
 
-On any failure the `EXIT` trap rolls everything back: local + remote tags in both repos, the GitHub
-release, the tarball and checksum, and the branch checkout. A failed run leaves nothing behind, so
-diagnose and re-run rather than cleaning up by hand.
+**The rollback only covers steps 1-9.** On a failure there the `EXIT` trap removes local + remote
+tags in both repos, the GitHub release, the tarball and checksum, and restores the branch checkout —
+a failed run leaves nothing behind, so diagnose and re-run.
+
+## If step 11 fails — the release is already published
+
+Step 11 is housekeeping, not release work, and it is deliberately outside the rollback. If it fails
+the script prints a block headed **"Release vX.Y.Z IS PUBLISHED"** and exits non-zero.
+
+**Do not re-run `./scripts/release.sh 2`.** There is no resume. `post_release_prep` may already have
+bumped and pushed `pyproject.toml`, so a re-run resolves `v${current}` to the **next** version and
+cuts a second, unreviewed production release. This is the trap the message exists to prevent.
+
+The failure block lists each sub-step as `[done]` or `[pending]` — checkout, merge-back, MCProxy
+bump/push, webapp bump, webapp push — and prints the commands to finish by hand. Work through it,
+then confirm the invariant that matters for next time:
+
+```bash
+for d in . ../webapp; do
+  git -C $d fetch origin --quiet
+  echo "$d unpushed: $(git -C $d rev-list --count origin/development..development)"   # both 0
+  echo "$d behind main: $(git -C $d rev-list --count development..origin/main)"       # both 0
+done
+```
+
+An unpushed webapp `development` is what aborts the **next** release at Stop 2.
 
 ## Stop 4 — The push `release.sh` used to forget (fixed — verify it)
 

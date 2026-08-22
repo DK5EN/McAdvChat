@@ -1,9 +1,10 @@
 # McApp production health log — mcapp.local
 
-> **Status:** Current — newest section: §5 (2026-08-22 18:10 CEST, **v2.0.1 promoted to
-> production**). Newest sweep: §4 (2026-08-22 17:53 CEST) — verdict **all green**, zero findings.
+> **Status:** Current — newest section: §6 (2026-08-22, fable review of the release tooling and
+> its fixes). Newest sweep: §4 (2026-08-22 17:53 CEST) — verdict **all green**, zero findings.
 > Open watch points: **W1** (swap), **W2** (live `config.json` stays `0640` by decision), **W3**
-> (Caddy 12 h certs). **W4** (§3) and **W5** (§5) are resolved.
+> (Caddy 12 h certs), **W6** and **W7** (§6, accepted residual risks). **W4** (§3) and **W5** (§5)
+> are resolved.
 >
 > **Kind:** Recurring ops review; one dated section per run, appended, never edited in place.
 > **Produced by:** the `ai-ops` skill (`.claude/skills/ai-ops/SKILL.md`).
@@ -411,3 +412,57 @@ skill, with the manual push as an explicit step.
 - webapp `package.json` still reads `2.0.0`; `post_release_prep` bumps only the two
   `pyproject.toml` files. Cosmetic today, but it means the webapp repo carries no version of its
   own that matches the release.
+
+## 6. 2026-08-22 — fable review of the v2.0.1 release tooling, and its fixes
+
+Not a sweep. Records an independent review of the release/deploy changes made after v2.0.1 shipped,
+so the next run knows what moved and which risks were accepted deliberately.
+
+Eight independent finders, then adversarial verification; only claims reproduced by experiment were
+acted on. **Two of the three high findings were defects in the fixes themselves.**
+
+### Fixed
+
+| #   | Defect                                                                                                                                                                                                                             | Where                            |
+| --- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | -------------------------------- |
+| 1   | `install_webapp_tree` was called as `f \|\| return 1` / `if ! f`, which suppresses errexit for the **whole function body** — `rm -rf`, `mkdir -p`, `chown -R`, `chmod -R` failed silently and the swap still happened, returning 0 | `bootstrap/lib/deploy.sh`        |
+| 2   | `release.sh` announced _"Rollback complete."_ on a step-11 failure while doing **nothing** — `cleanup_artifacts` had already cleared every flag the trap inspects                                                                  | `scripts/release.sh`             |
+| 3   | The webapp-push regression test was **tautological**: its fixture pushed before the call, so it passed with the push removed                                                                                                       | `scripts/release_prep_tests.py`  |
+| 4   | The deploy suite drove the function without `-e` while production has it, and asserted the AppleDouble guarantee by grepping release.sh's **source text**                                                                          | `scripts/webapp_deploy_tests.py` |
+| 5   | `mcapp-ble.service` embeds `BLE_API_KEY` in cleartext and was written `0644` (pre-existing)                                                                                                                                        | `bootstrap/lib/deploy.sh`        |
+| 6   | webapp `.prettierignore` covered only `*_vectors.json`, leaving `dedup_contract.json` and `push_contract.json` reformattable                                                                                                       | webapp repo                      |
+
+Every fix was confirmed by **mutation**: reverting it makes the relevant suite fail, restoring it
+makes the suite pass. A green suite was not accepted as evidence on its own — finding 3 is precisely
+the case where it was wrong.
+
+### Accepted residual risks — deliberate, do not re-litigate
+
+- **W6 — the swap has a sub-millisecond window with no serve directory.** `install_webapp_tree`
+  stages then swaps with two renames. Killed exactly between them, `/var/www/html/webapp` is absent
+  and **stays** absent until the next deploy: `system_converge.py`'s watchdog is scoped to
+  `SYSTEM_EPOCH` and never calls `deploy_webapp`. It is not data loss — the source is always the
+  freshly extracted tarball — and the next deploy self-heals, because `[[ -d "$WEBAPP_DIR" ]]` is
+  false and `get_installed_webapp_version` returns `not_installed`, forcing a redeploy.
+  Recovery by hand: `sudo mv /var/www/html/webapp.old /var/www/html/webapp`.
+  Not fixed: closing it properly needs a symlinked serve directory (`ln -sfn` is atomic where a
+  directory rename is not), which means `server.follow-symlink` in lighttpd — a front-door change,
+  therefore a `SYSTEM_EPOCH` bump. Not worth it for a ~10 ms window on a single-user box.
+- **W7 — stale clients can lose assets the old overlay preserved.** Replacing the tree deletes the
+  previous build's content-hashed chunks. A tab whose service worker finished precaching is
+  unaffected (Workbox precaches every built asset, including never-visited lazy chunks); the
+  exposure is a tab whose SW never completed, hitting a new route after a deploy. Accepted — the
+  alternative is unbounded accumulation, which is what §5 set out to fix.
+
+### Refuted — do not re-investigate
+
+- _"A step-11 failure deletes the published release and both repos' tags."_ Asserted in-session,
+  **wrong**: `cleanup_artifacts` clears `_CLEANUP_TAG`/`_CLEANUP_RELEASE` at step 10. The trap has
+  nothing left to delete; the real defect was that it claimed a rollback anyway (fixed above).
+- `chmod -R 755` on served files — identical in the pre-change code and inert; lighttpd loads no
+  CGI/FastCGI/magnet module.
+- `rm -rf` with an unset `WEBAPP_DIR` — unreachable; `readonly` and hardcoded in `bootstrap/mcapp.sh`.
+- Symlink/TOCTOU on `webapp.new`/`.old` — defeated by coreutils' non-follow defaults, and
+  `/var/www/html` is not writable by any non-root account.
+- `src/**/*_vectors.json` failing to match files directly under `src/` — `**` matches zero
+  directories in gitignore semantics; verified with prettier.
