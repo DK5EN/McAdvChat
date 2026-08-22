@@ -1,7 +1,8 @@
 # McApp production health log — mcapp.local
 
-> **Status:** Current — newest run: §2 (2026-08-22 07:48 CEST, first full sweep).
-> Verdict **all green**, zero findings, four watch points.
+> **Status:** Current — newest section: §3 (2026-08-22, follow-up fixes). Newest sweep: §2
+> (2026-08-22 07:48 CEST, first full sweep) — verdict **all green**, zero findings, four watch
+> points, of which **W2 and W4 are now resolved** in §3.
 >
 > **Kind:** Recurring ops review; one dated section per run, appended, never edited in place.
 > **Produced by:** the `ai-ops` skill (`.claude/skills/ai-ops/SKILL.md`).
@@ -131,3 +132,67 @@ The sweep improved its own instrument, committed as `ed82c25`:
 Earlier in the same night, the first run of the Phase 4 query returned `None` for the classifier
 because the DB key is `classifier_version` while the code calls the concept `classifier_ver` —
 a silent `None`, indistinguishable from a dead classifier. Corrected in `e8a1593`.
+
+## 3. 2026-08-22 — follow-up fixes from §2's watch points
+
+Not a sweep. Records what was done about §2's watch points, so the next run does not re-chase them.
+Per this document's own rule §2 is left exactly as it was written.
+
+### W4 — resolved
+
+`uptime_pct` reported **100.0** on a ledger that had never recorded a beacon: the read path
+anchored its live-tail gap on `last_beacon_ms`, so with that NULL no gap could be derived and the
+hole-filling step painted the stretch `up`. Now, with no beacon ever recorded, the silence is
+measured from `first_observed_ms` and split on the existing `GAP_TOLERANCE_MS`:
+
+| elapsed since `first_observed_ms` | segment | `uptime_pct` |
+| --------------------------------- | ------- | ------------ |
+| `<= GAP_TOLERANCE_MS`             | `dark`  | `null`       |
+| `> GAP_TOLERANCE_MS`              | `gap`   | `0.0`        |
+
+`state` stays `unknown` in both cases and the has-beaconed path is untouched. `dark` is
+deliberately widened from "the proxy was not running" to "no observation is available for this
+stretch", which now also covers "running, but has never heard anything yet".
+
+**A fresh ledger reporting 100.0 % again means this regressed.**
+
+### W2 — resolved for new writes; the live box is unchanged by design
+
+`/etc/mcapp/config.json` holds `BLE_API_KEY` in clear and was written `0640`. Both writers in
+`bootstrap/lib/config.sh` now set **`0600`** explicitly, and both `.bak` copies are created with
+`install -m 600`.
+
+A second, separate defect was found in the same file and is also fixed: `migrate_config()` did
+`mv "$tmp_config" "$CONFIG_FILE"` with **no chmod**, inheriting `mktemp`'s `0600`, while
+`write_config()` set `0640` — so the deployed mode depended on which writer ran last. Both are
+now explicit.
+
+Per decision, **no retroactive chmod** was added to the deploy path: the running box keeps its
+existing `0640` until someone runs `--reconfigure`. Expect `0640` on mcapp.local at the next
+sweep and do not report it as a regression.
+
+### Correction to a claim made while chasing W2
+
+While investigating, the `.bak` files were asserted to be world-readable `0644`, reasoned from
+`0666 & ~umask` with root's umask at `0022`. **That was wrong, and the reasoning was never
+tested.** Measured on mcapp.local (GNU coreutils 9.7): `cp` **preserves the source file's mode**
+— a `0640` source yields a `0640` copy, a `0600` source yields `0600`. The backups were never
+world-readable. (macOS's BSD `cp` differs again, which is why this had to be measured on the
+target rather than locally.)
+
+The fixes above remain worth having as hardening and for determinism, but they close **no live
+exposure**. Recorded here so the claim is not repeated from the transcript.
+
+### Verification
+
+`config_migration` cannot run on macOS (bash 3.2; `config.sh` is bash-4-only by design), so it was
+run on mcapp.local (bash 5.2.37) against scratch configs in `/tmp`, production untouched:
+
+| Tree                                | Result           |
+| ----------------------------------- | ---------------- |
+| new tests + **pre-fix** `config.sh` | **FAIL (15/20)** |
+| new tests + **fixed** `config.sh`   | **PASS**         |
+
+Five assertions flip — the two `migrate_config()` mode checks and the three `write_config()` ones.
+Full local gate green otherwise: ruff, `ruff format --check .` (161 files), mypy (91 files),
+`run_startup_tests.py` exit 0 with `uptime: PASS`, 47 suites PASS.

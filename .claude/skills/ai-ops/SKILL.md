@@ -163,8 +163,10 @@ Known-good shapes, so you do not report normal behaviour as a fault:
   UPTIME). `dark` = proxy not running (counts against COVERAGE). A `dark` row after a deploy
   is correct and expected, not an outage.
 - **`state: "unknown"` on a fresh ledger is expected** until the first beacon lands (≤ ~5 min
-  after a restart). Note: the API currently reports `uptime_pct: 100.0` during that window;
-  the card correctly shows "No data yet" instead, but any other consumer would be misled.
+  after a restart). Since 2026-08-22 the API reports `uptime_pct: null` inside the tolerance
+  (too early to judge, and the stretch renders `dark`, not `up`) and `0.0` once the tolerance
+  has passed with nothing ever heard. A fresh ledger reporting **100.0 % is the old bug** and
+  would mean the fix regressed.
 - **MHeard beacons are throttled to one row per station per 2 min** and run ~98/hour/station.
 - **RSSI/SNR are only real for `src_type == "lora"`.** `node` and `udp` send a `0/0`
   sentinel — exclude by an explicit `src_type` check, never by a range check. Both values are
