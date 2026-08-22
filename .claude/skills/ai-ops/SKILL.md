@@ -82,7 +82,9 @@ ssh mcapp.local '
   rotation — an unchanged `current` symlink is not by itself evidence of a failed deploy.
 - **`version.html` lies about what the browser runs.** It reports what was deployed, not what
   the service worker is serving; confirm the bundle filename and `SKIP_WAITING` before
-  believing a frontend fix is live.
+  believing a frontend fix is live. Its path is **`https://mcapp.local/webapp/version.html`** —
+  the bare `/version.html` returns a lighttpd **404**, which reads exactly like a failed
+  frontend deploy.
 - **System epoch parity**: `/var/lib/mcapp/system-epoch` must match `REQUIRED_SYSTEM_EPOCH`
   in `src/mcapp/system_converge.py` (and `SYSTEM_EPOCH` in `bootstrap/mcapp.sh`). A stale
   epoch means the converge watchdog has system-level work pending.
@@ -151,6 +153,9 @@ if r:
 PYEOF
 python3 /tmp/f.py; rm -f /tmp/f.py"
 ```
+
+The same ledger over HTTP: `curl -sk 'https://mcapp.local/api/uptime?range=24h'`. **`range` is
+required** (`24h` / `7d`) — the bare endpoint returns a 422 `Field required`, not a default window.
 
 Known-good shapes, so you do not report normal behaviour as a fault:
 

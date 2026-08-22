@@ -1,8 +1,9 @@
 # McApp production health log — mcapp.local
 
-> **Status:** Current — newest section: §3 (2026-08-22, follow-up fixes). Newest sweep: §2
-> (2026-08-22 07:48 CEST, first full sweep) — verdict **all green**, zero findings, four watch
-> points, of which **W2 and W4 are now resolved** in §3.
+> **Status:** Current — newest section and newest sweep: §4 (2026-08-22 17:53 CEST, pre-release
+> check for v2.0.1) — verdict **all green**, zero findings. Open watch points: **W1** (swap),
+> **W2** (live `config.json` stays `0640` by decision), **W3** (Caddy 12 h certs), **W5**
+> (untagged merge on webapp `main`). **W4 is resolved** (§3) and its fix is live.
 >
 > **Kind:** Recurring ops review; one dated section per run, appended, never edited in place.
 > **Produced by:** the `ai-ops` skill (`.claude/skills/ai-ops/SKILL.md`).
@@ -196,3 +197,152 @@ run on mcapp.local (bash 5.2.37) against scratch configs in `/tmp`, production u
 Five assertions flip — the two `migrate_config()` mode checks and the three `write_config()` ones.
 Full local gate green otherwise: ruff, `ruff format --check .` (161 files), mypy (91 files),
 `run_startup_tests.py` exit 0 with `uptime: PASS`, 47 suites PASS.
+
+## 4. 2026-08-22 17:53 CEST — second full sweep (pre-release check for v2.0.1)
+
+**Verdict: all green. Zero findings.** Run to answer one question: is `v2.0.1-dev.2` fit to be
+promoted to a production `v2.0.1`. Answer: yes. The gateway-uptime feature recorded its **first
+real `gap`** in this window — it is upstream and the metric behaved exactly as designed.
+
+### Anchors
+
+| Anchor              | Value                                                        |
+| ------------------- | ------------------------------------------------------------ |
+| Snapshot            | 2026-08-22 17:49–17:53 CEST                                  |
+| Release             | `v2.0.1-dev.2` (`/webapp/version.html` agrees)               |
+| App version         | `v2.0.1` (`/api/status`)                                     |
+| Active slot         | `slot-2` (rotated from `slot-1`)                             |
+| Schema              | **25** = `LATEST_SCHEMA_VERSION` ✓                           |
+| System epoch        | installed **1** = `REQUIRED_SYSTEM_EPOCH` = `SYSTEM_EPOCH` ✓ |
+| Service start       | 2026-08-22 08:54:49 CEST                                     |
+| Process uptime      | 32 096 s ≈ **8.9 h**                                         |
+| `systemd NRestarts` | **0** (mcapp and mcapp-ble)                                  |
+| Host uptime         | 3 days, 19:32                                                |
+
+The 08:54:49 restart is the `v2.0.1-dev.2` deploy, not a crash: `NRestarts` is still 0 on both
+units, and the slot symlink moved `slot-1 → slot-2`.
+
+### Rates — measured against §1
+
+| Signal              | §1 baseline | This run     | Window | Verdict                                      |
+| ------------------- | ----------- | ------------ | ------ | -------------------------------------------- |
+| `messages` `msg`    | 11 / h      | **7 / h**    | 1 h    | within noise; Saturday afternoon vs. morning |
+| `messages` `pos`    | 87 / h      | **74 / h**   | 1 h    | within noise                                 |
+| `signal_log`        | 347 / h     | **310 / h**  | 1 h    | within noise                                 |
+| journal warnings    | 0 / 24 h    | **0 / 24 h** | 24 h   | `-- No entries --`                           |
+| unclassified `msg`  | 0           | **0**        | 1 h    | classifier keeping up                        |
+| `{CET}` in messages | 0           | **0**        | all    | dropped at ingest; absence is correct        |
+
+Nothing moved by even a factor of 1.5. A **10-hour** cross-check against §2's totals gives lower
+mean rates than the 1-hour spot sample (`signal_log` +2 405 rows over 10.05 h = **239 / h** mean
+vs. 310 / h spot; `messages` +537 = **53 / h** mean vs. 81 / h spot for `msg`+`pos` combined),
+which is the expected shape for a diurnal RF band — the 1-hour window happened to catch a busy
+stretch. Neither figure is a concern; recorded so a future run reading ~240 / h does not chase it.
+
+Structural values all unchanged: schema **25**, epoch **1**, classifier version **3** with **38**
+rules and markers `backfill_done:v0/v1/v3`.
+
+### Measured
+
+| Check            | Value                                                             |
+| ---------------- | ----------------------------------------------------------------- |
+| Services         | mcapp, mcapp-ble, caddy, lighttpd all `active`                    |
+| `/health`        | `healthy`                                                         |
+| DB size          | **31 MB** of the 1 GB limit (3.1 %); **no `-wal` file** at all    |
+| Totals (context) | 19 583 messages, 221 stations, 57 931 signal rows                 |
+| Disk             | 3.8 G used of 59 G = **7 %**                                      |
+| MemAvailable     | **161 MB** of 415 MB (was 181 MB in §2)                           |
+| Swap             | SwapFree 329 004 of 424 956 kB → **~94 MB swapped out** (was 142) |
+| Load / temp      | 0.20 / 0.10 / 0.03 · **44.0 °C**                                  |
+| Journal warnings | **0** in 24 h                                                     |
+
+Swap pressure **improved** by ~48 MB across the deploy while available RAM fell ~20 MB — the net
+is a wash and both sit comfortably inside the envelope §2 established for this box.
+
+### Absent signals
+
+- `{CET}` rows in `messages`: **0**.
+- Unclassified `msg` rows in the last hour: **0**.
+- `udp_target_kind` `identified`, `udp_known_source_ips` `["192.168.68.56"]`,
+  `udp_multiple_sources` **false**, `udp_untrusted_source_ips` **empty**,
+  `udp_suppressed_target_changes` **0**. Nothing is injecting on the unauthenticated port 1799.
+- Journal warnings in 24 h: **0** (literal `-- No entries --`).
+- WAL file: **absent** — checkpointed clean, not a stalled checkpoint.
+- `dark` rows from the 08:54 deploy restart: **0**, and that is correct. The restart was shorter
+  than `DARK_THRESHOLD_MS` (3 missed 30 s heartbeats), so `reconcile_link_uptime_startup` left the
+  state untouched by design — "a deploy restart must never read as a link outage".
+
+### The first recorded `{CET}` gap — upstream, and the metric worked
+
+`GET /api/uptime?range=24h` (note: `range` is **required**; the bare endpoint returns 422):
+
+| Value           | Reading                                                  |
+| --------------- | -------------------------------------------------------- |
+| `state`         | `active`                                                 |
+| `uptime_pct`    | **99.007 %**                                             |
+| `coverage_pct`  | 70.61 % (ledger began 00:54:02, so 24 h is not yet full) |
+| longest outage  | **605 822 ms** = 10.1 min                                |
+| last beacon age | 8 s                                                      |
+| heartbeat age   | 14 s (30 s tick)                                         |
+| thresholds      | `silent_ms` 360 000 · `off_ms` 900 000                   |
+
+The single `gap` segment: **12:43:07 → 12:53:13**, 606 s. That is **exactly 2 × 303 s**, and the
+recovering beacon landed exactly on cadence — so precisely **one** `{CET}` frame was lost, not a
+ten-minute outage. It is also a third independent confirmation of the **303 s** cadence.
+
+**The RF side was demonstrably healthy throughout.** Between 12:38 and 12:58 the proxy stored 36
+`pos` rows from 20 distinct stations and 158 `signal_log` rows, with no interruption spanning the
+gap. The node and the UDP path to the proxy were fine; what dropped was the node's uplink to the
+MeshCom server. **Upstream, not ours — no action.**
+
+This is also the documented one-cadence resolution meeting real data: **a single lost frame costs
+~1 % of a 24 h window.** Do not read 99 % as a degraded link.
+
+### Watch points
+
+- **W1 — swap.** Carried, and improved: ~94 MB swapped out (from 142), 161 MB available. Still a
+  WATCH, not a finding.
+- **W2 — `config.json` is `0640` on the live box.** Confirmed still `0640`, exactly as §3
+  predicted. `vapid.json` is **`0600`** ✓. This is the decided state until someone runs
+  `--reconfigure`; **do not report it as a regression.**
+- **W3 — Caddy cert always looks near-expiry.** Confirmed again: `notBefore Aug 22 07:49:37 GMT →
+notAfter Aug 22 19:49:37 GMT`, read at 15:52 GMT = mid-life, issuer
+  `CN=Caddy Local Authority - ECC Intermediate`. Healthy.
+- **W4 — resolved, and the fix is live.** The `first_observed_ms` fallback is present in the
+  active slot (`storage/uptime.py:155`). It cannot be re-tested against this ledger, which has
+  beacons; the regression tripwire remains "a fresh ledger reporting 100.0 %".
+- **W5 (new) — webapp `main` carries an untagged merge.** `be6089d` ("Merge development: admin
+  history cards") was merged and pushed to webapp `main` at 2026-08-22 00:46 and carries no tag;
+  webapp `package.json` still reads `2.0.0` while the deployed build reports `v2.0.1-dev.2`.
+  Harmless today, but it means webapp `main` is one commit ahead of its own `development` with no
+  release naming it. Worth tidying when v2.0.1 is cut.
+
+### Release readiness — v2.0.1
+
+Asked and answered: **yes.**
+
+| Gate                        | Result                                                                     |
+| --------------------------- | -------------------------------------------------------------------------- |
+| `uvx ruff check`            | All checks passed                                                          |
+| `uvx ruff format --check .` | 161 files already formatted                                                |
+| `uv run mypy`               | Success: no issues found in 91 source files                                |
+| `run_startup_tests.py`      | **exit 0**, 47 suites, `uptime: PASS`                                      |
+| GitHub CI on `bc12783`      | success                                                                    |
+| Working tree                | clean, `development` in sync with `origin/development`                     |
+| Tag alignment               | `HEAD == v2.0.1-dev.2 == bc12783` in both repos                            |
+| Field soak                  | ~17 h across dev.1 + dev.2; **8.9 h on dev.2** with 0 restarts, 0 warnings |
+
+`config_migration` is `SKIPPED — NOT VERIFIED` locally (macOS bash 3.2; the suite is bash-4-only
+by design). It was run for real on mcapp.local per §3 and it runs on every CI push (ubuntu, bash
+5). Not a gap in coverage, only in the local instrument.
+
+`development` is **13 commits ahead of `main`** (`main` still at `dc27612`, the v2.0.0 merge).
+Promotion is the ordinary `scripts/release.sh` path from `development`.
+
+### Skill changes this run produced
+
+- Phase 3's `version.html` note gave no path. `curl -sk https://mcapp.local/version.html` returns
+  a lighttpd **404**, which reads exactly like a broken frontend deploy; the file is served at
+  **`/webapp/version.html`**. Path added to the skill.
+- Phase 5 reads the ledger from the DB but never names the HTTP surface. `GET /api/uptime`
+  **requires** `?range=` (`24h` / `7d`) and returns a 422 without it. Added.
