@@ -30,6 +30,7 @@ from config_migration_tests import run_config_migration_tests
 from release_prep_tests import run_release_prep_tests
 from system_converge_tests import run_system_converge_tests
 from update_runner_tests import run_update_runner_tests
+from webapp_deploy_tests import run_webapp_deploy_tests
 
 from mcapp.aprs_symbol_tests import run_aprs_symbol_tests
 from mcapp.ble_hydration_tests import run_ble_hydration_tests
@@ -179,6 +180,9 @@ async def main() -> int:  # noqa: PLR0915 - flat suite registry; one visible lin
     release_prep_ok = run_release_prep_tests()
     print(f"release_prep: {'PASS' if release_prep_ok else 'FAIL'}")
 
+    webapp_deploy_ok = run_webapp_deploy_tests()
+    print(f"webapp_deploy: {'PASS' if webapp_deploy_ok else 'FAIL'}")
+
     # The only suite that can be legitimately inapplicable: it drives a
     # bash-4-only installer function and macOS ships bash 3.2. It therefore
     # returns its own status label so a skip is never printed as "PASS".
@@ -236,6 +240,7 @@ async def main() -> int:  # noqa: PLR0915 - flat suite registry; one visible lin
         and caddy_config_ok
         and bootstrap_pinning_ok
         and release_prep_ok
+        and webapp_deploy_ok
         and config_migration_ok
         and commands_ok
     )

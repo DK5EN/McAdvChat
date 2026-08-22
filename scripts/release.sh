@@ -578,16 +578,25 @@ build_tarball() {
 
   # webapp/ — copy built SPA from ../webapp/dist
   if [[ -d "${WEBAPP_DIR}/dist" ]]; then
-    # Use tar to copy, excluding macOS metadata
+    # Use tar to copy, excluding macOS metadata.
+    #
+    # COPYFILE_DISABLE is the one that matters and is easy to miss: macOS tar
+    # emits an AppleDouble `._<name>` member for every file carrying extended
+    # attributes, so the sidecars are CREATED here rather than copied from dist.
+    # 133 of them reached mcapp.local's serve directory that way. The --exclude
+    # is belt and braces for a dist/ that already contains some.
     mkdir -p "${staging}/webapp"
-    tar -cf - -C "${WEBAPP_DIR}/dist" --exclude='.DS_Store' . | tar -xf - -C "${staging}/webapp"
+    COPYFILE_DISABLE=1 tar -cf - -C "${WEBAPP_DIR}/dist" \
+      --exclude='.DS_Store' --exclude='._*' . | tar -xf - -C "${staging}/webapp"
     log_info "  Included webapp ($(find "${staging}/webapp" -type f | wc -l | tr -d ' ') files)"
   else
     log_warn "  No webapp dist found — tarball will not include webapp"
   fi
 
-  # Build tarball
-  tar -czf "${PROJECT_DIR}/${tarball_name}" -C "$tmp_dir" "$prefix"
+  # Build tarball. COPYFILE_DISABLE again: the staging tree was assembled with
+  # `cp`, which preserves extended attributes, so this tar would otherwise
+  # reintroduce the `._*` members the copy above just avoided.
+  COPYFILE_DISABLE=1 tar -czf "${PROJECT_DIR}/${tarball_name}" -C "$tmp_dir" "$prefix"
 
   # Cleanup staging
   rm -rf "$tmp_dir"

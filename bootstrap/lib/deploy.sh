@@ -494,6 +494,56 @@ deploy_webapp() {
   fi
 }
 
+# Replace the served webapp tree wholesale, instead of copying over it.
+#
+# Both callers used to do `cp -a src/. "$WEBAPP_DIR/"`, which is an OVERLAY: it
+# writes the new build on top of the old one and removes nothing. Vite emits
+# content-hashed filenames, so every release left its entire predecessor behind.
+# Measured on mcapp.local right after v2.0.1: 868 files served where the release
+# contains 70 — 26 MB, 721 files in assets/ alone, plus 133 macOS AppleDouble
+# `._*` sidecars from older cuts. The leftovers are inert (nothing references
+# them) but they grow without bound, on the box whose SD card is the scarce
+# resource.
+#
+# Staged first, then swapped by two renames within the same filesystem, so the
+# serve directory is never observed half-written and a failed copy leaves the
+# live tree untouched. If the final rename fails, the previous tree is restored.
+install_webapp_tree() {
+  local src="$1"
+  local staging="${WEBAPP_DIR}.new"
+  local previous="${WEBAPP_DIR}.old"
+
+  rm -rf "$staging" "$previous"
+  mkdir -p "$staging"
+
+  if ! cp -a "${src}/." "${staging}/"; then
+    log_error "  Failed to stage webapp from ${src}"
+    rm -rf "$staging"
+    return 1
+  fi
+
+  # Belt and braces: release.sh keeps AppleDouble sidecars out of the tarball,
+  # but a tree built or copied on macOS by any other route can still carry them.
+  find "$staging" -name '._*' -delete 2>/dev/null || true
+
+  chown -R www-data:www-data "$staging"
+  chmod -R 755 "$staging"
+
+  if [[ -d "$WEBAPP_DIR" ]] && ! mv "$WEBAPP_DIR" "$previous"; then
+    log_error "  Could not move the current webapp aside; leaving it in place"
+    rm -rf "$staging"
+    return 1
+  fi
+
+  if ! mv "$staging" "$WEBAPP_DIR"; then
+    log_error "  Could not install the new webapp — restoring the previous tree"
+    [[ -d "$previous" ]] && mv "$previous" "$WEBAPP_DIR"
+    return 1
+  fi
+
+  rm -rf "$previous"
+}
+
 # Deploy webapp from the bundled webapp/ directory in the release tarball
 deploy_webapp_from_tarball() {
   local force="${1:-false}"
@@ -527,15 +577,7 @@ deploy_webapp_from_tarball() {
 
   log_info "  Deploying bundled webapp..."
 
-  # Ensure webapp directory exists
-  mkdir -p "$WEBAPP_DIR"
-
-  # Copy from tarball to webapp serve dir
-  cp -a "${deploy_target}/webapp/." "$WEBAPP_DIR/"
-
-  # Set permissions
-  chown -R www-data:www-data "$WEBAPP_DIR"
-  chmod -R 755 "$WEBAPP_DIR"
+  install_webapp_tree "${deploy_target}/webapp" || return 1
 
   log_ok "  Webapp deployed from tarball to ${WEBAPP_DIR}"
 }
@@ -601,15 +643,16 @@ download_webapp() {
     log_warn "  No checksum available, skipping verification"
   fi
 
-  # Ensure webapp directory exists
-  mkdir -p "$WEBAPP_DIR"
+  # Extract to a staging dir, never straight into the serve dir: extracting in
+  # place is the same overlay problem, and a truncated download would leave the
+  # live tree half-replaced.
+  mkdir -p "${tmp_dir}/extract"
+  tar -xzf "${tmp_dir}/webapp.tar.gz" -C "${tmp_dir}/extract" --strip-components=1 --warning=no-unknown-keyword
 
-  # Extract webapp
-  tar -xzf "${tmp_dir}/webapp.tar.gz" -C "$WEBAPP_DIR" --strip-components=1 --warning=no-unknown-keyword
-
-  # Set permissions
-  chown -R www-data:www-data "$WEBAPP_DIR"
-  chmod -R 755 "$WEBAPP_DIR"
+  if ! install_webapp_tree "${tmp_dir}/extract"; then
+    rm -rf "$tmp_dir"
+    return 1
+  fi
 
   # Cleanup
   rm -rf "$tmp_dir"
