@@ -99,16 +99,42 @@ _VERSION_PROBE = 'printf %s "${BASH_VERSINFO[0]}"'
 # Minimal bash harness: stub out the log_* functions config.sh calls (they're
 # normally defined by mcapp.sh, which we don't source), point CONFIG_FILE at
 # the scratch file, source config.sh, and run migrate_config() for real.
+#
+# umask is pinned to 022 (the observed root umask on mcapp.local) so the
+# file-permission cases below reproduce deterministically regardless of
+# whatever umask the test process itself inherited: `cp` (no -p) onto a
+# nonexistent destination creates at 0666 & ~umask, which is 0644 under 022
+# and would silently pass a laxer host umask like 077.
 _HARNESS = """
 set -euo pipefail
 log_info() { :; }
 log_ok() { :; }
 log_warn() { :; }
 log_error() { :; }
+umask 022
 CONFIG_FILE="$1"
 # shellcheck source=/dev/null
 source "$2"
 migrate_config
+"""
+
+# Same stubs, driving write_config() directly instead of migrate_config().
+# write_config() takes every value as an explicit argument and never prompts
+# (prompting lives in collect_config(), which calls it), so it can be
+# exercised in isolation the same way. CONFIG_DIR is required too: write_config()
+# does `mkdir -p "$CONFIG_DIR"`.
+_WRITE_CONFIG_HARNESS = """
+set -euo pipefail
+log_info() { :; }
+log_ok() { :; }
+log_warn() { :; }
+log_error() { :; }
+umask 022
+CONFIG_FILE="$1"
+CONFIG_DIR="$2"
+# shellcheck source=/dev/null
+source "$3"
+write_config "$4" "$5" "$6" "$7" "$8" "$9"
 """
 
 # A representative full config.json, matching write_config()'s heredoc shape.
@@ -232,6 +258,69 @@ def _run_migrate_config(
     if result.returncode != 0:
         detail = (
             f"migrate_config exited {result.returncode}: "
+            f"stdout={result.stdout!r} stderr={result.stderr!r}"
+        )
+        return _MigrationResult(config=None, raw_text="", backup_exists=backup_exists, error=detail)
+
+    raw_text = config_path.read_text(encoding="utf-8")
+    try:
+        parsed = json.loads(raw_text)
+    except json.JSONDecodeError as e:
+        return _MigrationResult(
+            config=None, raw_text=raw_text, backup_exists=backup_exists, error=f"invalid JSON: {e}"
+        )
+
+    return _MigrationResult(
+        config=parsed, raw_text=raw_text, backup_exists=backup_exists, error=None
+    )
+
+
+def _run_write_config(
+    bash: Path,
+    case_dir: Path,
+    pre_existing_config: dict[str, Any] | None,
+) -> _MigrationResult:
+    """Write case_dir/config.json via write_config() in a real bash subprocess.
+
+    `pre_existing_config`, when given, is written to config.json first so
+    write_config()'s backup branch fires too. Fixed, representative argument
+    values are used throughout — the values themselves aren't under test,
+    only the resulting file modes are.
+    """
+    case_dir.mkdir(parents=True, exist_ok=True)
+    config_path = case_dir / "config.json"
+    if pre_existing_config is not None:
+        config_path.write_text(json.dumps(pre_existing_config, indent=2), encoding="utf-8")
+
+    env = {"PATH": os.environ.get("PATH", "/usr/bin:/bin"), "TMPDIR": str(case_dir)}
+    argv = [
+        str(bash),
+        "-c",
+        _WRITE_CONFIG_HARNESS,
+        str(bash),
+        str(config_path),
+        str(case_dir),
+        str(_CONFIG_SH),
+        "DK5EN",
+        "dk5en.local",
+        "48.2082",
+        "16.3738",
+        "Test Station",
+        "DK5EN Node",
+    ]
+    result = subprocess.run(  # noqa: S603 - fixed argv built above, no shell=True, fully offline
+        argv,
+        capture_output=True,
+        text=True,
+        timeout=30,
+        env=env,
+        check=False,
+    )
+    backup_exists = (case_dir / "config.json.bak").exists()
+
+    if result.returncode != 0:
+        detail = (
+            f"write_config exited {result.returncode}: "
             f"stdout={result.stdout!r} stderr={result.stderr!r}"
         )
         return _MigrationResult(config=None, raw_text="", backup_exists=backup_exists, error=detail)
@@ -437,6 +526,83 @@ def _case_combined(bash: Path, tmp_dir: Path, record: _Recorder) -> None:
     record("combined -> other keys preserved", not preserved, "; ".join(preserved))
 
 
+def _case_migrate_config_file_permissions(bash: Path, tmp_dir: Path, record: _Recorder) -> None:
+    """Regression for the secret-exposure bug: config.json and config.json.bak
+    hold BLE_API_KEY in clear and must both land at 0600.
+
+    Before the fix, `cp "$CONFIG_FILE" "${CONFIG_FILE}.bak"` created the
+    backup at 0666 & ~umask (0644 under this harness's pinned 022 umask) —
+    world-readable — and the post-mv config.json had no explicit chmod at
+    all, inheriting whatever mode mktemp happened to hand out instead of a
+    mode the migration itself declares.
+    """
+    cfg = copy.deepcopy(_BASE_CONFIG)
+    cfg["BLE_API_KEY"] = "test-dev-key"  # weak -> guarantees updated=True -> backup written
+    case_dir = tmp_dir / "file-permissions"
+    res = _run_migrate_config(bash, case_dir, cfg)
+    if res.error or res.config is None:
+        record("migrate_config: config.json mode 0600", False, res.error or "no config")
+        record("migrate_config: config.json.bak mode 0600", False, res.error or "no config")
+        return
+
+    config_mode = (case_dir / "config.json").stat().st_mode & 0o777
+    record(
+        "migrate_config: config.json mode 0600",
+        config_mode == 0o600,
+        f"mode={oct(config_mode)}",
+    )
+
+    backup_path = case_dir / "config.json.bak"
+    if not backup_path.exists():
+        record("migrate_config: config.json.bak mode 0600", False, "backup not written")
+    else:
+        backup_mode = backup_path.stat().st_mode & 0o777
+        record(
+            "migrate_config: config.json.bak mode 0600",
+            backup_mode == 0o600,
+            f"mode={oct(backup_mode)}",
+        )
+
+
+def _case_write_config_file_permissions(bash: Path, tmp_dir: Path, record: _Recorder) -> None:
+    """Same regression as above, but for write_config() (fresh install /
+    --reconfigure), which has its own independent backup + chmod logic."""
+    fresh_dir = tmp_dir / "write-config-fresh"
+    res_fresh = _run_write_config(bash, fresh_dir, pre_existing_config=None)
+    if res_fresh.error or res_fresh.config is None:
+        record("write_config: config.json mode 0600 (fresh)", False, res_fresh.error or "no config")
+    else:
+        mode = (fresh_dir / "config.json").stat().st_mode & 0o777
+        record("write_config: config.json mode 0600 (fresh)", mode == 0o600, f"mode={oct(mode)}")
+
+    # Separate directory so a pre-existing config.json exercises the backup
+    # branch (write_config() only backs up when $CONFIG_FILE already exists).
+    backup_dir = tmp_dir / "write-config-with-backup"
+    pre = copy.deepcopy(_BASE_CONFIG)
+    res_backup = _run_write_config(bash, backup_dir, pre_existing_config=pre)
+    if res_backup.error or res_backup.config is None:
+        record("write_config: config.json.bak mode 0600", False, res_backup.error or "no config")
+        return
+
+    config_mode = (backup_dir / "config.json").stat().st_mode & 0o777
+    record(
+        "write_config: config.json mode 0600 (with prior config)",
+        config_mode == 0o600,
+        f"mode={oct(config_mode)}",
+    )
+
+    backup_path = backup_dir / "config.json.bak"
+    if not backup_path.exists():
+        record("write_config: config.json.bak mode 0600", False, "backup not written")
+    else:
+        backup_mode = backup_path.stat().st_mode & 0o777
+        record(
+            "write_config: config.json.bak mode 0600",
+            backup_mode == 0o600,
+            f"mode={oct(backup_mode)}",
+        )
+
+
 _CASES: tuple[Callable[[Path, Path, _Recorder], None], ...] = (
     _case_missing_key,
     _case_empty_key,
@@ -446,6 +612,8 @@ _CASES: tuple[Callable[[Path, Path, _Recorder], None], ...] = (
     _case_generation_failure,
     _case_retention_ints,
     _case_combined,
+    _case_migrate_config_file_permissions,
+    _case_write_config_file_permissions,
 )
 
 
