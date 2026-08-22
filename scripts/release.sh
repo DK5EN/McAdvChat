@@ -426,6 +426,24 @@ push_main_and_tags() {
 # POST-RELEASE PREP (production only)
 #──────────────────────────────────────────────────────────────────
 
+# Rewrite the top-level `version = "..."` line of a pyproject.toml in place.
+#
+# NOT `sed -i`: the in-place flag is the one place GNU and BSD sed disagree
+# outright. `sed -i ''` is correct on macOS and, on Linux, silently consumes the
+# empty string as the SCRIPT and then treats the real script as a filename. This
+# script normally runs on the release machine (macOS), but its regression suite
+# runs in CI on ubuntu, so the portable form is what keeps the two agreeing.
+#
+# `cat > "$file"` rather than `mv`: it writes through the existing inode and so
+# preserves the file's mode, where `mv` would stamp it with mktemp's 0600.
+set_pyproject_version() {
+  local file="$1" version="$2" tmp
+  tmp=$(mktemp)
+  sed "s/^version = \".*\"/version = \"${version}\"/" "$file" > "$tmp"
+  cat "$tmp" > "$file"
+  rm -f "$tmp"
+}
+
 post_release_prep() {
   local current_version="$1"
   local next_version
@@ -434,16 +452,37 @@ post_release_prep() {
   log_info "Preparing next dev cycle (${next_version})..."
 
   # Update pyproject.toml files
-  sed -i '' "s/^version = \".*\"/version = \"${next_version}\"/" \
-    "${PROJECT_DIR}/pyproject.toml"
-  sed -i '' "s/^version = \".*\"/version = \"${next_version}\"/" \
-    "${PROJECT_DIR}/ble_service/pyproject.toml"
+  set_pyproject_version "${PROJECT_DIR}/pyproject.toml" "$next_version"
+  set_pyproject_version "${PROJECT_DIR}/ble_service/pyproject.toml" "$next_version"
 
   git -C "$PROJECT_DIR" add pyproject.toml ble_service/pyproject.toml
   git -C "$PROJECT_DIR" commit -m "[chore] Prep v${next_version} for next dev cycle"
   git -C "$PROJECT_DIR" push origin development
 
-  log_info "  pyproject.toml bumped to ${next_version}, pushed development"
+  log_info "  MCProxy: pyproject.toml bumped to ${next_version}, pushed development"
+
+  # Webapp gets the same bump. `npm version` is used rather than editing the
+  # file, because it keeps package.json and package-lock.json consistent (both
+  # carry the version); --no-git-tag-version stops it making its own commit and
+  # tag. Guarded so a re-run cannot abort on npm's "Version not changed".
+  local webapp_version
+  webapp_version=$(jq -r .version "${WEBAPP_DIR}/package.json")
+  if [[ "$webapp_version" != "$next_version" ]]; then
+    (cd "$WEBAPP_DIR" && npm version "$next_version" --no-git-tag-version >/dev/null)
+    git -C "$WEBAPP_DIR" add package.json package-lock.json
+    git -C "$WEBAPP_DIR" commit -m "[chore] Prep v${next_version} for next dev cycle"
+  else
+    log_warn "  webapp: package.json already at ${next_version}, nothing to bump"
+  fi
+
+  # This push is NOT optional and NOT cosmetic. merge_main_back committed the
+  # main -> development merge in BOTH repos and pushed neither; the block above
+  # pushes MCProxy. Leave webapp unpushed and its origin/main ends up ahead of
+  # its origin/development — precisely the diverged state validate_main_mergeable
+  # aborts on, so the NEXT production release fails before it starts.
+  git -C "$WEBAPP_DIR" push origin development
+
+  log_info "  webapp: package.json bumped to ${next_version}, pushed development"
 }
 
 #──────────────────────────────────────────────────────────────────
