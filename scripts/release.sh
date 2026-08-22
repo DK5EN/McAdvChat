@@ -39,7 +39,19 @@ _CLEANUP_TARBALL=""       # tarball file to remove
 _CLEANUP_CHECKSUM=""      # checksum file to remove
 _CLEANUP_TMPDIR=""        # temp staging dir to remove
 _CLEANUP_SWITCHED_MAIN=false  # did we switch repos to main?
-_RELEASE_SUCCESS=false    # set to true at the very end
+_RELEASE_SUCCESS=false    # set true once the release is genuinely published and
+                          # irreversible (tag + release on GitHub) — NOT the same
+                          # moment as "the script is done"; see step 11 below.
+
+# Fine-grained status for the post-publish steps (step 11, production only).
+# These exist purely for reporting: if step 11 fails partway, the failure
+# block below needs to say exactly what completed, since none of it can be
+# rolled back and the operator has to finish the rest by hand.
+_POST_PUBLISH_CHECKOUT_DONE=false
+_POST_PUBLISH_MERGE_DONE=false
+_POST_PREP_MCPROXY_PUSHED=false
+_POST_PREP_WEBAPP_BUMPED=false
+_POST_PREP_WEBAPP_PUSHED=false
 
 on_failure() {
   if [[ "$_RELEASE_SUCCESS" == true ]]; then
@@ -343,10 +355,17 @@ merge_to_main() {
 }
 
 checkout_development() {
+  # Called as `if ! checkout_development; then ...` at the call site, which
+  # disables `set -e` for this entire function (bash's rule for a command
+  # tested by a conditional) — so a failed `git checkout` here would NOT stop
+  # the loop on its own; check explicitly instead of relying on `-e`.
   for repo_dir in "$PROJECT_DIR" "$WEBAPP_DIR"; do
     local repo_name
     repo_name=$(basename "$repo_dir")
-    git -C "$repo_dir" checkout development
+    if ! git -C "$repo_dir" checkout development; then
+      log_error "checkout_development: failed to checkout development in ${repo_name}"
+      return 1
+    fi
   done
   log_info "Both repos back on development"
 }
@@ -355,10 +374,16 @@ merge_main_back() {
   local version="$1"
   log_info "Merging main back into development in both repos..."
 
+  # Same `set -e`-disabled-in-a-conditional caveat as checkout_development —
+  # check the merge explicitly rather than letting a conflict run past.
   for repo_dir in "$PROJECT_DIR" "$WEBAPP_DIR"; do
     local repo_name
     repo_name=$(basename "$repo_dir")
-    git -C "$repo_dir" merge main --no-ff -m "[chore] Merge main back into development after ${version}"
+    if ! git -C "$repo_dir" merge main --no-ff -m "[chore] Merge main back into development after ${version}"; then
+      log_error "merge_main_back: merge of main into development failed in ${repo_name} (conflict?)"
+      log_error "  resolve or abort the merge manually in ${repo_dir}"
+      return 1
+    fi
     log_info "  ${repo_name}: merged main → development"
   done
 }
@@ -442,6 +467,15 @@ set_pyproject_version() {
   sed "s/^version = \".*\"/version = \"${version}\"/" "$file" > "$tmp"
   cat "$tmp" > "$file"
   rm -f "$tmp"
+
+  # sed exits 0 whether or not the pattern matched. If the version line moved
+  # or the file was reshaped, the command above silently no-ops and the bump
+  # is skipped with no error anywhere. Verify the rewrite actually landed.
+  if ! grep -qF "version = \"${version}\"" "$file"; then
+    log_error "set_pyproject_version: ${file} does not contain version = \"${version}\" after rewrite"
+    log_error "  the sed pattern likely did not match — check the file's version line"
+    return 1
+  fi
 }
 
 post_release_prep() {
@@ -451,13 +485,32 @@ post_release_prep() {
 
   log_info "Preparing next dev cycle (${next_version})..."
 
-  # Update pyproject.toml files
-  set_pyproject_version "${PROJECT_DIR}/pyproject.toml" "$next_version"
-  set_pyproject_version "${PROJECT_DIR}/ble_service/pyproject.toml" "$next_version"
+  # Called as `if ! post_release_prep ...` at the call site, which disables
+  # `set -e` for this entire function — every step below is checked
+  # explicitly rather than relying on `-e` to stop a failed git command from
+  # being silently run past (see checkout_development for the same note).
 
-  git -C "$PROJECT_DIR" add pyproject.toml ble_service/pyproject.toml
-  git -C "$PROJECT_DIR" commit -m "[chore] Prep v${next_version} for next dev cycle"
-  git -C "$PROJECT_DIR" push origin development
+  # Update pyproject.toml files
+  if ! set_pyproject_version "${PROJECT_DIR}/pyproject.toml" "$next_version"; then
+    return 1
+  fi
+  if ! set_pyproject_version "${PROJECT_DIR}/ble_service/pyproject.toml" "$next_version"; then
+    return 1
+  fi
+
+  if ! git -C "$PROJECT_DIR" add pyproject.toml ble_service/pyproject.toml; then
+    log_error "post_release_prep: git add failed in MCProxy"
+    return 1
+  fi
+  if ! git -C "$PROJECT_DIR" commit -m "[chore] Prep v${next_version} for next dev cycle"; then
+    log_error "post_release_prep: git commit failed in MCProxy"
+    return 1
+  fi
+  if ! git -C "$PROJECT_DIR" push origin development; then
+    log_error "post_release_prep: git push failed in MCProxy (development committed locally, NOT pushed)"
+    return 1
+  fi
+  _POST_PREP_MCPROXY_PUSHED=true
 
   log_info "  MCProxy: pyproject.toml bumped to ${next_version}, pushed development"
 
@@ -467,20 +520,41 @@ post_release_prep() {
   # tag. Guarded so a re-run cannot abort on npm's "Version not changed".
   local webapp_version
   webapp_version=$(jq -r .version "${WEBAPP_DIR}/package.json")
+  if [[ "$webapp_version" == "null" || -z "$webapp_version" ]]; then
+    log_error "webapp: package.json has no .version field (jq returned null/empty)"
+    log_error "  cannot determine whether a bump is needed — fix package.json and re-run"
+    return 1
+  fi
   if [[ "$webapp_version" != "$next_version" ]]; then
-    (cd "$WEBAPP_DIR" && npm version "$next_version" --no-git-tag-version >/dev/null)
-    git -C "$WEBAPP_DIR" add package.json package-lock.json
-    git -C "$WEBAPP_DIR" commit -m "[chore] Prep v${next_version} for next dev cycle"
+    if ! (cd "$WEBAPP_DIR" && npm version "$next_version" --no-git-tag-version >/dev/null); then
+      log_error "post_release_prep: npm version failed in webapp"
+      return 1
+    fi
+    if ! git -C "$WEBAPP_DIR" add package.json package-lock.json; then
+      log_error "post_release_prep: git add failed in webapp"
+      return 1
+    fi
+    if ! git -C "$WEBAPP_DIR" commit -m "[chore] Prep v${next_version} for next dev cycle"; then
+      log_error "post_release_prep: git commit failed in webapp"
+      return 1
+    fi
+    log_info "  webapp: package.json bumped to ${next_version}"
   else
     log_warn "  webapp: package.json already at ${next_version}, nothing to bump"
   fi
+  _POST_PREP_WEBAPP_BUMPED=true
 
   # This push is NOT optional and NOT cosmetic. merge_main_back committed the
   # main -> development merge in BOTH repos and pushed neither; the block above
   # pushes MCProxy. Leave webapp unpushed and its origin/main ends up ahead of
   # its origin/development — precisely the diverged state validate_main_mergeable
   # aborts on, so the NEXT production release fails before it starts.
-  git -C "$WEBAPP_DIR" push origin development
+  if ! git -C "$WEBAPP_DIR" push origin development; then
+    log_error "post_release_prep: git push failed in webapp (development committed locally, NOT pushed)"
+    log_error "  the NEXT production release's validate_main_mergeable will fail until this is pushed"
+    return 1
+  fi
+  _POST_PREP_WEBAPP_PUSHED=true
 
   log_info "  webapp: package.json bumped to ${next_version}, pushed development"
 }
@@ -694,6 +768,68 @@ cleanup_artifacts() {
 }
 
 #──────────────────────────────────────────────────────────────────
+# POST-PUBLISH FAILURE REPORTING (production only)
+#──────────────────────────────────────────────────────────────────
+
+# The tag, the branch merge to main, and the GitHub release are all already
+# public by the time step 11 runs — none of it can or should be rolled back.
+# `on_failure` knows this (it no-ops once `_RELEASE_SUCCESS` is true) but says
+# nothing on its own, so a step-11 failure needs its own actionable report:
+# what's published, what of the post-publish housekeeping completed, and what
+# to run by hand to finish it.
+print_post_publish_failure() {
+  local version="$1" failed_step="$2"
+
+  echo "" >&2
+  log_error "=================================================================="
+  log_error "Release ${version} IS PUBLISHED (tag + GitHub release are live)."
+  log_error "Do NOT re-run this script for ${version} — it will try to cut a"
+  log_error "new, unreviewed release, not resume this one."
+  log_error "=================================================================="
+  log_error "Post-publish step failed: ${failed_step}"
+  echo "" >&2
+  log_error "Status:"
+  if [[ "$_POST_PUBLISH_CHECKOUT_DONE" == true ]]; then
+    log_error "  [done]    both repos checked out back to development"
+  else
+    log_error "  [pending] both repos checked out back to development"
+  fi
+  if [[ "$_POST_PUBLISH_MERGE_DONE" == true ]]; then
+    log_error "  [done]    main merged back into development (both repos, unpushed)"
+  else
+    log_error "  [pending] main merged back into development"
+  fi
+  if [[ "$_POST_PREP_MCPROXY_PUSHED" == true ]]; then
+    log_error "  [done]    MCProxy: next dev version bumped and pushed"
+  else
+    log_error "  [pending] MCProxy: next dev version bump/push"
+  fi
+  if [[ "$_POST_PREP_WEBAPP_BUMPED" == true ]]; then
+    log_error "  [done]    webapp: next dev version bumped"
+  else
+    log_error "  [pending] webapp: next dev version bump"
+  fi
+  if [[ "$_POST_PREP_WEBAPP_PUSHED" == true ]]; then
+    log_error "  [done]    webapp: development pushed"
+  else
+    log_error "  [pending] webapp: development pushed (validate_main_mergeable WILL fail"
+    log_error "            on the next production release until this push happens)"
+  fi
+  echo "" >&2
+  log_error "To finish by hand:"
+  log_error "  cd ${PROJECT_DIR} && git checkout development"
+  log_error "  cd ${WEBAPP_DIR}  && git checkout development"
+  log_error "  # in ${PROJECT_DIR}:"
+  log_error "  git merge main --no-ff -m '[chore] Merge main back into development after ${version}'"
+  log_error "  # in ${WEBAPP_DIR}:"
+  log_error "  git merge main --no-ff -m '[chore] Merge main back into development after ${version}'"
+  log_error "  # then bump pyproject.toml, ble_service/pyproject.toml and package.json to the"
+  log_error "  # next patch version, commit, and push development in BOTH repos — see"
+  log_error "  # post_release_prep() in scripts/release.sh for the exact sequence"
+  echo "" >&2
+}
+
+#──────────────────────────────────────────────────────────────────
 # MAIN
 #──────────────────────────────────────────────────────────────────
 
@@ -784,13 +920,42 @@ main() {
     # Step 10: Cleanup artifacts
     cleanup_artifacts "$tarball" "$checksum"
 
-    # Step 11: Back to development, merge main in, prep next version
-    checkout_development
-    _CLEANUP_SWITCHED_MAIN=false
-    merge_main_back "$version"
-    post_release_prep "$current"
-
+    # The release is now genuinely published and irreversible: the tag and the
+    # GitHub release are both live on the remote. Mark success HERE, before
+    # step 11, not after it. Step 11 is post-publish housekeeping (branch
+    # bookkeeping + next dev-cycle version bump) — if it fails, that is not a
+    # release failure, and `on_failure` must not present it as one (it already
+    # cannot roll back anything: `cleanup_artifacts` just cleared every flag it
+    # inspects).
     _RELEASE_SUCCESS=true
+
+    # Step 11: Back to development, merge main in, prep next version.
+    #
+    # Each of these three can fail independently (merge conflict, rejected
+    # push, reshaped pyproject.toml, ...). Calling them as the condition of an
+    # `if` disables `set -e` for their entire execution (bash's normal rule
+    # for commands tested by a conditional) — so each function checks its own
+    # git commands explicitly and returns 1 rather than relying on `-e` to
+    # stop it, otherwise a failed command inside would be silently run past.
+    # On failure here, report exactly what completed and exit non-zero
+    # without touching the already-published release.
+    if ! checkout_development; then
+      print_post_publish_failure "$version" "checkout_development"
+      exit 1
+    fi
+    _POST_PUBLISH_CHECKOUT_DONE=true
+    _CLEANUP_SWITCHED_MAIN=false
+
+    if ! merge_main_back "$version"; then
+      print_post_publish_failure "$version" "merge_main_back"
+      exit 1
+    fi
+    _POST_PUBLISH_MERGE_DONE=true
+
+    if ! post_release_prep "$current"; then
+      print_post_publish_failure "$version" "post_release_prep"
+      exit 1
+    fi
 
     echo ""
     log_info "Release ${version} published!"

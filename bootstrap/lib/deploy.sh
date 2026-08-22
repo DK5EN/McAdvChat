@@ -513,8 +513,18 @@ install_webapp_tree() {
   local staging="${WEBAPP_DIR}.new"
   local previous="${WEBAPP_DIR}.old"
 
-  rm -rf "$staging" "$previous"
-  mkdir -p "$staging"
+  # This function runs both at call sites inside a `||`/`if !` — bash suppresses
+  # errexit for the ENTIRE body of a function called that way, so `set -e` gives
+  # none of these commands any protection. Every step below is checked by hand;
+  # do not rely on `set -e` catching a failure here, it provably won't.
+  if ! rm -rf "$staging" "$previous"; then
+    log_error "  Failed to clear old staging dirs (${staging}, ${previous})"
+    return 1
+  fi
+  if ! mkdir -p "$staging"; then
+    log_error "  Failed to create staging dir ${staging}"
+    return 1
+  fi
 
   if ! cp -a "${src}/." "${staging}/"; then
     log_error "  Failed to stage webapp from ${src}"
@@ -526,8 +536,16 @@ install_webapp_tree() {
   # but a tree built or copied on macOS by any other route can still carry them.
   find "$staging" -name '._*' -delete 2>/dev/null || true
 
-  chown -R www-data:www-data "$staging"
-  chmod -R 755 "$staging"
+  if ! chown -R www-data:www-data "$staging"; then
+    log_error "  Failed to chown staged webapp at ${staging}"
+    rm -rf "$staging"
+    return 1
+  fi
+  if ! chmod -R 755 "$staging"; then
+    log_error "  Failed to chmod staged webapp at ${staging}"
+    rm -rf "$staging"
+    return 1
+  fi
 
   if [[ -d "$WEBAPP_DIR" ]] && ! mv "$WEBAPP_DIR" "$previous"; then
     log_error "  Could not move the current webapp aside; leaving it in place"
@@ -536,8 +554,14 @@ install_webapp_tree() {
   fi
 
   if ! mv "$staging" "$WEBAPP_DIR"; then
-    log_error "  Could not install the new webapp — restoring the previous tree"
-    [[ -d "$previous" ]] && mv "$previous" "$WEBAPP_DIR"
+    if [[ -d "$previous" ]] && mv "$previous" "$WEBAPP_DIR"; then
+      log_error "  Could not install the new webapp — restored the previous tree"
+    else
+      # Both moves failed: WEBAPP_DIR is now missing and the previous tree is
+      # still sitting at $previous instead of being restored. The box is
+      # serving nothing until an operator intervenes by hand.
+      log_error "  CRITICAL: webapp install failed AND restore failed — ${WEBAPP_DIR} is now MISSING. The previous tree is still intact at ${previous}; move it back to ${WEBAPP_DIR} manually."
+    fi
     return 1
   fi
 
@@ -836,6 +860,11 @@ configure_systemd_service() {
         -e "s|{{HOME}}|${run_home}|g" \
         -e "s|{{BLE_API_KEY}}|${ble_api_key_escaped}|g" \
         "${template_dir}/mcapp-ble.service" > "$ble_service"
+
+    # This unit embeds BLE_API_KEY in cleartext; unlike mcapp.service (no
+    # secret substituted), it must not be left world-readable at the default
+    # root:root 0644 a plain redirect produces.
+    chmod 600 "$ble_service"
 
     log_info "  mcapp-ble.service configured"
   fi
