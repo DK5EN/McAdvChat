@@ -272,3 +272,29 @@ For every finding give the evidence (log line, callsign, counter) and say whethe
 upstream. Anything needing a code change goes into the repo and ships via `/dev-release` — never
 patched on the box. If the sweep finds nothing, "all green" is a valid result, but only after
 the phases above actually ran, not from `/health` alone.
+
+### Then append to the log — this is not optional
+
+**[`doc/ops-mcapp-health-log.md`](../../../doc/ops-mcapp-health-log.md) is the source of truth
+for observed baselines**, and the point of the whole exercise is the time series, not any single
+run. Append one new dated section following the shape of the existing ones — anchors table,
+verdict, measured values, absent signals, watch points `W<n>`, findings `F<n>` continuing the
+series across runs — and update the banner at the top to name the newest run. **Append, never
+edit a previous section**: a run that rewrites history destroys the comparison it exists to make.
+
+Compare against the **rate table in §1** and re-measure it. Raw counters cannot be compared
+across runs with different uptimes — a box six hours past a deploy and the same box six days
+later produce very different totals while being equally healthy. Record rates with their window;
+record totals only as context.
+
+The inline "Baseline 2026-08-22" values in the phases above are a starting point, not the
+record. When they and the log disagree, the log wins — and say so in the run.
+
+Finish with:
+
+```bash
+npx --yes prettier@3 --write doc/ops-mcapp-health-log.md && uvx ruff format --check .
+```
+
+Prettier and ruff both touch markdown, so run prettier first, then the ruff check — a docs-only
+commit has turned CI red here twice. Commit only if the user asks.
