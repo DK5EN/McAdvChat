@@ -48,10 +48,12 @@ correctness. The stub records its argv so the invocation itself is asserted.
 from __future__ import annotations
 
 import json
+import os
 import re
 import shutil
 import subprocess
 import tempfile
+from collections.abc import Callable
 from pathlib import Path
 
 _BASH = shutil.which("bash")
@@ -144,6 +146,7 @@ WEBAPP_DIR="$2"
 CURRENT="$3"
 log_info() {{ :; }}
 log_warn() {{ :; }}
+log_error() {{ echo "ERROR: $*" >&2; }}
 {functions}
 post_release_prep "$CURRENT"
 """
@@ -189,7 +192,6 @@ def _drive(tmp: Path, project: Path, webapp: Path, bin_dir: Path, current: str) 
 
     call_log = tmp / "npm-calls.log"
     call_log.touch()
-    import os
 
     env = dict(os.environ)
     env["PATH"] = f"{bin_dir}:{env['PATH']}"
@@ -210,27 +212,11 @@ def _pushed_head_message(origin: Path) -> str:
     return _run([_GIT, "log", "-1", "--format=%s", "development"], origin)
 
 
-def run_release_prep_tests() -> bool:
-    """Return True if every invariant holds."""
-    if _BASH is None or _GIT is None:
-        print("release_prep: SKIPPED - bash or git not on PATH")
-        return True
-    if _JQ is None:
-        print("release_prep: SKIPPED - jq not on PATH (release.sh requires it)")
-        return True
+_Record = Callable[..., None]
 
-    passed = 0
-    failed = 0
 
-    def record(label: str, ok: bool, detail: str = "") -> None:
-        nonlocal passed, failed
-        if ok:
-            passed += 1
-            print(f"PASS | {label}")
-        else:
-            failed += 1
-            print(f"FAIL | {label} {detail}")
-
+def _case_bump_and_push(record: _Record) -> None:
+    """Cases 1 & 2: both repos bumped, and both pushed (not just committed)."""
     with tempfile.TemporaryDirectory() as raw:
         tmp = Path(raw)
         project, project_origin, webapp, webapp_origin, bin_dir = _build_fixture(tmp)
@@ -287,9 +273,22 @@ def run_release_prep_tests() -> bool:
             f"(remote head: {_pushed_head_message(webapp_origin)!r})",
         )
 
-    # 3 — a webapp already sitting at the target version must not abort the
-    # release. Fresh fixture: pyproject at 2.0.1 (so it still has work to do),
-    # webapp package.json already at 2.0.2 (so `npm version` would fail).
+
+def _case_webapp_already_at_target(record: _Record) -> None:
+    """Case 3: a webapp already sitting at the target version must not abort
+    the release. Fresh fixture: pyproject at 2.0.1 (so it still has work to
+    do), webapp package.json already at 2.0.2 (so `npm version` would fail).
+
+    The hand-bump is committed but deliberately NOT pushed, so origin is left
+    sitting on `_init_repo`'s "initial" commit while the local branch moves
+    ahead. The version-bump `if` guard never runs here (the webapp is already
+    at the target version), so if the real push call were hiding inside that
+    guard — the exact regression this case exists to catch — origin would stay
+    stuck on "initial" and the call would return with nothing pushed. A
+    fixture that pushes the hand-bump itself before calling, as this one used
+    to, can't tell that apart: origin already holds the expected commit before
+    post_release_prep ever runs, so the assertion passes either way.
+    """
     with tempfile.TemporaryDirectory() as raw:
         tmp = Path(raw)
         project, _, webapp, webapp_origin, bin_dir = _build_fixture(tmp)
@@ -301,15 +300,18 @@ def run_release_prep_tests() -> bool:
                 doc["packages"][""]["version"] = "2.0.2"
             path.write_text(json.dumps(doc, indent=2), encoding="utf-8")
         _run([_GIT, "commit", "-am", "hand-bumped webapp"], webapp)
-        _run([_GIT, "push", "origin", "development"], webapp)
+        pre_call_remote_head = _pushed_head_message(webapp_origin)
 
         try:
             _drive(tmp, project, webapp, bin_dir, "2.0.1")
             record("a webapp already at the target version does not abort the release", True)
+            post_call_remote_head = _pushed_head_message(webapp_origin)
             record(
-                "and webapp development is still pushed in that case",
-                _pushed_head_message(webapp_origin) == "hand-bumped webapp",
-                f"(remote head: {_pushed_head_message(webapp_origin)!r})",
+                "and the call itself pushed webapp development (origin advanced past its "
+                "pre-call state, not merely 'already holds the right commit')",
+                pre_call_remote_head != "hand-bumped webapp"
+                and post_call_remote_head == "hand-bumped webapp",
+                f"(remote head before: {pre_call_remote_head!r}, after: {post_call_remote_head!r})",
             )
         except subprocess.CalledProcessError as exc:
             record(
@@ -317,6 +319,72 @@ def run_release_prep_tests() -> bool:
                 False,
                 f"(exit {exc.returncode}: {exc.stderr.strip()[:200]})",
             )
+
+
+def _case_webapp_missing_version(record: _Record) -> None:
+    """Case 4: package.json with no `.version` field (jq yields the literal
+    string "null") must be reported as a distinct, explicit error — not
+    silently treated as "not yet at the target version" and pushed through
+    as though it were an ordinary bump.
+    """
+    with tempfile.TemporaryDirectory() as raw:
+        tmp = Path(raw)
+        project, _, webapp, _, bin_dir = _build_fixture(tmp)
+        pkg_path = webapp / "package.json"
+        pkg = json.loads(pkg_path.read_text(encoding="utf-8"))
+        del pkg["version"]
+        pkg_path.write_text(json.dumps(pkg, indent=2), encoding="utf-8")
+        _run([_GIT, "commit", "-am", "strip webapp version"], webapp)
+
+        try:
+            _drive(tmp, project, webapp, bin_dir, "2.0.1")
+            record(
+                "package.json with no .version field is rejected as a distinct error",
+                False,
+                "(expected post_release_prep to fail; it exited 0)",
+            )
+        except subprocess.CalledProcessError as exc:
+            record(
+                "package.json with no .version field is rejected as a distinct error",
+                "no .version field" in exc.stderr,
+                f"(stderr: {exc.stderr.strip()[:200]})",
+            )
+
+
+def run_release_prep_tests() -> bool:
+    """Return True if every invariant holds."""
+    if _BASH is None or _GIT is None:
+        print("release_prep: SKIPPED - bash or git not on PATH")
+        return True
+    if _JQ is None:
+        print("release_prep: SKIPPED - jq not on PATH (release.sh requires it)")
+        return True
+
+    passed = 0
+    failed = 0
+
+    def record(label: str, ok: bool, detail: str = "") -> None:
+        nonlocal passed, failed
+        if ok:
+            passed += 1
+            print(f"PASS | {label}")
+        else:
+            failed += 1
+            print(f"FAIL | {label} {detail}")
+
+    try:
+        _case_bump_and_push(record)
+        _case_webapp_already_at_target(record)
+        _case_webapp_missing_version(record)
+    except AssertionError as exc:
+        # `_extract_function` raises when release.sh no longer defines one of
+        # the functions this suite extracts by name (e.g. a rename). Left
+        # uncaught, that propagates all the way out of this function —
+        # run_startup_tests.py calls every suite with no try/except, so an
+        # AssertionError here would abort every suite that runs after this one
+        # in the same process (config_migration, commands, ...) instead of
+        # just failing this one cleanly.
+        record("release.sh function extraction", False, str(exc))
 
     print(f"release_prep: {passed} passed, {failed} failed")
     return failed == 0
