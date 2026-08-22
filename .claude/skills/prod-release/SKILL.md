@@ -20,26 +20,31 @@ it leaves one push undone that silently breaks the _next_ release.
 # 0. is the thing you are promoting actually healthy in the field?
 /ai-ops                                            # then read doc/ops-mcapp-health-log.md
 
-# 1. gate BOTH repos — release.sh gates nothing
+# 1. update dependencies in BOTH repos — mandatory, not opportunistic
+uv lock --upgrade && uv sync --all-packages        # + the standalone ble_service lock
+cd ../webapp && npm update
+
+# 2. re-sync the shared code with ../mc-chat, and check the corpora
+diff -rq src/mcapp/contract    ../mc-chat/contract
+diff -rq src/mcapp/classifier  ../mc-chat/meshcom_mock/classifier
+
+# 3. gate BOTH repos — release.sh gates nothing, and step 1 invalidated your last run
 uvx ruff check && uvx ruff format --check . \
   && uv run mypy src/mcapp ble_service/src \
   && uv run python scripts/run_startup_tests.py    # exit 0
 cd ../webapp && npm run typecheck && npm run lint && npm run format:check && npm test
 
-# 2. clear the two pre-conditions (see Stops 1 and 2)
-git -C ../webapp merge main --no-ff && git -C ../webapp push origin development   # if main is ahead
+# 4. pre-conditions (see Stops 1 and 2), then commit the dependency bumps
+for d in . ../webapp; do git -C $d rev-list --count development..origin/main; done   # both 0
 $EDITOR doc/release-history.md                     # new section at the TOP
 git add doc/release-history.md
 git commit -m "[docs] Add release notes for vX.Y.Z" && git push origin development
 
-# 3. publish — newline on stdin, output to a file, read the exit code
+# 5. publish — newline on stdin, output to a file, read the exit code
 printf '\n' | ./scripts/release.sh 2 > /tmp/release.log 2>&1; echo "EXIT=$?"
 
-# 4. the push release.sh forgets
-git -C ../webapp push origin development
-
-# 5. deploy: webapp → version chip (bottom right) → Update to vX.Y.Z → Start Update
-# 6. verify against the ACTIVE slot, not the banner
+# 6. deploy: webapp → version chip (bottom right) → Update to vX.Y.Z → Start Update
+# 7. verify against the ACTIVE slot, not the banner
 ```
 
 ## Step 0 — Decide whether it is fit to promote
@@ -54,7 +59,102 @@ Run `/ai-ops` and read its verdict. A production cut needs more than a green sui
 Append the sweep to `doc/ops-mcapp-health-log.md` **before** releasing. It is the record of what the
 release was signed off against, and it is worthless written afterwards from memory.
 
-## Step 1 — Gate both repos yourself
+## Step 1 — Update dependencies, in both repos
+
+**Every production release ships current dependencies.** This is a release step, not an
+opportunistic chore: a patch release is the moment the whole fleet takes the new tree, so it is
+the moment the dependency set should be current. Doing it any later means the next security bump
+waits for the release after.
+
+```bash
+# MCProxy (workspace root — covers mcapp and the ble_service member)
+uv lock --upgrade
+uv sync --all-packages
+
+# webapp
+cd ../webapp && npm update
+```
+
+`npm outdated` reports **direct** dependencies only. `npm update` is what refreshes the
+transitive pins in `package-lock.json`, which is what actually ships.
+
+### The `ble_service` standalone lock does not update itself
+
+`ble_service` is a `[tool.uv.workspace]` member **and** ships its own `ble_service/uv.lock`, used
+when `mcapp-ble.service` is deployed independently. Running `uv lock --upgrade` _inside_
+`ble_service/` walks up, finds the root workspace, and updates the **root** lock instead — while
+its dry-run output misleadingly reports the bump you wanted. Regenerate it outside the workspace:
+
+```bash
+tmp=$(mktemp -d)
+cp ble_service/pyproject.toml ble_service/uv.lock "$tmp"/
+uv lock --upgrade --directory "$tmp"
+uv sync --directory "$tmp" --no-install-project     # prove it installs
+cp "$tmp"/uv.lock ble_service/uv.lock
+```
+
+Dependabot edits `ble_service/pyproject.toml` and never regenerates this lock, so its recorded
+specifiers drift behind the pyproject silently. Diff the `specifier =` lines, not just the
+versions.
+
+### Then re-run the whole gate
+
+A dependency bump is a change like any other. **The tree you release is not the tree you tested
+until you have re-tested it** — so Step 3 runs _after_ this, never before. If `uv.lock` or
+`package-lock.json` moved, the previous green run is void.
+
+Commit the bumps in each repo independently, before the release notes.
+
+## Step 2 — Re-sync the shared code with `../mc-chat`
+
+Two directories in this repo are `git subtree`s from mc-chat, and four vector corpora are
+hand-copied between three repos with nothing to sync them for you. A release is the checkpoint
+where they must agree.
+
+```bash
+diff -rq src/mcapp/contract    ../mc-chat/contract
+diff -rq src/mcapp/classifier  ../mc-chat/meshcom_mock/classifier
+```
+
+Silence is the pass. Any output is drift, and **which direction it points decides what to do**:
+
+- **mc-chat is ahead** → the normal case. Split and pull:
+
+  ```bash
+  git -C ../mc-chat subtree split --prefix=<upstream prefix> -b <split branch>
+  git subtree pull --prefix=<path> mc-chat <split branch> --squash
+  ```
+
+  | Path                    | Upstream prefix           | Split branch       |
+  | ----------------------- | ------------------------- | ------------------ |
+  | `src/mcapp/classifier/` | `meshcom_mock/classifier` | `classifier`       |
+  | `src/mcapp/contract/`   | `contract`                | `contract-subtree` |
+
+- **MCProxy is ahead** → someone edited a vendored subtree in place, which is the thing the
+  subtree rules forbid. Do **not** "fix" it by pulling: the pull would revert the local
+  improvement. Port the change into mc-chat, verify it _there_ (mc-chat is where the other branch
+  of any host-repo conditional actually executes), commit, then split and pull it back. This has
+  happened: `classifier/tests.py` carried an MCProxy-only mypy-portability fix for weeks.
+
+### The four hand-copied corpora
+
+`commands/group_dst_vectors.json`, `storage/conversation_key_vectors.json`,
+`blocklist_decision_vectors.json` and `commands/hashtag_dst_vectors.json` are canonical **here**
+and copied by hand to mc-chat (`tests/fixtures/`) and the webapp (`src/**/__tests__/`). They are
+not a subtree; no pull will move them.
+
+```bash
+for f in group_dst_vectors conversation_key_vectors hashtag_dst_vectors blocklist_decision_vectors; do
+  find . ../mc-chat ../webapp -name "$f.json" -not -path "*/node_modules/*" -exec shasum -a 256 {} +
+done
+```
+
+Equal hashes per corpus, or fix it. If you change one, copy it to both siblings **and** bump the
+webapp's `EXPECTED_SHA256`. Both repos carry a `.prettierignore` covering these files, because a
+formatter run is enough to break byte equality while leaving the content identical — which is the
+hardest version of this to spot.
+
+## Step 3 — Gate both repos yourself
 
 `release.sh` runs `npm run build:strict` and **nothing else**. No ruff, no mypy, no backend suite,
 no eslint, no vitest. A red tree releases silently.
@@ -122,8 +222,10 @@ fenced `python` blocks inside `.md`.
 [ERROR] Resolve this manually before releasing.
 ```
 
-**The webapp is the repo that drifts**, and it drifts _because of Stop 4_ — see below. Check both
-before you start:
+**The webapp is the repo that used to drift**, and it drifted because `post_release_prep` never
+pushed it. That root cause is fixed (see Stop 4), so this check should now always pass — which is
+exactly why it is still worth running: a non-zero count means something outside the release flow
+touched `main`. Check both before you start:
 
 ```bash
 for d in . ../webapp; do
@@ -172,35 +274,43 @@ Production path, after `validate_tools` / `validate_on_development` / `validate_
 8. push `main` + tag in both repos — **before** the release exists, so `gh` cannot invent its own
 9. sha256, `gh release create --verify-tag` (stable, not pre-release), upload both assets
 10. back to `development`, merge `main` back in **both** repos
-11. `post_release_prep`: bump both `pyproject.toml`s, commit, **push MCProxy development**
+11. `post_release_prep`: bump both `pyproject.toml`s and the webapp's `package.json` /
+    `package-lock.json` (via `npm version --no-git-tag-version`), commit in each, and push
+    **both** repos' `development`
 
 On any failure the `EXIT` trap rolls everything back: local + remote tags in both repos, the GitHub
 release, the tarball and checksum, and the branch checkout. A failed run leaves nothing behind, so
 diagnose and re-run rather than cleaning up by hand.
 
-## Stop 4 — The push `release.sh` never does
+## Stop 4 — The push `release.sh` used to forget (fixed — verify it)
 
-Step 11 pushes **MCProxy** `development` only. The webapp's merge-back from step 10 is committed and
-never pushed:
+**Historical, and the reason Stop 2 exists.** `post_release_prep` pushed **MCProxy**
+`development` only. The webapp's merge-back from step 10 was committed and never pushed:
 
 ```
 ## development...origin/development [ahead 2]
 ```
 
-Push it, every time:
+That left webapp `origin/main` ahead of `origin/development` — precisely the diverged state that
+aborts the **next** release at Stop 2. The failure therefore surfaced one release later, with an
+error naming the webapp rather than the release that caused it. It is what blocked the v2.0.1 cut.
+
+`post_release_prep` now bumps and pushes both repos, and `scripts/release_prep_tests.py` pins it —
+asserting against the **remotes**, because the old code committed in the webapp and simply never
+pushed, so a working-tree assertion would have passed while the bug was live.
+
+Still confirm it after every release, because this is cheap and its absence is expensive:
 
 ```bash
-git -C ../webapp push origin development
+for d in . ../webapp; do
+  git -C $d fetch origin --quiet
+  echo "$d unpushed: $(git -C $d rev-list --count origin/development..development)"   # both 0
+done
 ```
 
-Skip it and webapp `origin/main` is ahead of `origin/development` — which is exactly the diverged
-state that aborts the **next** release at Stop 2.
+If either is non-zero, push it and work out why the script did not — do not just paper over it.
 
-Also note: `post_release_prep` bumps `pyproject.toml` and `ble_service/pyproject.toml`. It does
-**not** touch the webapp's `package.json`, which stays at the old version. That is existing
-behaviour; do not "fix" it inside a release run.
-
-## Step 5 — Deploy to the Pi from the webapp Update page
+## Step 6 — Deploy to the Pi from the webapp Update page
 
 **Not `curl | sudo bash`.** That line is classifier-blocked, GitHub rate-limits the Pi at 429, and an
 unresolved version "deploys" the old slot green. The self-converging update path is the supported
@@ -225,7 +335,7 @@ until [ "$(curl -sk --max-time 5 https://mcapp.local/api/status \
 Auto-rollback is armed: if the health checks fail the previous slot stays active and the service
 keeps running the old code.
 
-## Step 6 — Verify
+## Step 7 — Verify
 
 The modal's DONE is not verification. Check the box:
 
