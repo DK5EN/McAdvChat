@@ -69,7 +69,6 @@ SLOTS_DIR = None  # ~/mcapp-slots
 META_DIR = None  # ~/mcapp-slots/meta
 home = None  # User home directory (inferred from script location)
 DB_PATH = Path("/var/lib/mcapp/messages.db")
-WEBAPP_SLOTS_DIR = Path("/var/www/html/webapp-slots")
 UPDATE_TRIGGER_FILE = Path("/var/lib/mcapp/update-trigger")  # must match sse_handler.py's copy
 _ANSI_RE = re.compile(r"\x1b\[[0-9;]*[a-zA-Z]")  # all ANSI escape sequences
 _DECORATIVE_LINE_RE = re.compile(r"^[\s╔╗╚╝═─┌┐└┘│┤├]+$")  # pure box-drawing decoration
