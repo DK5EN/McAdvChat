@@ -19,6 +19,9 @@ Covers plan §9 cases 1-6:
      it, longest outage is the longest single gap (never the dark stretch).
   6. Window clipping at both edges, and a window entirely before
      first_observed_ms.
+  7. Regression: a ledger that has NEVER recorded a beacon must not read the
+     live tail as `up` — split on GAP_TOLERANCE_MS into `dark` (too early to
+     judge) vs `gap` (an honest outage), never `uptime_pct: 100.0`.
 
 Ephemeral tempfile SQLite DB per scenario (never the live DB), mirroring
 storage/migration_chain_tests.py and this package's other `*_tests.py`
@@ -478,6 +481,111 @@ async def _test_window_clipping(results: list[tuple[str, bool]]) -> None:
             await storage.close()
 
 
+async def _test_fresh_ledger_no_beacon(results: list[tuple[str, bool]]) -> None:
+    """Case 7 (regression): a ledger that has NEVER recorded a beacon
+    (`last_beacon_ms IS NULL`) must never report `uptime_pct: 100.0` — the
+    live-tail gap used to be derived only from `last_beacon_ms`, so with no
+    beacon ever seen no gap could be derived and the hole-filling step
+    painted the whole stretch `up`. The fix measures the silence from
+    `first_observed_ms` instead and splits it on `GAP_TOLERANCE_MS`, exactly
+    like the has-beaconed live tail: under tolerance is `dark` (too early to
+    judge, not `up`), over tolerance is an honest `gap`. `state` stays
+    'unknown' on both sides of the boundary.
+    """
+
+    # -- under GAP_TOLERANCE_MS since first_observed_ms: dark, not up --
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        db_path = Path(tmp_dir) / "uptime_fresh_under_tol_test.db"
+        storage = await create_sqlite_storage(db_path)
+        try:
+            t0 = _BASE_TS
+            await storage.reconcile_link_uptime_startup(t0)  # seeds first_observed_ms only
+
+            now = t0 + GAP_TOLERANCE_MS - 1  # just under the boundary
+            window_ms = 3_600_000
+            result = await storage.get_link_uptime(window_ms, now_ms_=now)
+
+            segments = result["segments"]
+            total_span = sum(s["end_ms"] - s["start_ms"] for s in segments)
+            has_gap = any(s["kind"] == "gap" for s in segments)
+
+            results.append(
+                (
+                    "fresh ledger, under tolerance: uptime_pct is None (not 100.0)",
+                    result["uptime_pct"] is None,
+                )
+            )
+            results.append(
+                (
+                    "fresh ledger, under tolerance: no gap segment is produced",
+                    not has_gap,
+                )
+            )
+            results.append(
+                (
+                    "fresh ledger, under tolerance: state stays 'unknown'",
+                    result["state"] == "unknown",
+                )
+            )
+            results.append(
+                (
+                    "fresh ledger, under tolerance: segments remain a gapless cover of the window",
+                    total_span == window_ms,
+                )
+            )
+        finally:
+            await storage.close()
+
+    # -- over GAP_TOLERANCE_MS since first_observed_ms: an honest gap --
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        db_path = Path(tmp_dir) / "uptime_fresh_over_tol_test.db"
+        storage = await create_sqlite_storage(db_path)
+        try:
+            t0 = _BASE_TS
+            await storage.reconcile_link_uptime_startup(t0)  # seeds first_observed_ms only
+
+            now = t0 + GAP_TOLERANCE_MS + 1  # just over the boundary
+            window_ms = 3_600_000
+            result = await storage.get_link_uptime(window_ms, now_ms_=now)
+
+            segments = result["segments"]
+            total_span = sum(s["end_ms"] - s["start_ms"] for s in segments)
+            has_gap = any(s["kind"] == "gap" for s in segments)
+
+            results.append(
+                (
+                    "fresh ledger, over tolerance: uptime_pct == 0.0",
+                    result["uptime_pct"] == 0.0,
+                )
+            )
+            results.append(
+                (
+                    "fresh ledger, over tolerance: a gap segment is present",
+                    has_gap,
+                )
+            )
+            results.append(
+                (
+                    "fresh ledger, over tolerance: state stays 'unknown'",
+                    result["state"] == "unknown",
+                )
+            )
+            results.append(
+                (
+                    "fresh ledger, over tolerance: segments remain a gapless cover of the window",
+                    total_span == window_ms,
+                )
+            )
+            results.append(
+                (
+                    "regression guard: uptime_pct is never 100.0 with no beacon ever recorded",
+                    result["uptime_pct"] != 100.0,
+                )
+            )
+        finally:
+            await storage.close()
+
+
 def _test_route_registered(results: list[tuple[str, bool]]) -> None:
     """`GET /api/uptime` is registered on the router `build_uptime_router`
     hands to `SSEManager._create_app` for mounting.
@@ -520,6 +628,7 @@ async def run_uptime_tests() -> bool:
     await _test_startup_reconciliation(results)
     await _test_stats_maths(results)
     await _test_window_clipping(results)
+    await _test_fresh_ledger_no_beacon(results)
     _test_route_registered(results)
 
     for label, ok in results:

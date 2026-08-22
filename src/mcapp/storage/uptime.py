@@ -134,14 +134,28 @@ def _collect_non_up_intervals(  # noqa: PLR0913 - keyword-only, one seam per rea
         if seg_end > seg_start:
             non_up.append({"start_ms": seg_start, "end_ms": seg_end, "kind": row["kind"]})
 
-    # Live tail: silence since the last counted beacon (or, if none was ever
-    # seen, since first_observed_ms) that has already exceeded
-    # GAP_TOLERANCE_MS but has no CLOSING beacon yet to write it as a stored
-    # row — there is no shutdown hook, so the reader materialises it instead
-    # of a writer ever persisting it.
-    tail_anchor = last_beacon_ms if last_beacon_ms is not None else first_observed_ms
-    if tail_anchor is not None and now - tail_anchor > GAP_TOLERANCE_MS:
-        tail_start = max(tail_anchor, start)
+    # Live tail: silence since the last counted beacon that has already
+    # exceeded GAP_TOLERANCE_MS but has no CLOSING beacon yet to write it as
+    # a stored row — there is no shutdown hook, so the reader materialises it
+    # instead of a writer ever persisting it.
+    #
+    # If NO beacon has EVER been recorded, there is no last_beacon_ms to
+    # anchor on — measure the silence from first_observed_ms instead, and
+    # split on the same GAP_TOLERANCE_MS: within tolerance it is too early to
+    # call the link down, so it must NOT render as `up` (that is the fresh-
+    # ledger 100%-uptime bug) — fill it `dark` instead. `dark` normally means
+    # "the proxy was not running"; here it is deliberately widened to also
+    # mean "the proxy is running but has never heard anything yet, so this
+    # stretch cannot be claimed as measured". Beyond tolerance it becomes an
+    # honest `gap`, exactly like the has-beaconed case below.
+    if last_beacon_ms is None:
+        if first_observed_ms is not None:
+            tail_start = max(first_observed_ms, start)
+            if end > tail_start:
+                kind = "gap" if now - first_observed_ms > GAP_TOLERANCE_MS else "dark"
+                non_up.append({"start_ms": tail_start, "end_ms": end, "kind": kind})
+    elif now - last_beacon_ms > GAP_TOLERANCE_MS:
+        tail_start = max(last_beacon_ms, start)
         if end > tail_start:
             non_up.append({"start_ms": tail_start, "end_ms": end, "kind": "gap"})
 
@@ -348,12 +362,14 @@ class UptimeMixin(StorageBase):
         ending at `now_ms_` (defaults to `now_ms()`) — plan §5.
 
         Collects the non-`up` intervals — stored `gap`/`dark` rows overlapping
-        the window, the live tail gap (silence since `last_beacon_ms`, or
-        since `first_observed_ms` if no beacon was ever seen, that has
-        already exceeded `GAP_TOLERANCE_MS`), and everything before
-        `first_observed_ms` (or the whole window, if there is no state row at
-        all) as `dark` — clips each to the window, and fills every remaining
-        hole with `up`. These three sources are disjoint and chronologically
+        the window, the live tail (silence since `last_beacon_ms` that has
+        already exceeded `GAP_TOLERANCE_MS`, rendered `gap`; or, if no beacon
+        was EVER seen, silence since `first_observed_ms` instead, rendered
+        `gap` beyond `GAP_TOLERANCE_MS` and `dark` within it — never `up`,
+        which is what let a fresh ledger report a false 100% uptime), and
+        everything before `first_observed_ms` (or the whole window, if there
+        is no state row at all) as `dark` — clips each to the window, and
+        fills every remaining hole with `up`. These three sources are disjoint and chronologically
         ordered by construction of the writers above (a stored segment's
         `end_ms` always becomes the new `last_beacon_ms`/`open_up_start_ms`,
         which is where the next one starts), so no merge step is needed
