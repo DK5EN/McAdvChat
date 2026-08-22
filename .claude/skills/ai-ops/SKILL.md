@@ -207,14 +207,20 @@ exact line matters more than the count.
 ssh mcapp.local '
   df -h --output=source,size,used,avail,pcent /
   free -m | awk "NR==2 {print \"mem total=\" \$2 \" used=\" \$3 \" avail=\" \$7}"
+  grep -E "^(SwapTotal|SwapFree):" /proc/meminfo
   uptime
   vcgencmd measure_temp 2>/dev/null || cat /sys/class/thermal/thermal_zone0/temp
 '
 ```
 
 **This is a Pi Zero 2W with ~415 MB of usable RAM** — memory is the scarce resource, not disk.
-Baseline 2026-08-22: disk 7 % of 59 G, ~133 MB available RAM. Disk above 85 % or available RAM
-in the low tens of MB is a finding; three slots plus a growing DB is what fills the card.
+Baseline 2026-08-22 07:47: disk 7 % of 59 G, ~181 MB available RAM, and **~142 MB actually
+swapped out** (SwapFree 273 of 415 MB). Steady swap usage is normal for this box under zram and
+is a WATCH, not a finding — but SwapFree trending toward zero, MemAvailable in the low tens of
+MB, or disk above 85 % is a finding. Three slots plus a growing DB is what fills the card.
+
+Swap is read from `/proc/meminfo` rather than `free`, because `/proc` is English regardless of
+the shell's locale and needs no `$field` references — `free`'s own labels are German here.
 
 ## Phase 8 — Secret and TLS hygiene
 
@@ -235,6 +241,17 @@ curl -skI https://mcapp.local/ | head -3
 - Web Push needs outbound internet from the Pi and **degrades silently without it**.
 - TLS is Caddy on :80/:443 in front of lighttpd on :8082. For certificate work follow
   `doc/tls-maintenance-SOP.md` rather than improvising.
+- **A near-term `notAfter` on this host is NOT an expiry finding.** Caddy's internal CA
+  (`issuer=CN=Caddy Local Authority - ECC Intermediate`) issues **12-hour** leaf certs and
+  renews them automatically, so a spot check almost always shows a cert expiring within hours —
+  observed 2026-08-22: `notBefore Aug 21 23:39 → notAfter Aug 22 11:39`, checked at 05:48, i.e.
+  mid-life and healthy. Always read `notBefore` and the issuer before judging `notAfter`; only a
+  cert that has _actually_ expired, or a public-CA cert inside its last days, is a finding.
+
+```bash
+echo | openssl s_client -connect mcapp.local:443 2>/dev/null \
+  | openssl x509 -noout -issuer -dates -ext subjectAltName
+```
 
 ## Pi gotchas that cost round-trips
 
