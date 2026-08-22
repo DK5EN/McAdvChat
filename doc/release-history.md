@@ -1,5 +1,82 @@
 # Release History
 
+## v2.0.1 (2026-08-22)
+
+Patch release. Adds **Gateway Availability** — a measured record of whether the node's uplink to
+the MeshCom server is actually carrying the `{CET}` time beacon — plus two hardening fixes and an
+ops health-check routine. 13 backend commits and 4 frontend commits since v2.0.0.
+
+### Highlights
+
+- **Gateway Availability** — the proxy now keeps a persistent ledger of the `{CET}` uplink beacon
+  and charts it in Settings and in the admin panel. It answers a question no other surface could:
+  the mesh can be busy with RF traffic while the node's link to the MeshCom server is silently
+  down, and until now nothing distinguished the two.
+- **Uptime and coverage are separate claims.** A stretch where the proxy was running but heard no
+  beacon counts against _uptime_; a stretch where the proxy was not running counts only against
+  _coverage_. A deploy restart can therefore never masquerade as a link outage.
+
+### Backend (MCProxy)
+
+- **[feat]** Gateway-uptime ledger (schema **v25**): `link_uptime_state` and `link_uptime_segments`,
+  with `gap` (proxy up, no beacon) and `dark` (proxy not watching) kept strictly distinct, plus
+  retention.
+- **[feat]** Ingest hook, 30 s heartbeat, startup reconciliation and `GET /api/uptime?range=24h|7d`
+  returning state, `uptime_pct`, `coverage_pct`, longest outage and the segment list.
+  - The recorder sits **before** `_should_filter_message`, because `{CET}` is dropped at ingest and
+    never persisted — a hook placed after it would never fire.
+  - The uplink gate is **hop count 0**, not "no via": the same beacon arrives over `udp`,
+    `ble_remote` (where `via == src`) and as a foreign gateway's multi-hop relay, and only the
+    first two are ours. A BLE-only box would otherwise report permanent downtime.
+  - `GAP_TOLERANCE_MS` is **6 min** against a measured **303 s** beacon cadence. A tolerance at or
+    below the cadence marks a perfect link as silent — a link that never dropped a frame would have
+    reported roughly 60 % uptime.
+- **[fix]** `uptime_pct` no longer reports **100 %** on a ledger that has never heard a beacon.
+  With no beacon to anchor the live tail on, the silence is now measured from `first_observed_ms`
+  and split on the same tolerance: `dark` and `null` inside it, `gap` and `0.0` past it.
+- **[fix]** `/etc/mcapp/config.json` and its `.bak` copies are written **`0600`** explicitly. The
+  file holds `BLE_API_KEY` in clear, and the mode previously depended on which of the two writers
+  ran last — `migrate_config()` inherited `mktemp`'s `0600` while `write_config()` set `0640`.
+  Existing installs keep their current mode until `--reconfigure` is run.
+- **[chore]** `uv.lock` workspace member versions synced to 2.0.1.
+
+### Frontend (webapp)
+
+- **[feat]** Gateway Availability card in Settings — 24 h / 7 d availability with a segmented
+  timeline, rendering "No data yet" rather than a number while the ledger is still `unknown`.
+- **[feat]** Admin panel gains gateway availability, fleet activity and fleet composition cards,
+  backed by a typed admin-history store over the mc-chat availability/activity/fleet API.
+- **[docs]** `protocol.md` §5.4a documents the three mc-chat admin-history endpoints.
+
+### Ops
+
+- **[docs]** `ai-ops` skill — a repeatable production check for `mcapp.local` covering services and
+  restart history, the active slot, database and schema, live data flow, log triage, host headroom
+  and secret hygiene, together with the traps that make each phase lie if skipped.
+- **[docs]** `doc/ops-mcapp-health-log.md` — an append-only health log with per-hour rate baselines,
+  so successive runs are comparable instead of being read against raw counters at different uptimes.
+
+### Field notes
+
+The feature was measured in production before this release was cut. The beacon cadence is **303 s**,
+confirmed three times independently. The first real `gap` recorded was 606 s — exactly two cadences,
+i.e. **one lost beacon**, with the next arriving exactly on schedule; RF traffic continued
+uninterrupted throughout, so the loss was on the node-to-server uplink and not in the mesh.
+
+Two consequences worth knowing before reading the chart:
+
+- **The metric's resolution is one cadence.** A single lost frame costs about 1 % of a 24 h window.
+  99 % is not a degraded link.
+- Nothing shorter than ~6 min is visible at all, and an outage reads as its true length plus one
+  cadence.
+
+### Upgrade notes
+
+- The schema migration to v25 runs automatically on first start. No user action needed.
+- The ledger starts empty: availability reads `unknown` and the card shows "No data yet" until the
+  first beacon lands, normally within ~5 min.
+- After this release the development line continues as `v2.0.2-dev.N`.
+
 ## v2.0.0 (2026-08-21)
 
 Major release — 765 commits across both repos since v1.6.13 (229 backend, 536 frontend). McApp
