@@ -1,9 +1,9 @@
 # McApp production health log — mcapp.local
 
-> **Status:** Current — newest section and newest sweep: §4 (2026-08-22 17:53 CEST, pre-release
-> check for v2.0.1) — verdict **all green**, zero findings. Open watch points: **W1** (swap),
-> **W2** (live `config.json` stays `0640` by decision), **W3** (Caddy 12 h certs), **W5**
-> (untagged merge on webapp `main`). **W4 is resolved** (§3) and its fix is live.
+> **Status:** Current — newest section: §5 (2026-08-22 18:10 CEST, **v2.0.1 promoted to
+> production**). Newest sweep: §4 (2026-08-22 17:53 CEST) — verdict **all green**, zero findings.
+> Open watch points: **W1** (swap), **W2** (live `config.json` stays `0640` by decision), **W3**
+> (Caddy 12 h certs). **W4** (§3) and **W5** (§5) are resolved.
 >
 > **Kind:** Recurring ops review; one dated section per run, appended, never edited in place.
 > **Produced by:** the `ai-ops` skill (`.claude/skills/ai-ops/SKILL.md`).
@@ -346,3 +346,68 @@ Promotion is the ordinary `scripts/release.sh` path from `development`.
   **`/webapp/version.html`**. Path added to the skill.
 - Phase 5 reads the ledger from the DB but never names the HTTP surface. `GET /api/uptime`
   **requires** `?range=` (`24h` / `7d`) and returns a 422 without it. Added.
+
+## 5. 2026-08-22 18:10 CEST — v2.0.1 promoted to production
+
+Not a sweep. Records the promotion §4 cleared, and the post-deploy verification, so the next run
+knows what changed under it.
+
+`v2.0.1` was cut from `v2.0.1-dev.2` (`bc12783`, plus the §4 log entry and the release notes) and
+deployed from the webapp Update page. GitHub release:
+<https://github.com/DK5EN/McApp/releases/tag/v2.0.1>, sha256
+`cfaad29aa0a49ad5fc334e580a2528986a91feefe92bc634e33a3c4b9718a7db`.
+
+### Post-deploy verification
+
+| Check                  | Value                                                             |
+| ---------------------- | ----------------------------------------------------------------- |
+| `/api/status`          | `v2.0.1`                                                          |
+| `/webapp/version.html` | `v2.0.1`                                                          |
+| `/health`              | `healthy`                                                         |
+| Active slot            | **slot-0** (rotated from `slot-2`; slot-0 previously held v2.0.0) |
+| Services               | mcapp, mcapp-ble, caddy, lighttpd all `active`                    |
+| `NRestarts`            | **0** on both units                                               |
+| Schema                 | DB **25** = `LATEST_SCHEMA_VERSION` in the active slot ✓          |
+| System epoch           | installed **1** = required ✓                                      |
+
+### The uptime ledger survived the deploy cleanly
+
+This is the first time the gateway-uptime feature has been carried through a release deploy, so it
+is worth pinning what happened:
+
+- `first_observed_ms` still **00:54:02** — untouched.
+- **No `dark` row was written**, and that is correct: the service was down for less than
+  `DARK_THRESHOLD_MS` (3 missed 30 s heartbeats), so `reconcile_link_uptime_startup` left the state
+  as it found it. A production deploy does not read as a link outage.
+- The only segment in the ledger is still the single 12:43:07 → 12:53:13 `gap` from §4.
+- Beacon arrived 198 s after the restart, heartbeat 30 s — both inside their envelopes.
+- `uptime_pct` 99.03 %, `coverage_pct` 71.93 % — continuous with §4's reading, no discontinuity.
+
+### W5 — resolved
+
+webapp `main` carried `be6089d`, a development merge that was never merged back, leaving `main` one
+commit ahead of its own `development`. That state aborts `release.sh`'s `validate_main_mergeable`
+and **blocked the release**. Merged back non-destructively (the trees were identical, so the merge
+was purely topological) and pushed.
+
+**The root cause is structural and will recur.** `post_release_prep` pushes **MCProxy**
+`development` only; the webapp's merge-back from step 10 is committed and never pushed, so every
+production release leaves webapp `development` behind `origin/main` until someone pushes it by hand
+— which is exactly what aborts the _next_ release. Documented as Stop 4 in the new `prod-release`
+skill, with the manual push as an explicit step.
+
+### Related work this produced
+
+- **`prod-release` skill** (`.claude/skills/prod-release/SKILL.md`) — the production counterpart to
+  `dev-release`, covering the four stops that abort or silently bite: release notes must be
+  committed _before_ the script starts (its clean-tree check runs first), `main` must not be ahead
+  in either repo, the notes prompt is a bare `read` that `< /dev/null` kills into the rollback trap,
+  and the webapp `development` push the script never performs.
+
+### Open, unchanged
+
+- 169 pre-2026-08-13 duplicate telemetry pairs, still unexplained.
+- `fcs_ok` field-data verdict due after 2026-09-20 (`doc/backlog.md`).
+- webapp `package.json` still reads `2.0.0`; `post_release_prep` bumps only the two
+  `pyproject.toml` files. Cosmetic today, but it means the webapp repo carries no version of its
+  own that matches the release.
