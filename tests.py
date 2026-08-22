@@ -27,7 +27,7 @@ import inspect
 import json
 import tempfile
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 from .classify import Classifier
 from .rules import load_rules, match_rules
@@ -40,17 +40,21 @@ from .types import CATEGORIES, DIRECTED_DST_PATTERN, DIRECTED_DST_RE, StoragePro
 async def _make_storage(db_path: str) -> StorageProtocol:
     """Construct + initialize a real (tempfile) SQLite-backed storage,
     trying MCProxy's layout first, then mc-chat's."""
+    import importlib
+
     try:
-        import importlib
-
         _sqlite_storage = importlib.import_module("mcapp.sqlite_storage")  # MCProxy layout
-        return await _sqlite_storage.create_sqlite_storage(db_path)  # type: ignore[return-value]
+        return cast(StorageProtocol, await _sqlite_storage.create_sqlite_storage(db_path))
     except ImportError:
-        from ..storage import Storage  # mc-chat layout
-
-        storage = Storage(db_path)
-        await storage.initialize()
-        return storage  # type: ignore[return-value]
+        # mc-chat layout. Imported dynamically (not `from ..storage import Storage`) because
+        # this module is a git subtree synced into MCProxy, where `..storage` resolves to
+        # `mcapp.storage` (a namespace package with no `Storage`) — a static relative import
+        # would make mypy fail here even though this branch never actually executes in
+        # MCProxy (the try above always succeeds).
+        _mock_storage = importlib.import_module("meshcom_mock.storage")
+        mock_storage = _mock_storage.Storage(db_path)
+        await mock_storage.initialize()
+        return cast(StorageProtocol, mock_storage)
 
 
 async def _store_unclassified(storage: StorageProtocol, msg: dict[str, Any]) -> None:
