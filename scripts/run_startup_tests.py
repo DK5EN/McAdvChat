@@ -59,6 +59,7 @@ from mcapp.storage.migration_chain_tests import run_migration_chain_tests
 from mcapp.storage.query_tests import run_query_tests
 from mcapp.storage.signal_via_tests import run_signal_via_tests
 from mcapp.storage.telemetry_reconcile_tests import run_telemetry_reconcile_tests
+from mcapp.storage.uptime_tests import run_uptime_tests
 from mcapp.udp_handler import run_startup_tests as run_udp_handler_tests
 from mcapp.udp_parsing_tests import run_udp_parsing_tests
 
@@ -147,6 +148,9 @@ async def main() -> int:  # noqa: PLR0915 - flat suite registry; one visible lin
     connection_lifecycle_ok = await run_connection_lifecycle_tests()
     print(f"connection_lifecycle: {'PASS' if connection_lifecycle_ok else 'FAIL'}")
 
+    uptime_ok = await run_uptime_tests()
+    print(f"uptime: {'PASS' if uptime_ok else 'FAIL'}")
+
     meteo_ok = run_meteo_tests()
     print(f"meteo: {'PASS' if meteo_ok else 'FAIL'}")
 
@@ -218,6 +222,7 @@ async def main() -> int:  # noqa: PLR0915 - flat suite registry; one visible lin
         and migration_chain_ok
         and signal_via_ok
         and connection_lifecycle_ok
+        and uptime_ok
         and meteo_ok
         and push_ok
         and ble_protocol_ok

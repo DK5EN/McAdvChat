@@ -380,14 +380,20 @@ EOF
     fi
   fi
 
-  # Backup existing config if present
+  # Backup existing config if present. Contains BLE_API_KEY in clear, so
+  # create the backup at 0600 directly rather than cp-then-chmod: `cp` onto a
+  # nonexistent destination does not preserve mode, it creates at
+  # 0666 & ~umask (0644 under the common 022 umask), which would leave the
+  # secret world-readable, if only for the window before a follow-up chmod.
   if [[ -f "$CONFIG_FILE" ]]; then
-    cp "$CONFIG_FILE" "${CONFIG_FILE}.bak"
+    install -m 600 "$CONFIG_FILE" "${CONFIG_FILE}.bak"
   fi
 
-  # Atomic move
+  # Atomic move. 600, not 640: this file holds BLE_API_KEY in clear and both
+  # McApp services run as the owning user, so group-read buys nothing but
+  # exposure.
   mv "$tmp_config" "$CONFIG_FILE"
-  chmod 640 "$CONFIG_FILE"
+  chmod 600 "$CONFIG_FILE"
 
   # Ensure the service user can read the config (script runs as root via sudo)
   local run_user="${SUDO_USER:-root}"
@@ -488,8 +494,15 @@ migrate_config() {
   fi
 
   if [[ "$updated" == "true" ]]; then
-    cp "$CONFIG_FILE" "${CONFIG_FILE}.bak"
+    # Same reasoning as write_config()'s backup: contains BLE_API_KEY in
+    # clear, and cp-then-chmod would leave it briefly world-readable under a
+    # 022 umask. install -m 600 creates it at the right mode directly.
+    install -m 600 "$CONFIG_FILE" "${CONFIG_FILE}.bak"
     mv "$tmp_config" "$CONFIG_FILE"
+    # mv inherits tmp_config's mode from mktemp rather than any mode we
+    # declare, so it would otherwise be nondeterministic: make it explicit
+    # and match write_config()'s 600 instead of depending on mktemp's default.
+    chmod 600 "$CONFIG_FILE"
     # Preserve ownership for the service user
     local run_user="${SUDO_USER:-root}"
     if [[ "$run_user" != "root" ]]; then

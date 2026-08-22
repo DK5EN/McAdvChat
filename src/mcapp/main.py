@@ -77,6 +77,7 @@ MAX_PAGE_LIMIT = 100
 BLE_CMD_MAX_RETRIES = 3
 NIGHTLY_PRUNE_HOUR = 4
 CLASSIFIER_STATS_INTERVAL_S = 60.0
+LINK_UPTIME_HEARTBEAT_INTERVAL_S = 30.0
 SHUTDOWN_TIMEOUT_TOPIC_BEACONS_S = 5.0
 SHUTDOWN_TIMEOUT_BLE_S = 5.0
 SHUTDOWN_TIMEOUT_UDP_S = 3.0
@@ -2257,6 +2258,10 @@ async def build_app(cfg: Config) -> AppContext:  # noqa: PLR0915 - sequential wi
     # Initialize SQLite storage backend
     logger.info("Database: %s", cfg.storage.db_path)
     storage_handler = await create_sqlite_storage(cfg.storage.db_path)
+    # Gateway-uptime startup reconciliation (plan §4c): must run before the
+    # heartbeat task starts (_start_background_tasks, later) or the first
+    # tick would paper over the downtime this call is here to record.
+    await storage_handler.reconcile_link_uptime_startup(now_ms())
     # One-time migration: import mcdump.json into SQLite, then rename to prevent re-import
     dump_path = Path("mcdump.json")
     if await asyncio.to_thread(dump_path.exists):
@@ -2607,11 +2612,34 @@ async def _classifier_stats_broadcast(
     logger.debug("Classifier stats broadcaster stopped")
 
 
+async def _link_uptime_heartbeat(
+    storage_handler: SQLiteStorage,
+    stop_event: asyncio.Event,
+) -> None:
+    """Gateway-uptime heartbeat (plan §4b): proves the proxy PROCESS was
+    watching, independent of link state. Every 30s so a crash loses at most
+    half a minute of coverage; a failing tick logs and keeps looping —
+    reachability observation must never take the proxy down.
+    """
+    while not stop_event.is_set():
+        try:
+            await storage_handler.link_uptime_tick(now_ms())
+        except Exception as exc:
+            logger.warning("link uptime heartbeat tick failed: %s", exc)
+        try:
+            await asyncio.wait_for(stop_event.wait(), timeout=LINK_UPTIME_HEARTBEAT_INTERVAL_S)
+        except TimeoutError:
+            continue
+
+    logger.debug("Link uptime heartbeat stopped")
+
+
 @dataclass
 class _BackgroundTasks:
     """Handles kept alive for the app's lifetime (main() holds the only
-    reference). Only prune/stats/sperrliste/converge are cancelled at shutdown —
-    the backfill tasks are one-shots left to finish or be reaped by process exit."""
+    reference). Only prune/stats/sperrliste/converge/link_uptime_heartbeat are
+    cancelled at shutdown — the backfill tasks are one-shots left to finish or
+    be reaped by process exit."""
 
     prune_task: asyncio.Task[None]
     classifier_stats_task: asyncio.Task[None]
@@ -2620,14 +2648,16 @@ class _BackgroundTasks:
     aprs_escape_backfill_task: asyncio.Task[None]
     sperrliste_task: asyncio.Task[None]
     converge_task: asyncio.Task[None]
+    link_uptime_heartbeat_task: asyncio.Task[None]
 
 
 def _start_background_tasks(
     ctx: AppContext, cfg: Config, stop_event: asyncio.Event
 ) -> _BackgroundTasks:
     """Start the nightly-prune, classifier-backfill, signal-backfill,
-    APRS-escape-backfill, classifier-stats-broadcast, sperrliste-refresh, and
-    system-epoch converge-watchdog background tasks."""
+    APRS-escape-backfill, classifier-stats-broadcast, sperrliste-refresh,
+    system-epoch converge-watchdog, and link-uptime-heartbeat background
+    tasks."""
     prune_task = asyncio.create_task(_nightly_prune(ctx.storage_handler, cfg, stop_event))
     # Reference lives for the app's lifetime (run() awaits until shutdown)
     backfill_task = asyncio.create_task(
@@ -2654,6 +2684,11 @@ def _start_background_tasks(
     # mode once it goes idle. No-op everywhere except a real fielded Linux box —
     # see system_converge.py for the full gating.
     converge_task = asyncio.create_task(converge_watchdog(stop_event))
+    # Gateway-uptime heartbeat (plan §4b): proves the proxy process was
+    # watching, independent of the {CET} beacon hook in storage/ingest.py.
+    link_uptime_heartbeat_task = asyncio.create_task(
+        _link_uptime_heartbeat(ctx.storage_handler, stop_event)
+    )
     return _BackgroundTasks(
         prune_task=prune_task,
         classifier_stats_task=classifier_stats_task,
@@ -2662,15 +2697,17 @@ def _start_background_tasks(
         aprs_escape_backfill_task=aprs_escape_backfill_task,
         sperrliste_task=sperrliste_task,
         converge_task=converge_task,
+        link_uptime_heartbeat_task=link_uptime_heartbeat_task,
     )
 
 
 async def _cancel_background_tasks(tasks: _BackgroundTasks) -> None:
-    """Cancel the four long-running loops; backfill tasks are one-shots, left alone."""
+    """Cancel the five long-running loops; backfill tasks are one-shots, left alone."""
     tasks.prune_task.cancel()
     tasks.classifier_stats_task.cancel()
     tasks.sperrliste_task.cancel()
     tasks.converge_task.cancel()
+    tasks.link_uptime_heartbeat_task.cancel()
     with contextlib.suppress(asyncio.CancelledError):
         await tasks.prune_task
     with contextlib.suppress(asyncio.CancelledError):
@@ -2679,6 +2716,8 @@ async def _cancel_background_tasks(tasks: _BackgroundTasks) -> None:
         await tasks.sperrliste_task
     with contextlib.suppress(asyncio.CancelledError):
         await tasks.converge_task
+    with contextlib.suppress(asyncio.CancelledError):
+        await tasks.link_uptime_heartbeat_task
 
 
 async def _shutdown_services(ctx: AppContext) -> None:

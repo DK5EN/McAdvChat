@@ -419,10 +419,45 @@ class MigrationsMixin(StorageBase):
                         " (nullable, BLE-only, storage-only — no backfill)",
                         current_version,
                     )
+                    _set_schema_version(conn, 24)
+
+                if current_version < 25:  # noqa: PLR2004 - schema migration step
+                    # Gateway-uptime ledger (2026-08-21 plan): `{CET}` is dropped
+                    # at ingest by `_should_filter_message`, so there is no
+                    # history to backfill from — these tables start empty and
+                    # fill going forward. An append-only ledger of CLOSED
+                    # segments (not one row per minute) keeps row count
+                    # proportional to the number of state transitions (tens per
+                    # month), not to wall-clock time; `up` runs are never
+                    # stored, only derived by the reader from the gaps between
+                    # stored `gap`/`dark` rows — see storage/uptime.py.
+                    conn.executescript("""
+                        CREATE TABLE IF NOT EXISTS link_uptime_segments (
+                            start_ms INTEGER PRIMARY KEY,
+                            end_ms   INTEGER NOT NULL,
+                            kind     TEXT    NOT NULL
+                        );
+                        CREATE INDEX IF NOT EXISTS idx_link_uptime_segments_end
+                            ON link_uptime_segments(end_ms);
+
+                        CREATE TABLE IF NOT EXISTS link_uptime_state (
+                            id                INTEGER PRIMARY KEY CHECK (id = 1),
+                            first_observed_ms INTEGER,
+                            last_beacon_ms    INTEGER,
+                            last_tick_ms      INTEGER,
+                            open_up_start_ms  INTEGER
+                        );
+                    """)
+                    logger.info(
+                        "Migration v%d → v25: created link_uptime_segments/"
+                        "link_uptime_state (gateway-uptime ledger, empty until"
+                        " the first accepted {CET} beacon)",
+                        current_version,
+                    )
                     # Adding a step after this one? Bump LATEST_SCHEMA_VERSION in
                     # storage/constants.py in the same commit — the startup suite
                     # asserts every migration chain terminates there.
-                    _set_schema_version(conn, 24)
+                    _set_schema_version(conn, 25)
 
         await asyncio.to_thread(_init_db)
 

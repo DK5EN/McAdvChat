@@ -58,6 +58,7 @@ from .telemetry_reconcile import (
     reconcile,
     values_for,
 )
+from .uptime import is_uplink_time_beacon
 
 _MAX_FORENSIC_HOPS = 4  # log raw data for messages routed over more hops
 
@@ -877,6 +878,14 @@ class IngestMixin(StorageBase):
         if not isinstance(message, dict):
             logger.warning("store_message: invalid input, message is not a dict")
             return
+
+        # Gateway-uptime beacon hook: MUST run before _should_filter_message,
+        # which drops {CET} before any INSERT and returns early — a hook
+        # placed after it would never fire. See doc/2026-08-21_2350-gateway-
+        # uptime-plan.md §4a and CLAUDE.md's link-check "ingest guard" gotcha
+        # (the same trap, same shape, hit twice before).
+        if is_uplink_time_beacon(message):
+            await self.record_link_beacon(now_ms())
 
         # Filter conditions (matching MessageStorageHandler)
         if self._should_filter_message(message):

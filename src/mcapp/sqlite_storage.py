@@ -8,8 +8,9 @@ Uses Python's built-in sqlite3 with asyncio.to_thread() for async operations.
 `SQLiteStorage` is assembled (ST-04) from mixins in `storage/`, each owning one
 concern: `MigrationsMixin` (schema + versioned migrations), `IngestMixin`
 (store_message/store_telemetry + signal-bucket accumulation), `QueryMixin`
-(reporting/chart/dump reads), `PrefsMixin` (small UI-preference tables), and
-`ClassifierApiMixin` (classifier_rules/beacon_templates CRUD). This module keeps
+(reporting/chart/dump reads), `PrefsMixin` (small UI-preference tables),
+`ClassifierApiMixin` (classifier_rules/beacon_templates CRUD), and `UptimeMixin`
+(the gateway-uptime segment ledger). This module keeps
 only the core DB-access primitives (`_query`/`_mutate`/`_execute_many`),
 construction/teardown, and the module-level regression test suite.
 """
@@ -43,12 +44,15 @@ from .storage.ingest import _QFE_PLAUSIBLE_HPA_RANGE, IngestMixin
 from .storage.migrations import MigrationsMixin
 from .storage.prefs import PrefsMixin
 from .storage.query import QueryMixin
+from .storage.uptime import UptimeMixin
 from .util import now_ms
 
 logger = get_logger(__name__)
 
 
-class SQLiteStorage(MigrationsMixin, IngestMixin, QueryMixin, PrefsMixin, ClassifierApiMixin):
+class SQLiteStorage(
+    MigrationsMixin, IngestMixin, QueryMixin, PrefsMixin, ClassifierApiMixin, UptimeMixin
+):
     """
     SQLite-based message storage backend.
 

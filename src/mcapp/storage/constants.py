@@ -20,7 +20,7 @@ from ..commands.parsing import is_group, is_hashtag, resolve_dst_target
 # passing suite for a reason unrelated to the change being made. This is not
 # circular with migrations.py: the step numbers there are independent literals,
 # so forgetting either half fails loudly.
-LATEST_SCHEMA_VERSION = 24
+LATEST_SCHEMA_VERSION = 25
 
 # Constants matching message_storage.py
 BUCKET_SECONDS = 5 * 60
@@ -46,6 +46,42 @@ EIGHT_DAYS_MS = SIGNAL_BACKFILL_WINDOW_HOURS * 3600 * 1000
 MHEARD_THROTTLE_MS = 120_000  # 2 minutes
 ACK_DIAG_WINDOW_MS = 300_000
 TELEMETRY_DEDUP_WINDOW_MS = 60_000
+
+# Gateway-uptime ledger (schema v25) — see
+# doc/2026-08-21_2350-gateway-uptime-plan.md §4/§5/§6. `storage/uptime.py` is
+# the only reader/writer; kept here (not inlined there) so retuning any one of
+# these is a single-line edit that touches no logic.
+#
+# The only value baked into stored HISTORY: a silence shorter than this is
+# never written as a `gap` segment at all, so retuning it later cannot change
+# what already happened on disk.
+#
+# 6 min, and it MUST stay above the beacon cadence. Measured on mcapp.local
+# 2026-08-21 (three consecutive uplink beacons off the live SSE stream:
+# 23:40:31 → 23:45:34 → 23:50:37) the {CET} beacon arrives every 5 min 03 s —
+# the MeshCom server emits on a 303 s period, not the round 300 s it looks
+# like. A tolerance at or below that cadence would record a `gap` on every
+# single healthy cycle and report ~60% uptime for a link that never dropped a
+# frame. 360 s leaves ~57 s of margin for jitter and SSE reconnects, while a
+# genuinely missed beacon (2 × 303 s = 606 s of silence) still registers.
+GAP_TOLERANCE_MS = 360_000  # 6 min
+# Startup reconciliation only (storage/uptime.py's reconcile_link_uptime_startup):
+# silence since the last 30s heartbeat tick longer than this proves the PROXY
+# PROCESS itself was not running (not just the link), so that stretch is
+# charged to `dark` (COVERAGE), never `gap` (UPTIME) — a deploy restart must
+# never look like a link outage. 90s = 3 missed ticks.
+DARK_THRESHOLD_MS = 90_000
+# Read-time only (applied by get_link_uptime, never written to a stored row),
+# so amber/red can be retuned later without invalidating history — but never
+# below GAP_TOLERANCE_MS, or a beacon-jitter silence that was never even
+# recorded as a `gap` would already read as `silent`/`off`.
+SILENT_MS = 360_000  # 6 min since last beacon → 'silent' (== GAP_TOLERANCE_MS,
+# the smallest honest value: below the 303 s cadence a healthy link reads silent)
+OFF_MS = 900_000  # 15 min since last beacon → 'off'
+# prune_messages retention for link_uptime_segments (query.py). Independent
+# of the other per-table windows above — this ledger is a handful of rows per
+# month, not a high-volume table, so it gets its own generous horizon.
+LINK_UPTIME_RETENTION_DAYS = 400
 
 # Barometric formula: QFE = QNH × (1 - LAPSE_RATE × alt / STD_TEMP)^EXPONENT
 BARO_LAPSE_RATE_K_PER_M = 0.0065

@@ -102,6 +102,13 @@ class StorageBase(Protocol):
     async def get_blocked_texts(self) -> list[str]:
         raise NotImplementedError
 
+    # ── UptimeMixin → called across mixin boundaries ────────────────────────
+    # IngestMixin.store_message calls this on every accepted uplink {CET}
+    # beacon; declared here for the same reason every other cross-mixin call
+    # is, so the call site needs no type: ignore.
+    async def record_link_beacon(self, arrival_ms: int) -> None:
+        raise NotImplementedError
+
     # ── ClassifierApiMixin → called across mixin boundaries ─────────────────
     async def get_meta(self, key: str) -> str | None:
         raise NotImplementedError
