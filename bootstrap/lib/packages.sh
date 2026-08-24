@@ -215,14 +215,32 @@ install_lighttpd() {
   if command -v lighttpd &>/dev/null; then
     log_info "  lighttpd already installed"
     configure_lighttpd
+    configure_lighttpd_ktls_workaround
     return 0
   fi
 
   apt-get install -y -qq lighttpd
 
   configure_lighttpd
+  configure_lighttpd_ktls_workaround
 
   log_ok "  lighttpd installed and configured"
+}
+
+configure_lighttpd_ktls_workaround() {
+  # lighttpd-mod-openssl ships /usr/lib/modules-load.d/lighttpd-mod-openssl.conf
+  # requesting the `tls` kernel module (kTLS offload). The RPi kernel
+  # (rpt-rpi-v8) does not include this module, so systemd-modules-load logs
+  # "Failed to find module 'tls'" on every boot. kTLS is a performance
+  # optimisation — lighttpd's mod_openssl works correctly without it.
+  # A modprobe install override makes the load request a silent no-op.
+  local modprobe_conf="/etc/modprobe.d/no-ktls.conf"
+  if [[ -f "$modprobe_conf" ]] && grep -qF "install tls /bin/true" "$modprobe_conf" 2>/dev/null; then
+    log_info "  kTLS modprobe override already in place"
+    return 0
+  fi
+  printf '%s\n' "install tls /bin/true" > "$modprobe_conf"
+  log_ok "  kTLS modprobe override written (${modprobe_conf})"
 }
 
 configure_lighttpd() {
