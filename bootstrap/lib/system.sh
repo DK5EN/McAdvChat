@@ -341,6 +341,15 @@ configure_nftables() {
       needs_update=true
     fi
 
+    # Update if AIOps journal cross-shipping port 19532 is missing.
+    # Pi↔Pi journal-upload→journal-remote; LAN-scoped, required for off-box
+    # log evidence (AIOps AD-8, B-4). Without this, journal-remote is unreachable
+    # after any nftables rewrite and shipping silently stops.
+    if ! grep -q "dport 19532" "$nft_conf" 2>/dev/null; then
+      log_info "  Updating nftables rules (adding AIOps journal-xship port 19532)..."
+      needs_update=true
+    fi
+
     if [[ "$needs_update" == "false" ]]; then
       log_info "  nftables rules already configured"
       return 0
@@ -362,6 +371,7 @@ configure_nftables() {
 #   1799/udp - MeshCom node communication
 #   5353/udp - mDNS (avahi for .local resolution)
 #   2985/tcp - Update runner SSE stream
+#   19532/tcp - AIOps journal cross-shipping (Pi↔Pi, LAN only)
 #
 # Internal only (not exposed):
 #   2981/tcp - FastAPI SSE/REST (proxied via Caddy→lighttpd)
@@ -396,6 +406,9 @@ table inet filter {
 
     # Update runner SSE stream (frontend-triggered updates)
     tcp dport 2985 accept
+
+    # AIOps journal cross-shipping (Pi↔Pi, LAN only — AIOps AD-8/B-4)
+    ip saddr { 192.168.0.0/16, 10.0.0.0/8, 172.16.0.0/12 } tcp dport 19532 accept
 
     # MeshCom UDP communication
     udp dport 1799 accept
