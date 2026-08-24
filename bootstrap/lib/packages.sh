@@ -485,7 +485,61 @@ install_caddy() {
     log_ok "  Caddy installed ($(caddy version 2>/dev/null | head -1))"
   fi
 
+  configure_caddy_sudo
   configure_caddy
+}
+
+configure_caddy_sudo() {
+  # Caddy installs its local-CA root cert via two sudo calls:
+  #   sudo tee /usr/local/share/ca-certificates/<CA>.crt
+  #   sudo update-ca-certificates
+  # Both fail without a sudoers rule. Additionally, ProtectSystem=full in the
+  # package-shipped caddy.service makes /usr and /etc read-only for the service
+  # mount namespace — even root-owned child processes can't write there. A
+  # systemd drop-in with ReadWritePaths is required alongside the sudoers grant.
+
+  # 1. Sudoers drop-in
+  local sudoers_file="/etc/sudoers.d/caddy-ca"
+  local marker="caddy ALL=(root) NOPASSWD: /usr/bin/tee /usr/local/share/ca-certificates/*"
+  if [[ -f "$sudoers_file" ]] && grep -qF "$marker" "$sudoers_file" 2>/dev/null \
+      && grep -qF "update-ca-certificates" "$sudoers_file" 2>/dev/null; then
+    log_info "  caddy sudoers rules already in place"
+  else
+    {
+      printf '%s\n' "caddy ALL=(root) NOPASSWD: /usr/bin/tee /usr/local/share/ca-certificates/*"
+      printf '%s\n' "caddy ALL=(root) NOPASSWD: /usr/sbin/update-ca-certificates"
+    } > "$sudoers_file"
+    chmod 440 "$sudoers_file"
+    if visudo -c -f "$sudoers_file" &>/dev/null; then
+      log_ok "  caddy sudoers drop-in written (/etc/sudoers.d/caddy-ca)"
+    else
+      log_error "  caddy sudoers rule failed validation — removing"
+      rm -f "$sudoers_file"
+      return 1
+    fi
+  fi
+
+  # 2. Systemd drop-in — lift ProtectSystem=full read-only restriction for the
+  #    two paths that CA cert installation writes to.
+  local dropin_dir="/etc/systemd/system/caddy.service.d"
+  local dropin_file="${dropin_dir}/ca-trust.conf"
+  local dropin_marker="ReadWritePaths=/etc/ssl/certs"
+  if [[ -f "$dropin_file" ]] && grep -qF "$dropin_marker" "$dropin_file" 2>/dev/null; then
+    log_info "  caddy systemd drop-in already in place"
+  else
+    mkdir -p "$dropin_dir"
+    cat > "$dropin_file" <<'DROPIN'
+[Service]
+# Allow Caddy and its subprocesses (sudo tee + sudo update-ca-certificates) to
+# install the local-CA root certificate into the system trust store.
+# ProtectSystem=full (from the package unit) makes /usr and /etc read-only for
+# this service's mount namespace; without this override, both sudo calls fail.
+ReadWritePaths=/usr/local/share/ca-certificates
+ReadWritePaths=/etc/ssl/certs
+DROPIN
+    systemctl daemon-reload
+    log_ok "  caddy systemd drop-in written (${dropin_file})"
+  fi
 }
 
 configure_caddy() {
