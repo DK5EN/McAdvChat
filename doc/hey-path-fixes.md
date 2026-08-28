@@ -1,6 +1,7 @@
 # HEY path — fixes after the field review
 
-**Status:** shipped 2026-08-28 — MCProxy `48cda99`, webapp `761ee49` + `729370c`
+**Status:** backend fixes shipped 2026-08-28 (MCProxy `48cda99`); **the chain UI is withdrawn
+entirely** — F4 was built, run on air, and removed the same day. See §7.
 
 | Wave | Scope                                                     | State             |
 | ---- | --------------------------------------------------------- | ----------------- |
@@ -474,3 +475,43 @@ from both documents.
 `MeshCom-Firmware-DEV-Main/docs/issue-*.md` and `docs/adr-*.md` for that field, not only `src/` — and
 check whether a cited gate is still live at HEAD. This review found one (`913f502d`) that had been
 reverted 91 minutes after it landed, and cited as live evidence seven weeks later.
+
+---
+
+## 7. F4 withdrawn — the chain answers a question nobody asked
+
+**2026-08-28, same day it shipped.** F4 moved the hop ladder and weakest-hop summary onto the live
+feed, where the subject is at least correct (one row is one beacon). It was removed a few hours
+later, together with the raw `PP` line, and `utils/heyChain.ts`, `types/heyChain.ts` and their spec
+were deleted.
+
+The reason is not a defect. The parsing is right, the attribution is right, the own-hop rung is
+right. The problem is that **`PP` carries no callsigns**, so the strongest statement the UI can make
+is _"link 3 of 5 is the weak one"_ — with no way to say which two stations that link connects. An
+operator cannot act on that: no one to call, no antenna to re-point, no decision to make.
+
+Operator verdict, recorded verbatim because it is the design constraint going forward:
+
+> I don't care about the weakest link in the chain, as it doesn't matter. It is about what nodes,
+> and the signal report of the links.
+
+So the chain returns only when each link can be named on **both** ends. The blocker is one missing
+branch in the firmware — `sendExtern()` handles payload types `0x21` and `0x3A` and silently drops
+`0x40`, even though `queueExtern()` is already called for HEY and `cJson["src"]` already carries the
+full relay path for the other two types. Written up in
+`doc/2026-08-28_1830-hey-path-callsigns-handover.md`.
+
+**What deliberately stayed** (all backend, none of it renders anything):
+
+- F1's `PLT` gate on `gw`, F6's `MOD` mask, migration 27 — real bugs, unrelated to the chain, and
+  migration 27 has already run on the live DB and cannot be undone by a revert.
+- F2 and `hey_path.py` — the parser. It is correct and will be needed unchanged the moment the
+  firmware sends the path; deleting it would only mean rebuilding it.
+- F3's removal of the chain from the station cards and the map popup. That removal was right for a
+  second, independent reason: those surfaces attribute a relayed route to the wrong station.
+- F5's NCNT tooltip.
+
+**The intended consumer, once callsigns arrive:** per-link charts. A signal report is an edge
+(transmitter → receiver, measured at the receiver), never a node property — so one HEY yields up to
+`n` independent link measurements, including links our own node cannot hear. A station heard by two
+different neighbours produces two distinct edges and they must stay distinct.
