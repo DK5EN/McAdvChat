@@ -66,15 +66,14 @@ keyed by `mh_callsign` — `CALL` (`mheard_functions.cpp:313-321`, `:343`). That
 property of `CALL` and is structurally at least one beacon old: it is the count `CALL` announced in an
 earlier HEY of its own, replayed onto this frame.
 
-> **Correction (advisor).** The previous draft cited `913f502d` (2026-07-07, _"NCount from Hey only
->
-> > = 4.35p"_) and its `mh_fw_version > 35 || …` condition as a live firmware gate. **That gate was
-> > reverted the same afternoon** — weakened by `0432200e` (14:28) and removed entirely by `7f4f5e5a`
-> > (15:31). `mh_fw_version` does not exist anywhere in `src/` at HEAD, and `updateHeyPath()` has no
-> > version check. Do not cite it. What survives from that commit is the `/N` gate
-> > `charAt(itxt+2) >= '1' && <= '9'` (`aprs_functions.cpp:898`), which makes `/N0` unparseable by
-> > design — a **different channel**: position beacons carrying `/N` also feed `mheardNCount`
-> > (`lora_functions.cpp:662`, `:690`), so `NCNT` is not HEY-exclusive.
+> **Correction (advisor).** The previous draft cited `913f502d` (2026-07-07,
+> _"NCount from Hey only `>= 4.35p`"_) and its `mh_fw_version > 35 || …` condition as a live firmware
+> gate. **That gate was reverted the same afternoon** — weakened by `0432200e` (14:28) and removed
+> entirely by `7f4f5e5a` (15:31). `mh_fw_version` does not exist anywhere in `src/` at HEAD, and
+> `updateHeyPath()` has no version check. Do not cite it. What survives from that commit is the `/N`
+> gate `charAt(itxt+2) >= '1' && <= '9'` (`aprs_functions.cpp:898`), which makes `/N0` unparseable by
+> design — a **different channel**: position beacons carrying `/N` also feed `mheardNCount`
+> (`lora_functions.cpp:662`, `:690`), so `NCNT` is not HEY-exclusive.
 
 **One `PP` string is written by two different firmwares.** The leading `R<ncnt>;` comes from the
 originator's `sendHey()` (`loop_functions.cpp:4241`, `"R" + String(getMheardCount()) + ";"`); each
@@ -108,13 +107,14 @@ leading token from the originator, with 3-field groups appended by newer relays.
 
 The split is three-way, not two-way. `SRC` and `GW` each appear on both sides depending on the frame.
 
-| Describes `CALL` (the measured station)     | Describes `SRC` (the originating station)                | Describes only this frame / route              |
-| ------------------------------------------- | -------------------------------------------------------- | ---------------------------------------------- |
-| `RSSI`, `SNR`, `NCNT`, `DIST`, `HW`, `MESH` | `SRC` as identity + liveness; `GW` **when `PLT == '@'`** | `PP`, `PL`, `PLT`; `GW` on any non-`'@'` frame |
+| Describes `CALL` (the measured station)            | Describes `SRC` (the originating station)                | Describes only this frame / route              |
+| -------------------------------------------------- | -------------------------------------------------------- | ---------------------------------------------- |
+| `RSSI`, `SNR`, `NCNT`, `DIST`, `HW`, `MOD`, `MESH` | `SRC` as identity + liveness; `GW` **when `PLT == '@'`** | `PP`, `PL`, `PLT`; `GW` on any non-`'@'` frame |
 
 `SRC` is a station key and a frame value at once: as a value sitting on `CALL`'s row it is route
-data, as a row key it licenses exactly two claims — identity and liveness. `MOD` is deliberately
-absent from all three columns; see **F6**.
+data, as a row key it licenses exactly two claims — identity and liveness. `MOD` is correctly on
+`CALL`'s side — every relay rewrites `msg_source_mod` with its own value before forwarding
+(`lora_functions.cpp:1232`) — but it is a **packed byte**, not a scalar; see **F6**.
 
 `v2.0.2-dev.4` stores the third column on the station row keyed by `CALL`. `CALL` is a relay that
 forwards a different originator on nearly every frame — `DB0ED-99` produced nine different origins in
@@ -315,28 +315,45 @@ structurally at least one beacon old even when present.
   (`'the NCNT chip title conveys staleness — as last announced, not a live reading'`) and must be
   updated with it.
 
-### F6 — `MOD` carries a "not from the last hop" sentinel (MCProxy)
+### F6 — `MOD` is a packed byte and we store it raw (MCProxy)
 
-**Found by this review, not by UAT.** Same class of error as F1, independent of it.
+**Found by this review, not by UAT.** Independent of F1/F2, and much narrower than the first draft of
+this section claimed.
 
-`lora_functions.cpp:583-587`:
+> **Correction (self).** The first version of F6 said _"Both branches carry the **originator's**
+> modulation … `MOD` is not [`CALL`'s]"_. **That is wrong.** Every relay rewrites
+> `aprsmsg.msg_source_mod` with its own modulation and country before forwarding
+> (`lora_functions.cpp:1231-1232`, alongside `msg_last_hw = BOARD_HARDWARE | 0x80`), so the value we
+> receive describes the **last hop** — `CALL`. Storing it on `CALL`'s row is correct, and `MOD` stays
+> in the `CALL` column. There is no misattribution here. What is real is the encoding.
+
+`MOD` is two nibbles, not a number (`aprs_functions.cpp:113`):
 
 ```c
-if((aprsmsg.msg_last_hw & 0x80) == 0x80)    // Last-Sending
-    mheardLine.mh_mod = aprsmsg.msg_source_mod;
-else
-    mheardLine.mh_mod = aprsmsg.msg_source_mod | 0xF0;  // set mod not from last
+aprsmsg.msg_source_mod = (getMOD() & 0xF) | (meshcom_settings.node_country << 4);
 ```
 
-Both branches carry the **originator's** modulation; the high nibble is a sentinel meaning "this is
-not the last hop's". `HW` is genuinely `CALL`'s (`msg_last_hw & 0x7F`, `:582`) — `MOD` is not.
-MCProxy passes it through raw (`ble_protocol.py:735`) onto `CALL`'s `station_positions.lora_mod`
-(`storage/ingest.py:286`), and **nothing in either repo decodes `0xF0`**.
+Low nibble = modulation preset, `getMOD()` ∈ 3..8 (`lora_setchip.cpp:169-191`). High nibble = country
+index, 0..15 (`strCountry`, `lora_setchip.cpp:62`). The firmware's own surfaces decode it as two
+nibbles — `web_functions.cpp:939` (`%01X/%01X`) and `mheard_functions.cpp:725`.
 
-- Either drop `lora_mod` when the high nibble is `0xF` (fail closed, as F1 does for `gw`), or split it
-  into `lora_mod` (last hop, only when the sentinel is absent) and an `mh_src_mod` on the `SRC` row.
-- Separable from F1/F2 and lower urgency — it mis-labels a modulation, not a gateway. Sequence it
-  after wave 1 unless the fix falls out of the same `transform_mh` edit.
+MCProxy passes the byte through raw (`ble_protocol.py:735`) into `CALL`'s
+`station_positions.lora_mod` (`storage/ingest.py:286`) and decodes **neither** nibble. So a node in,
+say, `EU8` (country 8) stores `lora_mod = 0x83 = 131` where the modulation is `3`. Every value we
+have shown or compared as "modulation" is wrong for every node whose country index is non-zero.
+
+- Store `lora_mod = MOD & 0x0F` (the modulation, 3..8) and expose the country as a separate
+  `lora_country = MOD >> 4` if we want it — the data is already on the wire, we simply never split it.
+- **Do not** treat a high nibble of `0xF` as "unknown" without reading the firmware handover below:
+  `0xF` is a legitimate country (`strCountry[15] == "PL"`) **and** the value the firmware ORs in to
+  mark "modulation not from the last hop" (`lora_functions.cpp:587`). The two are indistinguishable on
+  the wire. Until the firmware separates them, `country == 15` must be rendered as ambiguous, never as
+  `PL` and never as `unknown`.
+- Existing `station_positions.lora_mod` rows hold undecoded bytes and cannot be repaired in place
+  (the country nibble is real data, so a blind mask would be fine — but a stored `0xF3` is either a
+  Polish node or an unmarked one). Mask on read, backfill on next observation.
+- Sequence after wave 1. It mis-labels a modulation, not a gateway.
+- Handover to the firmware team for the `0xF` collision: `doc/2026-08-28_1700-firmware-mod-nibble-handover.md`.
 
 ---
 
@@ -349,7 +366,7 @@ MCProxy passes it through raw (`ble_protocol.py:735`) onto `CALL`'s `station_pos
 | 1b   | Docs: CLAUDE.md MHeard `GW` bullet, `ingest.py` / `transform_mh` comments, adoption-note amendment | MCProxy |
 | 2    | F3 route fields off station surfaces · F5 NCNT wording                                             | webapp  |
 | 3    | F4 ladder into the live feed                                                                       | webapp  |
-| 4    | F6 `MOD` sentinel                                                                                  | MCProxy |
+| 4    | F6 `MOD` nibble decoding                                                                           | MCProxy |
 | 5    | Docs: correct the FE design doc and B4; archive                                                    | webapp  |
 
 > **Correction (advisor).** The previous draft claimed _"Wave 3 depends on 2 — both touch
