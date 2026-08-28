@@ -202,7 +202,11 @@ def parse_hey_chain(payload: str) -> HeyChain | None:
     Returns `None` — never raises, never returns a partial object — for:
     empty/blank input, a non-`str`, no leading `R`, a non-numeric neighbour
     count, the 1-comma leading shape, a group that is not exactly three
-    integers, a non-numeric field in a group, or any trailing garbage.
+    integers, a non-numeric field in a group, or any trailing garbage after
+    the (possibly repaired) terminator.
+
+    A payload with no trailing `;` at all is repaired, not rejected — see the
+    comment above the repair below.
 
     This parses unauthenticated data straight off the air: every input is
     treated as hostile, and the work done is bounded regardless of input
@@ -211,11 +215,28 @@ def parse_hey_chain(payload: str) -> HeyChain | None:
     if not isinstance(payload, str):
         return None
     payload = payload.strip()
-    # The grammar terminates every token (leading and hop groups alike) with
-    # ';'. Anything after the last ';' — including a payload with no ';' at
-    # all — is trailing garbage.
-    if not payload or len(payload) > _MAX_PAYLOAD_LEN or not payload.endswith(";"):
+    if not payload or len(payload) > _MAX_PAYLOAD_LEN:
         return None
+
+    # The firmware repairs this exact shape before parsing —
+    # `updateHeyPath()` treats a missing terminator as an old-format payload
+    # to fix up, not as invalid input (`mh_path_payload.concat(";")`,
+    # mheard_functions.cpp:450) — so a bare `R99` is a legitimate legacy
+    # shape, not garbage. Mirror that tolerance here.
+    #
+    # The append MUST stay conditional. The firmware's concat(";") is
+    # unconditional and gets away with it because updateHeyPath() only reads
+    # up to the FIRST ';' via indexOf. We split on EVERY ';' below, so an
+    # unconditional append would turn an already-terminated "R12;" into
+    # "R12;;" -> a trailing empty group -> None, rejecting every currently
+    # valid payload. Do not "simplify" this to match the firmware's
+    # unconditional concat — same intent, deliberately different mechanism.
+    if not payload.endswith(";"):
+        payload += ";"
+        # Re-check: the repair can push an already-max-length payload one
+        # byte over the bound.
+        if len(payload) > _MAX_PAYLOAD_LEN:
+            return None
 
     # Drop only the final terminator: parts[0] is the leading R<ncnt> token,
     # parts[1:] are hop groups. A malformed group (wrong field count, a

@@ -22,7 +22,7 @@ from __future__ import annotations
 import json
 
 from .commands.constants import has_console
-from .hey_path import HeyHop, parse_hey_chain
+from .hey_path import _MAX_PAYLOAD_LEN, HeyHop, parse_hey_chain
 
 _RecordFnResults = list[tuple[str, bool]]
 
@@ -144,7 +144,108 @@ def _test_structural_rejections() -> _RecordFnResults:
             parse_hey_chain("R12;8,101,-7;JUNK") is None,
         )
     )
-    results.append(("no terminator at all 'R12': -> None", parse_hey_chain("R12") is None))
+    # F2: the firmware repairs a missing terminator instead of rejecting it
+    # (`updateHeyPath()`, mheard_functions.cpp:450, `mh_path_payload.concat(";")`),
+    # so a bare "R12" is now a legitimate legacy shape, not garbage — this is
+    # the opposite of the old pinned expectation. See
+    # `_test_missing_terminator_repair` below for the detailed coverage.
+    results.append(
+        ("no terminator at all 'R12': -> parses, not None", parse_hey_chain("R12") is not None)
+    )
+    return results
+
+
+def _test_missing_terminator_repair() -> _RecordFnResults:
+    """F2: `parse_hey_chain` repairs a missing trailing ';' instead of
+    rejecting it, mirroring the firmware's own repair
+    (`updateHeyPath()`, mheard_functions.cpp:449-450). One case per rule
+    that must survive the repair unweakened."""
+    results: _RecordFnResults = []
+
+    # Bare "R12", no terminator at all -> repaired to "R12;" -> a valid
+    # origin-only chain with zero hops.
+    chain = parse_hey_chain("R12")
+    results.append(("bare 'R12': parses", chain is not None))
+    if chain is not None:
+        results.append(("bare 'R12': origin_ncnt == 12", chain.origin_ncnt == 12))
+        results.append(("bare 'R12': zero hops", chain.hops == ()))
+
+    # Real 2026-08-28 on-air capture from OE7FNH-99: legacy 2-comma leading
+    # token, already terminated. Regression guard — the repair must be a
+    # no-op here.
+    real_capture = "R3,115,-8;28,135,-16;17,120,-18;"
+    real_chain = parse_hey_chain(real_capture)
+    results.append(("real capture OE7FNH-99: parses", real_chain is not None))
+    if real_chain is not None:
+        results.append(
+            (
+                "real capture OE7FNH-99: origin_ncnt == 3 (leading integer kept)",
+                real_chain.origin_ncnt == 3,
+            )
+        )
+        results.append(("real capture OE7FNH-99: legacy is True", real_chain.legacy is True))
+        results.append(("real capture OE7FNH-99: two hops", len(real_chain.hops) == 2))
+
+    # Trailing garbage after the repaired terminator: "R12;8,101,-7;JUNK"
+    # repairs to "R12;8,101,-7;JUNK;", whose final group "JUNK" has ONE
+    # field instead of three -> rule (b), the hop-group rule
+    # (`_parse_hop_group`), rejects it. The leading token's comma count
+    # (rule a) is not involved here.
+    results.append(
+        (
+            "trailing garbage 'R12;8,101,-7;JUNK' repaired still -> None (rule b, hop group)",
+            parse_hey_chain("R12;8,101,-7;JUNK") is None,
+        )
+    )
+
+    # The 1-comma leading token stays invalid even unterminated:
+    # "R99,99" repairs to "R99,99;", still rejected by the 1-comma branch
+    # (rule a, `_parse_leading_token`).
+    results.append(
+        (
+            "1-comma leading token 'R99,99' repaired still -> None (rule a, leading token)",
+            parse_hey_chain("R99,99") is None,
+        )
+    )
+
+    # A payload already at exactly _MAX_PAYLOAD_LEN with no terminator must
+    # not slip past the length bound: the repair is applied AFTER the first
+    # length check, so this string (len == _MAX_PAYLOAD_LEN) passes that
+    # check, but appending ';' pushes it one byte over, and the ordering
+    # trap this proves is the required re-check after the append. Built so
+    # that appending ';' would otherwise yield a perfectly well-formed
+    # 5-hop chain — if the re-check were missing, this would incorrectly
+    # parse instead of being rejected.
+    hop_groups = "1,2,3;" * 5
+    # full_terminated length = 1 ("R") + origin_digits + 1 (";") + len(hop_groups);
+    # solve for origin_digits so full_terminated is exactly one char over
+    # _MAX_PAYLOAD_LEN, making the unterminated payload land exactly at it.
+    origin_digits = _MAX_PAYLOAD_LEN - 1 - len(hop_groups)
+    full_terminated = "R" + "1" * origin_digits + ";" + hop_groups
+    payload_at_cap_no_term = full_terminated[:-1]
+    label = (
+        f"payload at cap (len {len(payload_at_cap_no_term)} == _MAX_PAYLOAD_LEN) "
+        "with no terminator: -> None"
+    )
+    results.append(
+        (
+            label,
+            len(payload_at_cap_no_term) == _MAX_PAYLOAD_LEN
+            and parse_hey_chain(payload_at_cap_no_term) is None,
+        )
+    )
+
+    # Already-terminated "R12;" must be unaffected by the conditional
+    # append: no doubled ';' -> no trailing empty group -> still zero hops.
+    already_terminated = parse_hey_chain("R12;")
+    results.append(
+        ("already-terminated 'R12;': unaffected, still parses", already_terminated is not None)
+    )
+    if already_terminated is not None:
+        results.append(
+            ("already-terminated 'R12;': no doubled ';', zero hops", already_terminated.hops == ())
+        )
+
     return results
 
 
@@ -238,6 +339,7 @@ def run_hey_path_tests() -> bool:
     results.extend(_test_malformed_group_field_counts())
     results.extend(_test_non_numeric_fields_rejected())
     results.extend(_test_structural_rejections())
+    results.extend(_test_missing_terminator_repair())
     results.extend(_test_realistic_worst_case_at_wire_cap())
     results.extend(_test_pathological_input_bounded())
     results.extend(_test_as_dict_shape())

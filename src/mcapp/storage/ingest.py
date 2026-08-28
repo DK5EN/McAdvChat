@@ -396,9 +396,15 @@ class IngestMixin(StorageBase):
             #
             # `gw` is the MH `GW` flag, derived from the beacon's destination path
             # ("HG" vs "H"), which the ORIGINATOR sets and relays never modify — it
-            # describes SRC, never CALL. COALESCE means a `0` is an authoritative
-            # "not a gateway" and correctly overwrites a previously-known 1; `gw`
-            # absent (None) leaves the stored value untouched.
+            # describes SRC, never CALL. But that destination path exists only on a
+            # HEY (`PLT == '@'`); on any other payload type it is unrelated to
+            # anything the frame carries, so `transform_mh` now emits `gw = None`
+            # for every non-HEY frame instead of a meaningless `0`. COALESCE means
+            # a `0` is still an authoritative "not a gateway" and correctly
+            # overwrites a previously-known 1 — but only when it actually came off
+            # a HEY; `gw` absent (None) leaves the stored value untouched, which is
+            # now the case for every non-HEY frame, not only for a frame that omits
+            # the key entirely.
             await self._mutate(
                 """INSERT INTO station_positions (callsign, gw, last_seen)
                    VALUES (?, ?, ?)

@@ -61,6 +61,7 @@ async def run_migration_chain_tests() -> bool:
     await _test_v23_frozen_cache_scrub(results)
     await _test_v24_fcs_ok_column(results)
     await _test_v26_placeholder_station_scrub(results)
+    await _test_v27_gw_lora_mod_scrub(results)
 
     for label, ok in results:
         print(f"    {'✅ PASS' if ok else '❌ FAIL'} | {label}")
@@ -660,6 +661,98 @@ async def _test_v26_placeholder_station_scrub(results: list[tuple[str, bool]]) -
                         " kept (traffic stays visible; only the station identity is refused)"
                     ),
                     bool(msg) and msg[0]["src"] == "XX0XXX-00",
+                )
+            )
+        finally:
+            await storage.close()
+
+
+async def _test_v27_gw_lora_mod_scrub(results: list[tuple[str, bool]]) -> None:
+    """Seed a pre-v27 fixture holding stale `gw`/`lora_mod` values and assert the
+    v27 step repairs both (doc/hey-path-fixes.md F1/F6).
+
+    `gw`: until this wave, `transform_mh` emitted `GW` on every MH frame, not
+    only on a HEY (`PLT == '@'`), so a stored `gw = 0` is not recoverable — it
+    may be a real "not a gateway" or a meaningless `0` from some other frame
+    type. Every stored `0` is nulled and re-learned from the next HEY; a
+    stored `1` is left untouched (a real gateway is not un-learned).
+
+    `lora_mod`: the firmware packs `msg_source_mod = (getMOD() & 0xF) |
+    (node_country << 4)` (aprs_functions.cpp:113). A stored packed byte (e.g.
+    `131 == 0x83`, country 8 + modulation 3) is masked down to the low nibble
+    (`3`); a NULL `lora_mod` (never observed) stays NULL.
+    """
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        db_path = Path(tmp_dir) / "migration_chain_v27.db"
+
+        def _create_v26_db() -> None:
+            with db_write(db_path) as conn:
+                conn.executescript(CREATE_SCHEMA_SQL)
+                conn.executescript(CREATE_SCHEMA_V2_SQL)
+                conn.execute("DELETE FROM schema_version")
+                conn.execute("INSERT INTO schema_version (version) VALUES (26)")
+                conn.execute(
+                    "INSERT INTO station_positions (callsign, gw, lora_mod, last_seen)"
+                    " VALUES (?, ?, ?, ?)",
+                    ("OE1STALE-1", 0, 131, BASE_TS),
+                )
+                conn.execute(
+                    "INSERT INTO station_positions (callsign, gw, lora_mod, last_seen)"
+                    " VALUES (?, ?, ?, ?)",
+                    ("OE1GATE-1", 1, None, BASE_TS),
+                )
+                conn.commit()
+
+        await asyncio.to_thread(_create_v26_db)
+
+        try:
+            storage = await create_sqlite_storage(db_path)
+        except Exception:
+            logger.exception("v27 gw/lora_mod scrub migration raised")
+            results.append(("v27 gw/lora_mod scrub: migrator runs v26→HEAD without error", False))
+            return
+
+        results.append(("v27 gw/lora_mod scrub: migrator runs v26→HEAD without error", True))
+        try:
+            version = await _schema_version(storage)
+            results.append(
+                (
+                    f"v27 gw/lora_mod scrub: final schema_version marker is {FINAL_SCHEMA_VERSION}",
+                    version == FINAL_SCHEMA_VERSION,
+                )
+            )
+
+            stale = await storage._query(
+                "SELECT gw, lora_mod FROM station_positions WHERE callsign = ?",
+                ("OE1STALE-1",),
+            )
+            results.append(
+                (
+                    "v27 gw/lora_mod scrub: gw = 0 is nulled (unrecoverable, re-learned)",
+                    bool(stale) and stale[0]["gw"] is None,
+                )
+            )
+            results.append(
+                (
+                    "v27 gw/lora_mod scrub: lora_mod 131 (0x83) is masked to 3 (low nibble)",
+                    bool(stale) and stale[0]["lora_mod"] == 3,
+                )
+            )
+
+            gateway = await storage._query(
+                "SELECT gw, lora_mod FROM station_positions WHERE callsign = ?",
+                ("OE1GATE-1",),
+            )
+            results.append(
+                (
+                    "v27 gw/lora_mod scrub: gw = 1 is left untouched",
+                    bool(gateway) and gateway[0]["gw"] == 1,
+                )
+            )
+            results.append(
+                (
+                    "v27 gw/lora_mod scrub: lora_mod NULL stays NULL",
+                    bool(gateway) and gateway[0]["lora_mod"] is None,
                 )
             )
         finally:

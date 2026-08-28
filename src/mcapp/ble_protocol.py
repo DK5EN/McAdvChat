@@ -27,6 +27,12 @@ PAYLOAD_TYPE_MSG = 58  # ":" text message frame
 PAYLOAD_TYPE_POS = 33  # "!" position/telemetry frame
 PAYLOAD_TYPE_ACK = 65  # acknowledgement frame
 
+# MH register `PLT` value for a HEY beacon — mheard_functions.cpp:335:
+# `mhdoc["PLT"] = (uint8_t)mheardLine.mh_payload_type`. `GW` (destination-path
+# gateway flag) is only meaningful on this payload type; see `_coerce_gw`'s
+# call site in `transform_mh`.
+_MH_PAYLOAD_TYPE_HEY = 0x40  # '@'
+
 logger = logging.getLogger(__name__)
 
 
@@ -193,7 +199,7 @@ def _decode_data_frame(  # noqa: PLR0913 - all fields are needed from the shared
         "dest": dest,
         "message": message,
         "hardware_id": hardware_id,
-        "lora_mod": lora_mod,
+        "lora_mod": _coerce_lora_mod(lora_mod),
         "fw": fw,
         "fw_sub": fw_sub,
         "last_hw_id": last_hw_id,
@@ -596,6 +602,32 @@ def _coerce_optional_float(value: Any) -> float | None:
         return None
 
 
+def _coerce_lora_mod(value: Any) -> int | None:
+    """Mask the wire's packed `MOD`/`lora_mod` byte down to the modulation
+    nibble.
+
+    `aprs_functions.cpp:113` packs it as
+    `(getMOD() & 0xF) | (node_country << 4)`: low nibble the modulation
+    preset (`getMOD()` in 3..8), high nibble the country index (0..15) of
+    the node that last touched the frame. Every relay overwrites this with
+    its OWN modulation/country before forwarding
+    (`lora_functions.cpp:1231-1232`), so the byte already describes the last
+    hop (`CALL`) correctly — only the encoding was wrong, not the
+    attribution. Storing the byte raw makes an EU8 node (country 8) read as
+    modulation `0x83 == 131` instead of `3`.
+
+    Country is deliberately NOT decoded or exposed here — `0xF` is both a
+    real country index (`strCountry[15] == "PL"`) and the firmware's
+    "modulation not from the last hop" marker
+    (`lora_functions.cpp:587`), indistinguishable on the wire until the
+    firmware separates them (see
+    `doc/2026-08-28_1700-firmware-mod-nibble-handover.md`). Mask only."""
+    coerced = _coerce_optional_int(value)
+    if coerced is None:
+        return None
+    return coerced & 0x0F
+
+
 def _coerce_gw(value: Any) -> int | None:
     """Coerce the MH register's `GW` flag to a strict `0`/`1` `int`, never a
     `bool` (which would round-trip through `json.dumps` as `true`/`false`
@@ -689,6 +721,29 @@ def _coerce_mh_origin(value: Any) -> str | None:
     return origin
 
 
+def _coerce_mh_payload_type(value: Any) -> int | None:
+    """Coerce the MH register's `PLT` field to the raw payload-type byte
+    (`mheard_functions.cpp:335`), tolerant of every shape the wire actually
+    sends: the JSON int (`64`), its string form (`"64"`), or the single
+    ASCII character the byte encodes (`"@"`). `transform_mh` handles
+    unauthenticated input and must never raise; anything else — including
+    absence — returns `None`, which callers must treat as fail-closed
+    (not-a-HEY-frame), never as a fourth valid payload type."""
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return value
+    if isinstance(value, str):
+        stripped = value.strip()
+        if len(stripped) == 1:
+            return ord(stripped)
+        try:
+            return int(stripped)
+        except ValueError:
+            return None
+    return None
+
+
 def transform_mh(input_dict: dict[str, Any]) -> dict[str, Any]:
     """Transform a BLE MHeard beacon.
 
@@ -702,11 +757,17 @@ def transform_mh(input_dict: dict[str, Any]) -> dict[str, Any]:
     `RSSI`/`SNR` actually measured, and it stays keyed to `src` exactly as
     before (migration v22 exists because that attribution was once wrong —
     do not rekey it). `SRC` is the ORIGINATING station: it owns identity
-    (`mh_origin`) and gateway status (`gw`, derived from the destination path
-    the originator sets and relays never modify). On a typical site roughly
-    two thirds of HEY observations are relayed, so `SRC != CALL` is the
-    common case, and `gw` describes `SRC`, never `CALL` — attributing it to
-    `CALL` would be wrong for every relayed beacon.
+    (`mh_origin`) and, on a HEY frame only, gateway status (`gw`, derived
+    from the destination path the originator sets and relays never modify).
+    `GW` is `0` on every non-HEY payload because the destination path is
+    something else entirely, so `gw` is emitted only when `PLT ==
+    _MH_PAYLOAD_TYPE_HEY` (`0x40`) — otherwise `None`, fail-closed, rather
+    than asserting a claim the frame never made. `mh_origin` stays
+    ungated: `SRC` is set unconditionally on every frame type
+    (`mheard_functions.cpp:350`). On a typical site roughly two thirds of
+    HEY observations are relayed, so `SRC != CALL` is the common case, and
+    `gw` describes `SRC`, never `CALL` — attributing it to `CALL` would be
+    wrong for every relayed beacon.
 
     `PP`'s absence carries no information: as of firmware 2026-08-28 the
     register drops `PP` (then `DIST`) whenever the JSON would exceed 244
@@ -724,6 +785,7 @@ def transform_mh(input_dict: dict[str, Any]) -> dict[str, Any]:
     node_timestamp = timestamp_from_date_time(input_dict["DATE"], input_dict["TIME"])
     pp_raw = input_dict.get("PP")
     hey_chain = parse_hey_chain(pp_raw) if isinstance(pp_raw, str) else None
+    is_hey = _coerce_mh_payload_type(input_dict.get("PLT")) == _MH_PAYLOAD_TYPE_HEY
     return {
         "transformer": "mh",
         "src_type": "ble",
@@ -732,12 +794,12 @@ def transform_mh(input_dict: dict[str, Any]) -> dict[str, Any]:
         "rssi": input_dict.get("RSSI"),
         "snr": input_dict.get("SNR"),
         "hw_id": input_dict.get("HW"),
-        "lora_mod": input_dict.get("MOD"),
+        "lora_mod": _coerce_lora_mod(input_dict.get("MOD")),
         "mesh": input_dict.get("MESH"),
         "node_timestamp": node_timestamp,
         "timestamp": node_timestamp,
         "mh_origin": _coerce_mh_origin(input_dict.get("SRC")),
-        "gw": _coerce_gw(input_dict.get("GW")),
+        "gw": _coerce_gw(input_dict.get("GW")) if is_hey else None,
         "mh_ncnt": _coerce_mh_ncnt(input_dict.get("NCNT")),
         "mh_path_len": _coerce_optional_int(input_dict.get("PL")),
         "mh_dist": _coerce_mh_dist(input_dict.get("DIST")),

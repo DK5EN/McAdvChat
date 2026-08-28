@@ -173,10 +173,26 @@ evidence: `doc/2026-08-28_0900-firmware-4.35p.08.28-adoption.md`.
   `_store_mheard` returns True on a throttle hit and `store_message` returns on that same line, so
   code one branch later is skipped for every throttled frame — most of them under real traffic. Third
   instance of this trap in this repo; see Link Check and Gateway Uptime above.
-- **`GW` describes `SRC`, never `CALL`.** It comes from the beacon's destination path (`"HG"` vs
-  `"H"`), which the originator sets and relays never modify. Feeds the pre-existing
-  `station_positions.gw` column — no migration. `0` is authoritative and correctly overwrites a
-  stored `1`; absent (`None`) leaves it alone.
+- **`GW` describes `SRC`, never `CALL` — but only on a HEY frame.** It comes from the beacon's
+  destination path (`"HG"` vs `"H"`), which the originator sets and relays never modify. That path
+  is only a gateway claim when the payload type is `'@'`; on a text, position or ACK frame the
+  destination is something else entirely and the firmware's `GW: 0` is not a claim about anything.
+  `transform_mh` therefore gates `gw` on `PLT == 0x40` and emits `None` otherwise (fail closed when
+  `PLT` is absent). Within that gate the old rule stands: `0` is authoritative and correctly
+  overwrites a stored `1`; absent (`None`) leaves it alone. Ungating this — reading `GW` on every
+  frame, as we did until schema v27 — makes a relay's non-HEY traffic overwrite a real gateway flag,
+  which is exactly the 2026-08-28 `DF2SI-12` flip. Feeds the pre-existing `station_positions.gw`
+  column; migration 27 nulled the zeros stored under the old rule, because a wrong `0` and a real
+  one are indistinguishable after the fact.
+- **`MOD` is a packed byte, not a number.** `msg_source_mod = (getMOD() & 0xF) | (node_country << 4)`
+  (`aprs_functions.cpp:113`): low nibble modulation (3..8), high nibble country index (0..15). It
+  arrives on two paths — the binary GATT footer and the MH register's `MOD` — and both are masked
+  with `& 0x0F` in `ble_protocol.py`. Storing the raw byte made every non-EU node's "modulation"
+  wrong (country 8 → `0x83` → 131). The country nibble is deliberately not persisted: `0xF` is both
+  country `PL` and the firmware's "modulation not from the last hop" marker
+  (`lora_functions.cpp:587`), so it is ambiguous on the wire — a handover asking for that to be
+  separated is with the firmware maintainers
+  (`doc/2026-08-28_1700-firmware-mod-nibble-handover.md`).
 - **`PP` carries RSSI as a POSITIVE MAGNITUDE.** `appendHeySignalReport()` emits
   `String(rssi*-1.0, 0)`, so `-101 dBm` is on the wire as `101`. `hey_path.parse_hey_chain()` negates
   it. A parser that trusts the sign inverts every reading and still looks plausible.

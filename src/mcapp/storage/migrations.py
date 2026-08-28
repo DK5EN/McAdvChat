@@ -476,10 +476,54 @@ class MigrationsMixin(StorageBase):
                     # `messages` is deliberately untouched — the traffic stays
                     # visible, only the STATION identity is refused.
                     self._scrub_placeholder_stations(conn)
+                    _set_schema_version(conn, 26)
+
+                if current_version < 27:  # noqa: PLR2004 - schema migration step
+                    # HEY-path fixes (doc/hey-path-fixes.md F1/F6): the writer's
+                    # `gw` and `lora_mod` fixes do not repair rows already stored
+                    # under the old, wrong producer — this is that one-shot repair.
+                    #
+                    # `gw`: until this wave, `transform_mh` emitted `GW` on every MH
+                    # frame, not only on a HEY (`PLT == '@'`). A stored `gw = 0`
+                    # is therefore not recoverable: it may be a real "not a
+                    # gateway" from a HEY, or a meaningless `0` from some other
+                    # frame type that happened to overwrite a genuine `1` via the
+                    # `COALESCE` in the "heard" upsert (storage/ingest.py). The two
+                    # are indistinguishable in the stored value alone, so every
+                    # stored `0` is nulled and re-learned from that station's next
+                    # HEY. This is NOT idempotent in the general sense — re-running
+                    # it after relearning would null fresh, correct zeros again —
+                    # which is exactly why it lives in a one-shot versioned
+                    # migration rather than a repeatable startup task.
+                    #
+                    # `lora_mod`: the firmware packs
+                    # `msg_source_mod = (getMOD() & 0xF) | (node_country << 4)`
+                    # (aprs_functions.cpp:113) — low nibble modulation (3..8), high
+                    # nibble country (0..15). MCProxy stored the whole byte
+                    # unmasked. The mask is idempotent
+                    # (`x & 15 & 15 == x & 15`), so this is safe to apply even if a
+                    # future step or backfill runs it again.
+                    # Two `execute` calls, NOT `executescript`: the latter issues an
+                    # implicit COMMIT of the pending transaction before it runs, which
+                    # would split these UPDATEs from the `_set_schema_version` below.
+                    # A crash in that window re-runs the step — and the `gw` null is
+                    # precisely the statement that must not run twice.
+                    conn.execute("UPDATE station_positions SET gw = NULL WHERE gw = 0")
+                    conn.execute(
+                        "UPDATE station_positions SET lora_mod = lora_mod & 15"
+                        " WHERE lora_mod IS NOT NULL"
+                    )
+                    logger.info(
+                        "Migration v%d → v27: nulled station_positions.gw where"
+                        " 0 (unrecoverable, re-learned from the next HEY) and"
+                        " masked station_positions.lora_mod to its low nibble"
+                        " (modulation only, country nibble dropped)",
+                        current_version,
+                    )
                     # Adding a step after this one? Bump LATEST_SCHEMA_VERSION in
                     # storage/constants.py in the same commit — the startup suite
                     # asserts every migration chain terminates there.
-                    _set_schema_version(conn, 26)
+                    _set_schema_version(conn, 27)
 
         await asyncio.to_thread(_init_db)
 

@@ -212,6 +212,8 @@ MH_NCNT = 4
 MH_PL = 2
 MH_DIST = 12.5
 MH_PP = "R12;8,101,-7;15,95,5;"
+MH_PLT_HEY = 64  # 0x40 '@' — mheard_functions.cpp:335, the only PLT that makes GW meaningful
+MH_PLT_MSG = 58  # 0x3A ':' — a non-HEY payload type; GW must gate to None on this
 MH_PP_ORIGIN_NCNT = 12
 MH_PP_HOP0_NCNT = 8
 MH_PP_HOP0_WIRE_RSSI = 101  # positive magnitude on the wire
@@ -238,6 +240,7 @@ MH_ORIGIN_DIRECT_DICT: dict[str, Any] = {
     "PL": MH_PL,
     "DIST": MH_DIST,
     "PP": MH_PP,
+    "PLT": MH_PLT_HEY,
 }
 
 # Relayed frame: the originator (SRC) is a different station from the last hop
@@ -257,6 +260,7 @@ MH_DUMP_DICT: dict[str, Any] = {
     "HW": MH_HW,
     "MOD": MH_MOD,
     "MESH": MH_MESH,
+    "PLT": MH_PLT_HEY,  # dump builder emits PLT (mheard_functions.cpp:676) but no GW
 }
 
 # `PP` present but the firmware's own rejected shape: 1 comma in the leading
@@ -1048,6 +1052,91 @@ def _test_mh_sentinel_coercion(results: list[tuple[str, bool]]) -> None:
     )
 
 
+def _test_mh_plt_gate(results: list[tuple[str, bool]]) -> None:
+    """F1: `gw` is derived only from a HEY frame's `PLT` (`_MH_PAYLOAD_TYPE_HEY`
+    == 0x40); `mh_origin` stays ungated regardless of payload type. See
+    `transform_mh`'s docstring and `_coerce_mh_payload_type`.
+    """
+    # PLT=HEY, GW=0: a real "not a gateway" and must NOT become None.
+    not_gw_dict: dict[str, Any] = {**MH_ORIGIN_DIRECT_DICT, "GW": 0}
+    _check(
+        results,
+        "MH PLT=HEY, GW=0: gw stays int 0, not coerced to None",
+        transform_mh(not_gw_dict)["gw"] == 0,
+    )
+
+    # PLT=MSG (not HEY), GW=0: gw must gate to None even though GW itself
+    # coerces cleanly — the destination path is unrelated on this frame type.
+    # mh_origin must stay ungated: SRC is set unconditionally on every frame.
+    non_hey_dict: dict[str, Any] = {**MH_ORIGIN_DIRECT_DICT, "PLT": MH_PLT_MSG, "GW": 0}
+    non_hey = transform_mh(non_hey_dict)
+    _check(results, "MH PLT=MSG (not HEY): gw gates to None", non_hey["gw"] is None)
+    _check(
+        results,
+        "MH PLT=MSG (not HEY): mh_origin stays ungated",
+        non_hey["mh_origin"] == MH_CALL,
+    )
+
+    # PLT absent: fail closed.
+    no_plt_dict: dict[str, Any] = {k: v for k, v in MH_ORIGIN_DIRECT_DICT.items() if k != "PLT"}
+    _check(
+        results,
+        "MH PLT absent: gw gates to None (fail closed)",
+        transform_mh(no_plt_dict)["gw"] is None,
+    )
+
+    # A HEY whose PP was dropped by the firmware's 244-char size budget: PP
+    # absent, PLT still HEY — gw must still be derived from GW, pinning the
+    # gate on PLT, never on PP presence (mheard_functions.cpp:366-371).
+    pp_dropped_dict: dict[str, Any] = {k: v for k, v in MH_ORIGIN_DIRECT_DICT.items() if k != "PP"}
+    _check(
+        results,
+        "MH PP dropped by size budget, PLT still HEY: gw still derived from GW",
+        transform_mh(pp_dropped_dict)["gw"] == MH_GW,
+    )
+
+    # PLT coercer tolerance: the single ASCII char '@' and the string int
+    # form "64" must both still be recognised as HEY.
+    for plt_value in ("@", "64"):
+        str_plt_dict: dict[str, Any] = {**MH_ORIGIN_DIRECT_DICT, "PLT": plt_value}
+        _check(
+            results,
+            f"MH PLT given as {plt_value!r}: still treated as HEY, gw derived",
+            transform_mh(str_plt_dict)["gw"] == MH_GW,
+        )
+
+
+def _test_lora_mod_mask(results: list[tuple[str, bool]]) -> None:
+    """F6: `MOD`/`lora_mod` is a packed byte (`aprs_functions.cpp:113`) — low
+    nibble modulation, high nibble country. Both wire paths (the binary GATT
+    footer and `transform_mh`) must mask to the modulation nibble only, never
+    store the packed byte raw.
+    """
+    packed = 0x83  # country 8, modulation 3
+    expected = 0x03
+
+    packed_frame = _build_data_frame(
+        MSG_TYPE_BYTE,
+        MSG_MSG_ID,
+        MSG_MAX_HOP_RAW,
+        MSG_PATH.encode() + MSG_DEST.encode() + MSG_MESSAGE.encode(),
+        (MSG_HARDWARE_ID, packed, MSG_FW, MSG_LASTHW, MSG_FW_SUB_BYTE, MSG_ENDING, MSG_TIME_MS),
+    )
+    decoded = decode_binary_message(packed_frame)
+    _check(
+        results,
+        "binary footer: packed MOD 0x83 masks to lora_mod 3",
+        decoded is not None and decoded["lora_mod"] == expected,
+    )
+
+    mh_packed_dict: dict[str, Any] = {**MH_ORIGIN_DIRECT_DICT, "MOD": packed}
+    _check(
+        results,
+        "transform_mh: packed MOD 0x83 masks to lora_mod 3",
+        transform_mh(mh_packed_dict)["lora_mod"] == expected,
+    )
+
+
 def _test_i_register_fwdate_passthrough(results: list[tuple[str, bool]]) -> None:
     """A `TYP: "I"` frame's `FWDATE` passes through dispatcher() unchanged and
     stays an int — the webapp depends on this; it briefly shipped as a string
@@ -1077,6 +1166,8 @@ def run_ble_protocol_tests() -> bool:
     _test_timestamp(results)
     _test_mh_transform(results)
     _test_mh_sentinel_coercion(results)
+    _test_mh_plt_gate(results)
+    _test_lora_mod_mask(results)
     _test_i_register_fwdate_passthrough(results)
 
     for label, ok in results:
