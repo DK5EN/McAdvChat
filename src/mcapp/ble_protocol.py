@@ -619,6 +619,53 @@ def _coerce_gw(value: Any) -> int | None:
     return 1 if value else 0
 
 
+def _coerce_mh_dist(value: Any) -> float | None:
+    """Coerce the MH register's `DIST` field to a distance in km, mapping the
+    firmware's "unknown distance" sentinel to `None`.
+
+    `mheardLine.mh_dist` is unconditionally initialised to `-1` on every
+    received frame (`lora_functions.cpp:594`) and is overwritten only inside a
+    branch requiring `payload_type == '!'` AND a position message AND a
+    successful APRS decode AND `msg_source_call == msg_source_last` AND
+    non-zero coordinates on both sides (`:670`) — a HEY beacon (`'@'`) never
+    reaches it. `mheard_functions.cpp:317` repairs a negative only when a
+    stored record already exists, and the `%.1lf` record buffer round-trips
+    `"-1.0"`, so a first-seen station ships `DIST: -1`, and it is sticky.
+
+    Any negative value maps to `None`, not just exactly `-1` — the sentinel is
+    "negative", and a negative distance is physically meaningless regardless
+    of the exact value. `0` (or `0.0`) is a real measurement — a station
+    colocated with us — and passes through unchanged; do not fold it into the
+    sentinel."""
+    coerced = _coerce_optional_float(value)
+    if coerced is not None and coerced < 0:
+        return None
+    return coerced
+
+
+def _coerce_mh_ncnt(value: Any) -> int | None:
+    """Coerce the MH register's `NCNT` field to a neighbour count, mapping the
+    firmware's "never learned" sentinel to `None`.
+
+    `mh_ncount` is re-initialised to `0` on every received frame
+    (`lora_functions.cpp:597`), and the firmware itself reads `0` as "not
+    set", back-filling from its own table (`mheard_functions.cpp:313-314`). A
+    genuine measured zero is not distinguishable from it in this field:
+    `updateMheard` builds the register at `lora_functions.cpp:701`, *before*
+    `updateHeyPath` parses the fresh `R<ncnt>` at `:712`, so `NCNT` is always
+    one beacon stale — the stored table value, never the count carried by the
+    frame that ships it.
+
+    Do NOT reuse this for `hey_chain.origin_ncnt` or `hops[].ncnt` — those are
+    written fresh at transmit time (`loop_functions.cpp:4242`,
+    `appendHeySignalReport`), so a `0` there is a real measurement, not the
+    sentinel. `parse_hey_chain`/`hey_path.py` must stay untouched."""
+    coerced = _coerce_optional_int(value)
+    if coerced == 0:
+        return None
+    return coerced
+
+
 def _coerce_mh_origin(value: Any) -> str | None:
     """`SRC` -> uppercased, stripped callsign, or `None` if absent, blank,
     not a string, or an unconfigured-node placeholder.
@@ -666,6 +713,13 @@ def transform_mh(input_dict: dict[str, Any]) -> dict[str, Any]:
     chars, which starts at roughly 5 relay hops. A missing `hey_chain` on a
     deep path is therefore the NORM, not a sign of a direct link — do not
     read "no chain" as "no relays".
+
+    `NCNT` and `DIST` each carry a firmware sentinel that this transformer
+    normalises to `None` at this wire boundary (`_coerce_mh_ncnt`,
+    `_coerce_mh_dist`) — `0` and any negative value respectively are "not
+    set", not real measurements. The chain's own `origin_ncnt`/`hops[].ncnt`
+    are unaffected: those are fresh transmit-time values, and a `0` there is
+    real.
     """
     node_timestamp = timestamp_from_date_time(input_dict["DATE"], input_dict["TIME"])
     pp_raw = input_dict.get("PP")
@@ -684,9 +738,9 @@ def transform_mh(input_dict: dict[str, Any]) -> dict[str, Any]:
         "timestamp": node_timestamp,
         "mh_origin": _coerce_mh_origin(input_dict.get("SRC")),
         "gw": _coerce_gw(input_dict.get("GW")),
-        "mh_ncnt": _coerce_optional_int(input_dict.get("NCNT")),
+        "mh_ncnt": _coerce_mh_ncnt(input_dict.get("NCNT")),
         "mh_path_len": _coerce_optional_int(input_dict.get("PL")),
-        "mh_dist": _coerce_optional_float(input_dict.get("DIST")),
+        "mh_dist": _coerce_mh_dist(input_dict.get("DIST")),
         "hey_chain": hey_chain.as_dict() if hey_chain is not None else None,
         "hey_chain_raw": pp_raw if isinstance(pp_raw, str) else None,
     }

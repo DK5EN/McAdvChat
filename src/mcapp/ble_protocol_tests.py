@@ -274,6 +274,30 @@ MH_GW_VECTORS: tuple[tuple[Any, int], ...] = (
 
 MH_NONNUMERIC = "not-a-number"
 
+# DIST sentinel coercion (_coerce_mh_dist): the firmware's unconditional
+# per-frame initialiser is -1 ("unknown distance"), sticky via a %.1lf
+# buffer round-trip ("-1.0"). Any negative maps to None; 0 is a real
+# colocated-station measurement and must survive.
+MH_DIST_VECTORS: tuple[tuple[Any, float | None], ...] = (
+    (-1, None),
+    (-1.0, None),
+    (0, 0.0),
+    (25.7, 25.7),
+)
+
+# NCNT sentinel coercion (_coerce_mh_ncnt): the firmware re-initialises this
+# to 0 on every received frame and itself reads 0 as "not set". A non-zero
+# count passes straight through.
+MH_NCNT_VECTORS: tuple[tuple[Any, int | None], ...] = (
+    (0, None),
+    (7, 7),
+)
+
+# A PP whose leading token is a genuine zero (0 commas, valid per hey_path.py
+# point 2): the chain's OWN origin_ncnt is a fresh transmit-time value, never
+# subject to the NCNT==0 sentinel rule above.
+MH_PP_ZERO_NCNT = "R0;"
+
 
 # --- TYP: "I" register: FWDATE passthrough ------------------------------------
 # FWDATE briefly shipped as a string and was reverted; the webapp depends on it
@@ -818,9 +842,17 @@ def _test_mh_transform(results: list[tuple[str, bool]]) -> None:
     )
     _check(results, "MH direct: mh_origin == SRC", direct["mh_origin"] == MH_CALL)
     _check(results, "MH direct: gw coerced to int 1", direct["gw"] == 1)
-    _check(results, "MH direct: mh_ncnt passthrough", direct["mh_ncnt"] == MH_NCNT)
+    _check(
+        results,
+        "MH direct: mh_ncnt non-sentinel value passes through",
+        direct["mh_ncnt"] == MH_NCNT,
+    )
     _check(results, "MH direct: mh_path_len passthrough", direct["mh_path_len"] == MH_PL)
-    _check(results, "MH direct: mh_dist passthrough", direct["mh_dist"] == MH_DIST)
+    _check(
+        results,
+        "MH direct: mh_dist non-sentinel value passes through",
+        direct["mh_dist"] == MH_DIST,
+    )
     _check(
         results, "MH direct: hey_chain_raw is the raw PP string", direct["hey_chain_raw"] == MH_PP
     )
@@ -884,7 +916,10 @@ def _test_mh_transform(results: list[tuple[str, bool]]) -> None:
             ph_out["src"] == MH_CALL,
         )
 
-    # --mheard table dump schema: SRC/GW/PP/NCNT/PL/DIST all absent.
+    # --mheard table dump schema: only SRC/GW/PP are absent. The firmware
+    # DOES emit NCNT/PL/DIST from this dump (mheard_functions.cpp:681-685);
+    # this fixture (MH_DUMP_DICT) simply omits them too, so all six keys
+    # below read None here for the same reason the three real-absent ones do.
     dumped = transform_mh(MH_DUMP_DICT)
     new_keys = (
         "mh_origin",
@@ -961,6 +996,58 @@ def _test_mh_transform(results: list[tuple[str, bool]]) -> None:
     _check(results, "MH transformed dict is JSON-serialisable", serialisable)
 
 
+def _test_mh_sentinel_coercion(results: list[tuple[str, bool]]) -> None:
+    """MH register: `DIST`/`NCNT` firmware sentinels normalise to `None`.
+
+    Split out from `_test_mh_transform` to stay under the statement-count
+    lint budget; conceptually the same suite. See `_coerce_mh_dist`/
+    `_coerce_mh_ncnt` for the firmware citations behind each rule.
+    """
+    # DIST sentinel coercion: negative (any negative, not just exactly -1)
+    # maps to None; 0 is a real colocated-station measurement and survives.
+    for wire_value, expected in MH_DIST_VECTORS:
+        dist_dict: dict[str, Any] = {**MH_ORIGIN_DIRECT_DICT, "DIST": wire_value}
+        coerced_dist = transform_mh(dist_dict)["mh_dist"]
+        _check(
+            results,
+            f"MH dist sentinel coercion: {wire_value!r} -> {expected!r}",
+            coerced_dist == expected,
+        )
+
+    # NCNT sentinel coercion: 0 ("never learned") maps to None; a non-zero
+    # count survives.
+    for wire_value, expected in MH_NCNT_VECTORS:
+        ncnt_dict: dict[str, Any] = {**MH_ORIGIN_DIRECT_DICT, "NCNT": wire_value}
+        coerced_ncnt = transform_mh(ncnt_dict)["mh_ncnt"]
+        _check(
+            results,
+            f"MH ncnt sentinel coercion: {wire_value!r} -> {expected!r}",
+            coerced_ncnt == expected,
+        )
+
+    # Guard against later folding the NCNT==0 sentinel rule into the chain's
+    # own counts: R0; is a real zero-neighbour originator, and
+    # hey_chain.origin_ncnt must stay 0, untouched by _coerce_mh_ncnt.
+    zero_chain_dict: dict[str, Any] = {**MH_ORIGIN_DIRECT_DICT, "PP": MH_PP_ZERO_NCNT}
+    zero_hey_chain = transform_mh(zero_chain_dict)["hey_chain"]
+    _check(
+        results,
+        "MH PP=R0;: hey_chain.origin_ncnt stays 0 (chain's own count, not the NCNT sentinel)",
+        zero_hey_chain is not None and zero_hey_chain["origin_ncnt"] == 0,
+    )
+
+    # Contrast: GW: 0 is unchanged by this change (already covered by the GW
+    # coercion vectors in _test_mh_transform, MH_GW_VECTORS' (0, 0) case) —
+    # the new rules are field-specific (DIST negativity, NCNT-only zero),
+    # never a blanket falsy filter across the whole register.
+    gw_zero_dict: dict[str, Any] = {**MH_ORIGIN_DIRECT_DICT, "GW": 0}
+    _check(
+        results,
+        "MH GW: 0 still yields gw == 0 (contrast: not swept up by the sentinel rules)",
+        transform_mh(gw_zero_dict)["gw"] == 0,
+    )
+
+
 def _test_i_register_fwdate_passthrough(results: list[tuple[str, bool]]) -> None:
     """A `TYP: "I"` frame's `FWDATE` passes through dispatcher() unchanged and
     stays an int — the webapp depends on this; it briefly shipped as a string
@@ -989,6 +1076,7 @@ def run_ble_protocol_tests() -> bool:
     _test_aprs_symbol_table_ids(results)
     _test_timestamp(results)
     _test_mh_transform(results)
+    _test_mh_sentinel_coercion(results)
     _test_i_register_fwdate_passthrough(results)
 
     for label, ok in results:
