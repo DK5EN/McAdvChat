@@ -60,6 +60,7 @@ async def run_migration_chain_tests() -> bool:
     await _test_v22_signal_via_column(results)
     await _test_v23_frozen_cache_scrub(results)
     await _test_v24_fcs_ok_column(results)
+    await _test_v26_placeholder_station_scrub(results)
 
     for label, ok in results:
         print(f"    {'✅ PASS' if ok else '❌ FAIL'} | {label}")
@@ -572,6 +573,93 @@ async def _test_v23_frozen_cache_scrub(results: list[tuple[str, bool]]) -> None:
                 (
                     "v23 scrub: telemetry history is left alone (cache-only fix)",
                     tele[0]["n"] == 1,  # genuine_zero's 0.0 °C row
+                )
+            )
+        finally:
+            await storage.close()
+
+
+async def _test_v26_placeholder_station_scrub(results: list[tuple[str, bool]]) -> None:
+    """Seed a pre-v26 fixture holding placeholder-callsign station rows and assert
+    the v26 step removes them while leaving a real station untouched.
+
+    `XX0XXX-00` is the MeshCom firmware's factory default (esp32_flash.h
+    `node_call`) and a valid callsign SHAPE, so nothing rejected it before the
+    runtime guard landed. One such row appeared on mcapp.local within minutes of
+    deploying v2.0.2-dev.1. Every unconfigured node in the field shares that one
+    callsign, so the row is a mixture of all of them and means nothing about any
+    single station — hence delete, not rewrite.
+
+    `messages` is deliberately NOT scrubbed: an unconfigured node's traffic stays
+    visible, because noticing it is how the node gets configured. That is asserted
+    here so a future "tidy up" cannot quietly widen the scrub.
+    """
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        db_path = Path(tmp_dir) / "migration_chain_v26.db"
+
+        def _create_v25_db() -> None:
+            with db_write(db_path) as conn:
+                conn.executescript(CREATE_SCHEMA_SQL)
+                conn.executescript(CREATE_SCHEMA_V2_SQL)
+                conn.execute("DELETE FROM schema_version")
+                conn.execute("INSERT INTO schema_version (version) VALUES (25)")
+                for call in ("XX0XXX-00", "xx0xxx-12", "DK0XXX", "DX0XXX-1", "OE1REAL-1"):
+                    conn.execute(
+                        "INSERT INTO station_positions (callsign, rssi, snr, last_seen)"
+                        " VALUES (?, ?, ?, ?)",
+                        (call, -90, 3, BASE_TS),
+                    )
+                    conn.execute(
+                        "INSERT INTO signal_log (callsign, timestamp, rssi, snr)"
+                        " VALUES (?, ?, ?, ?)",
+                        (call, BASE_TS, -90, 3),
+                    )
+                conn.execute(
+                    "INSERT INTO messages (msg_id, src, dst, msg, type, timestamp, src_type)"
+                    " VALUES (?, ?, ?, ?, ?, ?, ?)",
+                    ("PRE0V26T", "XX0XXX-00", "*", "hi", "msg", BASE_TS, "ble"),
+                )
+                conn.commit()
+
+        await asyncio.to_thread(_create_v25_db)
+
+        try:
+            storage = await create_sqlite_storage(db_path)
+        except Exception:
+            logger.exception("v26 placeholder scrub migration raised")
+            results.append(("v26 placeholder scrub: migrator runs v25→HEAD without error", False))
+            return
+
+        results.append(("v26 placeholder scrub: migrator runs v25→HEAD without error", True))
+        try:
+            version = await _schema_version(storage)
+            results.append(
+                (
+                    f"v26 placeholder scrub: final schema_version marker is {FINAL_SCHEMA_VERSION}",
+                    version == FINAL_SCHEMA_VERSION,
+                )
+            )
+
+            for table in ("station_positions", "signal_log"):
+                left = await storage._query(
+                    f"SELECT callsign FROM {table} ORDER BY callsign"  # noqa: S608 - fixed literal tuple
+                )
+                names = [r["callsign"] for r in left]
+                results.append(
+                    (
+                        f"v26 placeholder scrub: {table} keeps ONLY the real station",
+                        names == ["OE1REAL-1"],
+                    )
+                )
+
+            msg = await storage._query("SELECT * FROM messages WHERE msg_id = ?", ("PRE0V26T",))
+            results.append(
+                (
+                    (
+                        "v26 placeholder scrub: a placeholder's MESSAGES are deliberately"
+                        " kept (traffic stays visible; only the station identity is refused)"
+                    ),
+                    bool(msg) and msg[0]["src"] == "XX0XXX-00",
                 )
             )
         finally:

@@ -8,7 +8,7 @@ import asyncio
 import sqlite3
 
 from ..logging_setup import get_logger
-from ..util import ACK_SUFFIX_RE
+from ..util import ACK_SUFFIX_RE, PLACEHOLDER_CALLSIGN_BASES
 from ._base import StorageBase
 from .constants import (
     BUCKET_SECONDS,
@@ -454,10 +454,32 @@ class MigrationsMixin(StorageBase):
                         " the first accepted {CET} beacon)",
                         current_version,
                     )
+                    _set_schema_version(conn, 25)
+
+                if current_version < 26:  # noqa: PLR2004 - schema migration step
+                    # Scrub station rows for unconfigured-node placeholder
+                    # callsigns. `XX0XXX-00` is the MeshCom firmware's factory
+                    # default (esp32_flash.h `node_call`) and is a valid callsign
+                    # SHAPE, so nothing rejected it until now; the runtime guard
+                    # in `_upsert_station_position`/`_ingest_signal` stops new
+                    # ones, and this removes what already landed.
+                    #
+                    # Observed on mcapp.local 2026-08-28 (v2.0.2-dev.1): one row,
+                    # created from an MHeard beacon's originator field within
+                    # minutes of the deploy — one in four HEY beacons carrying an
+                    # originator named a placeholder.
+                    #
+                    # Deletes rather than rewrites: there is nothing to preserve.
+                    # Every unconfigured node in the field shares the one
+                    # callsign, so the row's rssi/snr/last_seen/gw are a mixture
+                    # of all of them and mean nothing about any single station.
+                    # `messages` is deliberately untouched — the traffic stays
+                    # visible, only the STATION identity is refused.
+                    self._scrub_placeholder_stations(conn)
                     # Adding a step after this one? Bump LATEST_SCHEMA_VERSION in
                     # storage/constants.py in the same commit — the startup suite
                     # asserts every migration chain terminates there.
-                    _set_schema_version(conn, 25)
+                    _set_schema_version(conn, 26)
 
         await asyncio.to_thread(_init_db)
 
@@ -466,6 +488,42 @@ class MigrationsMixin(StorageBase):
 
         self._initialized: bool = True
         logger.info("SQLite database initialized")
+
+    @staticmethod
+    def _scrub_placeholder_stations(conn: sqlite3.Connection) -> None:
+        """V25 → V26: delete station rows whose callsign is an unconfigured-node
+        placeholder (see `util.PLACEHOLDER_CALLSIGN_BASES`).
+
+        Matches on the SSID-stripped base, case-insensitively, so `XX0XXX-00`,
+        `XX0XXX-12` and `xx0xxx` are all caught — the firmware does not normalise
+        the callsign it beacons, so neither can this.
+
+        Scrubs the three station-shaped tables and nothing else:
+        `station_positions` (the map/station list), `signal_log` and
+        `signal_buckets` (the signal-history series). `messages` is deliberately
+        left alone — the traffic from an unconfigured node stays visible, because
+        an operator noticing it is how the node gets configured. `signal_buckets`
+        is additionally scrubbed by `callsign`, which for that table is the
+        `signal_via` link, so a bucket series keyed on a placeholder LINK goes too.
+
+        Idempotent, and a no-op on a clean database.
+        """
+        # Built from the shared constant rather than a literal list so the
+        # migration can never drift from the runtime guard that replaced it.
+        patterns = [f"{base}%" for base in sorted(PLACEHOLDER_CALLSIGN_BASES)]
+        where = " OR ".join(["UPPER(callsign) LIKE ?"] * len(patterns))
+        total = 0
+        for table in ("station_positions", "signal_log", "signal_buckets"):
+            cur = conn.execute(f"DELETE FROM {table} WHERE {where}", patterns)  # noqa: S608 - table names are a fixed literal tuple, patterns are bound
+            deleted = cur.rowcount if cur.rowcount and cur.rowcount > 0 else 0
+            total += deleted
+            if deleted:
+                logger.info("Scrubbed %d placeholder-callsign rows from %s", deleted, table)
+        logger.info(
+            "Migration v25 → v26: removed %d placeholder-callsign station row(s) (bases: %s)",
+            total,
+            ", ".join(sorted(PLACEHOLDER_CALLSIGN_BASES)),
+        )
 
     @staticmethod
     def _backfill_new_tables(conn: sqlite3.Connection) -> None:

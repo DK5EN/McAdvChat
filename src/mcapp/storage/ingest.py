@@ -23,6 +23,7 @@ from ..util import (
     APRS_ALTERNATE_TABLE,
     FEET_TO_METERS,
     FIRMWARE_DOUBLED_BACKSLASH,
+    is_placeholder_callsign,
     now_ms,
     undouble_aprs_symbol_escapes,
 )
@@ -239,6 +240,32 @@ class IngestMixin(StorageBase):
         guards `last_seen IS NOT NULL`). A literal 0 is preserved: ble_protocol's
         unparseable-node-clock fallback deliberately produces epoch 0.
         """
+        # A placeholder callsign is not a station and must never become a row.
+        # `XX0XXX-00` is the MeshCom firmware's factory default (esp32_flash.h
+        # `node_call`), and it is a valid callsign SHAPE, so nothing upstream of
+        # here rejects it. Two things go wrong if it lands: the map and station
+        # list gain an entry that is not a station, and — worse — EVERY
+        # unconfigured node in the field shares that one callsign, so the row's
+        # rssi/snr/last_seen/gw become a meaningless mixture of all of them.
+        #
+        # This is the single chokepoint on purpose: all three update types
+        # ('signal', 'position', 'heard') and every transport (BLE MHeard, BLE
+        # data frames, Extern-UDP) reach station_positions through here, so one
+        # guard covers the paths we have seen and the ones we have not.
+        # `_detect_node_identity` (main.py) refuses the same set at the other
+        # end — it will not ADOPT a placeholder as the proxy's own identity.
+        #
+        # Deliberately NOT a message filter: traffic from an unconfigured node
+        # stays visible in the message history, because an operator watching for
+        # exactly that is how the node gets configured.
+        if is_placeholder_callsign(callsign):
+            logger.debug(
+                "Refusing station_positions %s for placeholder callsign %s",
+                update_type,
+                callsign,
+            )
+            return
+
         timestamp = data.get("timestamp")
         if timestamp is None:
             timestamp = now_ms()
@@ -442,6 +469,20 @@ class IngestMixin(StorageBase):
             and VALID_SNR_RANGE[0] <= snr <= VALID_SNR_RANGE[1]
         ):
             source = "mheard" if is_mheard else "lora"
+            # Same rule as `_upsert_station_position`'s guard, applied to the two
+            # signal-history tables: a placeholder is not a station, so it gets no
+            # signal_log rows and no signal_buckets series. Checked on BOTH
+            # callsigns because they are independent — `callsign` keys signal_log
+            # (the observed station) and `signal_via` keys signal_buckets (the link
+            # that delivered the reading), and either one can be a placeholder
+            # without the other being one.
+            if is_placeholder_callsign(callsign) or is_placeholder_callsign(signal_via):
+                logger.debug(
+                    "Refusing signal history for placeholder callsign=%s signal_via=%s",
+                    callsign,
+                    signal_via,
+                )
+                return is_mheard
             await self._mutate(
                 "INSERT INTO signal_log (callsign, timestamp, rssi, snr, source)"
                 " VALUES (?, ?, ?, ?, ?)",

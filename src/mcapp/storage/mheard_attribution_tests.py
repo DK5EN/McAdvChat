@@ -311,6 +311,75 @@ async def run_mheard_attribution_tests() -> bool:  # noqa: PLR0915 - flat list o
                     origin_row_8 is None and after_count_8 == before_count_8,
                 )
             )
+            # 9. Placeholder suppression at the storage chokepoint. Case 8's
+            #    guard is at the transform layer (transform_mh refuses SRC); this
+            #    is the storage-layer backstop for the path that layer cannot
+            #    reach: an UNCONFIGURED NODE HEARD DIRECTLY, arriving as `src`
+            #    itself with a real rssi/snr. `XX0XXX-00` is the MeshCom
+            #    firmware's factory default and a valid callsign SHAPE, so
+            #    nothing else rejects it — and every unconfigured node in the
+            #    field shares it, so one row would mix all of them.
+            for placeholder in ("XX0XXX-00", "xx0xxx-12", "DK0XXX", "DX0XXX-1"):
+                before_count_9 = await _station_count()
+                msg_9 = _mheard_msg(
+                    src=placeholder,
+                    timestamp=_BASE_TS + 9,
+                    rssi=-88,
+                    snr=4.0,
+                )
+                await storage.store_message(msg_9, json.dumps(msg_9))
+                row_9 = await _station_row(placeholder.upper())
+                sig_9 = await storage._query(
+                    "SELECT COUNT(*) c FROM signal_log WHERE UPPER(callsign) = ?",
+                    (placeholder.upper(),),
+                )
+                buckets_9 = await storage._query(
+                    "SELECT COUNT(*) c FROM signal_buckets WHERE UPPER(callsign) = ?",
+                    (placeholder.upper(),),
+                )
+                results.append(
+                    (
+                        (
+                            f"placeholder {placeholder!r} heard DIRECTLY creates no"
+                            " station_positions / signal_log / signal_buckets row"
+                        ),
+                        row_9 is None
+                        and await _station_count() == before_count_9
+                        and sig_9[0]["c"] == 0
+                        and buckets_9[0]["c"] == 0,
+                    )
+                )
+
+            # 10. A real station heard VIA a placeholder link still gets nothing
+            #     written: signal_buckets is keyed by signal_via, so a placeholder
+            #     LINK must not create a series either. The two callsigns are
+            #     independent — either can be a placeholder without the other.
+            before_count_10 = await _station_count()
+            msg_10 = {
+                "src": "DL1REAL-1,XX0XXX-00",
+                "dst": "*",
+                "msg": "",
+                "type": "pos",
+                "src_type": "lora",
+                "msg_id": "AAAA0010",
+                "timestamp": _BASE_TS + 10,
+                "rssi": -95,
+                "snr": 2.0,
+            }
+            await storage.store_message(msg_10, json.dumps(msg_10))
+            buckets_10 = await storage._query(
+                "SELECT COUNT(*) c FROM signal_buckets WHERE UPPER(callsign) LIKE 'XX0XXX%'"
+            )
+            results.append(
+                (
+                    (
+                        "a real station heard VIA a placeholder link writes no"
+                        " signal_buckets series for that link"
+                    ),
+                    buckets_10[0]["c"] == 0 and await _station_count() >= before_count_10,
+                )
+            )
+
         finally:
             await storage.close()
 
