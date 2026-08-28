@@ -59,6 +59,7 @@ from .classifier import Classifier
 from .classifier.seed import seed_defaults
 from .classifier.types import SSEEvent
 from .sqlite_storage import SQLiteStorage, create_sqlite_storage
+from .util import PLACEHOLDER_CALLSIGN_BASES as _PLACEHOLDER_CALLSIGN_BASES
 from .util import now_ms
 
 _MSG_PREVIEW_CHARS = 20
@@ -96,14 +97,11 @@ BLE_REGISTER_TYPES = ("I", "SN", "G", "SA", "SE", "S1", "SW", "S2", "W", "AN", "
 # that hardware and warns forever for a register that will never arrive.
 REQUIRED_BLE_REGISTER_TYPES = frozenset({"I", "SN", "G", "SA"})
 
-# Callsign bases that mean "nobody has configured this yet". Each is a valid
-# callsign SHAPE, so CALLSIGN_STRICT_RE accepts them and only an explicit list can
-# tell them apart from a real station. Compared against the SSID-stripped base, so
-# XX0XXX-00 and XX0XXX-12 are both caught.
-#   XX0XXX  MeshCom firmware factory default (esp32/esp32_flash.h node_call)
-#   DK0XXX  CommandHandler's own my_callsign default (commands/handler.py)
-#   DX0XXX  UDPConfig's default target (config_loader.py)
-PLACEHOLDER_CALLSIGN_BASES = frozenset({"XX0XXX", "DK0XXX", "DX0XXX"})
+# Re-exported from util so `main.PLACEHOLDER_CALLSIGN_BASES` keeps resolving for
+# existing import sites. The definition moved to util.py when transform_mh needed
+# it too and could not import main.py without a cycle — see util.py for the list
+# and why each entry is on it.
+PLACEHOLDER_CALLSIGN_BASES = _PLACEHOLDER_CALLSIGN_BASES
 
 VERSION = f"v{__version__}"
 

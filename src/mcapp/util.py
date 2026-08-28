@@ -10,6 +10,32 @@ from typing import Any
 
 FEET_TO_METERS = 0.3048
 
+# Callsign bases that mean "nobody has configured this yet". Each is a valid
+# callsign SHAPE, so a strict callsign regex accepts them and only an explicit list
+# can tell them apart from a real station. Compared against the SSID-stripped base,
+# so XX0XXX-00 and XX0XXX-12 are both caught.
+#   XX0XXX  MeshCom firmware factory default (esp32/esp32_flash.h node_call)
+#   DK0XXX  CommandHandler's own my_callsign default (commands/handler.py)
+#   DX0XXX  UDPConfig's default target (config_loader.py)
+#
+# Lives here, not in main.py, because two unrelated call sites need it and
+# ble_protocol.py cannot import main.py without a cycle: `_detect_node_identity`
+# refuses to ADOPT a placeholder as the proxy's own identity, and `transform_mh`
+# refuses to RECORD one as a heard station. main.py re-exports the name for
+# import-site stability.
+PLACEHOLDER_CALLSIGN_BASES = frozenset({"XX0XXX", "DK0XXX", "DX0XXX"})
+
+
+def is_placeholder_callsign(callsign: str) -> bool:
+    """True if `callsign`'s SSID-stripped base is an unconfigured-node placeholder.
+
+    Case-insensitive: the comparison base is upper-cased first, because callers
+    receive this straight off the wire and the firmware does not normalise it.
+    """
+    if not callsign:
+        return False
+    return callsign.strip().upper().split("-", maxsplit=1)[0] in PLACEHOLDER_CALLSIGN_BASES
+
 
 # --- MeshCom ack-request suffix ({NNN) -------------------------------------
 # The firmware appends an ack-request suffix to every DM it sends: an opening

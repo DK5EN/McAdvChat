@@ -21,7 +21,7 @@ from struct import unpack
 from typing import Any
 
 from .hey_path import parse_hey_chain
-from .util import FEET_TO_METERS, now_ms
+from .util import FEET_TO_METERS, is_placeholder_callsign, now_ms
 
 PAYLOAD_TYPE_MSG = 58  # ":" text message frame
 PAYLOAD_TYPE_POS = 33  # "!" position/telemetry frame
@@ -621,11 +621,25 @@ def _coerce_gw(value: Any) -> int | None:
 
 def _coerce_mh_origin(value: Any) -> str | None:
     """`SRC` -> uppercased, stripped callsign, or `None` if absent, blank,
-    or not a string."""
+    not a string, or an unconfigured-node placeholder.
+
+    The placeholder filter is load-bearing, not tidiness. A factory-fresh or
+    reset node beacons as `XX0XXX-00` (esp32_flash.h's `node_call` default),
+    and that is a valid callsign SHAPE, so nothing else rejects it. Observed
+    live on 2026-08-28: one in four HEY beacons carrying an originator named a
+    placeholder. Recording it would create a station row that is not a station
+    — and every unconfigured node in the field collapses onto that single row,
+    so its `last_seen` and `gw` would be a meaningless mixture of them all.
+    `_detect_node_identity` refuses the same set for the same reason (it will
+    not ADOPT a placeholder as our identity); this refuses to RECORD one as a
+    heard station.
+    """
     if not isinstance(value, str):
         return None
     origin = value.strip().upper()
-    return origin or None
+    if not origin or is_placeholder_callsign(origin):
+        return None
+    return origin
 
 
 def transform_mh(input_dict: dict[str, Any]) -> dict[str, Any]:

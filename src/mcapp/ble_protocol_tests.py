@@ -863,6 +863,27 @@ def _test_mh_transform(results: list[tuple[str, bool]]) -> None:
     _check(results, "MH relayed: mh_origin is SRC, not CALL", relayed["mh_origin"] == MH_RELAY_SRC)
     _check(results, "MH relayed: src != mh_origin", relayed["src"] != relayed["mh_origin"])
 
+    # An unconfigured node beacons as the firmware's factory-default callsign, and
+    # that is a valid callsign SHAPE so nothing else rejects it. Observed live on
+    # 2026-08-28 (v2.0.2-dev.1): one in four HEY beacons carrying an originator
+    # named a placeholder, which created a station_positions row that is not a
+    # station — and every unconfigured node in the field collapses onto that one
+    # row. `src` must still be CALL: the signal reading is real, only the
+    # ORIGINATOR attribution is refused.
+    for placeholder in ("XX0XXX-00", "xx0xxx-12", "DK0XXX", "DX0XXX-1"):
+        ph_frame = {**MH_RELAYED_DICT, "SRC": placeholder}
+        ph_out = transform_mh(ph_frame)
+        _check(
+            results,
+            f"MH placeholder originator {placeholder!r} is not recorded as a station",
+            ph_out["mh_origin"] is None,
+        )
+        _check(
+            results,
+            f"MH placeholder originator {placeholder!r} still keeps src == CALL",
+            ph_out["src"] == MH_CALL,
+        )
+
     # --mheard table dump schema: SRC/GW/PP/NCNT/PL/DIST all absent.
     dumped = transform_mh(MH_DUMP_DICT)
     new_keys = (
