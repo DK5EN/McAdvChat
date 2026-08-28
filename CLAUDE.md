@@ -158,6 +158,42 @@ webapp's Gateway Availability card in Settings. Design and the on-air measuremen
 - **The metric's resolution is one cadence.** A 20-minute outage between beacons reads as 20 min +
   303 s, and nothing shorter than ~6 min is visible at all. Inherent to a 5-minute heartbeat.
 
+## MHeard Register (`SRC` / `GW` / `PP`)
+
+The BLE `TYP: "MH"` register, extended by firmware 2026-08-27. Adoption plan and the field
+evidence: `doc/2026-08-28_0900-firmware-4.35p.08.28-adoption.md`.
+
+- **`CALL` is the LAST HOP, `SRC` is the ORIGINATOR, and they are different claims.** `CALL` is the
+  station whose transmission the frame's own `RSSI`/`SNR` measured; roughly two thirds of HEY
+  observations are relayed, so `SRC != CALL` is the common case. `transform_mh` therefore keeps
+  `src = CALL` and the signal write stays on that row — rekeying it onto `SRC` re-creates exactly the
+  bug migration v22 fixed. `SRC` gets a signal-free `"heard"` upsert (`last_seen` + `gw` only).
+  `hw_id`/`lora_mod`/`mesh` also describe the heard transmission and must never land on `SRC`'s row.
+- **The `"heard"` upsert must run BEFORE `_store_mheard`'s early return** (`storage/ingest.py`).
+  `_store_mheard` returns True on a throttle hit and `store_message` returns on that same line, so
+  code one branch later is skipped for every throttled frame — most of them under real traffic. Third
+  instance of this trap in this repo; see Link Check and Gateway Uptime above.
+- **`GW` describes `SRC`, never `CALL`.** It comes from the beacon's destination path (`"HG"` vs
+  `"H"`), which the originator sets and relays never modify. Feeds the pre-existing
+  `station_positions.gw` column — no migration. `0` is authoritative and correctly overwrites a
+  stored `1`; absent (`None`) leaves it alone.
+- **`PP` carries RSSI as a POSITIVE MAGNITUDE.** `appendHeySignalReport()` emits
+  `String(rssi*-1.0, 0)`, so `-101 dBm` is on the wire as `101`. `hey_path.parse_hey_chain()` negates
+  it. A parser that trusts the sign inverts every reading and still looks plausible.
+- **Legacy-shape detection is by COMMA COUNT in the leading token**, mirroring the firmware
+  (`mheard_functions.cpp:436-451`): 0 commas (`R99;`) and 2 (`R99,99,99;`) are valid, **1 comma
+  (`R99,99;`) is invalid**. Do not invent a different rule.
+- **An absent `PP` says nothing about the hop count.** The firmware drops it (then `DIST`) once the
+  register JSON would exceed 244 chars, which starts at ~5 relay hops — precisely the deep chains
+  where it would be most interesting. Never read "no chain" as "no relays".
+- **`PP` is deliberately NOT persisted.** It carries no callsigns, so it identifies the POSITION of a
+  weak link, never the station, and it self-censors at depth. Parsed and passed through for the live
+  view only. Revisit if hop identities ever reach the wire.
+- **Two schemas share `TYP: "MH"`.** The live builder sends `SRC`/`GW`/`PP`; the `--mheard` table
+  dump (`mheard_functions.cpp:651`) sends none of them, because it reconstructs from a stored
+  `|`-separated string that never held them. MCProxy never sends `--mheard`, but all three stay
+  optional — never subscript them.
+
 ## Web Push
 
 Web Push to browser / iOS-PWA clients, sharing one wire contract with mc-chat so both backends behave identically.
@@ -181,6 +217,15 @@ BLE mode: `remote` or `disabled` (`MCAPP_BLE_MODE` env override). See `ble_servi
 - **A `#TAG` destination is a hashtag channel, not a callsign — and `is_group()` stays numeric.** The MeshCom FW 4.36 RfC puts a `#OE-SOTA` token in the destination field. All three repos independently misclassified it as a personal DM, which sent it into `compute_conversation_key`'s DM branch where it was **split on its first hyphen** (`"#OE-SOTA"` → key `"#OE<>DK5EN"`), collapsing distinct tags and fragmenting one tag per sender. Fixed in `ea15511` by adding **sibling** predicates `is_hashtag()` / `dst_kind()` / `resolve_dst_target()` beside `is_group()` in `commands/parsing.py` — `is_group` was deliberately NOT widened, because it is pinned by a corpus mirrored in mc-chat and the webapp. Two invariants look like oversights and are load-bearing: classification is **case-insensitive** and **NOT length-bounded** — a tag failing either would fall straight back into the DM branch, which is the defect. The RfC's 9-char cap is send-side grammar, enforced at the API boundary, never in classification. `dst_kind` returns `"unknown"` (never `"direct"`) for a `#`-prefixed value that fails the tag charset: it addresses nobody, and is the shape most likely to arrive from a buggy or hostile sender. Contract: `commands/hashtag_dst_vectors.json` (32 vectors, sha256-pinned by `commands/hashtag_dst_tests.py`). **No prefix/subscription matching exists** (RfC US-3) — its stated rule contradicts its own worked examples, so implementing it would encode a guess. Background: `MeshCom-Hashtag-prep.md`.
 - **Four vector corpora are hand-copied to mc-chat and the webapp, and nothing syncs them for you.** `commands/group_dst_vectors.json` (v2), `storage/conversation_key_vectors.json` (v4), `blocklist_decision_vectors.json` (v2) and `commands/hashtag_dst_vectors.json` (v1) are canonical **here**. mc-chat asserts parse-equality against these exact paths; the webapp pins a sha256 of the conversation-key corpus and runs drift checks against both siblings. Change one and you must copy it to both repos **and** bump the webapp's `EXPECTED_SHA256`, or their suites fail the moment anyone runs them with siblings checked out. Unlike `contract/`, these are not a git subtree — there is no `subtree pull` that will do it for you.
 - **Two different ACKs, never conflate them.** `send_success` is the firmware's 7-byte **binary** ack (`ack_type` 0x00 Node / 0x01 Gateway, `ble_protocol.py`) — "my node or a gateway took the frame". `acked` is a matched inline `:ackNNN` text frame — "the addressee answered". `_handle_ack` publishes `msg_status` `{sent, ack_kind: node|gateway}`, the inline path publishes `{acked, ack_kind: "peer"}` with the ORIGINAL message's msg_id; the webapp renders only the latter as ✓✓ Delivered. Wiring the webapp's `msg_ack` to `send_success` is exactly the 2026-08-19 bug where three unanswered `!ctcping` probes all showed as delivered. `ack_status_tests.py` pins both payloads.
+- **A BLE `D{` register frame carries at most 244 chars of JSON.** `addBLEComToOutBuffer` clamps at
+  245 bytes, minus the `0x44` type byte; the firmware names it `BLE_JSON_PAYLOAD_MAX`. Over that it
+  cuts **mid-value**, so the app gets an unparseable object, not a shortened one — every field is
+  lost, not just the last. The builders in `command_functions.cpp` check against
+  `MAX_MSG_LEN_PHONE - 2` (298), which looks like the limit but never binds; that mismatch is how a
+  one-day `FWDATE` regression took the whole `I` register down on mcapp.local for 9 hours
+  (2026-08-27). `ble_service` salvages such a frame by trimming to the last COMPLETE member — whole
+  members only, never a coerced partial value. A node with all six `GCB` slots filled still
+  overflows, so the salvage stays load-bearing.
 - **All DB timestamps are in milliseconds** (not seconds). Divide by 1000 for `datetime.fromtimestamp()`. Forgetting this causes `ValueError: year 58089 is out of range`.
 - **SSH + `python3 -c` quoting**: single-quote the Python code, `\"` for strings inside. Never use f-strings with dict key access — use `%` formatting, or write a temp script with `cat > /tmp/q.py << 'PYEOF'`.
 - **MHeard beacons** (RSSI/SNR, no coordinates) and **position beacons** (lat/lon, no signal) used to be disjoint packet types. Since firmware `c4ad78bb`, an Extern-UDP `pos` packet with `src_type=="lora"` carries **both** — `store_message()` then updates both `station_positions` field groups. See the 2026-07-05 amendment in `doc/2026-02-11_1400-position-signal-architecture-ADR.md` and `doc/UDP-2.0-impl.md`.
