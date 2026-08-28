@@ -145,18 +145,30 @@ webapp's Gateway Availability card in Settings. Design and the on-air measuremen
   count. The webapp watchdog's `!element.via` rule rejects the BLE copy, which would break a
   BLE-only box — do not copy it into the backend. Contract: `is_uplink_time_beacon` in
   `storage/uptime.py`, pinned by `storage/uptime_tests.py` against all three real captured frames.
-- **`GAP_TOLERANCE_MS` must stay above the beacon cadence.** Measured 2026-08-21 on mcapp.local:
-  `23:40:31 → 23:45:34 → 23:50:37`, a **303 s** period, not the round 300 s it looks like. A
-  tolerance at or below the cadence records a gap on every healthy cycle — a link that never
-  dropped a frame reports ~60% uptime. It is 6 min for that reason, and it is the **only** value
-  baked into stored history; the amber/red split is applied at read time and stays retunable.
+- **`GAP_TOLERANCE_MS` must stay above the beacon cadence, and the cadence is NOT a constant.** It
+  is set upstream by the MeshCom server, not by our node, and OE1KBC has already halved it once:
+  **303 s** until 2026-08-22 (`23:40:31 → 23:45:34 → 23:50:37`), **606.5 s** since (measured
+  2026-08-28 over 12 consecutive intervals, all 10.11 min). A tolerance at or below the cadence
+  records a gap on every healthy cycle — at 6 min against the new 606.5 s the card read **0.0%
+  uptime for six days while beacons were arriving normally**, and the footer showed "No time sync"
+  for ~45% of every cycle. It is **12 min** for that reason (same 1.19x margin 6 min had over
+  303 s). **Symptom → cause:** uptime near zero while beacons are visibly arriving means this value
+  is under the cadence — re-measure before suspecting the link.
+- **Retune all four thresholds together.** `GAP_TOLERANCE_MS` and `SILENT_MS` (12 min) and `OFF_MS`
+  (30 min, ~3 cadences) in `storage/constants.py`, plus the webapp's `WATCHDOG_TIMEOUT_MS`
+  (`src/constants/index.ts`, 12 min). `GAP_TOLERANCE_MS` is the **only** one baked into stored
+  history — the amber/red split is applied at read time and stays retunable — so raising it does
+  NOT repair rows already written. Migration 28 scrubbed the 210 spurious gaps recorded between
+  2026-08-27 07:45:59 (where they became contiguous) and the retune, and deliberately KEPT the 37
+  earlier ones: the cadence still alternated there, so those are genuinely ambiguous.
 - **`gap` and `dark` are different claims and must never be conflated.** `gap` = proxy running, no
   beacon → counts against UPTIME. `dark` = proxy not running, nothing observed → counts against
   COVERAGE only. Startup reconciliation writes the `dark` row and resets `last_beacon_ms`, so a
   deploy restart can never look like a link outage — and it must run before the heartbeat task
   starts, or the first tick papers over the very downtime it exists to record.
 - **The metric's resolution is one cadence.** A 20-minute outage between beacons reads as 20 min +
-  303 s, and nothing shorter than ~6 min is visible at all. Inherent to a 5-minute heartbeat.
+  606 s, and nothing shorter than the tolerance (~12 min) is visible at all. Inherent to a
+  heartbeat-driven metric, and it got twice as coarse when the cadence halved.
 
 ## MHeard Register (`SRC` / `GW` / `PP`)
 

@@ -520,10 +520,64 @@ class MigrationsMixin(StorageBase):
                         " (modulation only, country nibble dropped)",
                         current_version,
                     )
+                    _set_schema_version(conn, 27)
+
+                if current_version < 28:  # noqa: PLR2004 - schema migration step
+                    # The {CET} cadence was halved upstream (OE1KBC) from 303 s to
+                    # 606.5 s, which put it ABOVE the old 6-min GAP_TOLERANCE_MS —
+                    # so from then on every perfectly healthy cycle was recorded as
+                    # a `gap` and the Gateway Availability card read 0% uptime while
+                    # beacons were arriving normally. The tolerance is now 12 min
+                    # (see storage/constants.py), but the tolerance is the one value
+                    # baked into STORED rows, so raising it does not repair the
+                    # ledger. This step removes the rows that were never outages.
+                    #
+                    # Scoped deliberately, NOT a blanket delete of short gaps:
+                    #
+                    #   * start_ms >= 1787809559726 (2026-08-27 07:45:59) — the point
+                    #     where the gap segments become CONTIGUOUS, i.e. every cycle
+                    #     was being logged as a gap. Measured on mcapp.local: 210
+                    #     segments from there, all <= 12 min, longest 11.9 min.
+                    #   * Before that timestamp the cadence still alternated between
+                    #     303 s and 606.5 s, so a 10-min gap there is genuinely
+                    #     ambiguous — it may be a real 2-cycle outage. Those 37
+                    #     segments are PRESERVED. Do not "simplify" this by dropping
+                    #     the timestamp bound; that would erase real outages.
+                    #   * <= GAP_TOLERANCE_MS keeps anything longer than one cadence,
+                    #     which is a real outage under either tolerance.
+                    #
+                    # Idempotent: re-running deletes nothing new, because any row it
+                    # would match has already gone.
+                    # Guarded on the table existing. Any real DB at v27 passed
+                    # through v25, which creates it — but a fixture seeded directly
+                    # at v26/v27 skips that block, and a migration step must never
+                    # depend on how the caller got to the previous version.
+                    has_table = conn.execute(
+                        "SELECT 1 FROM sqlite_master WHERE type = 'table'"
+                        " AND name = 'link_uptime_segments'"
+                    ).fetchone()
+                    cur = (
+                        conn.execute(
+                            "DELETE FROM link_uptime_segments"
+                            " WHERE kind = 'gap' AND start_ms >= 1787809559726"
+                            " AND (end_ms - start_ms) <= 720000"
+                        )
+                        if has_table
+                        else None
+                    )
+                    logger.info(
+                        "Migration v%d → v28: removed %d link_uptime_segments gap"
+                        " rows recorded between 2026-08-27 07:45:59 and the"
+                        " GAP_TOLERANCE_MS retune — normal cycles at the new 606.5 s"
+                        " {CET} cadence, never outages. Rows before that timestamp"
+                        " are kept: the cadence still alternated there.",
+                        current_version,
+                        cur.rowcount if cur is not None else 0,
+                    )
                     # Adding a step after this one? Bump LATEST_SCHEMA_VERSION in
                     # storage/constants.py in the same commit — the startup suite
                     # asserts every migration chain terminates there.
-                    _set_schema_version(conn, 27)
+                    _set_schema_version(conn, 28)
 
         await asyncio.to_thread(_init_db)
 

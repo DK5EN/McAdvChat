@@ -62,6 +62,7 @@ async def run_migration_chain_tests() -> bool:
     await _test_v24_fcs_ok_column(results)
     await _test_v26_placeholder_station_scrub(results)
     await _test_v27_gw_lora_mod_scrub(results)
+    await _test_v28_uptime_gap_scrub(results)
 
     for label, ok in results:
         print(f"    {'✅ PASS' if ok else '❌ FAIL'} | {label}")
@@ -661,6 +662,125 @@ async def _test_v26_placeholder_station_scrub(results: list[tuple[str, bool]]) -
                         " kept (traffic stays visible; only the station identity is refused)"
                     ),
                     bool(msg) and msg[0]["src"] == "XX0XXX-00",
+                )
+            )
+        finally:
+            await storage.close()
+
+
+async def _test_v28_uptime_gap_scrub(results: list[tuple[str, bool]]) -> None:
+    """Seed a pre-v28 fixture of `link_uptime_segments` and assert the v28 step
+    removes only the gaps that were never outages.
+
+    The {CET} cadence was halved upstream (303 s → 606.5 s), which put it above
+    the old 6-min `GAP_TOLERANCE_MS`, so every healthy cycle was logged as a
+    `gap`. The scrub is bounded on BOTH sides and this test pins both bounds:
+
+      * a short gap AFTER the 2026-08-27 07:45:59 cutoff is a normal cycle → gone
+      * a short gap BEFORE it is ambiguous (the cadence still alternated) → KEPT
+      * a long gap after the cutoff is a real outage under either tolerance → KEPT
+    """
+    cutoff = 1787809559726  # 2026-08-27 07:45:59, see migrations.py v28
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        db_path = Path(tmp_dir) / "migration_chain_v28.db"
+
+        def _create_v27_db() -> None:
+            with db_write(db_path) as conn:
+                conn.executescript(CREATE_SCHEMA_SQL)
+                conn.executescript(CREATE_SCHEMA_V2_SQL)
+                conn.execute("DELETE FROM schema_version")
+                conn.execute("INSERT INTO schema_version (version) VALUES (27)")
+                # link_uptime_segments is created by migration v25, not by the
+                # base schema, so a v27 fixture has to stand it up itself.
+                conn.executescript("""
+                    CREATE TABLE IF NOT EXISTS link_uptime_segments (
+                        start_ms INTEGER PRIMARY KEY,
+                        end_ms   INTEGER NOT NULL,
+                        kind     TEXT    NOT NULL
+                    );
+                    CREATE TABLE IF NOT EXISTS link_uptime_state (
+                        id                INTEGER PRIMARY KEY CHECK (id = 1),
+                        first_observed_ms INTEGER,
+                        last_beacon_ms    INTEGER,
+                        last_tick_ms      INTEGER,
+                        open_up_start_ms  INTEGER
+                    );
+                """)
+                # start_ms is the PRIMARY KEY, so every row needs a distinct one.
+                rows = [
+                    # (start, end, kind) — 606_000 ms = 10.1 min, one normal cycle
+                    (cutoff + 60_000, cutoff + 60_000 + 606_000, "gap"),  # scrubbed
+                    (cutoff - 3_600_000, cutoff - 3_600_000 + 606_000, "gap"),  # kept: ambiguous
+                    (cutoff + 7_200_000, cutoff + 7_200_000 + 3_600_000, "gap"),  # kept: real
+                    (cutoff + 120_000, cutoff + 120_000 + 606_000, "dark"),  # kept: not a gap
+                ]
+                conn.executemany(
+                    "INSERT INTO link_uptime_segments (start_ms, end_ms, kind) VALUES (?, ?, ?)",
+                    rows,
+                )
+                conn.commit()
+
+        await asyncio.to_thread(_create_v27_db)
+
+        try:
+            storage = await create_sqlite_storage(db_path)
+        except Exception:
+            logger.exception("v28 uptime gap scrub migration raised")
+            results.append(("v28 uptime gap scrub: migrator runs v27→HEAD without error", False))
+            return
+
+        results.append(("v28 uptime gap scrub: migrator runs v27→HEAD without error", True))
+        try:
+            version = await _schema_version(storage)
+            results.append(
+                (
+                    f"v28 uptime gap scrub: final schema_version marker is {FINAL_SCHEMA_VERSION}",
+                    version == FINAL_SCHEMA_VERSION,
+                )
+            )
+
+            kept = await storage._query(
+                "SELECT start_ms, end_ms, kind FROM link_uptime_segments ORDER BY start_ms", ()
+            )
+            results.append(
+                (
+                    (
+                        "v28 uptime gap scrub: a short gap after the cutoff is removed"
+                        " (a normal cycle at the new cadence, never an outage)"
+                    ),
+                    not any(
+                        r["kind"] == "gap"
+                        and r["start_ms"] == cutoff + 60_000
+                        and r["end_ms"] - r["start_ms"] <= 720_000
+                        for r in kept
+                    ),
+                )
+            )
+            results.append(
+                (
+                    (
+                        "v28 uptime gap scrub: a short gap BEFORE the cutoff is kept"
+                        " (cadence still alternated there — may be a real 2-cycle outage)"
+                    ),
+                    any(r["kind"] == "gap" and r["start_ms"] == cutoff - 3_600_000 for r in kept),
+                )
+            )
+            results.append(
+                (
+                    (
+                        "v28 uptime gap scrub: a gap longer than GAP_TOLERANCE_MS is kept"
+                        " (a real outage under either tolerance)"
+                    ),
+                    any(r["kind"] == "gap" and r["start_ms"] == cutoff + 7_200_000 for r in kept),
+                )
+            )
+            results.append(
+                (
+                    (
+                        "v28 uptime gap scrub: a 'dark' row is never touched"
+                        " (COVERAGE, not UPTIME — a different claim)"
+                    ),
+                    any(r["kind"] == "dark" for r in kept),
                 )
             )
         finally:
