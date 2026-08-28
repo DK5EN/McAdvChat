@@ -13,13 +13,17 @@ private-member access. Results are collected as `list[tuple[str, bool]]`.
 
 from __future__ import annotations
 
+import json
 import struct
+from typing import Any
 
 from .ble_protocol import (
     calc_fcs,
     decode_binary_message,
+    dispatcher,
     parse_aprs_position,
     timestamp_from_date_time,
+    transform_mh,
 )
 from .util import FEET_TO_METERS
 
@@ -190,6 +194,92 @@ APRS_SPACE_SYMBOL = " "
 
 # --- timestamp scaling ---
 MIN_MS_YEAR_2001 = 1_000_000_000_000  # a ms epoch > this proves ms (not s) scaling
+
+# --- MH (MHeard beacon) register: live-schema fields (mheard_functions.cpp:331) ---
+# `PP` example straight from hey_path.py's module docstring: leading `R12` (origin
+# neighbour count 12), then two relay hop groups. Wire RSSI is a positive magnitude
+# (`101`, `95`); the parsed hop must NEGATE it.
+MH_DATE = "2026-08-27"
+MH_TIME = "18:30:00"
+MH_CALL = "DL8DD-7"  # last hop: owns rssi/snr (v22 attribution)
+MH_RSSI = -95
+MH_SNR = 3
+MH_HW = 5
+MH_MOD = 2
+MH_MESH = 1
+MH_GW = 1
+MH_NCNT = 4
+MH_PL = 2
+MH_DIST = 12.5
+MH_PP = "R12;8,101,-7;15,95,5;"
+MH_PP_ORIGIN_NCNT = 12
+MH_PP_HOP0_NCNT = 8
+MH_PP_HOP0_WIRE_RSSI = 101  # positive magnitude on the wire
+MH_PP_HOP0_RSSI = -101  # negated: the actual dBm value
+MH_PP_HOP0_SNR = -7
+MH_PP_HOP1_NCNT = 15
+MH_PP_HOP1_RSSI = -95
+MH_PP_HOP1_SNR = 5
+MH_PP_LEGACY = False
+
+MH_ORIGIN_DIRECT_DICT: dict[str, Any] = {
+    "TYP": "MH",
+    "DATE": MH_DATE,
+    "TIME": MH_TIME,
+    "CALL": MH_CALL,
+    "RSSI": MH_RSSI,
+    "SNR": MH_SNR,
+    "HW": MH_HW,
+    "MOD": MH_MOD,
+    "MESH": MH_MESH,
+    "SRC": MH_CALL,  # direct: originator == last hop
+    "GW": MH_GW,
+    "NCNT": MH_NCNT,
+    "PL": MH_PL,
+    "DIST": MH_DIST,
+    "PP": MH_PP,
+}
+
+# Relayed frame: the originator (SRC) is a different station from the last hop
+# (CALL) that this frame's own RSSI/SNR actually measured.
+MH_RELAY_SRC = "DO7TW-1"
+MH_RELAYED_DICT: dict[str, Any] = {**MH_ORIGIN_DIRECT_DICT, "SRC": MH_RELAY_SRC}
+
+# `--mheard` table dump schema (mheard_functions.cpp:651): reconstructed from a
+# stored '|'-separated string that never held SRC/GW/PP/NCNT/PL/DIST.
+MH_DUMP_DICT: dict[str, Any] = {
+    "TYP": "MH",
+    "DATE": MH_DATE,
+    "TIME": MH_TIME,
+    "CALL": MH_CALL,
+    "RSSI": MH_RSSI,
+    "SNR": MH_SNR,
+    "HW": MH_HW,
+    "MOD": MH_MOD,
+    "MESH": MH_MESH,
+}
+
+# `PP` present but the firmware's own rejected shape: 1 comma in the leading
+# token (`R99,99;`) is invalid (hey_path.py docstring, point 2).
+MH_PP_UNPARSEABLE = "R99,99;"
+
+# GW coercion: (wire value, expected coerced int).
+MH_GW_VECTORS: tuple[tuple[Any, int], ...] = (
+    (0, 0),
+    (1, 1),
+    (True, 1),
+    ("1", 1),
+    ("0", 0),
+)
+
+MH_NONNUMERIC = "not-a-number"
+
+
+# --- TYP: "I" register: FWDATE passthrough ------------------------------------
+# FWDATE briefly shipped as a string and was reverted; the webapp depends on it
+# staying an int straight through the generic-BLE passthrough transformer.
+I_FWDATE = 20260827
+I_DICT: dict[str, Any] = {"TYP": "I", "FWDATE": I_FWDATE}
 
 
 def _build_data_frame(
@@ -710,6 +800,160 @@ def _test_timestamp(results: list[tuple[str, bool]]) -> None:
     )
 
 
+def _test_mh_transform(results: list[tuple[str, bool]]) -> None:
+    """MH register (`TYP: "MH"`) — SRC/GW/PP extension fields.
+
+    `CALL` is the last hop and keeps owning `src`/`rssi`/`snr` (migration v22);
+    `SRC` is the originator and owns `mh_origin`/`gw`. See `transform_mh`'s
+    docstring for why the two must never be merged.
+    """
+    direct = transform_mh(MH_ORIGIN_DIRECT_DICT)
+
+    # The v22 attribution invariant: src is ALWAYS CALL (the last hop), never
+    # SRC — even though in this direct-hop fixture they happen to be equal.
+    _check(
+        results,
+        "MH direct: src stays CALL (v22 attribution invariant)",
+        direct["src"] == MH_CALL,
+    )
+    _check(results, "MH direct: mh_origin == SRC", direct["mh_origin"] == MH_CALL)
+    _check(results, "MH direct: gw coerced to int 1", direct["gw"] == 1)
+    _check(results, "MH direct: mh_ncnt passthrough", direct["mh_ncnt"] == MH_NCNT)
+    _check(results, "MH direct: mh_path_len passthrough", direct["mh_path_len"] == MH_PL)
+    _check(results, "MH direct: mh_dist passthrough", direct["mh_dist"] == MH_DIST)
+    _check(
+        results, "MH direct: hey_chain_raw is the raw PP string", direct["hey_chain_raw"] == MH_PP
+    )
+
+    chain = direct["hey_chain"]
+    if chain is None:
+        _check(results, "MH direct: hey_chain parses (not None)", False)
+    else:
+        _check(
+            results, "MH direct: hey_chain origin_ncnt", chain["origin_ncnt"] == MH_PP_ORIGIN_NCNT
+        )
+        _check(results, "MH direct: hey_chain not legacy", chain["legacy"] is MH_PP_LEGACY)
+        hops = chain["hops"]
+        _check(results, "MH direct: hey_chain has 2 hops", len(hops) == 2)
+        if len(hops) == 2:
+            _check(
+                results,
+                "MH direct: hop 0 ncnt/snr",
+                hops[0]["ncnt"] == MH_PP_HOP0_NCNT and hops[0]["snr"] == MH_PP_HOP0_SNR,
+            )
+            # The negation invariant: wire value 101 (positive magnitude) must
+            # decode to -101 (real dBm), never pass through as +101.
+            _check(
+                results,
+                f"MH direct: hop 0 rssi negated (wire {MH_PP_HOP0_WIRE_RSSI} -> "
+                f"{MH_PP_HOP0_RSSI}, the negation invariant)",
+                hops[0]["rssi"] == MH_PP_HOP0_RSSI,
+            )
+            _check(
+                results,
+                "MH direct: hop 1 ncnt/rssi/snr",
+                hops[1]["ncnt"] == MH_PP_HOP1_NCNT
+                and hops[1]["rssi"] == MH_PP_HOP1_RSSI
+                and hops[1]["snr"] == MH_PP_HOP1_SNR,
+            )
+
+    # Relayed frame: SRC != CALL. src must still be CALL; mh_origin must be SRC.
+    relayed = transform_mh(MH_RELAYED_DICT)
+    _check(results, "MH relayed: src stays CALL (last hop)", relayed["src"] == MH_CALL)
+    _check(results, "MH relayed: mh_origin is SRC, not CALL", relayed["mh_origin"] == MH_RELAY_SRC)
+    _check(results, "MH relayed: src != mh_origin", relayed["src"] != relayed["mh_origin"])
+
+    # --mheard table dump schema: SRC/GW/PP/NCNT/PL/DIST all absent.
+    dumped = transform_mh(MH_DUMP_DICT)
+    new_keys = (
+        "mh_origin",
+        "gw",
+        "mh_ncnt",
+        "mh_path_len",
+        "mh_dist",
+        "hey_chain",
+        "hey_chain_raw",
+    )
+    _check(
+        results,
+        "MH --mheard dump: all 7 new keys are None",
+        all(dumped[key] is None for key in new_keys),
+    )
+    _check(
+        results,
+        "MH --mheard dump: pre-existing keys unchanged",
+        dumped["transformer"] == "mh"
+        and dumped["src_type"] == "ble"
+        and dumped["type"] == "pos"
+        and dumped["src"] == MH_CALL
+        and dumped["rssi"] == MH_RSSI
+        and dumped["snr"] == MH_SNR
+        and dumped["hw_id"] == MH_HW
+        and dumped["lora_mod"] == MH_MOD
+        and dumped["mesh"] == MH_MESH
+        and dumped["node_timestamp"] == dumped["timestamp"],
+    )
+
+    # PP present but the firmware's own rejected 1-comma shape: unparseable.
+    unparseable_dict: dict[str, Any] = {**MH_ORIGIN_DIRECT_DICT, "PP": MH_PP_UNPARSEABLE}
+    unparseable = transform_mh(unparseable_dict)
+    _check(
+        results,
+        "MH unparseable PP: hey_chain is None, hey_chain_raw keeps the raw string",
+        unparseable["hey_chain"] is None and unparseable["hey_chain_raw"] == MH_PP_UNPARSEABLE,
+    )
+
+    # GW coercion across the shapes the firmware/a hostile sender might send.
+    for wire_value, expected in MH_GW_VECTORS:
+        gw_dict: dict[str, Any] = {**MH_ORIGIN_DIRECT_DICT, "GW": wire_value}
+        coerced = transform_mh(gw_dict)["gw"]
+        _check(
+            results,
+            f"MH gw coercion: {wire_value!r} -> {expected} (int, not bool)",
+            coerced == expected and isinstance(coerced, int) and not isinstance(coerced, bool),
+        )
+
+    # Non-numeric NCNT/PL/DIST must become None, never raise.
+    nonnumeric_dict: dict[str, Any] = {
+        **MH_ORIGIN_DIRECT_DICT,
+        "NCNT": MH_NONNUMERIC,
+        "PL": MH_NONNUMERIC,
+        "DIST": MH_NONNUMERIC,
+    }
+    nonnumeric = transform_mh(nonnumeric_dict)
+    _check(
+        results,
+        "MH non-numeric NCNT/PL/DIST -> None, no raise",
+        nonnumeric["mh_ncnt"] is None
+        and nonnumeric["mh_path_len"] is None
+        and nonnumeric["mh_dist"] is None,
+    )
+
+    # The whole transformed dict must be JSON-serialisable (it is json.dumps'd
+    # on the storage path) — hey_chain must be the plain dict from as_dict(),
+    # never the HeyChain dataclass.
+    serialisable = True
+    try:
+        json.dumps(direct)
+    except (TypeError, ValueError):
+        serialisable = False
+    _check(results, "MH transformed dict is JSON-serialisable", serialisable)
+
+
+def _test_i_register_fwdate_passthrough(results: list[tuple[str, bool]]) -> None:
+    """A `TYP: "I"` frame's `FWDATE` passes through dispatcher() unchanged and
+    stays an int — the webapp depends on this; it briefly shipped as a string
+    and was reverted."""
+    result = dispatcher(I_DICT)
+    _check(
+        results,
+        "TYP=I: FWDATE passes through as an int, value intact",
+        result is not None
+        and result.get("FWDATE") == I_FWDATE
+        and isinstance(result.get("FWDATE"), int),
+    )
+
+
 def run_ble_protocol_tests() -> bool:
     """Run all ble_protocol golden-frame tests. Returns True iff all pass."""
     results: list[tuple[str, bool]] = []
@@ -723,6 +967,8 @@ def run_ble_protocol_tests() -> bool:
     _test_aprs_comment_injection(results)
     _test_aprs_symbol_table_ids(results)
     _test_timestamp(results)
+    _test_mh_transform(results)
+    _test_i_register_fwdate_passthrough(results)
 
     for label, ok in results:
         status = "✅ PASS" if ok else "❌ FAIL"

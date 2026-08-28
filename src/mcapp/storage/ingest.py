@@ -218,7 +218,8 @@ class IngestMixin(StorageBase):
     ) -> None:
         """Upsert station_positions table based on packet type.
 
-        update_type: 'signal' (MHeard) or 'position' (position beacon)
+        update_type: 'signal' (MHeard), 'position' (position beacon), or 'heard'
+        (MHeard originator — see the 'heard' branch below for why it is signal-free)
 
         `signal_via` is ONLY meaningful (and only ever written) on the 'signal'
         branch: the callsign of the station whose transmission actually delivered
@@ -343,6 +344,45 @@ class IngestMixin(StorageBase):
                     via,
                     via_paths_json,
                     timestamp,
+                    timestamp,
+                ),
+            )
+
+        elif update_type == "heard":
+            # MHeard originator (SRC): the ORIGINATING station of a relayed HEY
+            # beacon, as opposed to CALL — the last hop, whose transmission we
+            # actually measured and whose row `_ingest_signal`'s 'signal' branch
+            # writes rssi/snr/signal_via/signal_ts onto (unchanged, above). Upstream
+            # measured that on a typical site two thirds of HEY observations are
+            # relayed, so SRC != CALL is the common case: this station is alive and
+            # reachable via the mesh, but WE did not hear its transmission, so it
+            # gets no radio-quality columns at all.
+            #
+            # `hw_id`/`lora_mod`/`mesh` are deliberately excluded even though the
+            # 'signal' branch writes them: those three describe the transmission we
+            # heard, which came from CALL, not SRC. Writing them onto the
+            # originator's row would be a fresh instance of the exact bug migration
+            # v22 fixed (see migrations.py's `current_version < 22` block) — a
+            # measurement of one station's link stored under a different station's
+            # callsign. Do not "simplify" this by merging it into the 'signal'
+            # branch or rekeying the signal write onto SRC.
+            #
+            # `gw` is the MH `GW` flag, derived from the beacon's destination path
+            # ("HG" vs "H"), which the ORIGINATOR sets and relays never modify — it
+            # describes SRC, never CALL. COALESCE means a `0` is an authoritative
+            # "not a gateway" and correctly overwrites a previously-known 1; `gw`
+            # absent (None) leaves the stored value untouched.
+            await self._mutate(
+                """INSERT INTO station_positions (callsign, gw, last_seen)
+                   VALUES (?, ?, ?)
+                   ON CONFLICT(callsign) DO UPDATE SET
+                       gw = COALESCE(excluded.gw, station_positions.gw),
+                       last_seen = MAX(COALESCE(station_positions.last_seen, 0),
+                                       COALESCE(excluded.last_seen, 0))
+                """,
+                (
+                    callsign,
+                    data.get("gw"),
                     timestamp,
                 ),
             )
@@ -1109,6 +1149,27 @@ class IngestMixin(StorageBase):
 
         if is_position:
             await self._store_position(callsign, message, raw, relay_via)
+
+        # MHeard originator (SRC) attribution — additive to _ingest_signal above,
+        # never a replacement for it: CALL (the last hop, `callsign`) keeps its
+        # rssi/snr/signal_via via the 'signal' branch; SRC (`mh_origin`) gets only
+        # a signal-free 'heard' upsert (liveness + gw). Guarded on `is_mheard` so a
+        # UDP `pos` frame that happens to carry an `mh_origin` key can never reach
+        # this. Fires unconditionally on presence, including mh_origin == callsign
+        # (the direct-beacon case) — that is how `gw` gets recorded when we hear a
+        # station directly, not a special case to skip.
+        #
+        # MUST run before the `_store_mheard` throttle-early-return immediately
+        # below: `_store_mheard` returns True on a throttle hit and the caller
+        # (`if is_mheard and await self._store_mheard(...): return`) exits
+        # `store_message` entirely on that same line. Code placed after that
+        # return is silently skipped for every throttled MHeard frame — under
+        # real traffic, most of them (see CLAUDE.md's "Link Check" and "Gateway
+        # Uptime" gotchas for two prior instances of exactly this trap).
+        if is_mheard:
+            mh_origin = message.get("mh_origin")
+            if mh_origin:
+                await self._upsert_station_position(mh_origin, message, "heard")
 
         # --- LEGACY: Write to messages table (dual-write) ---
         if is_mheard and await self._store_mheard(src, rssi, snr, timestamp, raw):

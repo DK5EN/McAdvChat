@@ -44,6 +44,7 @@ from mcapp.commands.parsing_tests import run_parsing_tests
 from mcapp.commands.routing_tests import run_routing_tests
 from mcapp.contract_parity_tests import run_contract_parity_tests
 from mcapp.dedup_contract_tests import run_dedup_contract_tests
+from mcapp.hey_path_tests import run_hey_path_tests
 from mcapp.identity_tests import run_identity_tests
 from mcapp.linkcheck_sse_tests import run_linkcheck_sse_tests
 from mcapp.linkcheck_tests import run_linkcheck_tests
@@ -57,6 +58,7 @@ from mcapp.storage.ack_status_tests import run_ack_status_tests
 from mcapp.storage.connection_lifecycle_tests import run_connection_lifecycle_tests
 from mcapp.storage.conversation_key_tests import run_conversation_key_tests
 from mcapp.storage.linkcheck_ingest_tests import run_linkcheck_ingest_tests
+from mcapp.storage.mheard_attribution_tests import run_mheard_attribution_tests
 from mcapp.storage.migration_chain_tests import run_migration_chain_tests
 from mcapp.storage.query_tests import run_query_tests
 from mcapp.storage.signal_via_tests import run_signal_via_tests
@@ -147,6 +149,12 @@ async def main() -> int:  # noqa: PLR0915 - flat suite registry; one visible lin
     signal_via_ok = await run_signal_via_tests()
     print(f"signal_via: {'PASS' if signal_via_ok else 'FAIL'}")
 
+    mheard_attribution_ok = await run_mheard_attribution_tests()
+    print(f"mheard_attribution: {'PASS' if mheard_attribution_ok else 'FAIL'}")
+
+    hey_path_ok = run_hey_path_tests()
+    print(f"hey_path: {'PASS' if hey_path_ok else 'FAIL'}")
+
     connection_lifecycle_ok = await run_connection_lifecycle_tests()
     print(f"connection_lifecycle: {'PASS' if connection_lifecycle_ok else 'FAIL'}")
 
@@ -229,6 +237,8 @@ async def main() -> int:  # noqa: PLR0915 - flat suite registry; one visible lin
         and query_ok
         and migration_chain_ok
         and signal_via_ok
+        and mheard_attribution_ok
+        and hey_path_ok
         and connection_lifecycle_ok
         and uptime_ok
         and meteo_ok

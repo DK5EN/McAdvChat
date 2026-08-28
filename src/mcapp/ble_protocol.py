@@ -20,6 +20,7 @@ from datetime import datetime
 from struct import unpack
 from typing import Any
 
+from .hey_path import parse_hey_chain
 from .util import FEET_TO_METERS, now_ms
 
 PAYLOAD_TYPE_MSG = 58  # ":" text message frame
@@ -570,9 +571,91 @@ def transform_pos(input_dict: dict[str, Any], own_callsign: str = "") -> dict[st
     }
 
 
+def _coerce_optional_int(value: Any) -> int | None:
+    """Best-effort int coercion for unauthenticated RF data. `None` for
+    absence, `bool` (a `bool` is a subclass of `int` and would otherwise
+    silently pass through as e.g. `True`/`False` instead of `1`/`0` with a
+    non-int type), or anything that does not cleanly convert."""
+    if value is None or isinstance(value, bool):
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _coerce_optional_float(value: Any) -> float | None:
+    """Best-effort float coercion; `None` for absence, `bool`, or anything
+    that does not cleanly convert. See `_coerce_optional_int` for the `bool`
+    rationale."""
+    if value is None or isinstance(value, bool):
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _coerce_gw(value: Any) -> int | None:
+    """Coerce the MH register's `GW` flag to a strict `0`/`1` `int`, never a
+    `bool` (which would round-trip through `json.dumps` as `true`/`false`
+    and land in the `station_positions.gw` INTEGER column as something
+    unexpected). `None` when the field is absent.
+
+    The string forms `"0"`/`"1"` are handled explicitly because plain
+    truthiness gets `"0"` wrong (a non-empty string is always truthy in
+    Python). Every other shape — `True`/`False`, any other numeric value,
+    any other non-empty string a hostile sender might send — falls back to
+    truthiness, which is always exactly `0` or `1` and never raises."""
+    if value is None:
+        return None
+    if isinstance(value, str):
+        stripped = value.strip()
+        if stripped == "0":
+            return 0
+        if stripped == "1":
+            return 1
+        return 1 if stripped else 0
+    return 1 if value else 0
+
+
+def _coerce_mh_origin(value: Any) -> str | None:
+    """`SRC` -> uppercased, stripped callsign, or `None` if absent, blank,
+    or not a string."""
+    if not isinstance(value, str):
+        return None
+    origin = value.strip().upper()
+    return origin or None
+
+
 def transform_mh(input_dict: dict[str, Any]) -> dict[str, Any]:
-    """Transform a BLE MHeard beacon"""
+    """Transform a BLE MHeard beacon.
+
+    Two schemas share `TYP: "MH"`: the live builder
+    (`mheard_functions.cpp:331`) sends `SRC`/`GW`, and `PP` when present; the
+    `--mheard` table dump (`mheard_functions.cpp:651`) sends none of the
+    three, reconstructing from a stored `|`-separated string that never held
+    them. All three are therefore OPTIONAL here — never subscript them.
+
+    `CALL` is the LAST HOP: the station whose transmission this frame's own
+    `RSSI`/`SNR` actually measured, and it stays keyed to `src` exactly as
+    before (migration v22 exists because that attribution was once wrong —
+    do not rekey it). `SRC` is the ORIGINATING station: it owns identity
+    (`mh_origin`) and gateway status (`gw`, derived from the destination path
+    the originator sets and relays never modify). On a typical site roughly
+    two thirds of HEY observations are relayed, so `SRC != CALL` is the
+    common case, and `gw` describes `SRC`, never `CALL` — attributing it to
+    `CALL` would be wrong for every relayed beacon.
+
+    `PP`'s absence carries no information: as of firmware 2026-08-28 the
+    register drops `PP` (then `DIST`) whenever the JSON would exceed 244
+    chars, which starts at roughly 5 relay hops. A missing `hey_chain` on a
+    deep path is therefore the NORM, not a sign of a direct link — do not
+    read "no chain" as "no relays".
+    """
     node_timestamp = timestamp_from_date_time(input_dict["DATE"], input_dict["TIME"])
+    pp_raw = input_dict.get("PP")
+    hey_chain = parse_hey_chain(pp_raw) if isinstance(pp_raw, str) else None
     return {
         "transformer": "mh",
         "src_type": "ble",
@@ -585,6 +668,13 @@ def transform_mh(input_dict: dict[str, Any]) -> dict[str, Any]:
         "mesh": input_dict.get("MESH"),
         "node_timestamp": node_timestamp,
         "timestamp": node_timestamp,
+        "mh_origin": _coerce_mh_origin(input_dict.get("SRC")),
+        "gw": _coerce_gw(input_dict.get("GW")),
+        "mh_ncnt": _coerce_optional_int(input_dict.get("NCNT")),
+        "mh_path_len": _coerce_optional_int(input_dict.get("PL")),
+        "mh_dist": _coerce_optional_float(input_dict.get("DIST")),
+        "hey_chain": hey_chain.as_dict() if hey_chain is not None else None,
+        "hey_chain_raw": pp_raw if isinstance(pp_raw, str) else None,
     }
 
 
