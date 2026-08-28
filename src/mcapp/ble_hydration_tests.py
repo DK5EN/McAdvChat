@@ -172,6 +172,40 @@ def _capture_logs(*logger_names: str) -> Iterator[list[str]]:
             lg.setLevel(level)
 
 
+class _ListRecordHandler(logging.Handler):
+    """Like `_ListLogHandler`, but keeps the LEVEL alongside the formatted
+    message. The reconciler de-spam tests need to prove a message logged at
+    WARNING vs. DEBUG for otherwise-identical text -- `_ListLogHandler`
+    discards that distinction by design, so it cannot answer that."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.records: list[tuple[int, str]] = []
+
+    def emit(self, record: logging.LogRecord) -> None:
+        self.records.append((record.levelno, record.getMessage()))
+
+
+@contextlib.contextmanager
+def _capture_log_records(*logger_names: str) -> Iterator[list[tuple[int, str]]]:
+    """Capture (levelno, formatted message) pairs from the named loggers at
+    DEBUG-and-above for the duration of the block, restoring level and
+    handlers afterward. See `_ListRecordHandler` for why this exists
+    alongside `_capture_logs` rather than reusing it."""
+    handler = _ListRecordHandler()
+    loggers = [logging.getLogger(name) for name in logger_names]
+    saved_levels = [lg.level for lg in loggers]
+    for lg in loggers:
+        lg.addHandler(handler)
+        lg.setLevel(logging.DEBUG)
+    try:
+        yield handler.records
+    finally:
+        for lg, level in zip(loggers, saved_levels, strict=True):
+            lg.removeHandler(handler)
+            lg.setLevel(level)
+
+
 class _RecordingAsyncio:
     """Stand-in for the `asyncio` module reference inside `mcapp.main`.
 
@@ -369,6 +403,16 @@ def _hydration_task(router: MessageRouter) -> asyncio.Task[None]:
     if task is None:
         raise RuntimeError("test setup: no hydration task was scheduled")
     return task
+
+
+def _no_op_schedule_hydration(**_kwargs: Any) -> bool:
+    """Stand-in for `schedule_ble_register_hydration`, used by the reconciler
+    de-spam tests below to isolate the reconciler LOOP's own logging from a
+    real sweep's side effects (extra `_missing_required_ble_registers()`
+    calls via `skip_if_complete`, extra BLE commands) -- same isolation
+    `_test_reconciler_backoff_retry` uses its own local `_fake_schedule` for,
+    factored out here because three de-spam tests need the identical no-op."""
+    return True
 
 
 def _ensure_connected_endpoint(manager: _StubManager) -> Callable[..., Any]:
@@ -1232,6 +1276,224 @@ async def _test_reconciler_keeps_looping_while_connecting(
     )
 
 
+async def _test_reconciler_connecting_steady_cadence_still_warns(record: _RecordFn) -> None:
+    """A link stuck CONNECTING still reaches its own steady-cadence WARNING
+    ("link stuck CONNECTING") and still does NOT disarm -- existing
+    behaviour from before the de-spam mechanism below, pinned here so that
+    mechanism (which applies ONLY to the "missing TYPs" WARNING, see
+    `_reconcile_check_once`'s docstring) cannot regress it. This WARNING is
+    deliberately NOT de-spammed: it repeats on EVERY steady-cadence check for
+    as long as the link stays CONNECTING."""
+    client = _RecordingBLEClient(state=ConnectionState.CONNECTING)
+    # checks 1-2 ramp (15s, 60s, both silent -- not steady yet); checks 3-4
+    # steady (600s each, both CONNECTING -> both WARNING); check 5 reports
+    # disconnected and disarms.
+    client.disconnect_after_calls = 5
+    router = _make_router(client)
+    router.schedule_ble_register_hydration = _no_op_schedule_hydration  # type: ignore[method-assign]
+
+    with _capture_log_records(_MAIN_LOGGER) as records:
+        router.arm_ble_register_reconciler(reason="test: stuck connecting")
+        task = router._ble_reconcile_task
+        if task is None:
+            raise RuntimeError("test setup: reconciler did not arm")
+        await asyncio.wait_for(task, timeout=_TASK_JOIN_TIMEOUT_S)
+
+    connecting_warnings = [
+        msg for level, msg in records if level == logging.WARNING and "stuck CONNECTING" in msg
+    ]
+    record(
+        "CONNECTING steady cadence: the stuck-CONNECTING WARNING fires on EVERY steady "
+        "check (two steady checks here), unlike the de-spammed missing-TYPs WARNING",
+        len(connecting_warnings) == 2,
+    )
+    record(
+        "CONNECTING steady cadence: the loop never disarms while stuck CONNECTING -- it "
+        "only disarms once the link is later reported disconnected",
+        task.done() and not task.cancelled() and task.exception() is None,
+    )
+
+
+async def _test_reconciler_despam_persistent_missing(record: _RecordFn) -> None:
+    """De-spam, THE MOTIVATING CASE: a persistently-incomplete cache (same
+    missing TYP set, forever -- e.g. a firmware bug that makes one register
+    permanently unparseable) logs the first steady-cadence observation at
+    WARNING, every identical repeat at DEBUG, exactly ONE escalation WARNING
+    once BLE_RECONCILE_ESCALATION_THRESHOLD consecutive identical
+    observations have passed, and nothing above DEBUG after that for as long
+    as the set stays unchanged. Un-de-spammed, this exact scenario logged an
+    identical unactionable WARNING every 10 minutes for over 9 hours (55
+    times) in production with no pointer to the real cause."""
+    client = _RecordingBLEClient()
+    # checks 1-2 ramp (not steady); checks 3-9 steady (7 observations of the
+    # SAME missing set -- enough to cross BLE_RECONCILE_ESCALATION_THRESHOLD=6
+    # and see at least one post-escalation DEBUG repeat); check 10 disarms.
+    client.disconnect_after_calls = 10
+    router = _make_router(client)
+    router.schedule_ble_register_hydration = _no_op_schedule_hydration  # type: ignore[method-assign]
+    if main_module.BLE_RECONCILE_ESCALATION_THRESHOLD >= 7:
+        raise RuntimeError(
+            "test setup: fixture only exercises 7 steady observations, need threshold < 7"
+        )
+
+    with _capture_log_records(_MAIN_LOGGER) as records:
+        router.arm_ble_register_reconciler(reason="test: persistent missing")
+        task = router._ble_reconcile_task
+        if task is None:
+            raise RuntimeError("test setup: reconciler did not arm")
+        await asyncio.wait_for(task, timeout=_TASK_JOIN_TIMEOUT_S)
+
+    typed = [(level, msg) for level, msg in records if "missing TYPs" in msg]
+    warnings = [msg for level, msg in typed if level == logging.WARNING]
+    debugs = [msg for level, msg in typed if level == logging.DEBUG]
+
+    record(
+        "de-spam persistent: exactly one initial WARNING and exactly one escalation "
+        "WARNING -- nothing else about the missing set logs at WARNING",
+        len(warnings) == 2,
+    )
+    record(
+        "de-spam persistent: the initial WARNING is the plain 'missing TYPs' line",
+        bool(warnings) and "BLE register cache incomplete, missing TYPs" in warnings[0],
+    )
+    record(
+        "de-spam persistent: the escalation WARNING names the likely cause (ble_service "
+        "discarding the register as unparseable) and points at its journal",
+        len(warnings) == 2
+        and "ble_service" in warnings[1]
+        and "unparseable" in warnings[1]
+        and "journalctl -u mcapp-ble.service" in warnings[1]
+        and "Dropped BLE register update" in warnings[1],
+    )
+    record(
+        "de-spam persistent: DEBUG repeats fire both before and after the escalation",
+        len(debugs) == 5,
+    )
+    record(
+        "de-spam persistent: the reconciler keeps looping (never gives up) through all of "
+        "this -- de-spamming the LOG is not disarming the WATCHDOG",
+        task.done() and not task.cancelled() and task.exception() is None,
+    )
+
+
+async def _test_reconciler_despam_resets_on_change(record: _RecordFn) -> None:
+    """De-spam: when the missing set CHANGES at steady cadence, the WARNING
+    fires again for the new set even though the previous set had already
+    logged its own WARNING and dropped to DEBUG -- a change is a genuinely
+    new failure mode (a different register newly failing to hydrate) and
+    must never be swallowed by the old set's repeat count."""
+    client = _RecordingBLEClient()
+    client.disconnect_after_calls = 7  # checks 1-6 stay CONNECTED-incomplete, check 7 disarms
+    router = _make_router(client)
+    router.schedule_ble_register_hydration = _no_op_schedule_hydration  # type: ignore[method-assign]
+
+    # `_missing_required_ble_registers` is stubbed (rather than driven through
+    # `cached_ble_registers`) so the exact missing set at each check is
+    # deterministic and independent of whether a real sweep would have run --
+    # the sweep itself is stubbed out above precisely so it cannot.
+    missing_sequence: list[frozenset[str]] = [
+        frozenset({"I", "SN"}),  # check 1 (ramp, not steady)
+        frozenset({"I", "SN"}),  # check 2 (ramp, not steady)
+        frozenset({"I", "SN"}),  # check 3 (steady -- first observation, WARNING)
+        frozenset({"I", "SN"}),  # check 4 (steady -- unchanged, DEBUG)
+        frozenset({"I"}),  # check 5 (steady -- CHANGED, WARNING again)
+        frozenset({"I"}),  # check 6 (steady -- unchanged, DEBUG)
+    ]
+    calls = 0
+
+    def _fake_missing() -> frozenset[str]:
+        nonlocal calls
+        idx = min(calls, len(missing_sequence) - 1)
+        calls += 1
+        return missing_sequence[idx]
+
+    router._missing_required_ble_registers = _fake_missing  # type: ignore[method-assign]
+
+    with _capture_log_records(_MAIN_LOGGER) as records:
+        router.arm_ble_register_reconciler(reason="test: missing set changes")
+        task = router._ble_reconcile_task
+        if task is None:
+            raise RuntimeError("test setup: reconciler did not arm")
+        await asyncio.wait_for(task, timeout=_TASK_JOIN_TIMEOUT_S)
+
+    typed = [(level, msg) for level, msg in records if "missing TYPs" in msg]
+    warnings = [msg for level, msg in typed if level == logging.WARNING]
+    debugs = [msg for level, msg in typed if level == logging.DEBUG]
+
+    record(
+        "de-spam change: the set change re-warns instead of staying silent -- one WARNING "
+        "per distinct missing set, not one WARNING total",
+        len(warnings) == 2,
+    )
+    record(
+        "de-spam change: the first WARNING names the original two-TYP set, the second "
+        "names only the changed, smaller set",
+        len(warnings) == 2
+        and "'I'" in warnings[0]
+        and "'SN'" in warnings[0]
+        and "'I'" in warnings[1]
+        and "'SN'" not in warnings[1],
+    )
+    record(
+        "de-spam change: each set's own repeat still logs its own DEBUG",
+        len(debugs) == 2,
+    )
+
+
+async def _test_reconciler_despam_resets_on_rearm(record: _RecordFn) -> None:
+    """De-spam: re-arming a FRESH reconciler on the SAME router re-arms the
+    de-spam state too, not just the task. The state lives in
+    `_run_ble_register_reconciler`'s own local (`despam`), scoped to one loop
+    run and discarded when that run ends, precisely so a second arm can never
+    inherit the first run's repeat count or escalation latch -- see that
+    method's docstring."""
+    client_a = _RecordingBLEClient()
+    # checks 1-2 ramp, check 3 steady (WARNING), check 4 disarms.
+    client_a.disconnect_after_calls = 4
+    router = _make_router(client_a)
+    router.schedule_ble_register_hydration = _no_op_schedule_hydration  # type: ignore[method-assign]
+
+    with _capture_log_records(_MAIN_LOGGER) as records_a:
+        router.arm_ble_register_reconciler(reason="test: first run")
+        task_a = router._ble_reconcile_task
+        if task_a is None:
+            raise RuntimeError("test setup: reconciler did not arm (first run)")
+        await asyncio.wait_for(task_a, timeout=_TASK_JOIN_TIMEOUT_S)
+
+    warnings_a = [
+        msg for level, msg in records_a if level == logging.WARNING and "missing TYPs" in msg
+    ]
+
+    # Same router, same (still-empty) cached_ble_registers -> the identical
+    # missing set as the first run. A NEW client models a fresh arm finding
+    # the link CONNECTED again (e.g. a later reconnect), the same shape the
+    # first run saw.
+    client_b = _RecordingBLEClient()
+    client_b.disconnect_after_calls = 4
+    router.register_protocol("ble_client", client_b)
+
+    with _capture_log_records(_MAIN_LOGGER) as records_b:
+        router.arm_ble_register_reconciler(reason="test: second run, same router")
+        task_b = router._ble_reconcile_task
+        if task_b is None:
+            raise RuntimeError("test setup: reconciler did not arm (second run)")
+        await asyncio.wait_for(task_b, timeout=_TASK_JOIN_TIMEOUT_S)
+
+    warnings_b = [
+        msg for level, msg in records_b if level == logging.WARNING and "missing TYPs" in msg
+    ]
+
+    record(
+        "de-spam re-arm: the first run's only steady-cadence check warns once",
+        len(warnings_a) == 1,
+    )
+    record(
+        "de-spam re-arm: a fresh arm on the SAME router warns again for the identical "
+        "missing set instead of silently continuing the previous run's repeat count",
+        len(warnings_b) == 1,
+    )
+
+
 async def _test_reconciler_finally_guard_survives_interleaved_arm(record: _RecordFn) -> None:
     """Advisor rework R2 -- hardening. `cancel_ble_register_reconciler` nulls
     the handle BEFORE cancelling and awaiting the old task. If a NEW arm
@@ -1545,7 +1807,7 @@ async def _test_save_and_reboot_uses_save_endpoint(record: _RecordFn) -> None:
     )
 
 
-async def run_ble_hydration_tests() -> bool:
+async def run_ble_hydration_tests() -> bool:  # noqa: PLR0915 - sequential test-case invocations kept together
     """Return True iff every BLE register-hydration regression passes."""
     if has_console:
         print("\nTesting BLE register hydration:")
@@ -1581,6 +1843,10 @@ async def run_ble_hydration_tests() -> bool:
         await _test_reconciler_ignores_missing_optional(_record, sleeps)
         await _test_reconciler_backoff_retry(_record, sleeps)
         await _test_reconciler_keeps_looping_while_connecting(_record, sleeps)
+        await _test_reconciler_connecting_steady_cadence_still_warns(_record)
+        await _test_reconciler_despam_persistent_missing(_record)
+        await _test_reconciler_despam_resets_on_change(_record)
+        await _test_reconciler_despam_resets_on_rearm(_record)
         await _test_reconciler_finally_guard_survives_interleaved_arm(_record)
         await _test_hydration_skip_does_not_disarm_recovery(_record)
         await _test_sse_register_replay(_record)

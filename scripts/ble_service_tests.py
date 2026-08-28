@@ -529,11 +529,20 @@ def _test_notification_callback_register_json_happy_path(record: Any) -> None:
 
 def _test_notification_callback_truncated_frame_is_loud_not_silent(record: Any) -> None:
     """REGRESSION target: a `D{` register-update frame cut off by the
-    firmware's own 245-byte register-JSON producer clamp
-    (`addBLEComToOutBuffer`, `loop_functions.cpp:607-611`) -- exactly what
-    MeshCom FW 4.36's proposed filter-list register field risks -- must not
-    vanish behind only a DEBUG-level trace, AND must not be forwarded as a
-    junk fragment either. It must:
+    firmware's own 244-char register-JSON payload clamp
+    (`BLE_JSON_PAYLOAD_MAX`, `configuration_global.h`; enforced in
+    `addBLEComToOutBuffer`, `loop_functions.cpp:606-611`) -- exactly what
+    MeshCom FW 4.36's proposed filter-list register field risks, and what a
+    node with all six `GCB0..GCB5` slots populated already hits on `I` --
+    must not vanish behind only a DEBUG-level trace. This specific frame is
+    cut inside its very FIRST member's value (no closing quote), so no
+    complete top-level member survives at all and
+    `_repair_truncated_json_object` correctly declines -- the case where
+    salvage is genuinely impossible, exercised separately from
+    `_test_notification_callback_truncated_frame_is_salvaged_not_dropped`
+    below (most real-world truncations, cut near the 244-char mark, DO have
+    several complete members before the cut and get salvaged, not dropped).
+    For this genuinely unsalvageable case it must:
       (a) be logged at a level that is actually seen (WARNING or higher,
           never DEBUG);
       (b) name BOTH that it looks truncated AND that the update was
@@ -560,17 +569,16 @@ def _test_notification_callback_truncated_frame_is_loud_not_silent(record: Any) 
     handler, restore_logs = _capture_logs(ble_main.logger)
     restore_side_effects = _snapshot_side_effects()
     try:
-        # Missing closing brace and a dangling key/value -- exactly what the
-        # firmware's producer clamp cutting a JSON payload mid-field looks
-        # like on the wire.
-        truncated = b'D{"typ":"I","callsign":"DK5EN-98","firmware":"4.35p.07.2'
+        # Cut mid-value of the very FIRST member, before its closing quote
+        # -- nothing at all can be salvaged, unlike a cut further along.
+        truncated = b'D{"typ":"I'
 
         before = len(ble_main.state.notification_queue)
         ble_main.notification_callback(truncated)
 
         record(
-            "notification_callback: a truncated D{ frame is genuinely discarded -- NOT "
-            "enqueued for SSE delivery",
+            "notification_callback: an unsalvageable truncated D{ frame is genuinely "
+            "discarded -- NOT enqueued for SSE delivery",
             len(ble_main.state.notification_queue) == before,
         )
         record(
@@ -590,9 +598,108 @@ def _test_notification_callback_truncated_frame_is_loud_not_silent(record: Any) 
             ),
         )
         record(
-            "notification_callback: the log names the firmware's producer clamp "
+            "notification_callback: the log names the firmware's payload clamp "
             "(addBLEComToOutBuffer) as the binding cause, not the GATT/MTU layer",
             any("addblecomtooutbuffer" in r.getMessage().lower() for r in handler.records),
+        )
+        record(
+            "notification_callback: the log also says no member could be salvaged",
+            any("salvag" in r.getMessage().lower() for r in handler.records),
+        )
+    finally:
+        restore_logs()
+        restore_side_effects()
+
+
+def _test_notification_callback_truncated_frame_is_salvaged_not_dropped(record: Any) -> None:
+    """The common real-world shape: a `D{` `I`-register frame cut at the
+    firmware's 244-char payload clamp with several complete members before
+    the cut (built from the real `I`-register key set: TYP, FWVER, FWDATE,
+    CALL, ID, HWID, MAXV, BLE, BATP, BATV, GCB0..GCB5, CTRY, BOOST, BPIN --
+    this is what a node with all six `GCB0..GCB5` group-call slots
+    populated actually sends). Unlike the fully-unsalvageable frame in
+    `_test_notification_callback_truncated_frame_is_loud_not_silent`, this
+    one must now be SALVAGED, not dropped: forwarded as a partial 'json'
+    frame with every complete member intact (in particular `CALL`, which
+    real callers key node identity off), logged at WARNING (not ERROR --
+    this is a recovered value, not a discard), and the cut member (whatever
+    followed the last complete one) must be entirely absent, never a
+    corrupted fragment."""
+    handler, restore_logs = _capture_logs(ble_main.logger)
+    restore_side_effects = _snapshot_side_effects()
+    try:
+        register = {
+            "TYP": "I",
+            "FWVER": "4.35p.07.24",
+            "FWDATE": "2026-08-27",
+            "CALL": "DK5EN-98",
+            "ID": "1234567890",
+            "HWID": "T-Beam-S3",
+            "MAXV": 8,
+            "BLE": 1,
+            "BATP": 87,
+            "BATV": 4123,
+            "GCB0": "OE1XXX-1",
+            "GCB1": "OE2XXX-2",
+            "GCB2": "OE3XXX-3",
+            "GCB3": "OE4XXX-4",
+            "GCB4": "OE5XXX-5",
+            "GCB5": "OE6XXX-6",
+            "CTRY": "AT",
+            "BOOST": 1,
+            "BPIN": 123456,
+        }
+        full_json = json.dumps(register, separators=(",", ":"))
+        record(
+            "test setup: the built I-register JSON actually exceeds the 244-char clamp "
+            "(otherwise this test would not exercise truncation at all)",
+            len(full_json) > 244,
+        )
+        cut = full_json[:244]
+        truncated = b"D" + cut.encode("utf-8")
+
+        before = len(ble_main.state.notification_queue)
+        ble_main.notification_callback(truncated)
+
+        record(
+            "notification_callback: a salvageable truncated D{ frame IS enqueued for SSE "
+            "delivery (a partial register beats none)",
+            len(ble_main.state.notification_queue) == before + 1,
+        )
+        queued = ble_main.state.notification_queue[-1] if ble_main.state.notification_queue else {}
+        record(
+            "notification_callback: the salvaged frame is reported as format == json",
+            queued.get("format") == "json",
+        )
+        record(
+            "notification_callback: the salvaged frame is flagged partial == True",
+            queued.get("partial") is True,
+        )
+        parsed = queued.get("parsed")
+        record(
+            "notification_callback: CALL survives intact in the salvaged register",
+            isinstance(parsed, dict) and parsed.get("CALL") == "DK5EN-98",
+        )
+        record(
+            "notification_callback: every surviving member's value matches the original "
+            "exactly -- no truncated/corrupted value snuck through",
+            isinstance(parsed, dict)
+            and all(register[key] == value for key, value in parsed.items()),
+        )
+        record(
+            "notification_callback: the cut member itself (whatever followed the last "
+            "complete one) is entirely absent from the salvage, not a mangled fragment",
+            isinstance(parsed, dict) and len(parsed) < len(register),
+        )
+        record(
+            "notification_callback: the salvage is logged at WARNING, not ERROR -- this is "
+            "a recovery, not a discard",
+            any(r.levelno == logging.WARNING for r in handler.records)
+            and not any(r.levelno >= logging.ERROR for r in handler.records),
+        )
+        record(
+            "notification_callback: the salvage log names the TYP",
+            any("typ='i'" in r.getMessage().lower() for r in handler.records),
         )
     finally:
         restore_logs()
@@ -634,6 +741,152 @@ def _test_notification_callback_malformed_frame_distinguished_from_truncation(
         )
     finally:
         restore_logs()
+        restore_side_effects()
+
+
+def _test_repair_truncated_json_object_whole_members_only(record: Any) -> None:
+    """Direct unit coverage of `_repair_truncated_json_object`'s core
+    guarantee -- a cut value is NEVER applied in any form, whole or
+    corrupted -- for the shapes that would break a naive `rfind(',')`
+    repair: a cut landing inside a string value that itself contains a `,`
+    and a `}`, and a cut landing inside an escaped quote `\\"`. Both must
+    drop the cut member cleanly, without raising and without producing a
+    wrong-but-parseable object."""
+    # Cut mid-way through a string VALUE that itself contains a comma and a
+    # closing brace -- a naive rfind(',')/rfind('}') repair would slice
+    # inside this string and either raise or silently produce a corrupted
+    # NOTE value. The prior member (TYP) must survive; NOTE must not appear
+    # at all, complete or mangled.
+    json_str = '{"TYP":"I","NOTE":"a,b}c'
+    repaired = ble_main._repair_truncated_json_object(json_str)
+    record(
+        "_repair_truncated_json_object: a cut inside a string value containing ',' and '}' "
+        "does not raise",
+        repaired is not None,
+    )
+    if repaired is not None:
+        parsed = json.loads(repaired[0])
+        record(
+            "_repair_truncated_json_object: the string-with-comma-and-brace cut drops the "
+            "NOTE member entirely -- no corrupted value under any key",
+            parsed == {"TYP": "I"},
+        )
+
+    # Cut immediately after the backslash of an escaped quote inside a
+    # string value -- the scanner must still be tracking "in an escape",
+    # not "string just closed".
+    json_str_escaped = '{"TYP":"I","NOTE":"line one \\"quoted\\" line two, cut here \\'
+    repaired_escaped = ble_main._repair_truncated_json_object(json_str_escaped)
+    ok_escaped = True
+    parsed_escaped: Any = None
+    try:
+        if repaired_escaped is not None:
+            parsed_escaped = json.loads(repaired_escaped[0])
+    except Exception:  # must-not-raise is the assertion itself
+        ok_escaped = False
+    record(
+        "_repair_truncated_json_object: a cut inside an escaped quote never raises and "
+        "either declines or yields valid JSON",
+        ok_escaped and (repaired_escaped is None or parsed_escaped is not None),
+    )
+    record(
+        "_repair_truncated_json_object: a cut inside an escaped quote drops the NOTE "
+        "member entirely",
+        repaired_escaped is None or parsed_escaped == {"TYP": "I"},
+    )
+
+    # A cut leaving only the first member's key and value fully present,
+    # nothing more -- either a minimal valid object survives or the repair
+    # declines; either way, never an exception and never a wrong value.
+    minimal = '{"TYP":"I"'
+    repaired_minimal = ble_main._repair_truncated_json_object(minimal)
+    ok_minimal = True
+    parsed_minimal: Any = None
+    try:
+        if repaired_minimal is not None:
+            parsed_minimal = json.loads(repaired_minimal[0])
+    except Exception:  # must-not-raise is the assertion itself
+        ok_minimal = False
+    record(
+        '_repair_truncated_json_object(\'{"TYP":"I"\'): no exception either way',
+        ok_minimal,
+    )
+    record(
+        '_repair_truncated_json_object(\'{"TYP":"I"\'): whatever survives is valid JSON '
+        "with no wrong value, or the repair declines",
+        repaired_minimal is None or parsed_minimal == {"TYP": "I"},
+    )
+
+
+def _test_decode_register_frame_invalid_utf8_unaffected(record: Any) -> None:
+    """A `D{` frame whose bytes are not valid UTF-8 at all (cut mid
+    multi-byte codepoint) must still hit the pre-existing UnicodeDecodeError
+    path -- unaffected by the JSON-repair addition, which only ever runs on
+    a successfully DECODED string."""
+    notification: dict[str, Any] = {}
+    data = b'D{"TYP":"I","CALL":"D\xc3' + b"\xff"  # truncated multi-byte UTF-8 sequence
+    ok = ble_main._decode_register_frame(data, notification)
+    record(
+        "_decode_register_frame: invalid UTF-8 still returns False",
+        ok is False,
+    )
+    record(
+        "_decode_register_frame: invalid UTF-8 still reports format == raw, no partial "
+        "field applied",
+        notification.get("format") == "raw" and "parsed" not in notification,
+    )
+
+
+async def _test_register_cache_receives_salvaged_partial_frame(record: Any) -> None:
+    """A truncated `D{...}` register frame that IS salvageable must reach
+    `state.register_cache` through the ordinary `notification_callback` ->
+    `_cache_register_if_applicable` path, exactly like a cleanly-parsed one
+    -- a partial-but-honest snapshot is what `_decode_register_frame`'s
+    case 2 exists to deliver to the cache."""
+    restore_side_effects = _snapshot_side_effects()
+    original_cache = dict(ble_main.state.register_cache)
+    try:
+        ble_main.state.register_cache.clear()
+
+        register = {
+            "TYP": "I",
+            "FWVER": "4.35p.07.24",
+            "FWDATE": "2026-08-27",
+            "CALL": "DK5EN-98",
+            "ID": "1234567890",
+            "HWID": "T-Beam-S3",
+            "MAXV": 8,
+            "BLE": 1,
+            "BATP": 87,
+            "BATV": 4123,
+            "GCB0": "OE1XXX-1",
+            "GCB1": "OE2XXX-2",
+            "GCB2": "OE3XXX-3",
+            "GCB3": "OE4XXX-4",
+            "GCB4": "OE5XXX-5",
+            "GCB5": "OE6XXX-6",
+            "CTRY": "AT",
+            "BOOST": 1,
+            "BPIN": 123456,
+        }
+        cut = json.dumps(register, separators=(",", ":"))[:244]
+        ble_main.notification_callback(b"D" + cut.encode("utf-8"))
+
+        cached = ble_main.state.register_cache.get("I")
+        record(
+            "register cache: a salvaged partial I-register frame IS cached under its TYP",
+            isinstance(cached, dict) and cached.get("CALL") == "DK5EN-98",
+        )
+        record(
+            "register cache: the cached salvage carries only genuinely-recovered members "
+            "(a strict subset of the original, none corrupted)",
+            isinstance(cached, dict)
+            and len(cached) < len(register)
+            and all(register[key] == value for key, value in cached.items()),
+        )
+    finally:
+        ble_main.state.register_cache.clear()
+        ble_main.state.register_cache.update(original_cache)
         restore_side_effects()
 
 
@@ -754,22 +1007,26 @@ async def _test_register_cache_excludes_conffin_and_mh(record: Any) -> None:
 
 
 async def _test_register_cache_unaffected_by_truncated_or_malformed_frames(record: Any) -> None:
-    """A truncated frame (the firmware's 245-byte producer clamp cutting a
-    payload mid-field) or a malformed-but-closed one (the M4 discard path --
-    see `_decode_register_frame`) must never reach the cache at all: neither
+    """An UNSALVAGEABLE truncated frame (cut inside its very first member,
+    so `_repair_truncated_json_object` recovers nothing -- the firmware's
+    244-char payload clamp cutting a payload before even one member
+    completes) or a malformed-but-closed one (the M4 discard path -- see
+    `_decode_register_frame`) must never reach the cache at all: neither
     ever parses to a dict, so `_cache_register_if_applicable` is never even
-    called for them -- there is no partial-register concept anywhere in this
-    path (see `_decode_register_frame`'s docstring)."""
+    called for them. A truncated frame that DOES have complete members
+    before the cut is a different case, deliberately no longer covered
+    here -- see `_test_register_cache_receives_salvaged_partial_frame`,
+    which pins that it DOES now reach the cache, as a partial value."""
     _handler, restore_logs = _capture_logs(ble_main.logger)
     restore_side_effects = _snapshot_side_effects()
     original_cache = dict(ble_main.state.register_cache)
     try:
         ble_main.state.register_cache.clear()
 
-        truncated = b'D{"TYP":"I","callsign":"DK5EN-98","firmware":"4.35p.07.2'
+        truncated = b'D{"TYP":"I'
         ble_main.notification_callback(truncated)
         record(
-            "register cache: a truncated D{ frame does not pollute the cache",
+            "register cache: an unsalvageable truncated D{ frame does not pollute the cache",
             ble_main.state.register_cache == {},
         )
 
@@ -5469,10 +5726,18 @@ async def run_ble_service_tests() -> bool:
     _test_auto_reconnect_persists_the_name(_record)
     _test_api_key_valid(_record)
     _test_auth_boundary_via_testclient(_record)
-    _test_json_frame_looks_truncated_helper(_record)
-    _test_notification_callback_register_json_happy_path(_record)
-    _test_notification_callback_truncated_frame_is_loud_not_silent(_record)
-    _test_notification_callback_malformed_frame_distinguished_from_truncation(_record)
+    # D{...} register-frame decode/repair coverage. Tuple loop (all sync
+    # cases) purely to keep this function under ruff's PLR0915 statement cap.
+    for sync_case in (
+        _test_json_frame_looks_truncated_helper,
+        _test_notification_callback_register_json_happy_path,
+        _test_notification_callback_truncated_frame_is_loud_not_silent,
+        _test_notification_callback_truncated_frame_is_salvaged_not_dropped,
+        _test_notification_callback_malformed_frame_distinguished_from_truncation,
+        _test_repair_truncated_json_object_whole_members_only,
+        _test_decode_register_frame_invalid_utf8_unaffected,
+    ):
+        sync_case(_record)
     # Register cache (GET /api/ble/registers) + hello-settle-delay timing.
     # Tuple loop rather than one `await` per line, purely to keep this
     # function under ruff's PLR0915 statement cap -- same convention as the
@@ -5482,6 +5747,7 @@ async def run_ble_service_tests() -> bool:
         _test_registers_endpoint_contract_shape,
         _test_register_cache_excludes_conffin_and_mh,
         _test_register_cache_unaffected_by_truncated_or_malformed_frames,
+        _test_register_cache_receives_salvaged_partial_frame,
         _test_register_cache_cleared_on_target_change,
         _test_hello_settle_delay_ordering,
     ):

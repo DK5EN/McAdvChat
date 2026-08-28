@@ -272,8 +272,10 @@ def _json_frame_looks_truncated(json_str: str) -> bool:
     malformed?
 
     A frame chopped by the firmware's register-JSON producer clamp
-    (`addBLEComToOutBuffer`, `loop_functions.cpp:607-611` -- caps the JSON at
-    245 bytes before it ever reaches the wire, 247 bytes including the
+    (`addBLEComToOutBuffer`, `loop_functions.cpp:606-611` -- caps the JSON at
+    245 bytes (the named constant `BLE_JSON_PAYLOAD_MAX = 244`, in
+    `configuration_global.h`, is the 244-char usable-payload half of that
+    same clamp) before it ever reaches the wire, 247 bytes including the
     length/type header, well under both platforms' negotiated ATT MTU) loses
     only its TAIL -- it never gains stray bytes in the middle -- so the two
     failure shapes are distinguishable without a full parser: truncation
@@ -303,6 +305,134 @@ def _typ_hint(json_str: str) -> str | None:
     return match.group(1) if match else None
 
 
+def _repair_truncated_json_object(json_str: str) -> tuple[str, int] | None:
+    """Attempt a bounded, whole-member-only repair of a truncated `D{...}`
+    register frame's JSON text by trimming it back to the end of the last
+    COMPLETE top-level `"key":value` member and closing the object with `}`.
+
+    Scans `json_str` once, character by character, tracking string/escape
+    state and container nesting depth (so a `,`, `{`, `}` etc. that appears
+    literally inside a string value -- including one containing an escaped
+    quote `\\"` -- is never mistaken for structure; this is deliberately NOT
+    a naive `rfind(',')`). A top-level member is judged complete only when
+    its value has unambiguously finished: a matching `}`/`]` for a
+    container value, or the closing quote of a string value -- never a bare
+    trailing token, which is why a scalar (number/bool/null) value is only
+    ever included via a following `,` or the object's own closing `}`, not
+    by guessing where its digits end. A value cut mid-way (mid-string,
+    mid-number, mid-escape) is NEVER included in any form: the member it
+    belongs to, complete or not, is discarded entirely along with
+    everything after it -- this function only ever shrinks the tail, it
+    never coerces or defaults a partial value.
+
+    Returns `(repaired_json, discarded_char_count)` on a structurally sound
+    trim -- including the degenerate case where the object was actually
+    complete all along and only trailing garbage gets dropped -- or `None`
+    when no complete member could be recovered at all (e.g. the cut landed
+    inside, or immediately before the end of, the very first member). The
+    caller still runs the result through `json.loads`: this is a
+    character-level trim, not a JSON validator, so it never guarantees the
+    result parses.
+
+    Never raises.
+    """
+    if not json_str.startswith("{"):
+        return None
+
+    depth = 0
+    in_string = False
+    escape = False
+    awaiting_value = False  # meaningful only while depth == 1
+    last_safe_end: int | None = None
+
+    for i, ch in enumerate(json_str):
+        if in_string:
+            in_string, awaiting_value, escape, closed_value = _scan_string_char(
+                ch, escape, depth, awaiting_value
+            )
+            if closed_value:
+                last_safe_end = i + 1
+            continue
+        in_string, depth, awaiting_value, event = _scan_structural_char(ch, depth, awaiting_value)
+        if event == "unbalanced":
+            break
+        if event == "closed_object":
+            # The object closed cleanly after all -- nothing to guess at,
+            # just drop whatever trailing bytes follow the close.
+            return json_str[: i + 1], len(json_str) - (i + 1)
+        if event == "closed_member":
+            last_safe_end = i + 1
+        elif event == "comma":
+            last_safe_end = i
+
+    if last_safe_end is None:
+        return None
+    return json_str[:last_safe_end] + "}", len(json_str) - last_safe_end
+
+
+def _scan_string_char(
+    ch: str, escape: bool, depth: int, awaiting_value: bool
+) -> tuple[bool, bool, bool, bool]:
+    """One step of `_repair_truncated_json_object`'s scan while positioned
+    inside a JSON string literal. Returns `(in_string, awaiting_value,
+    escape, closed_value)` where `closed_value` is True only when `ch` is
+    the unescaped closing quote of a top-level (`depth == 1`) VALUE string
+    -- never a key string, which is why `awaiting_value` gates it; the
+    caller (which alone knows the current index) turns that into a safe
+    trim point. Split out of the main scan purely to keep that function's
+    branch count low; carries no state of its own.
+    """
+    if escape:
+        return True, awaiting_value, False, False
+    if ch == "\\":
+        return True, awaiting_value, True, False
+    if ch == '"':
+        if depth == 1 and awaiting_value:
+            return False, False, False, True
+        return False, awaiting_value, False, False
+    return True, awaiting_value, False, False
+
+
+def _scan_structural_char(ch: str, depth: int, awaiting_value: bool) -> tuple[bool, int, bool, str]:
+    """One step of `_repair_truncated_json_object`'s scan while positioned
+    OUTSIDE a JSON string literal. Returns `(in_string, depth,
+    awaiting_value, event)` where `event` is one of:
+
+      - "unbalanced": a stray closing bracket with no matching open --
+        the caller stops scanning (the frame is too malformed to trust
+        anything derived from depth after this point).
+      - "closed_object": this char closed the outer (depth 0) object.
+      - "closed_member": this char closed a nested container value that
+        belongs to the current top-level member (depth returned to 1).
+      - "comma": a top-level member separator.
+      - "none": no safe-trim-relevant event.
+
+    Split out of the main scan purely to keep that function's branch count
+    low; carries no state of its own.
+    """
+    if ch == '"':
+        return True, depth, awaiting_value, "none"
+
+    event = "none"
+    if ch in "{[":
+        depth += 1
+    elif ch in "}]":
+        depth -= 1
+        if depth < 0:
+            event = "unbalanced"
+        elif depth == 0:
+            event = "closed_object"
+        elif depth == 1:
+            awaiting_value = False
+            event = "closed_member"
+    elif depth == 1 and ch == ":":
+        awaiting_value = True
+    elif depth == 1 and ch == ",":
+        awaiting_value = False
+        event = "comma"
+    return False, depth, awaiting_value, event
+
+
 def _decode_register_frame(data: bytes, notification: dict[str, Any]) -> bool:
     """Decode a `D{...}` register-update notification into `notification`,
     in place. Never raises.
@@ -314,31 +444,39 @@ def _decode_register_frame(data: bytes, notification: dict[str, Any]) -> bool:
     module's "Multi-Part Responses" docstring for the one place the
     firmware DOES already split a response across notifications, by design
     and on a fixed schedule, not as an MTU workaround). So a truncated or
-    malformed frame here means the ENTIRE register update is discarded, not
-    just one field -- that used to surface as a DEBUG-adjacent one-line
-    warning indistinguishable from routine noise. This logs loudly instead,
-    and distinguishes two causes that have different fixes:
+    malformed frame here has three possible outcomes, in order:
 
-      - a truncated frame (`_json_frame_looks_truncated`) -- the firmware's
-        own 245-byte producer clamp in `addBLEComToOutBuffer`
-        (`loop_functions.cpp:607-611`) cutting a register JSON payload it
-        tried to send whole (the concern for MeshCom FW 4.36's proposed
-        filter-list register field, and for `I` already: today's worst case
-        is ~243 bytes, one char of margin). This is NOT an ATT MTU issue --
-        the clamp binds before the frame ever reaches the GATT layer, on
-        both bench platforms identically, well under either platform's
-        negotiated MTU. Logged at ERROR with the observed byte/char lengths
-        and, when recoverable from the partial JSON, the `TYP` of the
-        register that got cut.
-      - a genuinely malformed frame -- balanced/closed but not valid JSON,
-        or not valid UTF-8 at all. Logged at WARNING: this is a
-        firmware/decoding bug, not a clamp/size problem.
+      1. Clean `json.loads` success -- `notification["format"] = "json"`,
+         returns True. The common case.
+      2. Looks truncated (`_json_frame_looks_truncated`) AND at least one
+         complete top-level member survives (`_repair_truncated_json_object`
+         -- whole members only, never a guessed/partial value; see its
+         docstring): the salvaged object is applied, `notification["format"]
+         = "json"`, `notification["partial"] = True`, logged at WARNING
+         naming the `TYP`, original length, and which keys survived vs. how
+         many characters were discarded, and this returns True. The frame
+         still originates from the firmware's own 244-char register-JSON
+         payload clamp (`BLE_JSON_PAYLOAD_MAX`, `configuration_global.h`;
+         enforced in `addBLEComToOutBuffer`, `loop_functions.cpp:606-611`,
+         244 usable chars of a 245-byte cap, 247 bytes including the
+         length/type header) cutting a register JSON payload it tried to
+         send whole -- a live GCB0..GCB5-full `I` register still overflows
+         it even after the 2026-08-28 firmware fix for the worse case. This
+         is NOT an ATT MTU issue -- the clamp binds before the frame ever
+         reaches the GATT layer, well under either platform's negotiated
+         MTU.
+      3. Looks truncated but NOT ONE complete top-level member survives, or
+         looks genuinely malformed (balanced/closed but not valid JSON, or
+         not valid UTF-8 at all): `notification["format"] = "raw"`, no
+         partial/best-effort value is applied, logged at ERROR (truncated,
+         unsalvageable) or WARNING (malformed-but-intact -- a
+         firmware/decoding bug, not a clamp/size problem), and this returns
+         False so the caller drops the frame instead of forwarding it.
 
-    Either way `notification["format"]` is set to "raw" (never "json"), no
-    partial/best-effort value is applied, and this returns False so the
-    caller can drop the frame instead of forwarding it -- there is nothing
-    here that silently accepts, or queues for delivery, a half-decoded
-    register update. Returns True only for a clean `json.loads` success.
+    Case 2 is the only one where a value reaching `notification["parsed"]`
+    is anything less than the complete frame the firmware sent -- and even
+    there, every member present is either fully intact or fully absent;
+    nothing here ever applies a half-received field. Never raises.
     """
     raw_len = len(data)
     try:
@@ -350,10 +488,11 @@ def _decode_register_frame(data: bytes, notification: dict[str, Any]) -> bool:
         notification["format"] = "raw"
         logger.exception(
             "Dropped BLE register update: D{ frame (%d bytes) is not valid UTF-8 -- looks "
-            "truncated (cut mid-character), most likely the firmware's 245-byte register-"
-            "JSON producer clamp (addBLEComToOutBuffer, loop_functions.cpp:607-611) cutting "
-            "the payload before it reached the wire. The whole register update was "
-            "discarded, not partially applied, and was not forwarded.",
+            "truncated (cut mid-character), most likely the firmware's 244-char register-"
+            "JSON payload clamp (BLE_JSON_PAYLOAD_MAX, configuration_global.h; "
+            "addBLEComToOutBuffer, loop_functions.cpp:606-611) cutting the payload before "
+            "it reached the wire. The whole register update was discarded, not partially "
+            "applied, and was not forwarded.",
             raw_len,
         )
         return False
@@ -361,20 +500,50 @@ def _decode_register_frame(data: bytes, notification: dict[str, Any]) -> bool:
     try:
         notification["parsed"] = json.loads(json_str)
     except json.JSONDecodeError as e:
-        notification["format"] = "raw"
         if _json_frame_looks_truncated(json_str):
             typ = _typ_hint(json_str)
+            repaired = _repair_truncated_json_object(json_str)
+            parsed_repair: Any = None
+            if repaired is not None:
+                repaired_json, discarded_chars = repaired
+                try:
+                    parsed_repair = json.loads(repaired_json)
+                except json.JSONDecodeError:
+                    parsed_repair = None
+            if isinstance(parsed_repair, dict):
+                notification["parsed"] = parsed_repair
+                notification["format"] = "json"
+                notification["partial"] = True
+                logger.warning(
+                    "Salvaged truncated BLE register update%s: D{ frame (%d bytes, %d chars "
+                    "decoded) was cut by the firmware's 244-char register-JSON payload clamp "
+                    "(BLE_JSON_PAYLOAD_MAX, configuration_global.h; addBLEComToOutBuffer, "
+                    "loop_functions.cpp:606-611) -- recovered %d surviving key(s) (%s) and "
+                    "discarded %d trailing char(s), including any partial member. Applying "
+                    "and forwarding it as a PARTIAL register update.",
+                    f" (TYP={typ!r})" if typ else "",
+                    raw_len,
+                    len(json_str),
+                    len(parsed_repair),
+                    ", ".join(sorted(parsed_repair)),
+                    discarded_chars,
+                )
+                return True
+            notification["format"] = "raw"
             logger.exception(
                 "Dropped BLE register update%s: D{ frame (%d bytes, %d chars decoded) looks "
-                "truncated (unbalanced or unclosed JSON) -- most likely the firmware's "
-                "245-byte register-JSON producer clamp (addBLEComToOutBuffer, "
-                "loop_functions.cpp:607-611), not an ATT MTU overflow. The whole register "
-                "update was discarded, not partially applied, and was not forwarded.",
+                "truncated (unbalanced or unclosed JSON) and no complete top-level member "
+                "could be salvaged -- most likely the firmware's 244-char register-JSON "
+                "payload clamp (BLE_JSON_PAYLOAD_MAX, configuration_global.h; "
+                "addBLEComToOutBuffer, loop_functions.cpp:606-611), not an ATT MTU overflow. "
+                "The whole register update was discarded, not partially applied, and was "
+                "not forwarded.",
                 f" (TYP={typ!r})" if typ else "",
                 raw_len,
                 len(json_str),
             )
         else:
+            notification["format"] = "raw"
             logger.warning(
                 "Dropped BLE register update: malformed JSON in D{ frame (%d bytes) -- the "
                 "frame arrived intact (braces balanced, properly closed), so this is a "
@@ -390,13 +559,20 @@ def _decode_register_frame(data: bytes, notification: dict[str, Any]) -> bool:
 
 
 def _cache_register_if_applicable(parsed: Any) -> None:
-    """Store a cleanly-parsed `D{...}` register frame in `state.register_cache`,
-    keyed by its `TYP` value, last-write-wins -- called only from
-    `notification_callback` after `_decode_register_frame` has already
-    reported a clean `json.loads` success (format == "json"), so a truncated
-    or malformed frame never reaches here at all (see that function's
-    docstring: it returns False and the caller drops the frame before this is
-    ever called).
+    """Store a `D{...}` register frame in `state.register_cache`, keyed by
+    its `TYP` value, last-write-wins -- called only from
+    `notification_callback` after `_decode_register_frame` has reported
+    success (format == "json", return True). A frame that could not be
+    parsed or salvaged at all never reaches here (that function returns
+    False and the caller drops it before this is ever called) -- but one
+    that WAS salvaged from a truncated payload (`notification["partial"] =
+    True`, see `_decode_register_frame`'s case 2 and
+    `_repair_truncated_json_object`) reaches here the same as a fully clean
+    parse and is cached the same way: whatever top-level keys survived the
+    salvage are real, complete values, so caching a partial-but-honest
+    snapshot is preferable to caching nothing and re-querying the register.
+    This function itself has no notion of "partial" -- it just stores
+    whatever dict it is handed.
 
     Never raises and does nothing for anything that is not one of
     `_CACHEABLE_REGISTER_TYPS` -- in particular CONFFIN (a burst terminator,
@@ -477,10 +653,12 @@ def notification_callback(data: bytes) -> None:
     try:
         if data.startswith(b"D{"):
             if not _decode_register_frame(data, notification):
-                # Truncated or malformed register frame: _decode_register_frame
-                # already logged why (loudly -- ERROR or WARNING, never just
-                # DEBUG). There is no partial-register concept (see its
-                # docstring) and nothing downstream consumes format == "raw"
+                # Unsalvageable register frame (truncated with no complete
+                # member recoverable, or genuinely malformed):
+                # _decode_register_frame already logged why (loudly -- ERROR
+                # or WARNING, never just DEBUG). A frame it COULD salvage
+                # already came back True with format == "json" above and
+                # was cached; nothing downstream consumes format == "raw"
                 # for a D{ frame (ble_client_remote.py only handles
                 # "json"/"binary"), so queuing it for SSE delivery was pure
                 # noise dressed up as forwarding -- an "discarded" log next to
