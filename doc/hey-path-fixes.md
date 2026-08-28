@@ -1,6 +1,17 @@
 # HEY path — fixes after the field review
 
-**Status:** planned, not started
+**Status:** shipped 2026-08-28 — MCProxy `48cda99`, webapp `761ee49` + `729370c`
+
+| Wave | Scope                                                     | State             |
+| ---- | --------------------------------------------------------- | ----------------- |
+| 0    | Commit this plan                                          | done `9b5790b`    |
+| 1    | F1 `gw` HEY gate · F2 terminator tolerance · migration 27 | done `48cda99`    |
+| 1b   | MCProxy docs: CLAUDE.md, ingest comment, adoption note    | done, same commit |
+| 2    | F3 route fields off station surfaces · F5 NCNT wording    | done `761ee49`    |
+| 3    | F4 ladder into the live feed                              | done, same commit |
+| 4    | F6 `MOD` nibble decoding                                  | done `48cda99`    |
+| 5    | webapp docs: FE design doc + B4                           | done `729370c`    |
+
 **Trigger:** UAT on `v2.0.2-dev.4` (2026-08-28). Live frames showed `Origin` values that make no
 sense on the station they are rendered on, and `GW` flipping for one and the same originator.
 **Predecessor:** `webapp/docs/archive/mheard-chain-verdict.md` — the eight findings already fixed.
