@@ -222,6 +222,44 @@ evidence: `doc/2026-08-28_0900-firmware-4.35p.08.28-adoption.md`.
   `|`-separated string that never held them. MCProxy never sends `--mheard`, but all three stay
   optional — never subscript them.
 
+## Blocklist (`sperrliste.json`)
+
+The curated global blocklist, maintained in this repo and fetched by every node from
+`raw.githubusercontent.com/DK5EN/McApp/main/sperrliste.json` (branch **main**) (`commands/handler.py`). It is
+merged with admin `!kb` kickbans into `CommandHandler.blocked_callsigns` and pushed to clients over
+SSE. Design notes for the retroactive fix: `doc/2026-08-30_0930-blocklist-retroactive-plan.md`.
+
+- **The URL is pinned to `main`.** A commit that only reaches `development` blocks nobody. This has
+  already cost one debugging session.
+- **`blocklist_decision` is an INGEST gate, so blocking used to be forward-only.** It ran on ingest
+  (`main.py`) and on the live broadcast (`sse_handler._broadcast_handler`) and nowhere else, which
+  left every row a station had deposited *before* it was blocked in `messages.db`, replayed to
+  every client on every reload. The sperrliste is curated centrally and lands on boxes we do not
+  administer, so a per-host `DELETE` is not a fix. `MessageRouter.filter_history_row` is now applied
+  on the way **out** of storage — `get_smart_initial_with_summary` and `get_messages_page` take a
+  `blocklist_filter` — and that is the only thing making an entry retroactive.
+- **The summary counts must be filtered with the same predicate as the messages.** They drive the
+  sidebar badges; an unfiltered summary keeps advertising a conversation whose messages the filter
+  just removed. `has_more` is the opposite case: it stays keyed on the **raw** row count, or a page
+  that filters to empty reads as "start of history" and the client stops paging backwards.
+- **`blocked_callsigns` must be emitted BEFORE `smart_initial` in the SSE burst.** The webapp applies
+  the set at one ingest chokepoint (`messageProcessor`), so anything delivered ahead of it is
+  admitted against an *empty* blocklist and stays on screen. Emitting history first is exactly why a
+  blocked station survived every reload even with a correct list on both ends. Order is load-bearing.
+- **Offline-cache hydration is the one door into the webapp's store that bypasses
+  `processDataElement`.** `source === 'hydrate'` routes rows straight into `msgData`, so cached rows
+  were immune to the blocklist forever. Gated now, plus `purgeBlockedCallsigns` (memory + IndexedDB
+  + positions) on every `proxy:blocked_callsigns` snapshot. All three sites share
+  `blocklistVerdict()` so they cannot drift.
+- **The refresh is 15 min with a conditional GET, not 24 h.** An unchanged list costs a 304.
+  `_apply_sperrliste` REPLACES the curated portion instead of unioning it, so an upstream removal
+  un-blocks without a restart — but an entry an admin also kickbanned locally is protected from
+  that removal (provenance comes from the persisted kickban table; `blocked_callsigns` is a flat
+  union and knows none). The union runs after the subtraction and unconditionally, because
+  `!kb delall` clears the whole set and the next refresh has to restore the curated entries.
+- **The ETag is only stored for a payload that validated.** Caching the tag of a malformed list
+  turns every later refresh into a 304 and pins the node to its last good list forever.
+
 ## Web Push
 
 Web Push to browser / iOS-PWA clients, sharing one wire contract with mc-chat so both backends behave identically.

@@ -26,9 +26,30 @@ from .weather_command import WeatherCommandMixin
 SPERRLISTE_URL = "https://raw.githubusercontent.com/DK5EN/McApp/main/sperrliste.json"
 
 # V9.5: retry ladder for the sperrliste background loop while offline-at-boot
-# (30s → 5min, capped), and the refresh cadence once the first fetch succeeds.
+# (30s -> 5min, capped), and the refresh cadence once the first fetch succeeds.
 SPERRLISTE_RETRY_LADDER_S: tuple[float, ...] = (30.0, 60.0, 120.0, 300.0)
-SPERRLISTE_REFRESH_INTERVAL_S = 24 * 60 * 60  # 24h
+# 15 min, not the original 24h. A curated blocklist is only useful if an entry
+# reaches the whole fleet quickly; at 24h a freshly added callsign kept
+# spamming every node for up to a day. The poll is conditional
+# (If-None-Match / ETag), so an unchanged list costs one 304 with no body —
+# 96 conditional requests a day per node is nothing next to raw.
+# githubusercontent's budget, and there is no auth to rate-limit against.
+SPERRLISTE_REFRESH_INTERVAL_S = 15 * 60  # 15min
+HTTP_NOT_MODIFIED = 304
+
+
+class _NotModified:
+    """Sentinel returned by `_fetch_sperrliste` for a 304 response.
+
+    Distinct from both `None` (fetch/parse failed) and an empty set (the
+    upstream list is genuinely empty, which must un-block everything it
+    previously contributed).
+    """
+
+    __slots__ = ()
+
+
+NOT_MODIFIED = _NotModified()
 
 
 class CommandSpec(TypedDict):
@@ -166,7 +187,16 @@ class CommandHandler(
         stat_name: str = "",
         user_info_text: str | None = None,
     ) -> None:
-        self.blocked_callsigns = set()
+        self.blocked_callsigns: set[str] = set()
+        # The curated sperrliste's own contribution to blocked_callsigns, kept
+        # separately so a refresh can REPLACE it instead of only unioning it in:
+        # without this an upstream removal never reached a running node (the
+        # union merge could add, never subtract, so an un-blocking needed a
+        # restart). Admin kickbans are not in here and are never removed by a
+        # refresh - see `_apply_sperrliste`.
+        self._sperrliste_entries: set[str] = set()
+        # Last ETag seen, for the conditional refresh GET.
+        self._sperrliste_etag: str | None = None
 
         self.message_router = message_router
         self.storage_handler = storage_handler
@@ -229,14 +259,20 @@ class CommandHandler(
             self.blocked_callsigns.update(persisted)
             logger.info("Loaded %d persisted admin kickban(s)", len(persisted))
 
-    async def _fetch_sperrliste(self, url: str) -> set[str] | None:
-        """One HTTP round-trip: fetch + validate the curated sperrliste. Returns
-        the uppercased callsign set on success, or None on any failure (already
-        logged as a warning) — never raises.
+    async def _fetch_sperrliste(self, url: str) -> set[str] | _NotModified | None:
+        """One HTTP round-trip: fetch + validate the curated sperrliste.
+
+        Returns the uppercased callsign set on success, `NOT_MODIFIED` when the
+        conditional GET was answered 304 (nothing to do, the stored ETag still
+        describes what we hold), or None on any failure (already logged as a
+        warning) — never raises.
         """
+        headers = {"If-None-Match": self._sperrliste_etag} if self._sperrliste_etag else {}
         try:
             async with httpx.AsyncClient(timeout=httpx.Timeout(10.0)) as client:
-                response = await client.get(url)
+                response = await client.get(url, headers=headers)
+            if response.status_code == HTTP_NOT_MODIFIED:
+                return NOT_MODIFIED
             response.raise_for_status()
             data: Any = response.json()
         except (httpx.HTTPError, ValueError) as exc:
@@ -247,23 +283,59 @@ class CommandHandler(
             logger.warning("Sperrliste from %s has an unexpected format; ignoring", url)
             return None
 
+        # Only remember the ETag for a payload we actually accepted — caching the
+        # tag of a malformed list would make every later refresh a 304 and pin the
+        # node to the last good list forever.
+        self._sperrliste_etag = response.headers.get("ETag")
         return {item.upper() for item in data}
 
-    async def _merge_sperrliste(self, data: set[str], log_prefix: str) -> None:
-        """Union-merge a fetched sperrliste into blocked_callsigns and broadcast
-        only if it actually changed the set (avoids a pointless SSE push on an
-        unchanged daily refresh).
+    async def _protected_kickbans(self) -> set[str]:
+        """Admin kickbans that must survive a sperrliste removal.
+
+        Read from SQLite rather than tracked in memory: `blocked_callsigns` is a
+        flat union with no provenance, so the persisted set is the only place
+        that still knows an entry was an admin decision. Best-effort — on a
+        storage failure we protect everything currently blocked, i.e. degrade to
+        the old union-only behaviour rather than un-block an admin's kickban.
         """
-        added = data - self.blocked_callsigns
-        self.blocked_callsigns.update(data)
+        if self.storage_handler is None:
+            return set()
+        try:
+            return set(await self.storage_handler.get_kickban_callsigns())
+        except Exception:
+            logger.exception("Could not read persisted kickbans; skipping sperrliste removals")
+            return set(self.blocked_callsigns)
+
+    async def _apply_sperrliste(self, data: set[str], log_prefix: str) -> None:
+        """Apply a fetched sperrliste to blocked_callsigns as a REPLACEMENT of the
+        curated portion, and broadcast only if the effective set actually changed
+        (no pointless SSE push on an unchanged refresh).
+
+        Additions union in as before. Removals now take effect too: an entry this
+        node holds *because* a previous sperrliste carried it is dropped when the
+        upstream list drops it. An entry an admin kickbanned locally is protected
+        even if it also happens to be in the sperrliste, so an upstream removal
+        can never quietly undo a local `!kb`.
+        """
+        before = set(self.blocked_callsigns)
+        stale = self._sperrliste_entries - data
+        if stale:
+            protected = await self._protected_kickbans()
+            self.blocked_callsigns -= stale - protected
+        # Union AFTER the subtraction, and unconditionally: `!kb delall` clears
+        # blocked_callsigns wholesale, so the next refresh has to be able to put
+        # the curated entries back even when `data` itself did not change.
+        self.blocked_callsigns |= data
+        self._sperrliste_entries = set(data)
         logger.info(
-            "%s: %d entries (%d new); blocklist now %d callsign(s)",
+            "%s: %d entries (+%d/-%d); blocklist now %d callsign(s)",
             log_prefix,
             len(data),
-            len(added),
+            len(self.blocked_callsigns - before),
+            len(before - self.blocked_callsigns),
             len(self.blocked_callsigns),
         )
-        if added:
+        if self.blocked_callsigns != before:
             await self._broadcast_blocked_callsigns()
 
     async def load_sperrliste(
@@ -275,13 +347,14 @@ class CommandHandler(
         method owns its own retry/refresh scheduling.
 
         Resilient to an offline-at-boot Pi: retries with a capped backoff
-        ladder (SPERRLISTE_RETRY_LADDER_S, 30s → 5min) until the first
+        ladder (SPERRLISTE_RETRY_LADDER_S, 30s -> 5min) until the first
         successful fetch, then refreshes every SPERRLISTE_REFRESH_INTERVAL_S
-        (24h). Always union-merge, same as before — an entry removed from the
-        upstream sperrliste is never un-blocked here; that only takes effect
-        after a restart re-fetches and rebuilds the set from scratch (full
-        reconciliation is out of scope). Best-effort throughout: a fetch/parse
-        failure just logs a warning and leaves the current set untouched.
+        (15min) with a conditional GET, so an unchanged list costs a 304 and
+        nothing else. `_apply_sperrliste` reconciles both directions: additions
+        union in, and a callsign the upstream list has dropped is un-blocked
+        (unless a local admin kickban also holds it), which previously needed a
+        restart. Best-effort throughout: a fetch/parse failure just logs a
+        warning and leaves the current set untouched.
 
         `stop_event`, when given, lets shutdown exit this loop promptly
         (mirrors `_nightly_prune`/`_classifier_stats_broadcast` in main.py). A
@@ -295,8 +368,14 @@ class CommandHandler(
         fetched = False
         while not wait_event.is_set() and not fetched:
             data = await self._fetch_sperrliste(url)
+            # NOT_MODIFIED is unreachable on this first pass (no ETag stored
+            # yet), but treat it as "we are in sync" rather than as a failure so
+            # the phase can never spin on it.
+            if isinstance(data, _NotModified):
+                fetched = True
+                break
             if data is not None:
-                await self._merge_sperrliste(data, log_prefix="Loaded sperrliste")
+                await self._apply_sperrliste(data, log_prefix="Loaded sperrliste")
                 fetched = True
                 break
             delay = SPERRLISTE_RETRY_LADDER_S[min(retry_idx, len(SPERRLISTE_RETRY_LADDER_S) - 1)]
@@ -323,8 +402,10 @@ class CommandHandler(
                 break
 
             data = await self._fetch_sperrliste(url)
+            if isinstance(data, _NotModified):
+                continue  # 304: upstream unchanged, nothing to reconcile
             if data is not None:
-                await self._merge_sperrliste(data, log_prefix="Refreshed sperrliste")
+                await self._apply_sperrliste(data, log_prefix="Refreshed sperrliste")
 
     async def _broadcast_blocked_callsigns(self) -> None:
         """Push the current blocked_callsigns set to all SSE clients as

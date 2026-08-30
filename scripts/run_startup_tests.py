@@ -35,6 +35,7 @@ from webapp_deploy_tests import run_webapp_deploy_tests
 from mcapp.aprs_symbol_tests import run_aprs_symbol_tests
 from mcapp.ble_hydration_tests import run_ble_hydration_tests
 from mcapp.ble_protocol_tests import run_ble_protocol_tests
+from mcapp.blocklist_history_tests import run_blocklist_history_tests
 from mcapp.classifier.tests import run_all_tests as run_classifier_tests
 from mcapp.commands.dedup_tests import run_dedup_tests
 from mcapp.commands.handler import create_command_handler
@@ -167,6 +168,9 @@ async def main() -> int:  # noqa: PLR0915 - flat suite registry; one visible lin
     push_ok = await run_push_tests()
     print(f"push: {'PASS' if push_ok else 'FAIL'}")
 
+    blocklist_history_ok = await run_blocklist_history_tests()
+    print(f"blocklist_history: {'PASS' if blocklist_history_ok else 'FAIL'}")
+
     ble_protocol_ok = run_ble_protocol_tests()
     print(f"ble_protocol: {'PASS' if ble_protocol_ok else 'FAIL'}")
 
@@ -243,6 +247,7 @@ async def main() -> int:  # noqa: PLR0915 - flat suite registry; one visible lin
         and uptime_ok
         and meteo_ok
         and push_ok
+        and blocklist_history_ok
         and ble_protocol_ok
         and ble_hydration_ok
         and update_runner_ok

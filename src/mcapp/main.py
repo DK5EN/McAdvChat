@@ -19,7 +19,13 @@ from typing import Any
 from .ble_client import BLEMode, ConnectionState, create_ble_client
 from .commands import create_command_handler
 from .commands.constants import CALLSIGN_STRICT_RE
-from .commands.parsing import dst_kind, is_group, normalize_unified, strip_relay_path
+from .commands.parsing import (
+    SPAM_GROUP,
+    dst_kind,
+    is_group,
+    normalize_unified,
+    strip_relay_path,
+)
 from .config_loader import (
     BLE_SERVICE_URL,
     MESHCOM_UDP_PORT,
@@ -553,6 +559,29 @@ class MessageRouter:
             return "redirect"
         return "drop"
 
+    def filter_history_row(self, row: dict[str, Any]) -> dict[str, Any] | None:
+        """Apply the blocklist to one row on the way OUT of storage.
+
+        `blocklist_decision` only ever ran on ingest and on the live broadcast,
+        which made blocking purely forward-looking: every row a station had
+        already deposited before it was blocked stayed in `messages.db` and was
+        replayed to every client, on every reload, forever. Since the sperrliste
+        is curated centrally and lands on nodes we do not administer, deleting
+        those rows host by host is not a fix — the read path has to filter them.
+
+        Same shared decision as every other surface, so the semantics do not
+        fork: personal/position traffic is dropped, group/broadcast/hashtag
+        traffic is quarantined to SPAM_GROUP (still inspectable, out of normal
+        views). Returns the row to emit — possibly a dst-rewritten COPY, never a
+        mutation of the caller's dict — or None to drop it.
+        """
+        decision = self.blocklist_decision(row)
+        if decision == "drop":
+            return None
+        if decision == "redirect":
+            return {**row, "dst": SPAM_GROUP}
+        return row
+
     def register_protocol(self, name: str, handler: Any) -> None:
         """Register a protocol handler (UDP, BLE, WebSocket)"""
         self._protocols[name] = handler
@@ -718,7 +747,9 @@ class MessageRouter:
         if self.storage_handler is None:
             self._logger.warning("_handle_smart_initial_command: no storage_handler, skipping")
             return
-        initial_data, summary = await self.storage_handler.get_smart_initial_with_summary()
+        initial_data, summary = await self.storage_handler.get_smart_initial_with_summary(
+            blocklist_filter=self.filter_history_row
+        )
         acks_list = initial_data.get("acks", [])
 
         self._logger.debug(
@@ -840,7 +871,9 @@ class MessageRouter:
         src = params.get("src") or self.my_callsign
         request_id = params.get("request_id")
 
-        page_data = await self.storage_handler.get_messages_page(dst, before, limit, src=src)
+        page_data = await self.storage_handler.get_messages_page(
+            dst, before, limit, src=src, blocklist_filter=self.filter_history_row
+        )
         payload = {
             "type": "response",
             "msg": "messages_page",
