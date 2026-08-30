@@ -255,6 +255,37 @@ def _test_strip_invalid_utf8() -> list[tuple[str, bool]]:
     results.append(
         ("strip_invalid_utf8: surrogate bytes dropped", strip_invalid_utf8(surrogate_bytes) == "ok")
     )
+
+    # The emoji-sequence glue survives. Regression for 2026-08-30: only U+FE0F was
+    # whitelisted, so the Extern-UDP copy of an outgoing 🙋\u200d♂\ufe0f arrived as
+    # two separate glyphs while the BLE copy of the same msg_id — which never passes
+    # through this filter — was intact. Each of these joins its neighbours into one
+    # grapheme; dropping it splits a sequence rather than removing a character.
+    glue_cases = [
+        ("ZWJ sequence", "\U0001f64b\u200d\u2642\ufe0f Medium Rare"),
+        ("keycap sequence", "1\ufe0f\u20e3"),
+        ("text presentation selector", "\u2764\ufe0e"),
+        (
+            "subdivision flag tag sequence",
+            "\U0001f3f4\U000e0067\U000e0062\U000e0073\U000e0063\U000e0074\U000e007f",
+        ),
+    ]
+    for label, text in glue_cases:
+        results.append(
+            (
+                f"strip_invalid_utf8: {label} kept intact",
+                strip_invalid_utf8(text.encode()) == text,
+            )
+        )
+
+    # The whitelist stays a whitelist: an unrelated Cf format character is still
+    # dropped, so the fix above did not widen it to every invisible codepoint.
+    results.append(
+        (
+            "strip_invalid_utf8: unrelated format char still dropped",
+            strip_invalid_utf8("a\u200bb".encode()) == "ab",
+        )
+    )
     return results
 
 
