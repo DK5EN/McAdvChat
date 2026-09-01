@@ -23,6 +23,7 @@ from ..util import (
     APRS_ALTERNATE_TABLE,
     FEET_TO_METERS,
     FIRMWARE_DOUBLED_BACKSLASH,
+    is_placeholder_callsign,
     now_ms,
     undouble_aprs_symbol_escapes,
 )
@@ -218,7 +219,8 @@ class IngestMixin(StorageBase):
     ) -> None:
         """Upsert station_positions table based on packet type.
 
-        update_type: 'signal' (MHeard) or 'position' (position beacon)
+        update_type: 'signal' (MHeard), 'position' (position beacon), or 'heard'
+        (MHeard originator — see the 'heard' branch below for why it is signal-free)
 
         `signal_via` is ONLY meaningful (and only ever written) on the 'signal'
         branch: the callsign of the station whose transmission actually delivered
@@ -238,6 +240,32 @@ class IngestMixin(StorageBase):
         guards `last_seen IS NOT NULL`). A literal 0 is preserved: ble_protocol's
         unparseable-node-clock fallback deliberately produces epoch 0.
         """
+        # A placeholder callsign is not a station and must never become a row.
+        # `XX0XXX-00` is the MeshCom firmware's factory default (esp32_flash.h
+        # `node_call`), and it is a valid callsign SHAPE, so nothing upstream of
+        # here rejects it. Two things go wrong if it lands: the map and station
+        # list gain an entry that is not a station, and — worse — EVERY
+        # unconfigured node in the field shares that one callsign, so the row's
+        # rssi/snr/last_seen/gw become a meaningless mixture of all of them.
+        #
+        # This is the single chokepoint on purpose: all three update types
+        # ('signal', 'position', 'heard') and every transport (BLE MHeard, BLE
+        # data frames, Extern-UDP) reach station_positions through here, so one
+        # guard covers the paths we have seen and the ones we have not.
+        # `_detect_node_identity` (main.py) refuses the same set at the other
+        # end — it will not ADOPT a placeholder as the proxy's own identity.
+        #
+        # Deliberately NOT a message filter: traffic from an unconfigured node
+        # stays visible in the message history, because an operator watching for
+        # exactly that is how the node gets configured.
+        if is_placeholder_callsign(callsign):
+            logger.debug(
+                "Refusing station_positions %s for placeholder callsign %s",
+                update_type,
+                callsign,
+            )
+            return
+
         timestamp = data.get("timestamp")
         if timestamp is None:
             timestamp = now_ms()
@@ -347,6 +375,51 @@ class IngestMixin(StorageBase):
                 ),
             )
 
+        elif update_type == "heard":
+            # MHeard originator (SRC): the ORIGINATING station of a relayed HEY
+            # beacon, as opposed to CALL — the last hop, whose transmission we
+            # actually measured and whose row `_ingest_signal`'s 'signal' branch
+            # writes rssi/snr/signal_via/signal_ts onto (unchanged, above). Upstream
+            # measured that on a typical site two thirds of HEY observations are
+            # relayed, so SRC != CALL is the common case: this station is alive and
+            # reachable via the mesh, but WE did not hear its transmission, so it
+            # gets no radio-quality columns at all.
+            #
+            # `hw_id`/`lora_mod`/`mesh` are deliberately excluded even though the
+            # 'signal' branch writes them: those three describe the transmission we
+            # heard, which came from CALL, not SRC. Writing them onto the
+            # originator's row would be a fresh instance of the exact bug migration
+            # v22 fixed (see migrations.py's `current_version < 22` block) — a
+            # measurement of one station's link stored under a different station's
+            # callsign. Do not "simplify" this by merging it into the 'signal'
+            # branch or rekeying the signal write onto SRC.
+            #
+            # `gw` is the MH `GW` flag, derived from the beacon's destination path
+            # ("HG" vs "H"), which the ORIGINATOR sets and relays never modify — it
+            # describes SRC, never CALL. But that destination path exists only on a
+            # HEY (`PLT == '@'`); on any other payload type it is unrelated to
+            # anything the frame carries, so `transform_mh` now emits `gw = None`
+            # for every non-HEY frame instead of a meaningless `0`. COALESCE means
+            # a `0` is still an authoritative "not a gateway" and correctly
+            # overwrites a previously-known 1 — but only when it actually came off
+            # a HEY; `gw` absent (None) leaves the stored value untouched, which is
+            # now the case for every non-HEY frame, not only for a frame that omits
+            # the key entirely.
+            await self._mutate(
+                """INSERT INTO station_positions (callsign, gw, last_seen)
+                   VALUES (?, ?, ?)
+                   ON CONFLICT(callsign) DO UPDATE SET
+                       gw = COALESCE(excluded.gw, station_positions.gw),
+                       last_seen = MAX(COALESCE(station_positions.last_seen, 0),
+                                       COALESCE(excluded.last_seen, 0))
+                """,
+                (
+                    callsign,
+                    data.get("gw"),
+                    timestamp,
+                ),
+            )
+
     async def _ingest_signal(  # noqa: PLR0913 - keyword-only args mirror store_message's locals
         self,
         callsign: str,
@@ -402,6 +475,20 @@ class IngestMixin(StorageBase):
             and VALID_SNR_RANGE[0] <= snr <= VALID_SNR_RANGE[1]
         ):
             source = "mheard" if is_mheard else "lora"
+            # Same rule as `_upsert_station_position`'s guard, applied to the two
+            # signal-history tables: a placeholder is not a station, so it gets no
+            # signal_log rows and no signal_buckets series. Checked on BOTH
+            # callsigns because they are independent — `callsign` keys signal_log
+            # (the observed station) and `signal_via` keys signal_buckets (the link
+            # that delivered the reading), and either one can be a placeholder
+            # without the other being one.
+            if is_placeholder_callsign(callsign) or is_placeholder_callsign(signal_via):
+                logger.debug(
+                    "Refusing signal history for placeholder callsign=%s signal_via=%s",
+                    callsign,
+                    signal_via,
+                )
+                return is_mheard
             await self._mutate(
                 "INSERT INTO signal_log (callsign, timestamp, rssi, snr, source)"
                 " VALUES (?, ?, ?, ?, ?)",
@@ -1109,6 +1196,27 @@ class IngestMixin(StorageBase):
 
         if is_position:
             await self._store_position(callsign, message, raw, relay_via)
+
+        # MHeard originator (SRC) attribution — additive to _ingest_signal above,
+        # never a replacement for it: CALL (the last hop, `callsign`) keeps its
+        # rssi/snr/signal_via via the 'signal' branch; SRC (`mh_origin`) gets only
+        # a signal-free 'heard' upsert (liveness + gw). Guarded on `is_mheard` so a
+        # UDP `pos` frame that happens to carry an `mh_origin` key can never reach
+        # this. Fires unconditionally on presence, including mh_origin == callsign
+        # (the direct-beacon case) — that is how `gw` gets recorded when we hear a
+        # station directly, not a special case to skip.
+        #
+        # MUST run before the `_store_mheard` throttle-early-return immediately
+        # below: `_store_mheard` returns True on a throttle hit and the caller
+        # (`if is_mheard and await self._store_mheard(...): return`) exits
+        # `store_message` entirely on that same line. Code placed after that
+        # return is silently skipped for every throttled MHeard frame — under
+        # real traffic, most of them (see CLAUDE.md's "Link Check" and "Gateway
+        # Uptime" gotchas for two prior instances of exactly this trap).
+        if is_mheard:
+            mh_origin = message.get("mh_origin")
+            if mh_origin:
+                await self._upsert_station_position(mh_origin, message, "heard")
 
         # --- LEGACY: Write to messages table (dual-write) ---
         if is_mheard and await self._store_mheard(src, rssi, snr, timestamp, raw):

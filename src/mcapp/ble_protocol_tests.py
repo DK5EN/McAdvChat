@@ -13,13 +13,17 @@ private-member access. Results are collected as `list[tuple[str, bool]]`.
 
 from __future__ import annotations
 
+import json
 import struct
+from typing import Any
 
 from .ble_protocol import (
     calc_fcs,
     decode_binary_message,
+    dispatcher,
     parse_aprs_position,
     timestamp_from_date_time,
+    transform_mh,
 )
 from .util import FEET_TO_METERS
 
@@ -190,6 +194,120 @@ APRS_SPACE_SYMBOL = " "
 
 # --- timestamp scaling ---
 MIN_MS_YEAR_2001 = 1_000_000_000_000  # a ms epoch > this proves ms (not s) scaling
+
+# --- MH (MHeard beacon) register: live-schema fields (mheard_functions.cpp:331) ---
+# `PP` example straight from hey_path.py's module docstring: leading `R12` (origin
+# neighbour count 12), then two relay hop groups. Wire RSSI is a positive magnitude
+# (`101`, `95`); the parsed hop must NEGATE it.
+MH_DATE = "2026-08-27"
+MH_TIME = "18:30:00"
+MH_CALL = "DL8DD-7"  # last hop: owns rssi/snr (v22 attribution)
+MH_RSSI = -95
+MH_SNR = 3
+MH_HW = 5
+MH_MOD = 2
+MH_MESH = 1
+MH_GW = 1
+MH_NCNT = 4
+MH_PL = 2
+MH_DIST = 12.5
+MH_PP = "R12;8,101,-7;15,95,5;"
+MH_PLT_HEY = 64  # 0x40 '@' — mheard_functions.cpp:335, the only PLT that makes GW meaningful
+MH_PLT_MSG = 58  # 0x3A ':' — a non-HEY payload type; GW must gate to None on this
+MH_PP_ORIGIN_NCNT = 12
+MH_PP_HOP0_NCNT = 8
+MH_PP_HOP0_WIRE_RSSI = 101  # positive magnitude on the wire
+MH_PP_HOP0_RSSI = -101  # negated: the actual dBm value
+MH_PP_HOP0_SNR = -7
+MH_PP_HOP1_NCNT = 15
+MH_PP_HOP1_RSSI = -95
+MH_PP_HOP1_SNR = 5
+MH_PP_LEGACY = False
+
+MH_ORIGIN_DIRECT_DICT: dict[str, Any] = {
+    "TYP": "MH",
+    "DATE": MH_DATE,
+    "TIME": MH_TIME,
+    "CALL": MH_CALL,
+    "RSSI": MH_RSSI,
+    "SNR": MH_SNR,
+    "HW": MH_HW,
+    "MOD": MH_MOD,
+    "MESH": MH_MESH,
+    "SRC": MH_CALL,  # direct: originator == last hop
+    "GW": MH_GW,
+    "NCNT": MH_NCNT,
+    "PL": MH_PL,
+    "DIST": MH_DIST,
+    "PP": MH_PP,
+    "PLT": MH_PLT_HEY,
+}
+
+# Relayed frame: the originator (SRC) is a different station from the last hop
+# (CALL) that this frame's own RSSI/SNR actually measured.
+MH_RELAY_SRC = "DO7TW-1"
+MH_RELAYED_DICT: dict[str, Any] = {**MH_ORIGIN_DIRECT_DICT, "SRC": MH_RELAY_SRC}
+
+# `--mheard` table dump schema (mheard_functions.cpp:651): reconstructed from a
+# stored '|'-separated string that never held SRC/GW/PP/NCNT/PL/DIST.
+MH_DUMP_DICT: dict[str, Any] = {
+    "TYP": "MH",
+    "DATE": MH_DATE,
+    "TIME": MH_TIME,
+    "CALL": MH_CALL,
+    "RSSI": MH_RSSI,
+    "SNR": MH_SNR,
+    "HW": MH_HW,
+    "MOD": MH_MOD,
+    "MESH": MH_MESH,
+    "PLT": MH_PLT_HEY,  # dump builder emits PLT (mheard_functions.cpp:676) but no GW
+}
+
+# `PP` present but the firmware's own rejected shape: 1 comma in the leading
+# token (`R99,99;`) is invalid (hey_path.py docstring, point 2).
+MH_PP_UNPARSEABLE = "R99,99;"
+
+# GW coercion: (wire value, expected coerced int).
+MH_GW_VECTORS: tuple[tuple[Any, int], ...] = (
+    (0, 0),
+    (1, 1),
+    (True, 1),
+    ("1", 1),
+    ("0", 0),
+)
+
+MH_NONNUMERIC = "not-a-number"
+
+# DIST sentinel coercion (_coerce_mh_dist): the firmware's unconditional
+# per-frame initialiser is -1 ("unknown distance"), sticky via a %.1lf
+# buffer round-trip ("-1.0"). Any negative maps to None; 0 is a real
+# colocated-station measurement and must survive.
+MH_DIST_VECTORS: tuple[tuple[Any, float | None], ...] = (
+    (-1, None),
+    (-1.0, None),
+    (0, 0.0),
+    (25.7, 25.7),
+)
+
+# NCNT sentinel coercion (_coerce_mh_ncnt): the firmware re-initialises this
+# to 0 on every received frame and itself reads 0 as "not set". A non-zero
+# count passes straight through.
+MH_NCNT_VECTORS: tuple[tuple[Any, int | None], ...] = (
+    (0, None),
+    (7, 7),
+)
+
+# A PP whose leading token is a genuine zero (0 commas, valid per hey_path.py
+# point 2): the chain's OWN origin_ncnt is a fresh transmit-time value, never
+# subject to the NCNT==0 sentinel rule above.
+MH_PP_ZERO_NCNT = "R0;"
+
+
+# --- TYP: "I" register: FWDATE passthrough ------------------------------------
+# FWDATE briefly shipped as a string and was reverted; the webapp depends on it
+# staying an int straight through the generic-BLE passthrough transformer.
+I_FWDATE = 20260827
+I_DICT: dict[str, Any] = {"TYP": "I", "FWDATE": I_FWDATE}
 
 
 def _build_data_frame(
@@ -710,6 +828,329 @@ def _test_timestamp(results: list[tuple[str, bool]]) -> None:
     )
 
 
+def _test_mh_transform(results: list[tuple[str, bool]]) -> None:
+    """MH register (`TYP: "MH"`) — SRC/GW/PP extension fields.
+
+    `CALL` is the last hop and keeps owning `src`/`rssi`/`snr` (migration v22);
+    `SRC` is the originator and owns `mh_origin`/`gw`. See `transform_mh`'s
+    docstring for why the two must never be merged.
+    """
+    direct = transform_mh(MH_ORIGIN_DIRECT_DICT)
+
+    # The v22 attribution invariant: src is ALWAYS CALL (the last hop), never
+    # SRC — even though in this direct-hop fixture they happen to be equal.
+    _check(
+        results,
+        "MH direct: src stays CALL (v22 attribution invariant)",
+        direct["src"] == MH_CALL,
+    )
+    _check(results, "MH direct: mh_origin == SRC", direct["mh_origin"] == MH_CALL)
+    _check(results, "MH direct: gw coerced to int 1", direct["gw"] == 1)
+    _check(
+        results,
+        "MH direct: mh_ncnt non-sentinel value passes through",
+        direct["mh_ncnt"] == MH_NCNT,
+    )
+    _check(results, "MH direct: mh_path_len passthrough", direct["mh_path_len"] == MH_PL)
+    _check(
+        results,
+        "MH direct: mh_dist non-sentinel value passes through",
+        direct["mh_dist"] == MH_DIST,
+    )
+    _check(
+        results, "MH direct: hey_chain_raw is the raw PP string", direct["hey_chain_raw"] == MH_PP
+    )
+
+    chain = direct["hey_chain"]
+    if chain is None:
+        _check(results, "MH direct: hey_chain parses (not None)", False)
+    else:
+        _check(
+            results, "MH direct: hey_chain origin_ncnt", chain["origin_ncnt"] == MH_PP_ORIGIN_NCNT
+        )
+        _check(results, "MH direct: hey_chain not legacy", chain["legacy"] is MH_PP_LEGACY)
+        hops = chain["hops"]
+        _check(results, "MH direct: hey_chain has 2 hops", len(hops) == 2)
+        if len(hops) == 2:
+            _check(
+                results,
+                "MH direct: hop 0 ncnt/snr",
+                hops[0]["ncnt"] == MH_PP_HOP0_NCNT and hops[0]["snr"] == MH_PP_HOP0_SNR,
+            )
+            # The negation invariant: wire value 101 (positive magnitude) must
+            # decode to -101 (real dBm), never pass through as +101.
+            _check(
+                results,
+                f"MH direct: hop 0 rssi negated (wire {MH_PP_HOP0_WIRE_RSSI} -> "
+                f"{MH_PP_HOP0_RSSI}, the negation invariant)",
+                hops[0]["rssi"] == MH_PP_HOP0_RSSI,
+            )
+            _check(
+                results,
+                "MH direct: hop 1 ncnt/rssi/snr",
+                hops[1]["ncnt"] == MH_PP_HOP1_NCNT
+                and hops[1]["rssi"] == MH_PP_HOP1_RSSI
+                and hops[1]["snr"] == MH_PP_HOP1_SNR,
+            )
+
+    # Relayed frame: SRC != CALL. src must still be CALL; mh_origin must be SRC.
+    relayed = transform_mh(MH_RELAYED_DICT)
+    _check(results, "MH relayed: src stays CALL (last hop)", relayed["src"] == MH_CALL)
+    _check(results, "MH relayed: mh_origin is SRC, not CALL", relayed["mh_origin"] == MH_RELAY_SRC)
+    _check(results, "MH relayed: src != mh_origin", relayed["src"] != relayed["mh_origin"])
+
+    # An unconfigured node beacons as the firmware's factory-default callsign, and
+    # that is a valid callsign SHAPE so nothing else rejects it. Observed live on
+    # 2026-08-28 (v2.0.2-dev.1): one in four HEY beacons carrying an originator
+    # named a placeholder, which created a station_positions row that is not a
+    # station — and every unconfigured node in the field collapses onto that one
+    # row. `src` must still be CALL: the signal reading is real, only the
+    # ORIGINATOR attribution is refused.
+    for placeholder in ("XX0XXX-00", "xx0xxx-12", "DK0XXX", "DX0XXX-1"):
+        ph_frame = {**MH_RELAYED_DICT, "SRC": placeholder}
+        ph_out = transform_mh(ph_frame)
+        _check(
+            results,
+            f"MH placeholder originator {placeholder!r} is not recorded as a station",
+            ph_out["mh_origin"] is None,
+        )
+        _check(
+            results,
+            f"MH placeholder originator {placeholder!r} still keeps src == CALL",
+            ph_out["src"] == MH_CALL,
+        )
+
+    # --mheard table dump schema: only SRC/GW/PP are absent. The firmware
+    # DOES emit NCNT/PL/DIST from this dump (mheard_functions.cpp:681-685);
+    # this fixture (MH_DUMP_DICT) simply omits them too, so all six keys
+    # below read None here for the same reason the three real-absent ones do.
+    dumped = transform_mh(MH_DUMP_DICT)
+    new_keys = (
+        "mh_origin",
+        "gw",
+        "mh_ncnt",
+        "mh_path_len",
+        "mh_dist",
+        "hey_chain",
+        "hey_chain_raw",
+    )
+    _check(
+        results,
+        "MH --mheard dump: all 7 new keys are None",
+        all(dumped[key] is None for key in new_keys),
+    )
+    _check(
+        results,
+        "MH --mheard dump: pre-existing keys unchanged",
+        dumped["transformer"] == "mh"
+        and dumped["src_type"] == "ble"
+        and dumped["type"] == "pos"
+        and dumped["src"] == MH_CALL
+        and dumped["rssi"] == MH_RSSI
+        and dumped["snr"] == MH_SNR
+        and dumped["hw_id"] == MH_HW
+        and dumped["lora_mod"] == MH_MOD
+        and dumped["mesh"] == MH_MESH
+        and dumped["node_timestamp"] == dumped["timestamp"],
+    )
+
+    # PP present but the firmware's own rejected 1-comma shape: unparseable.
+    unparseable_dict: dict[str, Any] = {**MH_ORIGIN_DIRECT_DICT, "PP": MH_PP_UNPARSEABLE}
+    unparseable = transform_mh(unparseable_dict)
+    _check(
+        results,
+        "MH unparseable PP: hey_chain is None, hey_chain_raw keeps the raw string",
+        unparseable["hey_chain"] is None and unparseable["hey_chain_raw"] == MH_PP_UNPARSEABLE,
+    )
+
+    # GW coercion across the shapes the firmware/a hostile sender might send.
+    for wire_value, expected in MH_GW_VECTORS:
+        gw_dict: dict[str, Any] = {**MH_ORIGIN_DIRECT_DICT, "GW": wire_value}
+        coerced = transform_mh(gw_dict)["gw"]
+        _check(
+            results,
+            f"MH gw coercion: {wire_value!r} -> {expected} (int, not bool)",
+            coerced == expected and isinstance(coerced, int) and not isinstance(coerced, bool),
+        )
+
+    # Non-numeric NCNT/PL/DIST must become None, never raise.
+    nonnumeric_dict: dict[str, Any] = {
+        **MH_ORIGIN_DIRECT_DICT,
+        "NCNT": MH_NONNUMERIC,
+        "PL": MH_NONNUMERIC,
+        "DIST": MH_NONNUMERIC,
+    }
+    nonnumeric = transform_mh(nonnumeric_dict)
+    _check(
+        results,
+        "MH non-numeric NCNT/PL/DIST -> None, no raise",
+        nonnumeric["mh_ncnt"] is None
+        and nonnumeric["mh_path_len"] is None
+        and nonnumeric["mh_dist"] is None,
+    )
+
+    # The whole transformed dict must be JSON-serialisable (it is json.dumps'd
+    # on the storage path) — hey_chain must be the plain dict from as_dict(),
+    # never the HeyChain dataclass.
+    serialisable = True
+    try:
+        json.dumps(direct)
+    except (TypeError, ValueError):
+        serialisable = False
+    _check(results, "MH transformed dict is JSON-serialisable", serialisable)
+
+
+def _test_mh_sentinel_coercion(results: list[tuple[str, bool]]) -> None:
+    """MH register: `DIST`/`NCNT` firmware sentinels normalise to `None`.
+
+    Split out from `_test_mh_transform` to stay under the statement-count
+    lint budget; conceptually the same suite. See `_coerce_mh_dist`/
+    `_coerce_mh_ncnt` for the firmware citations behind each rule.
+    """
+    # DIST sentinel coercion: negative (any negative, not just exactly -1)
+    # maps to None; 0 is a real colocated-station measurement and survives.
+    for wire_value, expected in MH_DIST_VECTORS:
+        dist_dict: dict[str, Any] = {**MH_ORIGIN_DIRECT_DICT, "DIST": wire_value}
+        coerced_dist = transform_mh(dist_dict)["mh_dist"]
+        _check(
+            results,
+            f"MH dist sentinel coercion: {wire_value!r} -> {expected!r}",
+            coerced_dist == expected,
+        )
+
+    # NCNT sentinel coercion: 0 ("never learned") maps to None; a non-zero
+    # count survives.
+    for wire_value, expected in MH_NCNT_VECTORS:
+        ncnt_dict: dict[str, Any] = {**MH_ORIGIN_DIRECT_DICT, "NCNT": wire_value}
+        coerced_ncnt = transform_mh(ncnt_dict)["mh_ncnt"]
+        _check(
+            results,
+            f"MH ncnt sentinel coercion: {wire_value!r} -> {expected!r}",
+            coerced_ncnt == expected,
+        )
+
+    # Guard against later folding the NCNT==0 sentinel rule into the chain's
+    # own counts: R0; is a real zero-neighbour originator, and
+    # hey_chain.origin_ncnt must stay 0, untouched by _coerce_mh_ncnt.
+    zero_chain_dict: dict[str, Any] = {**MH_ORIGIN_DIRECT_DICT, "PP": MH_PP_ZERO_NCNT}
+    zero_hey_chain = transform_mh(zero_chain_dict)["hey_chain"]
+    _check(
+        results,
+        "MH PP=R0;: hey_chain.origin_ncnt stays 0 (chain's own count, not the NCNT sentinel)",
+        zero_hey_chain is not None and zero_hey_chain["origin_ncnt"] == 0,
+    )
+
+    # Contrast: GW: 0 is unchanged by this change (already covered by the GW
+    # coercion vectors in _test_mh_transform, MH_GW_VECTORS' (0, 0) case) —
+    # the new rules are field-specific (DIST negativity, NCNT-only zero),
+    # never a blanket falsy filter across the whole register.
+    gw_zero_dict: dict[str, Any] = {**MH_ORIGIN_DIRECT_DICT, "GW": 0}
+    _check(
+        results,
+        "MH GW: 0 still yields gw == 0 (contrast: not swept up by the sentinel rules)",
+        transform_mh(gw_zero_dict)["gw"] == 0,
+    )
+
+
+def _test_mh_plt_gate(results: list[tuple[str, bool]]) -> None:
+    """F1: `gw` is derived only from a HEY frame's `PLT` (`_MH_PAYLOAD_TYPE_HEY`
+    == 0x40); `mh_origin` stays ungated regardless of payload type. See
+    `transform_mh`'s docstring and `_coerce_mh_payload_type`.
+    """
+    # PLT=HEY, GW=0: a real "not a gateway" and must NOT become None.
+    not_gw_dict: dict[str, Any] = {**MH_ORIGIN_DIRECT_DICT, "GW": 0}
+    _check(
+        results,
+        "MH PLT=HEY, GW=0: gw stays int 0, not coerced to None",
+        transform_mh(not_gw_dict)["gw"] == 0,
+    )
+
+    # PLT=MSG (not HEY), GW=0: gw must gate to None even though GW itself
+    # coerces cleanly — the destination path is unrelated on this frame type.
+    # mh_origin must stay ungated: SRC is set unconditionally on every frame.
+    non_hey_dict: dict[str, Any] = {**MH_ORIGIN_DIRECT_DICT, "PLT": MH_PLT_MSG, "GW": 0}
+    non_hey = transform_mh(non_hey_dict)
+    _check(results, "MH PLT=MSG (not HEY): gw gates to None", non_hey["gw"] is None)
+    _check(
+        results,
+        "MH PLT=MSG (not HEY): mh_origin stays ungated",
+        non_hey["mh_origin"] == MH_CALL,
+    )
+
+    # PLT absent: fail closed.
+    no_plt_dict: dict[str, Any] = {k: v for k, v in MH_ORIGIN_DIRECT_DICT.items() if k != "PLT"}
+    _check(
+        results,
+        "MH PLT absent: gw gates to None (fail closed)",
+        transform_mh(no_plt_dict)["gw"] is None,
+    )
+
+    # A HEY whose PP was dropped by the firmware's 244-char size budget: PP
+    # absent, PLT still HEY — gw must still be derived from GW, pinning the
+    # gate on PLT, never on PP presence (mheard_functions.cpp:366-371).
+    pp_dropped_dict: dict[str, Any] = {k: v for k, v in MH_ORIGIN_DIRECT_DICT.items() if k != "PP"}
+    _check(
+        results,
+        "MH PP dropped by size budget, PLT still HEY: gw still derived from GW",
+        transform_mh(pp_dropped_dict)["gw"] == MH_GW,
+    )
+
+    # PLT coercer tolerance: the single ASCII char '@' and the string int
+    # form "64" must both still be recognised as HEY.
+    for plt_value in ("@", "64"):
+        str_plt_dict: dict[str, Any] = {**MH_ORIGIN_DIRECT_DICT, "PLT": plt_value}
+        _check(
+            results,
+            f"MH PLT given as {plt_value!r}: still treated as HEY, gw derived",
+            transform_mh(str_plt_dict)["gw"] == MH_GW,
+        )
+
+
+def _test_lora_mod_mask(results: list[tuple[str, bool]]) -> None:
+    """F6: `MOD`/`lora_mod` is a packed byte (`aprs_functions.cpp:113`) — low
+    nibble modulation, high nibble country. Both wire paths (the binary GATT
+    footer and `transform_mh`) must mask to the modulation nibble only, never
+    store the packed byte raw.
+    """
+    packed = 0x83  # country 8, modulation 3
+    expected = 0x03
+
+    packed_frame = _build_data_frame(
+        MSG_TYPE_BYTE,
+        MSG_MSG_ID,
+        MSG_MAX_HOP_RAW,
+        MSG_PATH.encode() + MSG_DEST.encode() + MSG_MESSAGE.encode(),
+        (MSG_HARDWARE_ID, packed, MSG_FW, MSG_LASTHW, MSG_FW_SUB_BYTE, MSG_ENDING, MSG_TIME_MS),
+    )
+    decoded = decode_binary_message(packed_frame)
+    _check(
+        results,
+        "binary footer: packed MOD 0x83 masks to lora_mod 3",
+        decoded is not None and decoded["lora_mod"] == expected,
+    )
+
+    mh_packed_dict: dict[str, Any] = {**MH_ORIGIN_DIRECT_DICT, "MOD": packed}
+    _check(
+        results,
+        "transform_mh: packed MOD 0x83 masks to lora_mod 3",
+        transform_mh(mh_packed_dict)["lora_mod"] == expected,
+    )
+
+
+def _test_i_register_fwdate_passthrough(results: list[tuple[str, bool]]) -> None:
+    """A `TYP: "I"` frame's `FWDATE` passes through dispatcher() unchanged and
+    stays an int — the webapp depends on this; it briefly shipped as a string
+    and was reverted."""
+    result = dispatcher(I_DICT)
+    _check(
+        results,
+        "TYP=I: FWDATE passes through as an int, value intact",
+        result is not None
+        and result.get("FWDATE") == I_FWDATE
+        and isinstance(result.get("FWDATE"), int),
+    )
+
+
 def run_ble_protocol_tests() -> bool:
     """Run all ble_protocol golden-frame tests. Returns True iff all pass."""
     results: list[tuple[str, bool]] = []
@@ -723,6 +1164,11 @@ def run_ble_protocol_tests() -> bool:
     _test_aprs_comment_injection(results)
     _test_aprs_symbol_table_ids(results)
     _test_timestamp(results)
+    _test_mh_transform(results)
+    _test_mh_sentinel_coercion(results)
+    _test_mh_plt_gate(results)
+    _test_lora_mod_mask(results)
+    _test_i_register_fwdate_passthrough(results)
 
     for label, ok in results:
         status = "✅ PASS" if ok else "❌ FAIL"

@@ -20,7 +20,7 @@ from ..commands.parsing import is_group, is_hashtag, resolve_dst_target
 # passing suite for a reason unrelated to the change being made. This is not
 # circular with migrations.py: the step numbers there are independent literals,
 # so forgetting either half fails loudly.
-LATEST_SCHEMA_VERSION = 25
+LATEST_SCHEMA_VERSION = 28
 
 # Constants matching message_storage.py
 BUCKET_SECONDS = 5 * 60
@@ -56,15 +56,29 @@ TELEMETRY_DEDUP_WINDOW_MS = 60_000
 # never written as a `gap` segment at all, so retuning it later cannot change
 # what already happened on disk.
 #
-# 6 min, and it MUST stay above the beacon cadence. Measured on mcapp.local
-# 2026-08-21 (three consecutive uplink beacons off the live SSE stream:
-# 23:40:31 → 23:45:34 → 23:50:37) the {CET} beacon arrives every 5 min 03 s —
-# the MeshCom server emits on a 303 s period, not the round 300 s it looks
-# like. A tolerance at or below that cadence would record a `gap` on every
-# single healthy cycle and report ~60% uptime for a link that never dropped a
-# frame. 360 s leaves ~57 s of margin for jitter and SSE reconnects, while a
-# genuinely missed beacon (2 × 303 s = 606 s of silence) still registers.
-GAP_TOLERANCE_MS = 360_000  # 6 min
+# 12 min, and it MUST stay above the beacon cadence. A tolerance at or below
+# the cadence records a `gap` on every single healthy cycle and reports a link
+# that never dropped a frame as near-zero uptime.
+#
+# The cadence is set UPSTREAM by the MeshCom server, not by our node, and it
+# HAS ALREADY CHANGED ONCE — so this is a measurement, not a constant of
+# nature. If the Gateway Availability card ever reads ~0% uptime while beacons
+# are visibly arriving, re-measure before touching anything else; that symptom
+# is this value being under the cadence, not a broken link.
+#
+#   2026-08-21: 23:40:31 → 23:45:34 → 23:50:37   = 303 s   (tolerance was 360 s)
+#   2026-08-28: 12 consecutive intervals, all      = 606.5 s (exactly 2 × 303 s)
+#               10.11 min, e.g. 18:49:28 → 18:59:35 → 19:09:42
+#
+# OE1KBC halved the {CET} rate; the changeover shows in the stored history as
+# the first 10.1-min gap on 2026-08-22 12:43, becoming continuous 2026-08-27
+# 07:45:59. Between those dates the cadence alternated, which is why gaps there
+# are ambiguous and migration 28 deliberately does not scrub them.
+#
+# 720 s keeps the same 1.19x margin over the cadence that 360 s had over 303 s
+# (~114 s of slack for jitter and SSE reconnects), while a genuinely missed
+# beacon (2 × 606.5 s = 1213 s of silence) still registers.
+GAP_TOLERANCE_MS = 720_000  # 12 min
 # Startup reconciliation only (storage/uptime.py's reconcile_link_uptime_startup):
 # silence since the last 30s heartbeat tick longer than this proves the PROXY
 # PROCESS itself was not running (not just the link), so that stretch is
@@ -75,9 +89,12 @@ DARK_THRESHOLD_MS = 90_000
 # so amber/red can be retuned later without invalidating history — but never
 # below GAP_TOLERANCE_MS, or a beacon-jitter silence that was never even
 # recorded as a `gap` would already read as `silent`/`off`.
-SILENT_MS = 360_000  # 6 min since last beacon → 'silent' (== GAP_TOLERANCE_MS,
-# the smallest honest value: below the 303 s cadence a healthy link reads silent)
-OFF_MS = 900_000  # 15 min since last beacon → 'off'
+SILENT_MS = 720_000  # 12 min since last beacon → 'silent' (== GAP_TOLERANCE_MS,
+# the smallest honest value: below the 606.5 s cadence a healthy link reads silent)
+# ~3 cadences, scaled with GAP_TOLERANCE_MS above (was 900 s against a 303 s
+# cadence). Left at 900 s it would sit only 180 s past SILENT_MS, collapsing the
+# amber band to almost nothing on a link that has merely missed one beacon.
+OFF_MS = 1_800_000  # 30 min since last beacon → 'off'
 # prune_messages retention for link_uptime_segments (query.py). Independent
 # of the other per-table windows above — this ledger is a handful of rows per
 # month, not a high-volume table, so it gets its own generous horizon.

@@ -1,9 +1,10 @@
 # McApp production health log — mcapp.local
 
-> **Status:** Current — newest section and newest sweep: §4 (2026-08-22 17:53 CEST, pre-release
-> check for v2.0.1) — verdict **all green**, zero findings. Open watch points: **W1** (swap),
-> **W2** (live `config.json` stays `0640` by decision), **W3** (Caddy 12 h certs), **W5**
-> (untagged merge on webapp `main`). **W4 is resolved** (§3) and its fix is live.
+> **Status:** Current — newest section: §6 (2026-08-22, fable review of the release tooling and
+> its fixes). Newest sweep: §4 (2026-08-22 17:53 CEST) — verdict **all green**, zero findings.
+> Open watch points: **W1** (swap), **W2** (live `config.json` stays `0640` by decision), **W3**
+> (Caddy 12 h certs), **W6** and **W7** (§6, accepted residual risks). **W4** (§3) and **W5** (§5)
+> are resolved.
 >
 > **Kind:** Recurring ops review; one dated section per run, appended, never edited in place.
 > **Produced by:** the `ai-ops` skill (`.claude/skills/ai-ops/SKILL.md`).
@@ -346,3 +347,122 @@ Promotion is the ordinary `scripts/release.sh` path from `development`.
   **`/webapp/version.html`**. Path added to the skill.
 - Phase 5 reads the ledger from the DB but never names the HTTP surface. `GET /api/uptime`
   **requires** `?range=` (`24h` / `7d`) and returns a 422 without it. Added.
+
+## 5. 2026-08-22 18:10 CEST — v2.0.1 promoted to production
+
+Not a sweep. Records the promotion §4 cleared, and the post-deploy verification, so the next run
+knows what changed under it.
+
+`v2.0.1` was cut from `v2.0.1-dev.2` (`bc12783`, plus the §4 log entry and the release notes) and
+deployed from the webapp Update page. GitHub release:
+<https://github.com/DK5EN/McApp/releases/tag/v2.0.1>, sha256
+`cfaad29aa0a49ad5fc334e580a2528986a91feefe92bc634e33a3c4b9718a7db`.
+
+### Post-deploy verification
+
+| Check                  | Value                                                             |
+| ---------------------- | ----------------------------------------------------------------- |
+| `/api/status`          | `v2.0.1`                                                          |
+| `/webapp/version.html` | `v2.0.1`                                                          |
+| `/health`              | `healthy`                                                         |
+| Active slot            | **slot-0** (rotated from `slot-2`; slot-0 previously held v2.0.0) |
+| Services               | mcapp, mcapp-ble, caddy, lighttpd all `active`                    |
+| `NRestarts`            | **0** on both units                                               |
+| Schema                 | DB **25** = `LATEST_SCHEMA_VERSION` in the active slot ✓          |
+| System epoch           | installed **1** = required ✓                                      |
+
+### The uptime ledger survived the deploy cleanly
+
+This is the first time the gateway-uptime feature has been carried through a release deploy, so it
+is worth pinning what happened:
+
+- `first_observed_ms` still **00:54:02** — untouched.
+- **No `dark` row was written**, and that is correct: the service was down for less than
+  `DARK_THRESHOLD_MS` (3 missed 30 s heartbeats), so `reconcile_link_uptime_startup` left the state
+  as it found it. A production deploy does not read as a link outage.
+- The only segment in the ledger is still the single 12:43:07 → 12:53:13 `gap` from §4.
+- Beacon arrived 198 s after the restart, heartbeat 30 s — both inside their envelopes.
+- `uptime_pct` 99.03 %, `coverage_pct` 71.93 % — continuous with §4's reading, no discontinuity.
+
+### W5 — resolved
+
+webapp `main` carried `be6089d`, a development merge that was never merged back, leaving `main` one
+commit ahead of its own `development`. That state aborts `release.sh`'s `validate_main_mergeable`
+and **blocked the release**. Merged back non-destructively (the trees were identical, so the merge
+was purely topological) and pushed.
+
+**The root cause is structural and will recur.** `post_release_prep` pushes **MCProxy**
+`development` only; the webapp's merge-back from step 10 is committed and never pushed, so every
+production release leaves webapp `development` behind `origin/main` until someone pushes it by hand
+— which is exactly what aborts the _next_ release. Documented as Stop 4 in the new `prod-release`
+skill, with the manual push as an explicit step.
+
+### Related work this produced
+
+- **`prod-release` skill** (`.claude/skills/prod-release/SKILL.md`) — the production counterpart to
+  `dev-release`, covering the four stops that abort or silently bite: release notes must be
+  committed _before_ the script starts (its clean-tree check runs first), `main` must not be ahead
+  in either repo, the notes prompt is a bare `read` that `< /dev/null` kills into the rollback trap,
+  and the webapp `development` push the script never performs.
+
+### Open, unchanged
+
+- 169 pre-2026-08-13 duplicate telemetry pairs, still unexplained.
+- `fcs_ok` field-data verdict due after 2026-09-20 (`doc/backlog.md`).
+- webapp `package.json` still reads `2.0.0`; `post_release_prep` bumps only the two
+  `pyproject.toml` files. Cosmetic today, but it means the webapp repo carries no version of its
+  own that matches the release.
+
+## 6. 2026-08-22 — fable review of the v2.0.1 release tooling, and its fixes
+
+Not a sweep. Records an independent review of the release/deploy changes made after v2.0.1 shipped,
+so the next run knows what moved and which risks were accepted deliberately.
+
+Eight independent finders, then adversarial verification; only claims reproduced by experiment were
+acted on. **Two of the three high findings were defects in the fixes themselves.**
+
+### Fixed
+
+| #   | Defect                                                                                                                                                                                                                             | Where                            |
+| --- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | -------------------------------- |
+| 1   | `install_webapp_tree` was called as `f \|\| return 1` / `if ! f`, which suppresses errexit for the **whole function body** — `rm -rf`, `mkdir -p`, `chown -R`, `chmod -R` failed silently and the swap still happened, returning 0 | `bootstrap/lib/deploy.sh`        |
+| 2   | `release.sh` announced _"Rollback complete."_ on a step-11 failure while doing **nothing** — `cleanup_artifacts` had already cleared every flag the trap inspects                                                                  | `scripts/release.sh`             |
+| 3   | The webapp-push regression test was **tautological**: its fixture pushed before the call, so it passed with the push removed                                                                                                       | `scripts/release_prep_tests.py`  |
+| 4   | The deploy suite drove the function without `-e` while production has it, and asserted the AppleDouble guarantee by grepping release.sh's **source text**                                                                          | `scripts/webapp_deploy_tests.py` |
+| 5   | `mcapp-ble.service` embeds `BLE_API_KEY` in cleartext and was written `0644` (pre-existing)                                                                                                                                        | `bootstrap/lib/deploy.sh`        |
+| 6   | webapp `.prettierignore` covered only `*_vectors.json`, leaving `dedup_contract.json` and `push_contract.json` reformattable                                                                                                       | webapp repo                      |
+
+Every fix was confirmed by **mutation**: reverting it makes the relevant suite fail, restoring it
+makes the suite pass. A green suite was not accepted as evidence on its own — finding 3 is precisely
+the case where it was wrong.
+
+### Accepted residual risks — deliberate, do not re-litigate
+
+- **W6 — the swap has a sub-millisecond window with no serve directory.** `install_webapp_tree`
+  stages then swaps with two renames. Killed exactly between them, `/var/www/html/webapp` is absent
+  and **stays** absent until the next deploy: `system_converge.py`'s watchdog is scoped to
+  `SYSTEM_EPOCH` and never calls `deploy_webapp`. It is not data loss — the source is always the
+  freshly extracted tarball — and the next deploy self-heals, because `[[ -d "$WEBAPP_DIR" ]]` is
+  false and `get_installed_webapp_version` returns `not_installed`, forcing a redeploy.
+  Recovery by hand: `sudo mv /var/www/html/webapp.old /var/www/html/webapp`.
+  Not fixed: closing it properly needs a symlinked serve directory (`ln -sfn` is atomic where a
+  directory rename is not), which means `server.follow-symlink` in lighttpd — a front-door change,
+  therefore a `SYSTEM_EPOCH` bump. Not worth it for a ~10 ms window on a single-user box.
+- **W7 — stale clients can lose assets the old overlay preserved.** Replacing the tree deletes the
+  previous build's content-hashed chunks. A tab whose service worker finished precaching is
+  unaffected (Workbox precaches every built asset, including never-visited lazy chunks); the
+  exposure is a tab whose SW never completed, hitting a new route after a deploy. Accepted — the
+  alternative is unbounded accumulation, which is what §5 set out to fix.
+
+### Refuted — do not re-investigate
+
+- _"A step-11 failure deletes the published release and both repos' tags."_ Asserted in-session,
+  **wrong**: `cleanup_artifacts` clears `_CLEANUP_TAG`/`_CLEANUP_RELEASE` at step 10. The trap has
+  nothing left to delete; the real defect was that it claimed a rollback anyway (fixed above).
+- `chmod -R 755` on served files — identical in the pre-change code and inert; lighttpd loads no
+  CGI/FastCGI/magnet module.
+- `rm -rf` with an unset `WEBAPP_DIR` — unreachable; `readonly` and hardcoded in `bootstrap/mcapp.sh`.
+- Symlink/TOCTOU on `webapp.new`/`.old` — defeated by coreutils' non-follow defaults, and
+  `/var/www/html` is not writable by any non-root account.
+- `src/**/*_vectors.json` failing to match files directly under `src/` — `**` matches zero
+  directories in gitignore semantics; verified with prettier.

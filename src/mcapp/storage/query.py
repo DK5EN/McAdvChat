@@ -10,12 +10,13 @@ import json
 import sqlite3
 import time
 from collections import defaultdict
+from collections.abc import Callable
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from statistics import mean
 from typing import Any, cast
 
-from ..commands.parsing import is_group, is_hashtag, resolve_dst_target
+from ..commands.parsing import SPAM_GROUP, is_group, is_hashtag, resolve_dst_target
 from ..logging_setup import get_logger
 from ..util import now_ms
 from ._base import StorageBase
@@ -55,6 +56,23 @@ from .constants import (
 )
 
 logger = get_logger(__name__)
+
+# Read-path blocklist hook. Takes an already-built message/position dict and
+# returns the dict to emit (possibly a dst-rewritten copy) or None to drop it.
+# Supplied by MessageRouter.filter_history_row — storage deliberately holds no
+# blocklist of its own, so the same shared decision governs ingest, live
+# broadcast and history alike.
+HistoryFilter = Callable[[dict[str, Any]], dict[str, Any] | None]
+
+
+def _emit_row(data: dict[str, Any], blocklist_filter: HistoryFilter | None) -> str | None:
+    """Serialise one built row, or return None when the blocklist drops it."""
+    if blocklist_filter is not None:
+        filtered = blocklist_filter(data)
+        if filtered is None:
+            return None
+        data = filtered
+    return json.dumps(data, ensure_ascii=False)
 
 
 class QueryMixin(StorageBase):
@@ -336,12 +354,19 @@ class QueryMixin(StorageBase):
     async def get_smart_initial_with_summary(
         self,
         limit_per_dst: int = DEFAULT_PAGE_SIZE,
+        blocklist_filter: HistoryFilter | None = None,
     ) -> tuple[dict[str, Any], dict[str, Any]]:
         """Get smart initial payload + summary in a single thread call.
 
         Uses a ROW_NUMBER() window function partitioned by conversation_key
         to fetch the last N messages per conversation in one query, instead
         of N+1 queries (one per destination).
+
+        `blocklist_filter` (MessageRouter.filter_history_row) is applied to
+        every message, ack and position on the way out. It is what makes a
+        blocklist entry retroactive: rows a station deposited before it was
+        blocked are still in the table, and this is the only place that keeps
+        them off every client's screen without a per-host DELETE.
         """
         build_msg = self._build_message_dict
         build_pos = self._build_position_dict
@@ -372,7 +397,9 @@ class QueryMixin(StorageBase):
                     (window_cutoff_ms, limit_per_dst),
                 ).fetchall()
                 messages = [
-                    json.dumps(build_msg(dict(row)), ensure_ascii=False) for row in msg_rows
+                    emitted
+                    for row in msg_rows
+                    if (emitted := _emit_row(build_msg(dict(row)), blocklist_filter)) is not None
                 ]
 
                 # 2. Positions: station_positions table
@@ -380,7 +407,9 @@ class QueryMixin(StorageBase):
                     "SELECT * FROM station_positions",
                 ).fetchall()
                 positions = [
-                    json.dumps(build_pos(dict(row)), ensure_ascii=False) for row in pos_rows
+                    emitted
+                    for row in pos_rows
+                    if (emitted := _emit_row(build_pos(dict(row)), blocklist_filter)) is not None
                 ]
 
                 # 3. ACK messages. GLOB, not LIKE, and the EXACT complement of
@@ -397,17 +426,48 @@ class QueryMixin(StorageBase):
                     " WHERE type = 'msg' AND msg GLOB '*:ack[0-9]*'"
                     f" ORDER BY timestamp DESC LIMIT {INITIAL_ACK_LIMIT}",
                 ).fetchall()
-                acks = [json.dumps(build_msg(dict(row)), ensure_ascii=False) for row in ack_rows]
+                acks = [
+                    emitted
+                    for row in ack_rows
+                    if (emitted := _emit_row(build_msg(dict(row)), blocklist_filter)) is not None
+                ]
 
                 # 4. Summary counts
-                summary_rows = conn.execute(
-                    "SELECT COALESCE(conversation_key, dst) AS key, COUNT(*) as cnt"
-                    " FROM messages"
-                    " WHERE type = 'msg' AND msg NOT GLOB '*:ack[0-9]*' AND timestamp >= ?"
-                    " GROUP BY key",
-                    (window_cutoff_ms,),
-                ).fetchall()
-                summary = {row["key"]: row["cnt"] for row in summary_rows if row["key"]}
+                # Grouped by src/dst as well as key when a blocklist filter is
+                # active: the counts drive the sidebar badges, so leaving them
+                # unfiltered would advertise conversations whose messages the
+                # filter above has just removed. The extra group columns are only
+                # paid for when there is something to filter.
+                if blocklist_filter is None:
+                    summary_rows = conn.execute(
+                        "SELECT COALESCE(conversation_key, dst) AS key, COUNT(*) as cnt"
+                        " FROM messages"
+                        " WHERE type = 'msg' AND msg NOT GLOB '*:ack[0-9]*' AND timestamp >= ?"
+                        " GROUP BY key",
+                        (window_cutoff_ms,),
+                    ).fetchall()
+                    summary = {row["key"]: row["cnt"] for row in summary_rows if row["key"]}
+                else:
+                    summary_rows = conn.execute(
+                        "SELECT COALESCE(conversation_key, dst) AS key, src, dst,"
+                        " COUNT(*) as cnt"
+                        " FROM messages"
+                        " WHERE type = 'msg' AND msg NOT GLOB '*:ack[0-9]*' AND timestamp >= ?"
+                        " GROUP BY key, src, dst",
+                        (window_cutoff_ms,),
+                    ).fetchall()
+                    counts: dict[str, int] = defaultdict(int)
+                    for row in summary_rows:
+                        if not row["key"]:
+                            continue
+                        kept = blocklist_filter({"src": row["src"] or "", "dst": row["dst"] or ""})
+                        if kept is None:
+                            continue  # dropped outright
+                        # A quarantined group post is counted under SPAM_GROUP,
+                        # matching where the message itself now shows up.
+                        key = SPAM_GROUP if kept.get("dst") == SPAM_GROUP else row["key"]
+                        counts[key] += row["cnt"]
+                    summary = dict(counts)
 
                 initial = {"messages": messages, "positions": positions, "acks": acks}
                 return initial, summary
@@ -437,6 +497,7 @@ class QueryMixin(StorageBase):
         before_timestamp: int | None = None,
         limit: int = DEFAULT_PAGE_SIZE,
         src: str | None = None,
+        blocklist_filter: HistoryFilter | None = None,
     ) -> dict[str, Any]:
         """Get a page of messages for a destination, cursor-based.
 
@@ -444,6 +505,10 @@ class QueryMixin(StorageBase):
         to query via conversation_key for a single-index scan. A hashtag dst
         ('#OE-SOTA') takes the same group-style conversation_key path as a
         numeric group (hashtag_dst_vectors.json).
+
+        `blocklist_filter` is applied after the query, for the same retroactive
+        reason as in `get_smart_initial_with_summary` — scrolling back must not
+        re-surface what the initial burst filtered out.
         """
         if before_timestamp is None:
             before_timestamp = now_ms()
@@ -552,9 +617,14 @@ class QueryMixin(StorageBase):
 
         rows = await self._query(query, params)
 
+        # has_more stays keyed on the RAW row count, deliberately: a page whose
+        # rows are all filtered out must still report has_more so the client keeps
+        # walking backwards instead of concluding it reached the start of history.
         has_more = len(rows) > limit
         result = [
-            json.dumps(self._build_message_dict(row), ensure_ascii=False) for row in rows[:limit]
+            emitted
+            for row in rows[:limit]
+            if (emitted := _emit_row(self._build_message_dict(row), blocklist_filter)) is not None
         ]
         result.reverse()
         return {"messages": result, "has_more": has_more}

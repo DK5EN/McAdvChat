@@ -60,6 +60,9 @@ async def run_migration_chain_tests() -> bool:
     await _test_v22_signal_via_column(results)
     await _test_v23_frozen_cache_scrub(results)
     await _test_v24_fcs_ok_column(results)
+    await _test_v26_placeholder_station_scrub(results)
+    await _test_v27_gw_lora_mod_scrub(results)
+    await _test_v28_uptime_gap_scrub(results)
 
     for label, ok in results:
         print(f"    {'✅ PASS' if ok else '❌ FAIL'} | {label}")
@@ -572,6 +575,304 @@ async def _test_v23_frozen_cache_scrub(results: list[tuple[str, bool]]) -> None:
                 (
                     "v23 scrub: telemetry history is left alone (cache-only fix)",
                     tele[0]["n"] == 1,  # genuine_zero's 0.0 °C row
+                )
+            )
+        finally:
+            await storage.close()
+
+
+async def _test_v26_placeholder_station_scrub(results: list[tuple[str, bool]]) -> None:
+    """Seed a pre-v26 fixture holding placeholder-callsign station rows and assert
+    the v26 step removes them while leaving a real station untouched.
+
+    `XX0XXX-00` is the MeshCom firmware's factory default (esp32_flash.h
+    `node_call`) and a valid callsign SHAPE, so nothing rejected it before the
+    runtime guard landed. One such row appeared on mcapp.local within minutes of
+    deploying v2.0.2-dev.1. Every unconfigured node in the field shares that one
+    callsign, so the row is a mixture of all of them and means nothing about any
+    single station — hence delete, not rewrite.
+
+    `messages` is deliberately NOT scrubbed: an unconfigured node's traffic stays
+    visible, because noticing it is how the node gets configured. That is asserted
+    here so a future "tidy up" cannot quietly widen the scrub.
+    """
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        db_path = Path(tmp_dir) / "migration_chain_v26.db"
+
+        def _create_v25_db() -> None:
+            with db_write(db_path) as conn:
+                conn.executescript(CREATE_SCHEMA_SQL)
+                conn.executescript(CREATE_SCHEMA_V2_SQL)
+                conn.execute("DELETE FROM schema_version")
+                conn.execute("INSERT INTO schema_version (version) VALUES (25)")
+                for call in ("XX0XXX-00", "xx0xxx-12", "DK0XXX", "DX0XXX-1", "OE1REAL-1"):
+                    conn.execute(
+                        "INSERT INTO station_positions (callsign, rssi, snr, last_seen)"
+                        " VALUES (?, ?, ?, ?)",
+                        (call, -90, 3, BASE_TS),
+                    )
+                    conn.execute(
+                        "INSERT INTO signal_log (callsign, timestamp, rssi, snr)"
+                        " VALUES (?, ?, ?, ?)",
+                        (call, BASE_TS, -90, 3),
+                    )
+                conn.execute(
+                    "INSERT INTO messages (msg_id, src, dst, msg, type, timestamp, src_type)"
+                    " VALUES (?, ?, ?, ?, ?, ?, ?)",
+                    ("PRE0V26T", "XX0XXX-00", "*", "hi", "msg", BASE_TS, "ble"),
+                )
+                conn.commit()
+
+        await asyncio.to_thread(_create_v25_db)
+
+        try:
+            storage = await create_sqlite_storage(db_path)
+        except Exception:
+            logger.exception("v26 placeholder scrub migration raised")
+            results.append(("v26 placeholder scrub: migrator runs v25→HEAD without error", False))
+            return
+
+        results.append(("v26 placeholder scrub: migrator runs v25→HEAD without error", True))
+        try:
+            version = await _schema_version(storage)
+            results.append(
+                (
+                    f"v26 placeholder scrub: final schema_version marker is {FINAL_SCHEMA_VERSION}",
+                    version == FINAL_SCHEMA_VERSION,
+                )
+            )
+
+            for table in ("station_positions", "signal_log"):
+                left = await storage._query(
+                    f"SELECT callsign FROM {table} ORDER BY callsign"  # noqa: S608 - fixed literal tuple
+                )
+                names = [r["callsign"] for r in left]
+                results.append(
+                    (
+                        f"v26 placeholder scrub: {table} keeps ONLY the real station",
+                        names == ["OE1REAL-1"],
+                    )
+                )
+
+            msg = await storage._query("SELECT * FROM messages WHERE msg_id = ?", ("PRE0V26T",))
+            results.append(
+                (
+                    (
+                        "v26 placeholder scrub: a placeholder's MESSAGES are deliberately"
+                        " kept (traffic stays visible; only the station identity is refused)"
+                    ),
+                    bool(msg) and msg[0]["src"] == "XX0XXX-00",
+                )
+            )
+        finally:
+            await storage.close()
+
+
+async def _test_v28_uptime_gap_scrub(results: list[tuple[str, bool]]) -> None:
+    """Seed a pre-v28 fixture of `link_uptime_segments` and assert the v28 step
+    removes only the gaps that were never outages.
+
+    The {CET} cadence was halved upstream (303 s → 606.5 s), which put it above
+    the old 6-min `GAP_TOLERANCE_MS`, so every healthy cycle was logged as a
+    `gap`. The scrub is bounded on BOTH sides and this test pins both bounds:
+
+      * a short gap AFTER the 2026-08-27 07:45:59 cutoff is a normal cycle → gone
+      * a short gap BEFORE it is ambiguous (the cadence still alternated) → KEPT
+      * a long gap after the cutoff is a real outage under either tolerance → KEPT
+    """
+    cutoff = 1787809559726  # 2026-08-27 07:45:59, see migrations.py v28
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        db_path = Path(tmp_dir) / "migration_chain_v28.db"
+
+        def _create_v27_db() -> None:
+            with db_write(db_path) as conn:
+                conn.executescript(CREATE_SCHEMA_SQL)
+                conn.executescript(CREATE_SCHEMA_V2_SQL)
+                conn.execute("DELETE FROM schema_version")
+                conn.execute("INSERT INTO schema_version (version) VALUES (27)")
+                # link_uptime_segments is created by migration v25, not by the
+                # base schema, so a v27 fixture has to stand it up itself.
+                conn.executescript("""
+                    CREATE TABLE IF NOT EXISTS link_uptime_segments (
+                        start_ms INTEGER PRIMARY KEY,
+                        end_ms   INTEGER NOT NULL,
+                        kind     TEXT    NOT NULL
+                    );
+                    CREATE TABLE IF NOT EXISTS link_uptime_state (
+                        id                INTEGER PRIMARY KEY CHECK (id = 1),
+                        first_observed_ms INTEGER,
+                        last_beacon_ms    INTEGER,
+                        last_tick_ms      INTEGER,
+                        open_up_start_ms  INTEGER
+                    );
+                """)
+                # start_ms is the PRIMARY KEY, so every row needs a distinct one.
+                rows = [
+                    # (start, end, kind) — 606_000 ms = 10.1 min, one normal cycle
+                    (cutoff + 60_000, cutoff + 60_000 + 606_000, "gap"),  # scrubbed
+                    (cutoff - 3_600_000, cutoff - 3_600_000 + 606_000, "gap"),  # kept: ambiguous
+                    (cutoff + 7_200_000, cutoff + 7_200_000 + 3_600_000, "gap"),  # kept: real
+                    (cutoff + 120_000, cutoff + 120_000 + 606_000, "dark"),  # kept: not a gap
+                ]
+                conn.executemany(
+                    "INSERT INTO link_uptime_segments (start_ms, end_ms, kind) VALUES (?, ?, ?)",
+                    rows,
+                )
+                conn.commit()
+
+        await asyncio.to_thread(_create_v27_db)
+
+        try:
+            storage = await create_sqlite_storage(db_path)
+        except Exception:
+            logger.exception("v28 uptime gap scrub migration raised")
+            results.append(("v28 uptime gap scrub: migrator runs v27→HEAD without error", False))
+            return
+
+        results.append(("v28 uptime gap scrub: migrator runs v27→HEAD without error", True))
+        try:
+            version = await _schema_version(storage)
+            results.append(
+                (
+                    f"v28 uptime gap scrub: final schema_version marker is {FINAL_SCHEMA_VERSION}",
+                    version == FINAL_SCHEMA_VERSION,
+                )
+            )
+
+            kept = await storage._query(
+                "SELECT start_ms, end_ms, kind FROM link_uptime_segments ORDER BY start_ms", ()
+            )
+            results.append(
+                (
+                    (
+                        "v28 uptime gap scrub: a short gap after the cutoff is removed"
+                        " (a normal cycle at the new cadence, never an outage)"
+                    ),
+                    not any(
+                        r["kind"] == "gap"
+                        and r["start_ms"] == cutoff + 60_000
+                        and r["end_ms"] - r["start_ms"] <= 720_000
+                        for r in kept
+                    ),
+                )
+            )
+            results.append(
+                (
+                    (
+                        "v28 uptime gap scrub: a short gap BEFORE the cutoff is kept"
+                        " (cadence still alternated there — may be a real 2-cycle outage)"
+                    ),
+                    any(r["kind"] == "gap" and r["start_ms"] == cutoff - 3_600_000 for r in kept),
+                )
+            )
+            results.append(
+                (
+                    (
+                        "v28 uptime gap scrub: a gap longer than GAP_TOLERANCE_MS is kept"
+                        " (a real outage under either tolerance)"
+                    ),
+                    any(r["kind"] == "gap" and r["start_ms"] == cutoff + 7_200_000 for r in kept),
+                )
+            )
+            results.append(
+                (
+                    (
+                        "v28 uptime gap scrub: a 'dark' row is never touched"
+                        " (COVERAGE, not UPTIME — a different claim)"
+                    ),
+                    any(r["kind"] == "dark" for r in kept),
+                )
+            )
+        finally:
+            await storage.close()
+
+
+async def _test_v27_gw_lora_mod_scrub(results: list[tuple[str, bool]]) -> None:
+    """Seed a pre-v27 fixture holding stale `gw`/`lora_mod` values and assert the
+    v27 step repairs both (doc/hey-path-fixes.md F1/F6).
+
+    `gw`: until this wave, `transform_mh` emitted `GW` on every MH frame, not
+    only on a HEY (`PLT == '@'`), so a stored `gw = 0` is not recoverable — it
+    may be a real "not a gateway" or a meaningless `0` from some other frame
+    type. Every stored `0` is nulled and re-learned from the next HEY; a
+    stored `1` is left untouched (a real gateway is not un-learned).
+
+    `lora_mod`: the firmware packs `msg_source_mod = (getMOD() & 0xF) |
+    (node_country << 4)` (aprs_functions.cpp:113). A stored packed byte (e.g.
+    `131 == 0x83`, country 8 + modulation 3) is masked down to the low nibble
+    (`3`); a NULL `lora_mod` (never observed) stays NULL.
+    """
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        db_path = Path(tmp_dir) / "migration_chain_v27.db"
+
+        def _create_v26_db() -> None:
+            with db_write(db_path) as conn:
+                conn.executescript(CREATE_SCHEMA_SQL)
+                conn.executescript(CREATE_SCHEMA_V2_SQL)
+                conn.execute("DELETE FROM schema_version")
+                conn.execute("INSERT INTO schema_version (version) VALUES (26)")
+                conn.execute(
+                    "INSERT INTO station_positions (callsign, gw, lora_mod, last_seen)"
+                    " VALUES (?, ?, ?, ?)",
+                    ("OE1STALE-1", 0, 131, BASE_TS),
+                )
+                conn.execute(
+                    "INSERT INTO station_positions (callsign, gw, lora_mod, last_seen)"
+                    " VALUES (?, ?, ?, ?)",
+                    ("OE1GATE-1", 1, None, BASE_TS),
+                )
+                conn.commit()
+
+        await asyncio.to_thread(_create_v26_db)
+
+        try:
+            storage = await create_sqlite_storage(db_path)
+        except Exception:
+            logger.exception("v27 gw/lora_mod scrub migration raised")
+            results.append(("v27 gw/lora_mod scrub: migrator runs v26→HEAD without error", False))
+            return
+
+        results.append(("v27 gw/lora_mod scrub: migrator runs v26→HEAD without error", True))
+        try:
+            version = await _schema_version(storage)
+            results.append(
+                (
+                    f"v27 gw/lora_mod scrub: final schema_version marker is {FINAL_SCHEMA_VERSION}",
+                    version == FINAL_SCHEMA_VERSION,
+                )
+            )
+
+            stale = await storage._query(
+                "SELECT gw, lora_mod FROM station_positions WHERE callsign = ?",
+                ("OE1STALE-1",),
+            )
+            results.append(
+                (
+                    "v27 gw/lora_mod scrub: gw = 0 is nulled (unrecoverable, re-learned)",
+                    bool(stale) and stale[0]["gw"] is None,
+                )
+            )
+            results.append(
+                (
+                    "v27 gw/lora_mod scrub: lora_mod 131 (0x83) is masked to 3 (low nibble)",
+                    bool(stale) and stale[0]["lora_mod"] == 3,
+                )
+            )
+
+            gateway = await storage._query(
+                "SELECT gw, lora_mod FROM station_positions WHERE callsign = ?",
+                ("OE1GATE-1",),
+            )
+            results.append(
+                (
+                    "v27 gw/lora_mod scrub: gw = 1 is left untouched",
+                    bool(gateway) and gateway[0]["gw"] == 1,
+                )
+            )
+            results.append(
+                (
+                    "v27 gw/lora_mod scrub: lora_mod NULL stays NULL",
+                    bool(gateway) and gateway[0]["lora_mod"] is None,
                 )
             )
         finally:

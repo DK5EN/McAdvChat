@@ -19,7 +19,13 @@ from typing import Any
 from .ble_client import BLEMode, ConnectionState, create_ble_client
 from .commands import create_command_handler
 from .commands.constants import CALLSIGN_STRICT_RE
-from .commands.parsing import dst_kind, is_group, normalize_unified, strip_relay_path
+from .commands.parsing import (
+    SPAM_GROUP,
+    dst_kind,
+    is_group,
+    normalize_unified,
+    strip_relay_path,
+)
 from .config_loader import (
     BLE_SERVICE_URL,
     MESHCOM_UDP_PORT,
@@ -59,6 +65,7 @@ from .classifier import Classifier
 from .classifier.seed import seed_defaults
 from .classifier.types import SSEEvent
 from .sqlite_storage import SQLiteStorage, create_sqlite_storage
+from .util import PLACEHOLDER_CALLSIGN_BASES as _PLACEHOLDER_CALLSIGN_BASES
 from .util import now_ms
 
 _MSG_PREVIEW_CHARS = 20
@@ -96,14 +103,11 @@ BLE_REGISTER_TYPES = ("I", "SN", "G", "SA", "SE", "S1", "SW", "S2", "W", "AN", "
 # that hardware and warns forever for a register that will never arrive.
 REQUIRED_BLE_REGISTER_TYPES = frozenset({"I", "SN", "G", "SA"})
 
-# Callsign bases that mean "nobody has configured this yet". Each is a valid
-# callsign SHAPE, so CALLSIGN_STRICT_RE accepts them and only an explicit list can
-# tell them apart from a real station. Compared against the SSID-stripped base, so
-# XX0XXX-00 and XX0XXX-12 are both caught.
-#   XX0XXX  MeshCom firmware factory default (esp32/esp32_flash.h node_call)
-#   DK0XXX  CommandHandler's own my_callsign default (commands/handler.py)
-#   DX0XXX  UDPConfig's default target (config_loader.py)
-PLACEHOLDER_CALLSIGN_BASES = frozenset({"XX0XXX", "DK0XXX", "DX0XXX"})
+# Re-exported from util so `main.PLACEHOLDER_CALLSIGN_BASES` keeps resolving for
+# existing import sites. The definition moved to util.py when transform_mh needed
+# it too and could not import main.py without a cycle — see util.py for the list
+# and why each entry is on it.
+PLACEHOLDER_CALLSIGN_BASES = _PLACEHOLDER_CALLSIGN_BASES
 
 VERSION = f"v{__version__}"
 
@@ -185,6 +189,23 @@ BLE_RECONCILE_FIRST_CHECK_DELAY_S = 15.0
 BLE_RECONCILE_BACKOFF_DELAY_S = 60.0
 BLE_RECONCILE_STEADY_INTERVAL_S = 600.0
 
+# Consecutive identical steady-cadence "missing TYPs" observations before the
+# reconciler's de-spam state machine (see _log_missing_registers_despammed)
+# escalates from a repeating WARNING to exactly ONE escalation WARNING and
+# then goes quiet (DEBUG only) for as long as the set stays unchanged. In
+# wall-clock terms that is BLE_RECONCILE_ESCALATION_THRESHOLD *
+# BLE_RECONCILE_STEADY_INTERVAL_S = 6 * 600s = 1 hour: long enough that this
+# is clearly not a hydration sweep still catching up or a replay still
+# landing, short enough that whoever is on shift when it starts still sees
+# it. THE MOTIVATING CASE: a firmware bug made one register permanently
+# unparseable and the un-de-spammed reconciler logged the identical
+# unactionable "missing TYPs ['I']" WARNING every 10 minutes for over 9 hours
+# (55 times) with nothing pointing at the real cause, which was visible only
+# in a different systemd unit's journal (ble_service dropping the frame as
+# truncated) -- see _log_missing_registers_despammed for where that pointer
+# now lives.
+BLE_RECONCILE_ESCALATION_THRESHOLD = 6
+
 # Minimum movement, in degrees, before the node's live GPS position is written
 # back to the runtime overlay. NOT a debounce against jitter alone: MeshCom
 # firmware rounds the fix to 4 decimals (`cround4` in gps_functions.cpp, ~11 m),
@@ -207,6 +228,118 @@ _LON_LIMIT_DEG = 180.0
 
 # Module logger
 logger = get_logger(__name__)
+
+
+@dataclass
+class _ReconcileCheckResult:
+    """Outcome of one `MessageRouter._reconcile_check_once` call.
+
+    `missing` carries the still-incomplete register set back to
+    `_run_ble_register_reconciler`'s de-spam state machine ONLY when this
+    check landed at steady cadence with the link CONNECTED and registers
+    still missing -- the one case that state machine needs to see. Every
+    other outcome (no client, link not CONNECTED/CONNECTING, cache complete,
+    link stuck CONNECTING, or a check that has not yet reached steady
+    cadence) carries None: there is nothing to de-spam, either because the
+    condition already resolved a different way or because silence at this
+    cadence step was always the correct behaviour, unchanged from before this
+    de-spam mechanism existed.
+    """
+
+    keep_looping: bool
+    missing: frozenset[str] | None = None
+
+
+@dataclass
+class _ReconcileMissingRegistersDespam:
+    """De-spam state for the "missing TYPs" steady-cadence WARNING, scoped to
+    ONE `_run_ble_register_reconciler` run -- a fresh call always constructs
+    a fresh instance, so re-arming the reconciler (`arm_ble_register_reconciler`)
+    always re-arms the WARNING too, exactly as if the condition were new.
+
+    `last_missing` is the most recently observed missing set at steady
+    cadence. `repeat_count` counts consecutive steady-cadence observations of
+    THAT set, starting at 1 on the observation that logged the initial
+    WARNING. `escalated` latches once the single escalation WARNING has fired
+    for the current set, so nothing above DEBUG logs again until the set
+    changes (which resets all three fields, see
+    `_log_missing_registers_despammed`).
+    """
+
+    last_missing: frozenset[str] | None = None
+    repeat_count: int = 0
+    escalated: bool = False
+
+
+def _log_missing_registers_despammed(
+    reason: str, missing: frozenset[str], state: _ReconcileMissingRegistersDespam
+) -> None:
+    """Log one steady-cadence "missing TYPs" observation at the right level,
+    mutating `state` in place. Free function (not a MessageRouter method)
+    because it needs no instance state beyond what `_run_ble_register_reconciler`
+    already tracks locally and passes in -- see that method's docstring for
+    why the state itself lives there and not on the router.
+
+    A NEW or CHANGED missing set always logs WARNING immediately (an operator
+    must still see the first occurrence of any given failure mode promptly,
+    same as before this de-spam mechanism existed) and resets the run to
+    repeat_count=1, escalated=False. An UNCHANGED set logs DEBUG on every
+    repeat until repeat_count reaches BLE_RECONCILE_ESCALATION_THRESHOLD, at
+    which point it logs exactly ONE escalation WARNING naming the likely
+    cause -- the register is most likely being received by ble_service and
+    then discarded as unparseable, not lost on the wire, per the incident
+    BLE_RECONCILE_ESCALATION_THRESHOLD's docstring records -- and points at
+    `journalctl -u mcapp-ble.service` for the "Dropped BLE register update"
+    line that names it. After that it latches to DEBUG for as long as the set
+    stays unchanged, so the operator who already saw the escalation is never
+    shown it again for a condition that has not changed.
+    """
+    if missing != state.last_missing:
+        state.last_missing = missing
+        state.repeat_count = 1
+        state.escalated = False
+        logger.warning(
+            "BLE register cache incomplete, missing TYPs %s (%s)", sorted(missing), reason
+        )
+        return
+
+    state.repeat_count += 1
+
+    if state.escalated:
+        logger.debug(
+            "BLE register reconciler (%s): missing TYPs %s still unchanged since "
+            "escalation (observation %d)",
+            reason,
+            sorted(missing),
+            state.repeat_count,
+        )
+        return
+
+    if state.repeat_count < BLE_RECONCILE_ESCALATION_THRESHOLD:
+        logger.debug(
+            "BLE register reconciler (%s): missing TYPs %s unchanged "
+            "(%d/%d steady-cadence observations before escalation)",
+            reason,
+            sorted(missing),
+            state.repeat_count,
+            BLE_RECONCILE_ESCALATION_THRESHOLD,
+        )
+        return
+
+    state.escalated = True
+    persisted_minutes = state.repeat_count * BLE_RECONCILE_STEADY_INTERVAL_S / 60.0
+    logger.warning(
+        "BLE register cache still missing TYPs %s after %d consecutive steady-cadence "
+        "checks (~%.0f min, %s) -- this register is most likely being RECEIVED by "
+        "ble_service and then discarded as unparseable, not lost on the wire; check "
+        "`journalctl -u mcapp-ble.service` for a 'Dropped BLE register update' entry. "
+        "This will keep being retried but will not warn again unless the missing set "
+        "changes.",
+        sorted(missing),
+        state.repeat_count,
+        persisted_minutes,
+        reason,
+    )
 
 
 block_list = [
@@ -426,6 +559,29 @@ class MessageRouter:
             return "redirect"
         return "drop"
 
+    def filter_history_row(self, row: dict[str, Any]) -> dict[str, Any] | None:
+        """Apply the blocklist to one row on the way OUT of storage.
+
+        `blocklist_decision` only ever ran on ingest and on the live broadcast,
+        which made blocking purely forward-looking: every row a station had
+        already deposited before it was blocked stayed in `messages.db` and was
+        replayed to every client, on every reload, forever. Since the sperrliste
+        is curated centrally and lands on nodes we do not administer, deleting
+        those rows host by host is not a fix — the read path has to filter them.
+
+        Same shared decision as every other surface, so the semantics do not
+        fork: personal/position traffic is dropped, group/broadcast/hashtag
+        traffic is quarantined to SPAM_GROUP (still inspectable, out of normal
+        views). Returns the row to emit — possibly a dst-rewritten COPY, never a
+        mutation of the caller's dict — or None to drop it.
+        """
+        decision = self.blocklist_decision(row)
+        if decision == "drop":
+            return None
+        if decision == "redirect":
+            return {**row, "dst": SPAM_GROUP}
+        return row
+
     def register_protocol(self, name: str, handler: Any) -> None:
         """Register a protocol handler (UDP, BLE, WebSocket)"""
         self._protocols[name] = handler
@@ -591,7 +747,9 @@ class MessageRouter:
         if self.storage_handler is None:
             self._logger.warning("_handle_smart_initial_command: no storage_handler, skipping")
             return
-        initial_data, summary = await self.storage_handler.get_smart_initial_with_summary()
+        initial_data, summary = await self.storage_handler.get_smart_initial_with_summary(
+            blocklist_filter=self.filter_history_row
+        )
         acks_list = initial_data.get("acks", [])
 
         self._logger.debug(
@@ -713,7 +871,9 @@ class MessageRouter:
         src = params.get("src") or self.my_callsign
         request_id = params.get("request_id")
 
-        page_data = await self.storage_handler.get_messages_page(dst, before, limit, src=src)
+        page_data = await self.storage_handler.get_messages_page(
+            dst, before, limit, src=src, blocklist_filter=self.filter_history_row
+        )
         payload = {
             "type": "response",
             "msg": "messages_page",
@@ -1219,33 +1379,43 @@ class MessageRouter:
         logger.debug("BLE register reconciler armed (%s)", reason)
         return True
 
-    async def _reconcile_check_once(self, reason: str, delay: float) -> bool:
-        """One reconciler check. Returns True to keep looping, False to
-        disarm. Split out of `_run_ble_register_reconciler` purely to keep
-        that method's branch count under ruff's ceiling — there is no other
-        caller and no state lives here between calls.
+    async def _reconcile_check_once(self, reason: str, delay: float) -> _ReconcileCheckResult:
+        """One reconciler check. Returns a `_ReconcileCheckResult` whose
+        `keep_looping` tells the caller whether to keep looping or disarm.
+        Split out of `_run_ble_register_reconciler` purely to keep that
+        method's branch count under ruff's ceiling — there is no other
+        caller and no state lives here between calls (the de-spam state DOES
+        live between calls, but it lives in the caller's local, passed
+        nowhere near here — see `_run_ble_register_reconciler`).
 
-        Bails (returns False) if the BLE client is gone or reports
-        DISCONNECTED/ERROR/DISCONNECTING. Keeps looping (returns True,
+        Disarms (`keep_looping=False`) if the BLE client is gone or reports
+        DISCONNECTED/ERROR/DISCONNECTING. Keeps looping (`keep_looping=True`,
         without asking for a sweep — there is nothing to sweep yet) if it
-        reports CONNECTING. Disarms silently (returns False) once
-        `cached_ble_registers` covers every REQUIRED_BLE_REGISTER_TYPES.
-        Otherwise asks for another sweep via `schedule_ble_register_hydration`,
-        with `skip_if_complete=True` — `missing` was non-empty at THIS check,
-        but the requested sweep only actually runs after its own initial
-        delay, and by then a CONFFIN-driven burst still draining or a replay
+        reports CONNECTING. Disarms silently once `cached_ble_registers`
+        covers every REQUIRED_BLE_REGISTER_TYPES. Otherwise asks for another
+        sweep via `schedule_ble_register_hydration`, with
+        `skip_if_complete=True` — `missing` was non-empty at THIS check, but
+        the requested sweep only actually runs after its own initial delay,
+        and by then a CONFFIN-driven burst still draining or a replay
         elsewhere may have finished the job on its own; asking it to check
         again immediately before sweeping avoids paying the full ~9 s of RF
         for nothing (its own single-flight guard may also SKIP this outright
         — that is fine, it means one is already running, and the caller
         re-checks on its own cadence regardless of whether that particular
         request was skipped, completeness-skipped, or acted on) and returns
-        True.
+        `keep_looping=True`.
 
         `delay` is the CURRENT cadence step (the one just slept), passed in
-        only to decide whether THIS check has reached the steady cadence and
-        therefore warrants a WARNING instead of silence — it plays no part
-        in choosing the next delay, which the caller computes.
+        only to decide whether THIS check has reached the steady cadence —
+        it plays no part in choosing the next delay, which the caller
+        computes. THIS METHOD DOES NOT DECIDE THE LOG LEVEL for a non-empty
+        missing set: at steady cadence it hands the missing set back to the
+        caller via the result's `missing` field (None otherwise) and lets
+        `_run_ble_register_reconciler`'s de-spam state machine
+        (`_log_missing_registers_despammed`) decide WARNING vs. DEBUG vs. the
+        one-shot escalation. That decision needs state carried across many
+        calls, which does not belong here (see the branch-count note above);
+        this method stays a stateless per-check fact-finder.
 
         CONNECTING IS NOT A DISARM REASON (advisor rework R1b). ble_service
         pushes `reconnecting` (-> CONNECTING) before `connected` on EVERY
@@ -1261,12 +1431,16 @@ class MessageRouter:
         reaches the steady 600s WARNING eventually, worded slightly
         differently from the "missing TYPs" one since there is no register
         list to name yet) — this just doesn't give up on it, and doesn't
-        waste a sweep request on a link that cannot answer one.
+        waste a sweep request on a link that cannot answer one. This
+        WARNING is deliberately NOT de-spammed like the "missing TYPs" one:
+        it repeats every steady-cadence check for as long as the link stays
+        stuck CONNECTING, unchanged from before this de-spam mechanism
+        existed.
         """
         client = self._get_ble_client()
         if client is None:
             logger.debug("BLE register reconciler (%s): no BLE client, disarming", reason)
-            return False
+            return _ReconcileCheckResult(keep_looping=False)
         if hasattr(client, "refresh_status"):
             status = await client.refresh_status()
         else:
@@ -1278,31 +1452,30 @@ class MessageRouter:
                 logger.warning(
                     "BLE register cache still incomplete — link stuck CONNECTING (%s)", reason
                 )
-            return True
+            return _ReconcileCheckResult(keep_looping=True)
 
         if status.state != ConnectionState.CONNECTED:
             logger.debug(
                 "BLE register reconciler (%s): link %s, disarming", reason, status.state.value
             )
-            return False
+            return _ReconcileCheckResult(keep_looping=False)
 
         missing = self._missing_required_ble_registers()
         if not missing:
             logger.debug(
                 "BLE register reconciler (%s): required registers complete, disarming", reason
             )
-            return False
+            return _ReconcileCheckResult(keep_looping=False)
 
-        if at_steady_cadence:
-            logger.warning(
-                "BLE register cache incomplete, missing TYPs %s (%s)", sorted(missing), reason
-            )
         self.schedule_ble_register_hydration(
             reason=f"register reconciler ({reason})",
             after_hello=False,
             skip_if_complete=True,
         )
-        return True
+        return _ReconcileCheckResult(
+            keep_looping=True,
+            missing=missing if at_steady_cadence else None,
+        )
 
     async def _run_ble_register_reconciler(self, reason: str) -> None:
         """Body of the reconciler loop armed by `arm_ble_register_reconciler`.
@@ -1314,15 +1487,38 @@ class MessageRouter:
         sleep BLE_RECONCILE_STEADY_INTERVAL_S between checks. See
         `_reconcile_check_once` for what one check actually does.
 
+        OWNS THE "MISSING TYPs" DE-SPAM STATE (`despam`, a
+        `_ReconcileMissingRegistersDespam`), scoped to THIS loop instance —
+        a local, not an attribute on `self`, so it starts fresh every time
+        this method runs and is discarded when it returns, deliberately: a
+        fresh arm of the reconciler (`arm_ble_register_reconciler`) means a
+        fresh run of this loop, which means the first steady-cadence
+        "missing TYPs" observation after re-arming always warrants a WARNING
+        again, exactly like a genuinely new occurrence. `_reconcile_check_once`
+        hands back the missing set (only when the check actually landed at
+        steady cadence with something missing; `None` otherwise) and this
+        loop feeds it to `_log_missing_registers_despammed`, which is what
+        actually decides WARNING vs. DEBUG vs. the one-shot escalation. The
+        decision lives in that free function, and the state lives in this
+        loop's local, specifically so `_reconcile_check_once` does not grow
+        the extra branches that decision would otherwise cost it (see that
+        method's docstring on ruff's branch-count ceiling) — this loop's own
+        branch count only grows by the one `if result.missing is not None`
+        guard below.
+
         NEVER RAISES, by the same construction and for the same reason as
         `_run_ble_register_hydration`: this runs fully detached from whatever
         armed it.
         """
         delay = BLE_RECONCILE_FIRST_CHECK_DELAY_S
+        despam = _ReconcileMissingRegistersDespam()
         try:
             while True:
                 await asyncio.sleep(delay)
-                if not await self._reconcile_check_once(reason, delay):
+                result = await self._reconcile_check_once(reason, delay)
+                if result.missing is not None:
+                    _log_missing_registers_despammed(reason, result.missing, despam)
+                if not result.keep_looping:
                     return
                 delay = (
                     BLE_RECONCILE_STEADY_INTERVAL_S

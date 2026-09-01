@@ -162,6 +162,17 @@ def _strip_non_scalar_fields(message: dict[str, Any]) -> list[str]:
     return dropped
 
 
+# Codepoints that join other codepoints into a single emoji grapheme. Whitelisted
+# wholesale in `is_allowed_char` because none of them survives its category test:
+#   U+200D  ZERO WIDTH JOINER      (Cf) — 🙋‍♂️, 👨‍👩‍👧, ⛹️‍♀️
+#   U+FE0E  VARIATION SELECTOR-15  (Mn) — text presentation
+#   U+FE0F  VARIATION SELECTOR-16  (Mn) — emoji presentation, full colour
+#   U+20E3  COMBINING ENCLOSING KEYCAP (Me) — 1️⃣
+# The tag range U+E0020..U+E007F (Cf, subdivision-flag sequences such as 🏴󠁧󠁢󠁳󠁣󠁴󠁿) is a
+# contiguous range and is tested separately.
+_EMOJI_SEQUENCE_GLUE = frozenset({0x200D, 0xFE0E, 0xFE0F, 0x20E3})
+
+
 def is_allowed_char(ch: str) -> bool:  # noqa: PLR0911 - complex handler kept intact
     """Check if character is allowed in our charset"""
     codepoint = ord(ch)
@@ -181,9 +192,17 @@ def is_allowed_char(ch: str) -> bool:  # noqa: PLR0911 - complex handler kept in
     if 0x5D <= codepoint <= 0x7E:  # noqa: PLR2004 - Unicode range boundary
         return True
 
-    # Allow Emoji Variation Selector
-    if codepoint == 0xFE0F:  # noqa: PLR2004 - Unicode range boundary
-        return True  # critical for full-color emoji rendering
+    # Allow the emoji-sequence glue. These carry no glyph of their own — they only
+    # bind neighbouring codepoints into ONE grapheme — so the category test below
+    # rejects every one of them (ZWJ and the tag characters are Cf, the variation
+    # selectors Mn, the keycap Me). Dropping one does not remove a character, it
+    # SPLITS a sequence the sender composed: `🙋\u200d♂\ufe0f` renders as two
+    # glyphs `🙋 ♂` once the ZWJ is gone (observed 2026-08-30 on the Extern-UDP copy
+    # of an outgoing message whose BLE copy — this filter's only bypass — was
+    # intact). U+FE0F alone was whitelisted here, which fixed the symptom for
+    # single-codepoint emoji and left every joined sequence broken.
+    if codepoint in _EMOJI_SEQUENCE_GLUE or 0xE0020 <= codepoint <= 0xE007F:  # noqa: PLR2004 - Unicode range boundary
+        return True
 
     # Reject surrogates, noncharacters
     if 0xD800 <= codepoint <= 0xDFFF:  # noqa: PLR2004 - Unicode range boundary

@@ -215,14 +215,32 @@ install_lighttpd() {
   if command -v lighttpd &>/dev/null; then
     log_info "  lighttpd already installed"
     configure_lighttpd
+    configure_lighttpd_ktls_workaround
     return 0
   fi
 
   apt-get install -y -qq lighttpd
 
   configure_lighttpd
+  configure_lighttpd_ktls_workaround
 
   log_ok "  lighttpd installed and configured"
+}
+
+configure_lighttpd_ktls_workaround() {
+  # lighttpd-mod-openssl ships /usr/lib/modules-load.d/lighttpd-mod-openssl.conf
+  # requesting the `tls` kernel module (kTLS offload). The RPi kernel
+  # (rpt-rpi-v8) does not include this module, so systemd-modules-load logs
+  # "Failed to find module 'tls'" on every boot. kTLS is a performance
+  # optimisation — lighttpd's mod_openssl works correctly without it.
+  # A modprobe install override makes the load request a silent no-op.
+  local modprobe_conf="/etc/modprobe.d/no-ktls.conf"
+  if [[ -f "$modprobe_conf" ]] && grep -qF "install tls /bin/true" "$modprobe_conf" 2>/dev/null; then
+    log_info "  kTLS modprobe override already in place"
+    return 0
+  fi
+  printf '%s\n' "install tls /bin/true" > "$modprobe_conf"
+  log_ok "  kTLS modprobe override written (${modprobe_conf})"
 }
 
 configure_lighttpd() {
@@ -485,7 +503,61 @@ install_caddy() {
     log_ok "  Caddy installed ($(caddy version 2>/dev/null | head -1))"
   fi
 
+  configure_caddy_sudo
   configure_caddy
+}
+
+configure_caddy_sudo() {
+  # Caddy installs its local-CA root cert via two sudo calls:
+  #   sudo tee /usr/local/share/ca-certificates/<CA>.crt
+  #   sudo update-ca-certificates
+  # Both fail without a sudoers rule. Additionally, ProtectSystem=full in the
+  # package-shipped caddy.service makes /usr and /etc read-only for the service
+  # mount namespace — even root-owned child processes can't write there. A
+  # systemd drop-in with ReadWritePaths is required alongside the sudoers grant.
+
+  # 1. Sudoers drop-in
+  local sudoers_file="/etc/sudoers.d/caddy-ca"
+  local marker="caddy ALL=(root) NOPASSWD: /usr/bin/tee /usr/local/share/ca-certificates/*"
+  if [[ -f "$sudoers_file" ]] && grep -qF "$marker" "$sudoers_file" 2>/dev/null \
+      && grep -qF "update-ca-certificates" "$sudoers_file" 2>/dev/null; then
+    log_info "  caddy sudoers rules already in place"
+  else
+    {
+      printf '%s\n' "caddy ALL=(root) NOPASSWD: /usr/bin/tee /usr/local/share/ca-certificates/*"
+      printf '%s\n' "caddy ALL=(root) NOPASSWD: /usr/sbin/update-ca-certificates"
+    } > "$sudoers_file"
+    chmod 440 "$sudoers_file"
+    if visudo -c -f "$sudoers_file" &>/dev/null; then
+      log_ok "  caddy sudoers drop-in written (/etc/sudoers.d/caddy-ca)"
+    else
+      log_error "  caddy sudoers rule failed validation — removing"
+      rm -f "$sudoers_file"
+      return 1
+    fi
+  fi
+
+  # 2. Systemd drop-in — lift ProtectSystem=full read-only restriction for the
+  #    two paths that CA cert installation writes to.
+  local dropin_dir="/etc/systemd/system/caddy.service.d"
+  local dropin_file="${dropin_dir}/ca-trust.conf"
+  local dropin_marker="ReadWritePaths=/etc/ssl/certs"
+  if [[ -f "$dropin_file" ]] && grep -qF "$dropin_marker" "$dropin_file" 2>/dev/null; then
+    log_info "  caddy systemd drop-in already in place"
+  else
+    mkdir -p "$dropin_dir"
+    cat > "$dropin_file" <<'DROPIN'
+[Service]
+# Allow Caddy and its subprocesses (sudo tee + sudo update-ca-certificates) to
+# install the local-CA root certificate into the system trust store.
+# ProtectSystem=full (from the package unit) makes /usr and /etc read-only for
+# this service's mount namespace; without this override, both sudo calls fail.
+ReadWritePaths=/usr/local/share/ca-certificates
+ReadWritePaths=/etc/ssl/certs
+DROPIN
+    systemctl daemon-reload
+    log_ok "  caddy systemd drop-in written (${dropin_file})"
+  fi
 }
 
 configure_caddy() {

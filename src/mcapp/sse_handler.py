@@ -234,7 +234,38 @@ class SSEManager:
         """
         storage = self._get_storage_or_none()
         if storage:
-            initial_data, summary = await storage.get_smart_initial_with_summary()
+            # V9.4/V9.5: blocked callsigns (sperrliste loaded server-side + admin
+            # kickbans), owned by the CommandHandler. Always emitted, including
+            # `[]` (V9.5) — unlike blocked_texts/hidden_destinations, the webapp
+            # fully REPLACES its blocklist on every received event, so gating
+            # this burst on non-empty content left a client that reconnected
+            # after an admin `!kb delall` (a non-empty-gated mutation broadcast)
+            # stuck with its stale non-empty blocklist forever. mc-chat's
+            # meshcom_mock/api.py carries the same fix.
+            #
+            # FIRST in the burst, before smart_initial: the webapp applies this
+            # set at its single ingest chokepoint (messageProcessor), so anything
+            # delivered ahead of it is admitted with an EMPTY blocklist and stays
+            # on screen. Emitting history first is exactly why a blocked station's
+            # messages survived every reload. Order is load-bearing — do not sort
+            # this back down among the other snapshots.
+            command_handler = (
+                self.message_router.get_protocol("commands") if self.message_router else None
+            )
+            blocked_callsigns = sorted(getattr(command_handler, "blocked_callsigns", set()))
+            yield self.format_sse_event(
+                {
+                    "type": "response",
+                    "msg": "blocked_callsigns",
+                    "data": blocked_callsigns,
+                },
+                SSEManager._RESPONSE_EVENT_MAP["blocked_callsigns"],
+            )
+            initial_data, summary = await storage.get_smart_initial_with_summary(
+                blocklist_filter=(
+                    self.message_router.filter_history_row if self.message_router else None
+                )
+            )
             logger.debug(
                 "SSE client %s: sending smart_initial (%d msgs, %d pos, %d acks)",
                 client_id,
@@ -289,26 +320,6 @@ class SSEManager:
                     },
                     SSEManager._RESPONSE_EVENT_MAP["blocked_texts"],
                 )
-            # V9.4/V9.5: blocked callsigns (sperrliste loaded server-side + admin
-            # kickbans), owned by the CommandHandler. Always emitted, including
-            # `[]` (V9.5) — unlike blocked_texts/hidden_destinations, the webapp
-            # fully REPLACES its blocklist on every received event, so gating
-            # this burst on non-empty content left a client that reconnected
-            # after an admin `!kb delall` (a non-empty-gated mutation broadcast)
-            # stuck with its stale non-empty blocklist forever. mc-chat's
-            # meshcom_mock/api.py carries the same fix.
-            command_handler = (
-                self.message_router.get_protocol("commands") if self.message_router else None
-            )
-            blocked_callsigns = sorted(getattr(command_handler, "blocked_callsigns", set()))
-            yield self.format_sse_event(
-                {
-                    "type": "response",
-                    "msg": "blocked_callsigns",
-                    "data": blocked_callsigns,
-                },
-                SSEManager._RESPONSE_EVENT_MAP["blocked_callsigns"],
-            )
             sidebar = await storage.get_mheard_sidebar()
             if sidebar:
                 yield self.format_sse_event(

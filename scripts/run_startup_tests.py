@@ -27,12 +27,15 @@ from ble_service_tests import run_ble_service_tests
 from bootstrap_pinning_tests import run_bootstrap_pinning_tests
 from caddy_config_tests import run_caddy_config_tests
 from config_migration_tests import run_config_migration_tests
+from release_prep_tests import run_release_prep_tests
 from system_converge_tests import run_system_converge_tests
 from update_runner_tests import run_update_runner_tests
+from webapp_deploy_tests import run_webapp_deploy_tests
 
 from mcapp.aprs_symbol_tests import run_aprs_symbol_tests
 from mcapp.ble_hydration_tests import run_ble_hydration_tests
 from mcapp.ble_protocol_tests import run_ble_protocol_tests
+from mcapp.blocklist_history_tests import run_blocklist_history_tests
 from mcapp.classifier.tests import run_all_tests as run_classifier_tests
 from mcapp.commands.dedup_tests import run_dedup_tests
 from mcapp.commands.handler import create_command_handler
@@ -42,6 +45,7 @@ from mcapp.commands.parsing_tests import run_parsing_tests
 from mcapp.commands.routing_tests import run_routing_tests
 from mcapp.contract_parity_tests import run_contract_parity_tests
 from mcapp.dedup_contract_tests import run_dedup_contract_tests
+from mcapp.hey_path_tests import run_hey_path_tests
 from mcapp.identity_tests import run_identity_tests
 from mcapp.linkcheck_sse_tests import run_linkcheck_sse_tests
 from mcapp.linkcheck_tests import run_linkcheck_tests
@@ -55,6 +59,7 @@ from mcapp.storage.ack_status_tests import run_ack_status_tests
 from mcapp.storage.connection_lifecycle_tests import run_connection_lifecycle_tests
 from mcapp.storage.conversation_key_tests import run_conversation_key_tests
 from mcapp.storage.linkcheck_ingest_tests import run_linkcheck_ingest_tests
+from mcapp.storage.mheard_attribution_tests import run_mheard_attribution_tests
 from mcapp.storage.migration_chain_tests import run_migration_chain_tests
 from mcapp.storage.query_tests import run_query_tests
 from mcapp.storage.signal_via_tests import run_signal_via_tests
@@ -145,6 +150,12 @@ async def main() -> int:  # noqa: PLR0915 - flat suite registry; one visible lin
     signal_via_ok = await run_signal_via_tests()
     print(f"signal_via: {'PASS' if signal_via_ok else 'FAIL'}")
 
+    mheard_attribution_ok = await run_mheard_attribution_tests()
+    print(f"mheard_attribution: {'PASS' if mheard_attribution_ok else 'FAIL'}")
+
+    hey_path_ok = run_hey_path_tests()
+    print(f"hey_path: {'PASS' if hey_path_ok else 'FAIL'}")
+
     connection_lifecycle_ok = await run_connection_lifecycle_tests()
     print(f"connection_lifecycle: {'PASS' if connection_lifecycle_ok else 'FAIL'}")
 
@@ -156,6 +167,9 @@ async def main() -> int:  # noqa: PLR0915 - flat suite registry; one visible lin
 
     push_ok = await run_push_tests()
     print(f"push: {'PASS' if push_ok else 'FAIL'}")
+
+    blocklist_history_ok = await run_blocklist_history_tests()
+    print(f"blocklist_history: {'PASS' if blocklist_history_ok else 'FAIL'}")
 
     ble_protocol_ok = run_ble_protocol_tests()
     print(f"ble_protocol: {'PASS' if ble_protocol_ok else 'FAIL'}")
@@ -174,6 +188,12 @@ async def main() -> int:  # noqa: PLR0915 - flat suite registry; one visible lin
 
     bootstrap_pinning_ok = run_bootstrap_pinning_tests()
     print(f"bootstrap_pinning: {'PASS' if bootstrap_pinning_ok else 'FAIL'}")
+
+    release_prep_ok = run_release_prep_tests()
+    print(f"release_prep: {'PASS' if release_prep_ok else 'FAIL'}")
+
+    webapp_deploy_ok = run_webapp_deploy_tests()
+    print(f"webapp_deploy: {'PASS' if webapp_deploy_ok else 'FAIL'}")
 
     # The only suite that can be legitimately inapplicable: it drives a
     # bash-4-only installer function and macOS ships bash 3.2. It therefore
@@ -221,16 +241,21 @@ async def main() -> int:  # noqa: PLR0915 - flat suite registry; one visible lin
         and query_ok
         and migration_chain_ok
         and signal_via_ok
+        and mheard_attribution_ok
+        and hey_path_ok
         and connection_lifecycle_ok
         and uptime_ok
         and meteo_ok
         and push_ok
+        and blocklist_history_ok
         and ble_protocol_ok
         and ble_hydration_ok
         and update_runner_ok
         and system_converge_ok
         and caddy_config_ok
         and bootstrap_pinning_ok
+        and release_prep_ok
+        and webapp_deploy_ok
         and config_migration_ok
         and commands_ok
     )

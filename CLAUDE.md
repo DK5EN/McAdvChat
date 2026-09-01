@@ -145,18 +145,120 @@ webapp's Gateway Availability card in Settings. Design and the on-air measuremen
   count. The webapp watchdog's `!element.via` rule rejects the BLE copy, which would break a
   BLE-only box — do not copy it into the backend. Contract: `is_uplink_time_beacon` in
   `storage/uptime.py`, pinned by `storage/uptime_tests.py` against all three real captured frames.
-- **`GAP_TOLERANCE_MS` must stay above the beacon cadence.** Measured 2026-08-21 on mcapp.local:
-  `23:40:31 → 23:45:34 → 23:50:37`, a **303 s** period, not the round 300 s it looks like. A
-  tolerance at or below the cadence records a gap on every healthy cycle — a link that never
-  dropped a frame reports ~60% uptime. It is 6 min for that reason, and it is the **only** value
-  baked into stored history; the amber/red split is applied at read time and stays retunable.
+- **`GAP_TOLERANCE_MS` must stay above the beacon cadence, and the cadence is NOT a constant.** It
+  is set upstream by the MeshCom server, not by our node, and OE1KBC has already halved it once:
+  **303 s** until 2026-08-22 (`23:40:31 → 23:45:34 → 23:50:37`), **606.5 s** since (measured
+  2026-08-28 over 12 consecutive intervals, all 10.11 min). A tolerance at or below the cadence
+  records a gap on every healthy cycle — at 6 min against the new 606.5 s the card read **0.0%
+  uptime for six days while beacons were arriving normally**, and the footer showed "No time sync"
+  for ~45% of every cycle. It is **12 min** for that reason (same 1.19x margin 6 min had over
+  303 s). **Symptom → cause:** uptime near zero while beacons are visibly arriving means this value
+  is under the cadence — re-measure before suspecting the link.
+- **Retune all four thresholds together.** `GAP_TOLERANCE_MS` and `SILENT_MS` (12 min) and `OFF_MS`
+  (30 min, ~3 cadences) in `storage/constants.py`, plus the webapp's `WATCHDOG_TIMEOUT_MS`
+  (`src/constants/index.ts`, 12 min). `GAP_TOLERANCE_MS` is the **only** one baked into stored
+  history — the amber/red split is applied at read time and stays retunable — so raising it does
+  NOT repair rows already written. Migration 28 scrubbed the 210 spurious gaps recorded between
+  2026-08-27 07:45:59 (where they became contiguous) and the retune, and deliberately KEPT the 37
+  earlier ones: the cadence still alternated there, so those are genuinely ambiguous.
 - **`gap` and `dark` are different claims and must never be conflated.** `gap` = proxy running, no
   beacon → counts against UPTIME. `dark` = proxy not running, nothing observed → counts against
   COVERAGE only. Startup reconciliation writes the `dark` row and resets `last_beacon_ms`, so a
   deploy restart can never look like a link outage — and it must run before the heartbeat task
   starts, or the first tick papers over the very downtime it exists to record.
 - **The metric's resolution is one cadence.** A 20-minute outage between beacons reads as 20 min +
-  303 s, and nothing shorter than ~6 min is visible at all. Inherent to a 5-minute heartbeat.
+  606 s, and nothing shorter than the tolerance (~12 min) is visible at all. Inherent to a
+  heartbeat-driven metric, and it got twice as coarse when the cadence halved.
+
+## MHeard Register (`SRC` / `GW` / `PP`)
+
+The BLE `TYP: "MH"` register, extended by firmware 2026-08-27. Adoption plan and the field
+evidence: `doc/2026-08-28_0900-firmware-4.35p.08.28-adoption.md`.
+
+- **`CALL` is the LAST HOP, `SRC` is the ORIGINATOR, and they are different claims.** `CALL` is the
+  station whose transmission the frame's own `RSSI`/`SNR` measured; roughly two thirds of HEY
+  observations are relayed, so `SRC != CALL` is the common case. `transform_mh` therefore keeps
+  `src = CALL` and the signal write stays on that row — rekeying it onto `SRC` re-creates exactly the
+  bug migration v22 fixed. `SRC` gets a signal-free `"heard"` upsert (`last_seen` + `gw` only).
+  `hw_id`/`lora_mod`/`mesh` also describe the heard transmission and must never land on `SRC`'s row.
+- **The `"heard"` upsert must run BEFORE `_store_mheard`'s early return** (`storage/ingest.py`).
+  `_store_mheard` returns True on a throttle hit and `store_message` returns on that same line, so
+  code one branch later is skipped for every throttled frame — most of them under real traffic. Third
+  instance of this trap in this repo; see Link Check and Gateway Uptime above.
+- **`GW` describes `SRC`, never `CALL` — but only on a HEY frame.** It comes from the beacon's
+  destination path (`"HG"` vs `"H"`), which the originator sets and relays never modify. That path
+  is only a gateway claim when the payload type is `'@'`; on a text, position or ACK frame the
+  destination is something else entirely and the firmware's `GW: 0` is not a claim about anything.
+  `transform_mh` therefore gates `gw` on `PLT == 0x40` and emits `None` otherwise (fail closed when
+  `PLT` is absent). Within that gate the old rule stands: `0` is authoritative and correctly
+  overwrites a stored `1`; absent (`None`) leaves it alone. Ungating this — reading `GW` on every
+  frame, as we did until schema v27 — makes a relay's non-HEY traffic overwrite a real gateway flag,
+  which is exactly the 2026-08-28 `DF2SI-12` flip. Feeds the pre-existing `station_positions.gw`
+  column; migration 27 nulled the zeros stored under the old rule, because a wrong `0` and a real
+  one are indistinguishable after the fact.
+- **`MOD` is a packed byte, not a number.** `msg_source_mod = (getMOD() & 0xF) | (node_country << 4)`
+  (`aprs_functions.cpp:113`): low nibble modulation (3..8), high nibble country index (0..15). It
+  arrives on two paths — the binary GATT footer and the MH register's `MOD` — and both are masked
+  with `& 0x0F` in `ble_protocol.py`. Storing the raw byte made every non-EU node's "modulation"
+  wrong (country 8 → `0x83` → 131). The country nibble is deliberately not persisted: `0xF` is both
+  country `PL` and the firmware's "modulation not from the last hop" marker
+  (`lora_functions.cpp:587`), so it is ambiguous on the wire — a handover asking for that to be
+  separated is with the firmware maintainers
+  (`doc/2026-08-28_1700-firmware-mod-nibble-handover.md`).
+- **`PP` carries RSSI as a POSITIVE MAGNITUDE.** `appendHeySignalReport()` emits
+  `String(rssi*-1.0, 0)`, so `-101 dBm` is on the wire as `101`. `hey_path.parse_hey_chain()` negates
+  it. A parser that trusts the sign inverts every reading and still looks plausible.
+- **Legacy-shape detection is by COMMA COUNT in the leading token**, mirroring the firmware
+  (`mheard_functions.cpp:436-451`): 0 commas (`R99;`) and 2 (`R99,99,99;`) are valid, **1 comma
+  (`R99,99;`) is invalid**. Do not invent a different rule.
+- **An absent `PP` says nothing about the hop count.** The firmware drops it (then `DIST`) once the
+  register JSON would exceed 244 chars, which starts at ~5 relay hops — precisely the deep chains
+  where it would be most interesting. Never read "no chain" as "no relays".
+- **`PP` is deliberately NOT persisted.** It carries no callsigns, so it identifies the POSITION of a
+  weak link, never the station, and it self-censors at depth. Parsed and passed through for the live
+  view only. Revisit if hop identities ever reach the wire.
+- **Two schemas share `TYP: "MH"`.** The live builder sends `SRC`/`GW`/`PP`; the `--mheard` table
+  dump (`mheard_functions.cpp:651`) sends none of them, because it reconstructs from a stored
+  `|`-separated string that never held them. MCProxy never sends `--mheard`, but all three stay
+  optional — never subscript them.
+
+## Blocklist (`sperrliste.json`)
+
+The curated global blocklist, maintained in this repo and fetched by every node from
+`raw.githubusercontent.com/DK5EN/McApp/main/sperrliste.json` (branch **main**) (`commands/handler.py`). It is
+merged with admin `!kb` kickbans into `CommandHandler.blocked_callsigns` and pushed to clients over
+SSE. Design notes for the retroactive fix: `doc/2026-08-30_0930-blocklist-retroactive-plan.md`.
+
+- **The URL is pinned to `main`.** A commit that only reaches `development` blocks nobody. This has
+  already cost one debugging session.
+- **`blocklist_decision` is an INGEST gate, so blocking used to be forward-only.** It ran on ingest
+  (`main.py`) and on the live broadcast (`sse_handler._broadcast_handler`) and nowhere else, which
+  left every row a station had deposited *before* it was blocked in `messages.db`, replayed to
+  every client on every reload. The sperrliste is curated centrally and lands on boxes we do not
+  administer, so a per-host `DELETE` is not a fix. `MessageRouter.filter_history_row` is now applied
+  on the way **out** of storage — `get_smart_initial_with_summary` and `get_messages_page` take a
+  `blocklist_filter` — and that is the only thing making an entry retroactive.
+- **The summary counts must be filtered with the same predicate as the messages.** They drive the
+  sidebar badges; an unfiltered summary keeps advertising a conversation whose messages the filter
+  just removed. `has_more` is the opposite case: it stays keyed on the **raw** row count, or a page
+  that filters to empty reads as "start of history" and the client stops paging backwards.
+- **`blocked_callsigns` must be emitted BEFORE `smart_initial` in the SSE burst.** The webapp applies
+  the set at one ingest chokepoint (`messageProcessor`), so anything delivered ahead of it is
+  admitted against an *empty* blocklist and stays on screen. Emitting history first is exactly why a
+  blocked station survived every reload even with a correct list on both ends. Order is load-bearing.
+- **Offline-cache hydration is the one door into the webapp's store that bypasses
+  `processDataElement`.** `source === 'hydrate'` routes rows straight into `msgData`, so cached rows
+  were immune to the blocklist forever. Gated now, plus `purgeBlockedCallsigns` (memory + IndexedDB
+  + positions) on every `proxy:blocked_callsigns` snapshot. All three sites share
+  `blocklistVerdict()` so they cannot drift.
+- **The refresh is 15 min with a conditional GET, not 24 h.** An unchanged list costs a 304.
+  `_apply_sperrliste` REPLACES the curated portion instead of unioning it, so an upstream removal
+  un-blocks without a restart — but an entry an admin also kickbanned locally is protected from
+  that removal (provenance comes from the persisted kickban table; `blocked_callsigns` is a flat
+  union and knows none). The union runs after the subtraction and unconditionally, because
+  `!kb delall` clears the whole set and the next refresh has to restore the curated entries.
+- **The ETag is only stored for a payload that validated.** Caching the tag of a malformed list
+  turns every later refresh into a 304 and pins the node to its last good list forever.
 
 ## Web Push
 
@@ -181,6 +283,15 @@ BLE mode: `remote` or `disabled` (`MCAPP_BLE_MODE` env override). See `ble_servi
 - **A `#TAG` destination is a hashtag channel, not a callsign — and `is_group()` stays numeric.** The MeshCom FW 4.36 RfC puts a `#OE-SOTA` token in the destination field. All three repos independently misclassified it as a personal DM, which sent it into `compute_conversation_key`'s DM branch where it was **split on its first hyphen** (`"#OE-SOTA"` → key `"#OE<>DK5EN"`), collapsing distinct tags and fragmenting one tag per sender. Fixed in `ea15511` by adding **sibling** predicates `is_hashtag()` / `dst_kind()` / `resolve_dst_target()` beside `is_group()` in `commands/parsing.py` — `is_group` was deliberately NOT widened, because it is pinned by a corpus mirrored in mc-chat and the webapp. Two invariants look like oversights and are load-bearing: classification is **case-insensitive** and **NOT length-bounded** — a tag failing either would fall straight back into the DM branch, which is the defect. The RfC's 9-char cap is send-side grammar, enforced at the API boundary, never in classification. `dst_kind` returns `"unknown"` (never `"direct"`) for a `#`-prefixed value that fails the tag charset: it addresses nobody, and is the shape most likely to arrive from a buggy or hostile sender. Contract: `commands/hashtag_dst_vectors.json` (32 vectors, sha256-pinned by `commands/hashtag_dst_tests.py`). **No prefix/subscription matching exists** (RfC US-3) — its stated rule contradicts its own worked examples, so implementing it would encode a guess. Background: `MeshCom-Hashtag-prep.md`.
 - **Four vector corpora are hand-copied to mc-chat and the webapp, and nothing syncs them for you.** `commands/group_dst_vectors.json` (v2), `storage/conversation_key_vectors.json` (v4), `blocklist_decision_vectors.json` (v2) and `commands/hashtag_dst_vectors.json` (v1) are canonical **here**. mc-chat asserts parse-equality against these exact paths; the webapp pins a sha256 of the conversation-key corpus and runs drift checks against both siblings. Change one and you must copy it to both repos **and** bump the webapp's `EXPECTED_SHA256`, or their suites fail the moment anyone runs them with siblings checked out. Unlike `contract/`, these are not a git subtree — there is no `subtree pull` that will do it for you.
 - **Two different ACKs, never conflate them.** `send_success` is the firmware's 7-byte **binary** ack (`ack_type` 0x00 Node / 0x01 Gateway, `ble_protocol.py`) — "my node or a gateway took the frame". `acked` is a matched inline `:ackNNN` text frame — "the addressee answered". `_handle_ack` publishes `msg_status` `{sent, ack_kind: node|gateway}`, the inline path publishes `{acked, ack_kind: "peer"}` with the ORIGINAL message's msg_id; the webapp renders only the latter as ✓✓ Delivered. Wiring the webapp's `msg_ack` to `send_success` is exactly the 2026-08-19 bug where three unanswered `!ctcping` probes all showed as delivered. `ack_status_tests.py` pins both payloads.
+- **A BLE `D{` register frame carries at most 244 chars of JSON.** `addBLEComToOutBuffer` clamps at
+  245 bytes, minus the `0x44` type byte; the firmware names it `BLE_JSON_PAYLOAD_MAX`. Over that it
+  cuts **mid-value**, so the app gets an unparseable object, not a shortened one — every field is
+  lost, not just the last. The builders in `command_functions.cpp` check against
+  `MAX_MSG_LEN_PHONE - 2` (298), which looks like the limit but never binds; that mismatch is how a
+  one-day `FWDATE` regression took the whole `I` register down on mcapp.local for 9 hours
+  (2026-08-27). `ble_service` salvages such a frame by trimming to the last COMPLETE member — whole
+  members only, never a coerced partial value. A node with all six `GCB` slots filled still
+  overflows, so the salvage stays load-bearing.
 - **All DB timestamps are in milliseconds** (not seconds). Divide by 1000 for `datetime.fromtimestamp()`. Forgetting this causes `ValueError: year 58089 is out of range`.
 - **SSH + `python3 -c` quoting**: single-quote the Python code, `\"` for strings inside. Never use f-strings with dict key access — use `%` formatting, or write a temp script with `cat > /tmp/q.py << 'PYEOF'`.
 - **MHeard beacons** (RSSI/SNR, no coordinates) and **position beacons** (lat/lon, no signal) used to be disjoint packet types. Since firmware `c4ad78bb`, an Extern-UDP `pos` packet with `src_type=="lora"` carries **both** — `store_message()` then updates both `station_positions` field groups. See the 2026-07-05 amendment in `doc/2026-02-11_1400-position-signal-architecture-ADR.md` and `doc/UDP-2.0-impl.md`.

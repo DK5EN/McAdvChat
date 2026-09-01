@@ -20,11 +20,18 @@ from datetime import datetime
 from struct import unpack
 from typing import Any
 
-from .util import FEET_TO_METERS, now_ms
+from .hey_path import parse_hey_chain
+from .util import FEET_TO_METERS, is_placeholder_callsign, now_ms
 
 PAYLOAD_TYPE_MSG = 58  # ":" text message frame
 PAYLOAD_TYPE_POS = 33  # "!" position/telemetry frame
 PAYLOAD_TYPE_ACK = 65  # acknowledgement frame
+
+# MH register `PLT` value for a HEY beacon — mheard_functions.cpp:335:
+# `mhdoc["PLT"] = (uint8_t)mheardLine.mh_payload_type`. `GW` (destination-path
+# gateway flag) is only meaningful on this payload type; see `_coerce_gw`'s
+# call site in `transform_mh`.
+_MH_PAYLOAD_TYPE_HEY = 0x40  # '@'
 
 logger = logging.getLogger(__name__)
 
@@ -192,7 +199,7 @@ def _decode_data_frame(  # noqa: PLR0913 - all fields are needed from the shared
         "dest": dest,
         "message": message,
         "hardware_id": hardware_id,
-        "lora_mod": lora_mod,
+        "lora_mod": _coerce_lora_mod(lora_mod),
         "fw": fw,
         "fw_sub": fw_sub,
         "last_hw_id": last_hw_id,
@@ -570,9 +577,215 @@ def transform_pos(input_dict: dict[str, Any], own_callsign: str = "") -> dict[st
     }
 
 
+def _coerce_optional_int(value: Any) -> int | None:
+    """Best-effort int coercion for unauthenticated RF data. `None` for
+    absence, `bool` (a `bool` is a subclass of `int` and would otherwise
+    silently pass through as e.g. `True`/`False` instead of `1`/`0` with a
+    non-int type), or anything that does not cleanly convert."""
+    if value is None or isinstance(value, bool):
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _coerce_optional_float(value: Any) -> float | None:
+    """Best-effort float coercion; `None` for absence, `bool`, or anything
+    that does not cleanly convert. See `_coerce_optional_int` for the `bool`
+    rationale."""
+    if value is None or isinstance(value, bool):
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _coerce_lora_mod(value: Any) -> int | None:
+    """Mask the wire's packed `MOD`/`lora_mod` byte down to the modulation
+    nibble.
+
+    `aprs_functions.cpp:113` packs it as
+    `(getMOD() & 0xF) | (node_country << 4)`: low nibble the modulation
+    preset (`getMOD()` in 3..8), high nibble the country index (0..15) of
+    the node that last touched the frame. Every relay overwrites this with
+    its OWN modulation/country before forwarding
+    (`lora_functions.cpp:1231-1232`), so the byte already describes the last
+    hop (`CALL`) correctly — only the encoding was wrong, not the
+    attribution. Storing the byte raw makes an EU8 node (country 8) read as
+    modulation `0x83 == 131` instead of `3`.
+
+    Country is deliberately NOT decoded or exposed here — `0xF` is both a
+    real country index (`strCountry[15] == "PL"`) and the firmware's
+    "modulation not from the last hop" marker
+    (`lora_functions.cpp:587`), indistinguishable on the wire until the
+    firmware separates them (see
+    `doc/2026-08-28_1700-firmware-mod-nibble-handover.md`). Mask only."""
+    coerced = _coerce_optional_int(value)
+    if coerced is None:
+        return None
+    return coerced & 0x0F
+
+
+def _coerce_gw(value: Any) -> int | None:
+    """Coerce the MH register's `GW` flag to a strict `0`/`1` `int`, never a
+    `bool` (which would round-trip through `json.dumps` as `true`/`false`
+    and land in the `station_positions.gw` INTEGER column as something
+    unexpected). `None` when the field is absent.
+
+    The string forms `"0"`/`"1"` are handled explicitly because plain
+    truthiness gets `"0"` wrong (a non-empty string is always truthy in
+    Python). Every other shape — `True`/`False`, any other numeric value,
+    any other non-empty string a hostile sender might send — falls back to
+    truthiness, which is always exactly `0` or `1` and never raises."""
+    if value is None:
+        return None
+    if isinstance(value, str):
+        stripped = value.strip()
+        if stripped == "0":
+            return 0
+        if stripped == "1":
+            return 1
+        return 1 if stripped else 0
+    return 1 if value else 0
+
+
+def _coerce_mh_dist(value: Any) -> float | None:
+    """Coerce the MH register's `DIST` field to a distance in km, mapping the
+    firmware's "unknown distance" sentinel to `None`.
+
+    `mheardLine.mh_dist` is unconditionally initialised to `-1` on every
+    received frame (`lora_functions.cpp:594`) and is overwritten only inside a
+    branch requiring `payload_type == '!'` AND a position message AND a
+    successful APRS decode AND `msg_source_call == msg_source_last` AND
+    non-zero coordinates on both sides (`:670`) — a HEY beacon (`'@'`) never
+    reaches it. `mheard_functions.cpp:317` repairs a negative only when a
+    stored record already exists, and the `%.1lf` record buffer round-trips
+    `"-1.0"`, so a first-seen station ships `DIST: -1`, and it is sticky.
+
+    Any negative value maps to `None`, not just exactly `-1` — the sentinel is
+    "negative", and a negative distance is physically meaningless regardless
+    of the exact value. `0` (or `0.0`) is a real measurement — a station
+    colocated with us — and passes through unchanged; do not fold it into the
+    sentinel."""
+    coerced = _coerce_optional_float(value)
+    if coerced is not None and coerced < 0:
+        return None
+    return coerced
+
+
+def _coerce_mh_ncnt(value: Any) -> int | None:
+    """Coerce the MH register's `NCNT` field to a neighbour count, mapping the
+    firmware's "never learned" sentinel to `None`.
+
+    `mh_ncount` is re-initialised to `0` on every received frame
+    (`lora_functions.cpp:597`), and the firmware itself reads `0` as "not
+    set", back-filling from its own table (`mheard_functions.cpp:313-314`). A
+    genuine measured zero is not distinguishable from it in this field:
+    `updateMheard` builds the register at `lora_functions.cpp:701`, *before*
+    `updateHeyPath` parses the fresh `R<ncnt>` at `:712`, so `NCNT` is always
+    one beacon stale — the stored table value, never the count carried by the
+    frame that ships it.
+
+    Do NOT reuse this for `hey_chain.origin_ncnt` or `hops[].ncnt` — those are
+    written fresh at transmit time (`loop_functions.cpp:4242`,
+    `appendHeySignalReport`), so a `0` there is a real measurement, not the
+    sentinel. `parse_hey_chain`/`hey_path.py` must stay untouched."""
+    coerced = _coerce_optional_int(value)
+    if coerced == 0:
+        return None
+    return coerced
+
+
+def _coerce_mh_origin(value: Any) -> str | None:
+    """`SRC` -> uppercased, stripped callsign, or `None` if absent, blank,
+    not a string, or an unconfigured-node placeholder.
+
+    The placeholder filter is load-bearing, not tidiness. A factory-fresh or
+    reset node beacons as `XX0XXX-00` (esp32_flash.h's `node_call` default),
+    and that is a valid callsign SHAPE, so nothing else rejects it. Observed
+    live on 2026-08-28: one in four HEY beacons carrying an originator named a
+    placeholder. Recording it would create a station row that is not a station
+    — and every unconfigured node in the field collapses onto that single row,
+    so its `last_seen` and `gw` would be a meaningless mixture of them all.
+    `_detect_node_identity` refuses the same set for the same reason (it will
+    not ADOPT a placeholder as our identity); this refuses to RECORD one as a
+    heard station.
+    """
+    if not isinstance(value, str):
+        return None
+    origin = value.strip().upper()
+    if not origin or is_placeholder_callsign(origin):
+        return None
+    return origin
+
+
+def _coerce_mh_payload_type(value: Any) -> int | None:
+    """Coerce the MH register's `PLT` field to the raw payload-type byte
+    (`mheard_functions.cpp:335`), tolerant of every shape the wire actually
+    sends: the JSON int (`64`), its string form (`"64"`), or the single
+    ASCII character the byte encodes (`"@"`). `transform_mh` handles
+    unauthenticated input and must never raise; anything else — including
+    absence — returns `None`, which callers must treat as fail-closed
+    (not-a-HEY-frame), never as a fourth valid payload type."""
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return value
+    if isinstance(value, str):
+        stripped = value.strip()
+        if len(stripped) == 1:
+            return ord(stripped)
+        try:
+            return int(stripped)
+        except ValueError:
+            return None
+    return None
+
+
 def transform_mh(input_dict: dict[str, Any]) -> dict[str, Any]:
-    """Transform a BLE MHeard beacon"""
+    """Transform a BLE MHeard beacon.
+
+    Two schemas share `TYP: "MH"`: the live builder
+    (`mheard_functions.cpp:331`) sends `SRC`/`GW`, and `PP` when present; the
+    `--mheard` table dump (`mheard_functions.cpp:651`) sends none of the
+    three, reconstructing from a stored `|`-separated string that never held
+    them. All three are therefore OPTIONAL here — never subscript them.
+
+    `CALL` is the LAST HOP: the station whose transmission this frame's own
+    `RSSI`/`SNR` actually measured, and it stays keyed to `src` exactly as
+    before (migration v22 exists because that attribution was once wrong —
+    do not rekey it). `SRC` is the ORIGINATING station: it owns identity
+    (`mh_origin`) and, on a HEY frame only, gateway status (`gw`, derived
+    from the destination path the originator sets and relays never modify).
+    `GW` is `0` on every non-HEY payload because the destination path is
+    something else entirely, so `gw` is emitted only when `PLT ==
+    _MH_PAYLOAD_TYPE_HEY` (`0x40`) — otherwise `None`, fail-closed, rather
+    than asserting a claim the frame never made. `mh_origin` stays
+    ungated: `SRC` is set unconditionally on every frame type
+    (`mheard_functions.cpp:350`). On a typical site roughly two thirds of
+    HEY observations are relayed, so `SRC != CALL` is the common case, and
+    `gw` describes `SRC`, never `CALL` — attributing it to `CALL` would be
+    wrong for every relayed beacon.
+
+    `PP`'s absence carries no information: as of firmware 2026-08-28 the
+    register drops `PP` (then `DIST`) whenever the JSON would exceed 244
+    chars, which starts at roughly 5 relay hops. A missing `hey_chain` on a
+    deep path is therefore the NORM, not a sign of a direct link — do not
+    read "no chain" as "no relays".
+
+    `NCNT` and `DIST` each carry a firmware sentinel that this transformer
+    normalises to `None` at this wire boundary (`_coerce_mh_ncnt`,
+    `_coerce_mh_dist`) — `0` and any negative value respectively are "not
+    set", not real measurements. The chain's own `origin_ncnt`/`hops[].ncnt`
+    are unaffected: those are fresh transmit-time values, and a `0` there is
+    real.
+    """
     node_timestamp = timestamp_from_date_time(input_dict["DATE"], input_dict["TIME"])
+    pp_raw = input_dict.get("PP")
+    hey_chain = parse_hey_chain(pp_raw) if isinstance(pp_raw, str) else None
+    is_hey = _coerce_mh_payload_type(input_dict.get("PLT")) == _MH_PAYLOAD_TYPE_HEY
     return {
         "transformer": "mh",
         "src_type": "ble",
@@ -581,10 +794,17 @@ def transform_mh(input_dict: dict[str, Any]) -> dict[str, Any]:
         "rssi": input_dict.get("RSSI"),
         "snr": input_dict.get("SNR"),
         "hw_id": input_dict.get("HW"),
-        "lora_mod": input_dict.get("MOD"),
+        "lora_mod": _coerce_lora_mod(input_dict.get("MOD")),
         "mesh": input_dict.get("MESH"),
         "node_timestamp": node_timestamp,
         "timestamp": node_timestamp,
+        "mh_origin": _coerce_mh_origin(input_dict.get("SRC")),
+        "gw": _coerce_gw(input_dict.get("GW")) if is_hey else None,
+        "mh_ncnt": _coerce_mh_ncnt(input_dict.get("NCNT")),
+        "mh_path_len": _coerce_optional_int(input_dict.get("PL")),
+        "mh_dist": _coerce_mh_dist(input_dict.get("DIST")),
+        "hey_chain": hey_chain.as_dict() if hey_chain is not None else None,
+        "hey_chain_raw": pp_raw if isinstance(pp_raw, str) else None,
     }
 
 

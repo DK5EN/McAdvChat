@@ -494,6 +494,80 @@ deploy_webapp() {
   fi
 }
 
+# Replace the served webapp tree wholesale, instead of copying over it.
+#
+# Both callers used to do `cp -a src/. "$WEBAPP_DIR/"`, which is an OVERLAY: it
+# writes the new build on top of the old one and removes nothing. Vite emits
+# content-hashed filenames, so every release left its entire predecessor behind.
+# Measured on mcapp.local right after v2.0.1: 868 files served where the release
+# contains 70 — 26 MB, 721 files in assets/ alone, plus 133 macOS AppleDouble
+# `._*` sidecars from older cuts. The leftovers are inert (nothing references
+# them) but they grow without bound, on the box whose SD card is the scarce
+# resource.
+#
+# Staged first, then swapped by two renames within the same filesystem, so the
+# serve directory is never observed half-written and a failed copy leaves the
+# live tree untouched. If the final rename fails, the previous tree is restored.
+install_webapp_tree() {
+  local src="$1"
+  local staging="${WEBAPP_DIR}.new"
+  local previous="${WEBAPP_DIR}.old"
+
+  # This function runs both at call sites inside a `||`/`if !` — bash suppresses
+  # errexit for the ENTIRE body of a function called that way, so `set -e` gives
+  # none of these commands any protection. Every step below is checked by hand;
+  # do not rely on `set -e` catching a failure here, it provably won't.
+  if ! rm -rf "$staging" "$previous"; then
+    log_error "  Failed to clear old staging dirs (${staging}, ${previous})"
+    return 1
+  fi
+  if ! mkdir -p "$staging"; then
+    log_error "  Failed to create staging dir ${staging}"
+    return 1
+  fi
+
+  if ! cp -a "${src}/." "${staging}/"; then
+    log_error "  Failed to stage webapp from ${src}"
+    rm -rf "$staging"
+    return 1
+  fi
+
+  # Belt and braces: release.sh keeps AppleDouble sidecars out of the tarball,
+  # but a tree built or copied on macOS by any other route can still carry them.
+  find "$staging" -name '._*' -delete 2>/dev/null || true
+
+  if ! chown -R www-data:www-data "$staging"; then
+    log_error "  Failed to chown staged webapp at ${staging}"
+    rm -rf "$staging"
+    return 1
+  fi
+  if ! chmod -R 755 "$staging"; then
+    log_error "  Failed to chmod staged webapp at ${staging}"
+    rm -rf "$staging"
+    return 1
+  fi
+
+  if [[ -d "$WEBAPP_DIR" ]] && ! mv "$WEBAPP_DIR" "$previous"; then
+    log_error "  Could not move the current webapp aside; leaving it in place"
+    rm -rf "$staging"
+    return 1
+  fi
+
+  if ! mv "$staging" "$WEBAPP_DIR"; then
+    if [[ -d "$previous" ]] && mv "$previous" "$WEBAPP_DIR"; then
+      log_error "  Could not install the new webapp — restored the previous tree"
+    else
+      # Both moves failed: WEBAPP_DIR is now missing and the previous tree is
+      # still sitting at $previous instead of being restored. The box is
+      # serving nothing until an operator intervenes by hand.
+      log_error "  CRITICAL: webapp install failed AND restore failed — ${WEBAPP_DIR} is now MISSING. The previous tree is still intact at ${previous}; move it back to ${WEBAPP_DIR} manually."
+    fi
+    return 1
+  fi
+
+  rm -rf "$previous"
+}
+
 # Deploy webapp from the bundled webapp/ directory in the release tarball
 deploy_webapp_from_tarball() {
   local force="${1:-false}"
@@ -527,15 +601,7 @@ deploy_webapp_from_tarball() {
 
   log_info "  Deploying bundled webapp..."
 
-  # Ensure webapp directory exists
-  mkdir -p "$WEBAPP_DIR"
-
-  # Copy from tarball to webapp serve dir
-  cp -a "${deploy_target}/webapp/." "$WEBAPP_DIR/"
-
-  # Set permissions
-  chown -R www-data:www-data "$WEBAPP_DIR"
-  chmod -R 755 "$WEBAPP_DIR"
+  install_webapp_tree "${deploy_target}/webapp" || return 1
 
   log_ok "  Webapp deployed from tarball to ${WEBAPP_DIR}"
 }
@@ -601,15 +667,16 @@ download_webapp() {
     log_warn "  No checksum available, skipping verification"
   fi
 
-  # Ensure webapp directory exists
-  mkdir -p "$WEBAPP_DIR"
+  # Extract to a staging dir, never straight into the serve dir: extracting in
+  # place is the same overlay problem, and a truncated download would leave the
+  # live tree half-replaced.
+  mkdir -p "${tmp_dir}/extract"
+  tar -xzf "${tmp_dir}/webapp.tar.gz" -C "${tmp_dir}/extract" --strip-components=1 --warning=no-unknown-keyword
 
-  # Extract webapp
-  tar -xzf "${tmp_dir}/webapp.tar.gz" -C "$WEBAPP_DIR" --strip-components=1 --warning=no-unknown-keyword
-
-  # Set permissions
-  chown -R www-data:www-data "$WEBAPP_DIR"
-  chmod -R 755 "$WEBAPP_DIR"
+  if ! install_webapp_tree "${tmp_dir}/extract"; then
+    rm -rf "$tmp_dir"
+    return 1
+  fi
 
   # Cleanup
   rm -rf "$tmp_dir"
@@ -793,6 +860,11 @@ configure_systemd_service() {
         -e "s|{{HOME}}|${run_home}|g" \
         -e "s|{{BLE_API_KEY}}|${ble_api_key_escaped}|g" \
         "${template_dir}/mcapp-ble.service" > "$ble_service"
+
+    # This unit embeds BLE_API_KEY in cleartext; unlike mcapp.service (no
+    # secret substituted), it must not be left world-readable at the default
+    # root:root 0644 a plain redirect produces.
+    chmod 600 "$ble_service"
 
     log_info "  mcapp-ble.service configured"
   fi

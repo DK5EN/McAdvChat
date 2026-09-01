@@ -1,5 +1,197 @@
 # Release History
 
+## v2.0.2 (2026-09-01)
+
+Patch release. Three field-reported defects and their causes: the **Gateway Availability** card had
+been reading **0.0 % for six days** while the link was perfectly healthy, a blocked callsign
+**survived every reload**, and the dark map had started serving watermarked tiles. Alongside them,
+the firmware's new **MHeard originator fields** are adopted so a relayed beacon is attributed to the
+station that actually sent it. 32 backend commits and 23 frontend commits since v2.0.1. Schema
+**v25 → v28**.
+
+### Highlights
+
+- **Gateway Availability was measuring the wrong thing, and said so loudly.** The `{CET}` beacon
+  cadence is set by the MeshCom server, not by our node, and OE1KBC halved it — **303 s until
+  2026-08-22, 606.5 s since** (measured over 12 consecutive intervals, all 10.11 min). The gap
+  tolerance was 6 min, i.e. _below_ the new cadence, so every healthy cycle was recorded as an
+  outage: 210 contiguous gap segments, 0.0 % uptime, and a footer reading "No time sync" for ~45 %
+  of every cycle. All four thresholds are retuned together and a migration repairs the ledger.
+- **The blocklist is now retroactive.** It was an ingest-only gate, so every message a station had
+  deposited _before_ it was blocked stayed in the database and was replayed on every reload. Three
+  independent gaps, each sufficient on its own, are closed — one of them in the SSE burst _ordering_.
+  Refresh is also 24 h → **15 min**, so an addition to `sperrliste.json` reaches the fleet the same
+  quarter-hour instead of the next day.
+- **A relayed MHeard beacon is now attributed to whoever sent it.** Roughly **two thirds** of HEY
+  observations are relayed, so the station whose signal we measured is usually _not_ the station that
+  originated the beacon. The firmware now tells us both; we now record both, without letting either
+  one's data land on the other's row.
+- **The dark basemap needs an API key as of 2026-09**, and CARTO signals its absence by serving a
+  watermark inside a normal **HTTP 200** — so nothing in the app, the build or the smoke test can
+  detect it. Gated behind a build-time key, and every map style now carries the attribution its
+  licence requires.
+
+### Backend (MCProxy)
+
+**Gateway uptime**
+
+- **[fix]** `GAP_TOLERANCE_MS` 6 → **12 min**, `SILENT_MS` 6 → **12 min**, `OFF_MS` 15 → **30 min**
+  (~3 cadences). All three derived from the new 606.5 s cadence, keeping the same 1.19x margin the
+  old value had over 303 s. The webapp's `WATCHDOG_TIMEOUT_MS` is retuned to match — the four move
+  together or not at all.
+- **[fix]** Migration **v28** repairs the ledger, because `GAP_TOLERANCE_MS` is the one threshold
+  baked into stored rows and raising it fixes nothing already written. It is bounded on both sides on
+  purpose: it deletes the **210** gaps ≤ 12 min recorded from 2026-08-27 07:45:59 (where the segments
+  become contiguous), and deliberately **keeps the 37 earlier ones** — the cadence still alternated
+  before that point, so a 10-min gap there may be a real two-cycle outage.
+
+**MHeard register (firmware 4.35p.08.28)**
+
+- **[feat]** `SRC`, `GW` and `PP` adopted from the BLE `TYP: "MH"` register. `CALL` is the **last
+  hop** and keeps `src` and the signal write; `SRC` is the **originator** and gets a signal-free
+  `"heard"` upsert carrying only `last_seen` and `gw`. It deliberately receives no `rssi`/`snr` and
+  no `hw_id`/`lora_mod`/`mesh` — all five describe the transmission we heard, which came from `CALL`.
+- **[fix]** `GW` is gated on the payload type (`PLT == 0x40`, a HEY frame) and emits nothing
+  otherwise. It derives from the beacon's destination path, which is only a gateway claim on a HEY;
+  on a text or ACK frame the firmware still emits `GW: 0`, and that zero was overwriting a genuine
+  gateway flag — observed on air as `DF2SI-12` reading GW 1 and GW 0 minutes apart. Migration **v27**
+  nulls the zeros stored under the old rule, since a wrong `0` and a real one are indistinguishable
+  after the fact.
+- **[fix]** `MOD` is a **packed byte**, not a number: low nibble modulation, high nibble country
+  index. Storing it raw made every non-EU node's modulation wrong (country 8 → `0x83` → 131). Masked
+  to its low nibble on both arrival paths; migration **v27** masks what was stored.
+- **[fix]** The firmware sentinels `NCNT: 0` and `DIST: -1` are normalised to _unknown_ rather than
+  passed through as measurements — they were rendering as a neighbour count of 0 beside a live RSSI,
+  and **-1 km** for every first-seen station.
+- **[fix]** A placeholder callsign is no longer recorded as a station. `XX0XXX-00` is the firmware's
+  factory default and a valid callsign _shape_, so nothing upstream rejects it — and **every**
+  unconfigured node in the field shares that one row, making its `rssi`/`last_seen`/`gw` a mixture of
+  all of them. The guard sits at the storage chokepoint where all three update types and all three
+  transports converge; migration **v26** scrubs `station_positions`, `signal_log` and
+  `signal_buckets`.
+
+**Ingest and resilience**
+
+- **[fix]** A truncated BLE register frame is **salvaged** instead of dropped. The firmware clamps a
+  `D{` frame at 244 usable chars of JSON and cuts **mid-value**, so what arrives is unparseable
+  rather than merely short — on mcapp.local that took the node-identity register down **55 consecutive
+  times over 9 hours** (2026-08-27 22:29 → 08-28 07:50) while logging the same unactionable warning
+  every 10 minutes. The frame is now trimmed back to the last **complete** member and re-parsed;
+  never a coerced partial value. Upstream fixed the firmware trigger, but a node with all six group-call
+  slots filled still overflows, so the salvage stays load-bearing.
+- **[fix]** UDP ingress keeps the whole emoji glue class, not just U+FE0F. U+200D ZERO WIDTH JOINER
+  is category `Cf` and matched no rule, so it was stripped from every Extern-UDP datagram — the same
+  outgoing message was stored intact via BLE and split into two graphemes (`🙋 ♂`) via UDP. U+200D,
+  U+FE0E, U+FE0F, U+20E3 and the tag range are whitelisted; the whitelist stays a whitelist
+  (U+200B is still dropped).
+
+**Blocklist**
+
+- **[fix]** `MessageRouter.filter_history_row` is applied on the way **out** of storage, threaded
+  through `get_smart_initial_with_summary` and `get_messages_page`. The summary counts use the same
+  predicate, or the sidebar keeps advertising a conversation whose messages were just filtered away;
+  `has_more` deliberately stays keyed on the **raw** row count, or a page that filters to empty reads
+  as "start of history" and the client stops paging backwards.
+- **[fix]** `blocked_callsigns` is emitted **before** `smart_initial` in the SSE connect burst. The
+  webapp applies the set at one ingest chokepoint, so history delivered ahead of it was admitted
+  against an empty list — which is why a blocked station survived every reload with a correct list on
+  both ends.
+- **[fix]** Refresh 24 h → **15 min** with an `If-None-Match` conditional GET (an unchanged list
+  costs a 304), and the curated portion is **replaced** rather than unioned, so an upstream removal
+  un-blocks without a restart. An entry a local admin also kickbanned is protected from that removal.
+  The ETag is stored only for a payload that validated — caching the tag of a malformed list would
+  pin the node to its last good list forever.
+- **[chore]** `DJ4XI-12` added to `sperrliste.json`.
+
+**Deploy and ops**
+
+- **[fix]** The webapp deploy **replaces** the served tree instead of layering onto it. Both paths ran
+  an overlay copy, and Vite emits content-hashed filenames, so nothing was ever overwritten and every
+  release left its whole predecessor behind: measured right after v2.0.1, **868 files served where the
+  release contains 70 — 26 MB, 721 of them in `assets/`**. The new build is staged beside the serve
+  directory and swapped in with two renames, so it is never observed half-written and a failure leaves
+  the live tree untouched. Also removes the **133 macOS AppleDouble `._*` sidecars** that had reached
+  the box — `release.sh` was manufacturing them during the build, and both `tar` invocations now run
+  under `COPYFILE_DISABLE=1`.
+- **[fix]** `release.sh` now bumps **and pushes** both repos. It pushed MCProxy only, leaving the
+  webapp's merge-back committed and unpushed — which put its `origin/main` one commit ahead of
+  `origin/development`, exactly the diverged state the next release aborts on. The failure therefore
+  surfaced one release later naming the wrong repo; it is what blocked the v2.0.1 cut.
+  `scripts/release_prep_tests.py` pins it against the **remotes**, because a working-tree assertion
+  would have passed while the bug was live.
+- **[fix]** Caddy can install its local CA root into the OS trust store: a sudoers drop-in, plus a
+  systemd drop-in relaxing the package unit's `ProtectSystem=full`, which made `/usr` and `/etc`
+  read-only inside the service's mount namespace even for root.
+- **[fix]** The `lighttpd-mod-openssl` kTLS module-load error is suppressed. The RPi kernel has no
+  `tls` module, so `systemd-modules-load` logged a failure on every boot; kTLS is a performance
+  optimisation and mod_openssl is correct without it.
+- **[feat]** TCP **19532** opened LAN-only (same source supernets as SSH) for the
+  `systemd-journal-upload` → `journal-remote` transport used by Pi↔Pi log evidence, with a converge
+  gate so existing installs pick it up.
+- **[chore]** Dependencies refreshed. The standalone `ble_service/uv.lock` — used when the BLE service
+  is deployed independently — had drifted behind its own pyproject (still recording version 2.0.0 and
+  `uvicorn>=0.52.3`), because Dependabot edits the pyproject and never regenerates that lock.
+
+### Frontend (webapp)
+
+- **[fix]** The CARTO dark basemap is gated behind a build-time `VITE_CARTO_KEY`. CARTO made a key
+  mandatory on its raster basemaps in 2026-09 and answers a keyless request with **HTTP 200 and an
+  "API KEY REQUIRED" watermark painted into the PNG** — so `isRoutineTileError` never sees it, the
+  service worker's `CacheFirst` route caches it as a valid tile for 30 days, and no fallback can hang
+  off a signal that does not exist. `.env` is gitignored with `.env.example` as the template; **any
+  build destined for a Pi must run with `.env` present.**
+- **[fix]** Every map style now declares its `attribution`. Light (OSM) and satellite (Esri) had none,
+  and MapLibre renders only what the active style's sources declare — so both were shipping an
+  uncredited map. CARTO's free tier is granted in exchange for visible CARTO+OSM credit.
+- **[fix]** The blocklist gates **offline-cache hydration**, which was the one door into the store
+  that bypassed the ingest gate entirely and put the whole cached backlog back on every PWA start.
+  `purgeBlockedCallsigns()` now also sweeps memory, positions and the IndexedDB mirror on every
+  `proxy:blocked_callsigns` snapshot, so nothing hydrates back on the next boot. All three sites share
+  one `blocklistVerdict()` so they cannot drift.
+- **[fix]** `WATCHDOG_TIMEOUT_MS` 5.5 → **12 min**, mirroring the backend. Its spec now computes the
+  expected age from the constant instead of a hand-derived literal, so the next retune cannot break a
+  test whose point is that the dot and the age agree.
+- **[feat]** Node Identity shows the firmware build stamp (`FWDATE`), so sub-releases are
+  distinguishable — `FWVER` carries only "4.35 p" and is held stable on purpose. Formatted with pure
+  string arithmetic, never through `Date`: a build stamp has no timezone, and constructing a date from
+  it can shift the displayed day across a UTC boundary.
+- **[revert]** The MHeard **link-chain UI is withdrawn**. `PP` carries no callsigns, so the strongest
+  claim the UI could make was "link 3 of 5 is the weakest" with no way to name the two stations that
+  link connects. The parsing was never wrong; the question was — an operator needs to know _which
+  nodes_ and their signal reports. The live-frames debug panel goes with it. The backend still parses
+  and emits the chain for the live view.
+- **[fix]** The certificate-install panel derives its example URLs from the live hostname instead of
+  a hardcoded `mcapp.local` — on a box named anything else every example pointed at a host its owner
+  could not resolve, on top of the trust failure they came to the page to fix. The macOS section
+  gains the symptom up front ("the app only works via its IP address" _is_ a certificate problem), a
+  terminal alternative to the Keychain GUI, and the required cold browser restart.
+- **[fix]** The Update page's architecture diagram labels the stable and dev branches `v2.x.x`.
+- **[chore]** `.prettierignore` covers every `.json` under `src/`, not just `*_vectors.json` — the
+  shared `dedup_contract.json` and `push_contract.json` were byte-sensitive and exposed.
+
+### Upgrade notes
+
+- **Schema v25 → v28**, applied automatically on first start. Three migrations touch existing data:
+  **v26** removes placeholder-callsign rows from `station_positions`, `signal_log` and
+  `signal_buckets`; **v27** nulls `station_positions.gw` where it is `0` (re-learned from the next HEY
+  beacon) and masks `lora_mod` to its low nibble; **v28** deletes the 210 spurious uptime gap segments.
+  All three are one-way — take a copy of `/var/lib/mcapp/messages.db` first if that matters to you.
+- **The Gateway Availability card will look different, and that is the fix.** Uptime for the six days
+  before this release was being recorded against a tolerance below the beacon cadence; v28 removes
+  those rows, so the 24 h and 7 d figures will jump from near zero to their real values.
+- **The `{CET}` cadence is an upstream value and has already changed once.** If the card ever reads
+  near-zero uptime while beacons are visibly arriving, re-measure the cadence before suspecting the
+  link — `GAP_TOLERANCE_MS` sitting under it is the cause, and it is the only threshold baked into
+  stored history.
+- **A `sperrliste.json` entry now takes effect retroactively and within 15 minutes.** Messages a
+  newly-blocked station sent before the block will disappear from history on the next load. Nothing
+  is deleted from the database; the filter is applied on read.
+- **Building the webapp requires `webapp/.env` with `VITE_CARTO_KEY`.** Without it the dark basemap
+  ships a watermark on every tile and nothing will tell you — check `/webapp/positions` in dark mode
+  by eye after deploying. Light and satellite need no key.
+- The MHeard link-chain UI is gone. If you were reading the hop ladder, that surface no longer
+  exists; station attribution replaces it.
+
 ## v2.0.1 (2026-08-22)
 
 Patch release. Adds **Gateway Availability** — a measured record of whether the node's uplink to

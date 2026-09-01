@@ -8,7 +8,7 @@ import asyncio
 import sqlite3
 
 from ..logging_setup import get_logger
-from ..util import ACK_SUFFIX_RE
+from ..util import ACK_SUFFIX_RE, PLACEHOLDER_CALLSIGN_BASES
 from ._base import StorageBase
 from .constants import (
     BUCKET_SECONDS,
@@ -454,10 +454,130 @@ class MigrationsMixin(StorageBase):
                         " the first accepted {CET} beacon)",
                         current_version,
                     )
+                    _set_schema_version(conn, 25)
+
+                if current_version < 26:  # noqa: PLR2004 - schema migration step
+                    # Scrub station rows for unconfigured-node placeholder
+                    # callsigns. `XX0XXX-00` is the MeshCom firmware's factory
+                    # default (esp32_flash.h `node_call`) and is a valid callsign
+                    # SHAPE, so nothing rejected it until now; the runtime guard
+                    # in `_upsert_station_position`/`_ingest_signal` stops new
+                    # ones, and this removes what already landed.
+                    #
+                    # Observed on mcapp.local 2026-08-28 (v2.0.2-dev.1): one row,
+                    # created from an MHeard beacon's originator field within
+                    # minutes of the deploy — one in four HEY beacons carrying an
+                    # originator named a placeholder.
+                    #
+                    # Deletes rather than rewrites: there is nothing to preserve.
+                    # Every unconfigured node in the field shares the one
+                    # callsign, so the row's rssi/snr/last_seen/gw are a mixture
+                    # of all of them and mean nothing about any single station.
+                    # `messages` is deliberately untouched — the traffic stays
+                    # visible, only the STATION identity is refused.
+                    self._scrub_placeholder_stations(conn)
+                    _set_schema_version(conn, 26)
+
+                if current_version < 27:  # noqa: PLR2004 - schema migration step
+                    # HEY-path fixes (doc/hey-path-fixes.md F1/F6): the writer's
+                    # `gw` and `lora_mod` fixes do not repair rows already stored
+                    # under the old, wrong producer — this is that one-shot repair.
+                    #
+                    # `gw`: until this wave, `transform_mh` emitted `GW` on every MH
+                    # frame, not only on a HEY (`PLT == '@'`). A stored `gw = 0`
+                    # is therefore not recoverable: it may be a real "not a
+                    # gateway" from a HEY, or a meaningless `0` from some other
+                    # frame type that happened to overwrite a genuine `1` via the
+                    # `COALESCE` in the "heard" upsert (storage/ingest.py). The two
+                    # are indistinguishable in the stored value alone, so every
+                    # stored `0` is nulled and re-learned from that station's next
+                    # HEY. This is NOT idempotent in the general sense — re-running
+                    # it after relearning would null fresh, correct zeros again —
+                    # which is exactly why it lives in a one-shot versioned
+                    # migration rather than a repeatable startup task.
+                    #
+                    # `lora_mod`: the firmware packs
+                    # `msg_source_mod = (getMOD() & 0xF) | (node_country << 4)`
+                    # (aprs_functions.cpp:113) — low nibble modulation (3..8), high
+                    # nibble country (0..15). MCProxy stored the whole byte
+                    # unmasked. The mask is idempotent
+                    # (`x & 15 & 15 == x & 15`), so this is safe to apply even if a
+                    # future step or backfill runs it again.
+                    # Two `execute` calls, NOT `executescript`: the latter issues an
+                    # implicit COMMIT of the pending transaction before it runs, which
+                    # would split these UPDATEs from the `_set_schema_version` below.
+                    # A crash in that window re-runs the step — and the `gw` null is
+                    # precisely the statement that must not run twice.
+                    conn.execute("UPDATE station_positions SET gw = NULL WHERE gw = 0")
+                    conn.execute(
+                        "UPDATE station_positions SET lora_mod = lora_mod & 15"
+                        " WHERE lora_mod IS NOT NULL"
+                    )
+                    logger.info(
+                        "Migration v%d → v27: nulled station_positions.gw where"
+                        " 0 (unrecoverable, re-learned from the next HEY) and"
+                        " masked station_positions.lora_mod to its low nibble"
+                        " (modulation only, country nibble dropped)",
+                        current_version,
+                    )
+                    _set_schema_version(conn, 27)
+
+                if current_version < 28:  # noqa: PLR2004 - schema migration step
+                    # The {CET} cadence was halved upstream (OE1KBC) from 303 s to
+                    # 606.5 s, which put it ABOVE the old 6-min GAP_TOLERANCE_MS —
+                    # so from then on every perfectly healthy cycle was recorded as
+                    # a `gap` and the Gateway Availability card read 0% uptime while
+                    # beacons were arriving normally. The tolerance is now 12 min
+                    # (see storage/constants.py), but the tolerance is the one value
+                    # baked into STORED rows, so raising it does not repair the
+                    # ledger. This step removes the rows that were never outages.
+                    #
+                    # Scoped deliberately, NOT a blanket delete of short gaps:
+                    #
+                    #   * start_ms >= 1787809559726 (2026-08-27 07:45:59) — the point
+                    #     where the gap segments become CONTIGUOUS, i.e. every cycle
+                    #     was being logged as a gap. Measured on mcapp.local: 210
+                    #     segments from there, all <= 12 min, longest 11.9 min.
+                    #   * Before that timestamp the cadence still alternated between
+                    #     303 s and 606.5 s, so a 10-min gap there is genuinely
+                    #     ambiguous — it may be a real 2-cycle outage. Those 37
+                    #     segments are PRESERVED. Do not "simplify" this by dropping
+                    #     the timestamp bound; that would erase real outages.
+                    #   * <= GAP_TOLERANCE_MS keeps anything longer than one cadence,
+                    #     which is a real outage under either tolerance.
+                    #
+                    # Idempotent: re-running deletes nothing new, because any row it
+                    # would match has already gone.
+                    # Guarded on the table existing. Any real DB at v27 passed
+                    # through v25, which creates it — but a fixture seeded directly
+                    # at v26/v27 skips that block, and a migration step must never
+                    # depend on how the caller got to the previous version.
+                    has_table = conn.execute(
+                        "SELECT 1 FROM sqlite_master WHERE type = 'table'"
+                        " AND name = 'link_uptime_segments'"
+                    ).fetchone()
+                    cur = (
+                        conn.execute(
+                            "DELETE FROM link_uptime_segments"
+                            " WHERE kind = 'gap' AND start_ms >= 1787809559726"
+                            " AND (end_ms - start_ms) <= 720000"
+                        )
+                        if has_table
+                        else None
+                    )
+                    logger.info(
+                        "Migration v%d → v28: removed %d link_uptime_segments gap"
+                        " rows recorded between 2026-08-27 07:45:59 and the"
+                        " GAP_TOLERANCE_MS retune — normal cycles at the new 606.5 s"
+                        " {CET} cadence, never outages. Rows before that timestamp"
+                        " are kept: the cadence still alternated there.",
+                        current_version,
+                        cur.rowcount if cur is not None else 0,
+                    )
                     # Adding a step after this one? Bump LATEST_SCHEMA_VERSION in
                     # storage/constants.py in the same commit — the startup suite
                     # asserts every migration chain terminates there.
-                    _set_schema_version(conn, 25)
+                    _set_schema_version(conn, 28)
 
         await asyncio.to_thread(_init_db)
 
@@ -466,6 +586,42 @@ class MigrationsMixin(StorageBase):
 
         self._initialized: bool = True
         logger.info("SQLite database initialized")
+
+    @staticmethod
+    def _scrub_placeholder_stations(conn: sqlite3.Connection) -> None:
+        """V25 → V26: delete station rows whose callsign is an unconfigured-node
+        placeholder (see `util.PLACEHOLDER_CALLSIGN_BASES`).
+
+        Matches on the SSID-stripped base, case-insensitively, so `XX0XXX-00`,
+        `XX0XXX-12` and `xx0xxx` are all caught — the firmware does not normalise
+        the callsign it beacons, so neither can this.
+
+        Scrubs the three station-shaped tables and nothing else:
+        `station_positions` (the map/station list), `signal_log` and
+        `signal_buckets` (the signal-history series). `messages` is deliberately
+        left alone — the traffic from an unconfigured node stays visible, because
+        an operator noticing it is how the node gets configured. `signal_buckets`
+        is additionally scrubbed by `callsign`, which for that table is the
+        `signal_via` link, so a bucket series keyed on a placeholder LINK goes too.
+
+        Idempotent, and a no-op on a clean database.
+        """
+        # Built from the shared constant rather than a literal list so the
+        # migration can never drift from the runtime guard that replaced it.
+        patterns = [f"{base}%" for base in sorted(PLACEHOLDER_CALLSIGN_BASES)]
+        where = " OR ".join(["UPPER(callsign) LIKE ?"] * len(patterns))
+        total = 0
+        for table in ("station_positions", "signal_log", "signal_buckets"):
+            cur = conn.execute(f"DELETE FROM {table} WHERE {where}", patterns)  # noqa: S608 - table names are a fixed literal tuple, patterns are bound
+            deleted = cur.rowcount if cur.rowcount and cur.rowcount > 0 else 0
+            total += deleted
+            if deleted:
+                logger.info("Scrubbed %d placeholder-callsign rows from %s", deleted, table)
+        logger.info(
+            "Migration v25 → v26: removed %d placeholder-callsign station row(s) (bases: %s)",
+            total,
+            ", ".join(sorted(PLACEHOLDER_CALLSIGN_BASES)),
+        )
 
     @staticmethod
     def _backfill_new_tables(conn: sqlite3.Connection) -> None:
