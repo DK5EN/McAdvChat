@@ -4,9 +4,9 @@
 > Newest sweep: §7 (2026-09-01 15:45 CEST) — box **all green**. Its one finding (**F13**, a 6.07 h
 > `{CET}` uplink outage) was upstream and **resolved the same evening at 18:38 CEST**, which also
 > verified the v2.0.2 gap-close path and re-confirmed the 606.8 s cadence.
-> Open watch points: **W2** (live `config.json` stays `0640` by decision), **W3** (Caddy 12 h
-> certs), **W6** and **W7** (§6, accepted residual risks).
-> **W1**, **W4** (§3), **W5** (§5) and **W8** (§7) are resolved.
+> Open watch points: **W1** (zram swap, 59 MB out — improving), **W2** (live `config.json` stays
+> `0640` by decision), **W3** (Caddy 12 h certs), **W6** and **W7** (§6, accepted residual risks).
+> **W4** (§3), **W5** (§5) and **W8** (§7) are resolved.
 >
 > **Kind:** Recurring ops review; one dated section per run, appended, never edited in place.
 > **Produced by:** the `ai-ops` skill (`.claude/skills/ai-ops/SKILL.md`).
@@ -607,5 +607,20 @@ Structural: schema **28** (was 25 — this release), system epoch **1**, classif
   back 18:38:32, 6.07 h, upstream. Kept on the record so a future run reading a depressed 24 h
   uptime figure finds the cause here instead of re-diagnosing it as a threshold problem. The
   cadence was re-measured on recovery and is unchanged at 606.8 s.
-- W2, W3, W6, W7 carry forward unchanged. **W1** and **W5** are closed: the tree-replace fix is
-  measured above, and `mcapp-ble.service` is now `0600`.
+- **W1 — swap. Carried, and improved again.** **59 MB** swapped out under zram (from 94 in §4,
+  142 in §2), 355 MB SwapFree, 135 MB RAM available. Still a WATCH, not a finding; it becomes one
+  if SwapFree trends toward zero.
+- **W2 — `config.json` is `0640` on the live box.** Confirmed again. The decided state until
+  someone runs `--reconfigure`; **do not report it as a regression.**
+- **W3 — Caddy cert always looks near-expiry.** Confirmed healthy: issuer
+  `CN=Caddy Local Authority - ECC Intermediate`, `notBefore Sep 1 12:38:16 GMT →
+notAfter Sep 2 00:38:16 GMT`, read at 17:06 GMT = mid-life on a 12 h leaf.
+- **W6, W7** carry forward unchanged (§6, accepted residual risks).
+- **W5 is closed.** webapp `main` no longer runs ahead of its own `development`: `release.sh` now
+  tags, bumps and **pushes** both repos, and both read `behind_main: 0` after this release.
+
+> **Correction to an earlier draft of this section.** A first pass of these notes closed **W1**
+> and credited it to the tree-replace measurement. That was wrong on both halves: W1 is **memory
+> swap under zram**, and the directory-swap window in `install_webapp_tree` is **W6**, which is an
+> accepted residual risk and stays open. Swap is measured above and carries forward. The
+> `mcapp-ble.service` `0600` change closes **§6 finding 5**, not W5.
