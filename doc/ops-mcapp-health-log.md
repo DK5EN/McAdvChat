@@ -1,11 +1,12 @@
 # McApp production health log — mcapp.local
 
 > **Status:** Current — newest section: §7 (2026-09-01, v2.0.2 promoted to production).
-> Newest sweep: §7 (2026-09-01 15:45 CEST) — box **all green**, one live upstream finding
-> (**F13**, the `{CET}` uplink down since 12:34 CEST while RF is normal).
+> Newest sweep: §7 (2026-09-01 15:45 CEST) — box **all green**. Its one finding (**F13**, a 6.07 h
+> `{CET}` uplink outage) was upstream and **resolved the same evening at 18:38 CEST**, which also
+> verified the v2.0.2 gap-close path and re-confirmed the 606.8 s cadence.
 > Open watch points: **W2** (live `config.json` stays `0640` by decision), **W3** (Caddy 12 h
-> certs), **W6** and **W7** (§6, accepted residual risks), **W8** (§7, the `{CET}` outage).
-> **W1**, **W4** (§3) and **W5** (§5) are resolved.
+> certs), **W6** and **W7** (§6, accepted residual risks).
+> **W1**, **W4** (§3), **W5** (§5) and **W8** (§7) are resolved.
 >
 > **Kind:** Recurring ops review; one dated section per run, appended, never edited in place.
 > **Produced by:** the `ai-ops` skill (`.claude/skills/ai-ops/SKILL.md`).
@@ -557,6 +558,26 @@ time, and there was nothing to hear.
 return and the ledger to close the segment; if it stays dark for many hours, it is an upstream
 report, not a local fix.
 
+#### F13 resolved, 18:38 CEST — and it verified the shipped recorder
+
+The beacon returned at **18:38:32** after a **6.07 h** outage (12:34:34 → 18:38:32). The ledger
+closed the gap at exactly that timestamp and opened an `up` run; `state` went `off` → `active`.
+Confirmed upstream, not a defect in anything we ship.
+
+Two things worth keeping:
+
+- **This is the one v2.0.2 code path the promotion sweep could not exercise.** The retuned
+  thresholds and migration v28 were verified against stored history, but a gap being _closed_ by
+  a returning beacon needed a returning beacon. It behaved correctly on the new build.
+- **Cadence re-measured: 606.8 s (10.11 min)**, from 18:38:32 → 18:48:39. Unchanged from the
+  documented 606.5 s, so `GAP_TOLERANCE_MS` at 12 min keeps its intended 1.19x margin — **no
+  retune needed.** Re-measuring here was the point: the cadence is set upstream by the MeshCom
+  server and has already moved once, and a long outage is exactly the occasion on which it might
+  have moved again.
+
+The 24 h uptime reads **73.3 %** while the outage is still inside the window; it climbs out over
+the following day. Coverage stayed **100 %** throughout — the proxy was watching the whole time.
+
 ### Rate baseline — re-measured
 
 | Signal                     | Baseline (§1)     | This run                | Verdict                    |
@@ -582,7 +603,9 @@ Structural: schema **28** (was 25 — this release), system epoch **1**, classif
 
 ### Watch points
 
-- **W8 (new)** — the `{CET}` uplink outage above. Not a defect in anything we ship; recorded so the
-  next run has the start time and does not re-diagnose it as a threshold problem.
+- **W8 — opened and closed within this section.** The `{CET}` uplink outage above: down 12:34:34,
+  back 18:38:32, 6.07 h, upstream. Kept on the record so a future run reading a depressed 24 h
+  uptime figure finds the cause here instead of re-diagnosing it as a threshold problem. The
+  cadence was re-measured on recovery and is unchanged at 606.8 s.
 - W2, W3, W6, W7 carry forward unchanged. **W1** and **W5** are closed: the tree-replace fix is
   measured above, and `mcapp-ble.service` is now `0600`.
