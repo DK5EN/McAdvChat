@@ -33,7 +33,7 @@ readonly SCRIPT_VERSION="2.6.0"
 # front door). Bump this when setup_system/install_packages output changes in
 # a way existing installs must converge to. Independent of the app version
 # and of the DB schema version.
-readonly SYSTEM_EPOCH=1
+readonly SYSTEM_EPOCH=2
 
 # Detect piped mode (curl | bash) — BASH_SOURCE is empty when piped
 # SCRIPT_DIR is intentionally NOT readonly: source_libs() overwrites it with

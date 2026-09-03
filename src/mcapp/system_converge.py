@@ -37,7 +37,7 @@ UPDATE_RUNNER_PORT = 2985  # must match scripts/update-runner.py's listen port
 
 # Mirror of SYSTEM_EPOCH in bootstrap/mcapp.sh. Bump both together -- a
 # startup test enforces parity by parsing mcapp.sh.
-REQUIRED_SYSTEM_EPOCH = 1
+REQUIRED_SYSTEM_EPOCH = 2
 
 SYSTEM_EPOCH_FILE = Path("/var/lib/mcapp/system-epoch")
 CONVERGE_ATTEMPT_FILE = Path("/var/lib/mcapp/converge-attempt")
