@@ -222,6 +222,25 @@ evidence: `doc/2026-08-28_0900-firmware-4.35p.08.28-adoption.md`.
   `|`-separated string that never held them. MCProxy never sends `--mheard`, but all three stay
   optional — never subscript them.
 
+## ACK Attribution (`message_acks`, "who acknowledged?")
+
+Attribution behind the single-flag `send_success` / `acked`: which station sent the Node,
+Gateway or Peer ACK. Plan and the compatibility matrix: `doc/2026-09-05_1545-ack-attribution-plan.md`;
+firmware side: `MeshCom-Firmware-DEV-Main/docs/ack-wer-hat-quittiert.md`.
+
+- **Vocabulary is `node` / `gateway` / `peer`** (`ack_kind` on `msg:status`, `ACK_KIND_BY_TYPE`
+  in `ble_protocol.py`). The proposal's "heard" / "server reached" are explanations, not
+  identifiers. Do not rename on the wire: the webapp's ctcping ordering guard keys on `sent`.
+- **The BLE appendix is length-prefixed at GATT byte 7**, not separator-terminated. Old firmware
+  sends `0x00` there, which IS the legacy format. A bad appendix drops the appendix, never the ACK
+  (`parse_ack_appendix`). The 4-byte timestamp is never read; `transform_ack` stamps arrival.
+- **`from` / `via` are on `msg_status` ONLY when known.** Legacy payloads are byte-identical and
+  pinned by `ack_status_tests` cases 1-6; adding `from: None` breaks them and mc-chat parity.
+- **`message_acks.from_call` is `''`, never NULL, for an unattributed frame** so the
+  `(msg_id, kind, from_call)` key collapses repeats once firmware stops gating "first ACK only".
+- **The extUDP `{"type":"ack"}` datagram has no `msg` key** and must be claimed in
+  `_handle_non_chat_frame` before the DEBUG-only non-chat log, which is where it used to vanish.
+
 ## Blocklist (`sperrliste.json`)
 
 The curated global blocklist, maintained in this repo and fetched by every node from

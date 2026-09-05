@@ -63,6 +63,7 @@ async def run_migration_chain_tests() -> bool:
     await _test_v26_placeholder_station_scrub(results)
     await _test_v27_gw_lora_mod_scrub(results)
     await _test_v28_uptime_gap_scrub(results)
+    await _test_v29_message_acks_table(results)
 
     for label, ok in results:
         print(f"    {'✅ PASS' if ok else '❌ FAIL'} | {label}")
@@ -943,6 +944,61 @@ async def _test_v24_fcs_ok_column(results: list[tuple[str, bool]]) -> None:
                 (
                     "v24 fcs_ok: pre-existing row's own data (msg/src/dst) is untouched",
                     bool(row) and row[0]["msg"] == "hi" and row[0]["dst"] == "OE3ABC",
+                )
+            )
+        finally:
+            await storage.close()
+
+
+async def _test_v29_message_acks_table(results: list[tuple[str, bool]]) -> None:
+    """Seed a v28 fixture and assert the v29 step stands up `message_acks` with
+    the (msg_id, kind, from_call) key that makes repeated acks collapse — the
+    property ingest relies on once firmware stops gating "first ACK only"."""
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        db_path = Path(tmp_dir) / "migration_chain_v29.db"
+
+        def _create_v28_db() -> None:
+            with db_write(db_path) as conn:
+                conn.executescript(CREATE_SCHEMA_SQL)
+                conn.executescript(CREATE_SCHEMA_V2_SQL)
+                conn.execute("DELETE FROM schema_version")
+                conn.execute("INSERT INTO schema_version (version) VALUES (28)")
+                conn.commit()
+
+        await asyncio.to_thread(_create_v28_db)
+
+        try:
+            storage = await create_sqlite_storage(db_path)
+        except Exception:
+            logger.exception("v29 message_acks migration raised")
+            results.append(("v29 message_acks: migrator runs v28→HEAD without error", False))
+            return
+
+        results.append(("v29 message_acks: migrator runs v28→HEAD without error", True))
+        try:
+            version = await _schema_version(storage)
+            results.append(
+                (
+                    f"v29 message_acks: final schema_version marker is {FINAL_SCHEMA_VERSION}",
+                    version == FINAL_SCHEMA_VERSION,
+                )
+            )
+            for _ in range(2):
+                await storage._mutate(
+                    "INSERT OR IGNORE INTO message_acks"
+                    " (msg_id, kind, from_call, via, timestamp) VALUES (?, ?, ?, ?, ?)",
+                    ("ABCD0001", "gateway", "OE1XYZ-12", "lora", 1),
+                )
+            await storage._mutate(
+                "INSERT OR IGNORE INTO message_acks"
+                " (msg_id, kind, from_call, via, timestamp) VALUES (?, ?, ?, ?, ?)",
+                ("ABCD0001", "node", "", None, 2),
+            )
+            rows = await storage._query("SELECT COUNT(*) AS n FROM message_acks", ())
+            results.append(
+                (
+                    "v29 message_acks: (msg_id, kind, from_call) is the key — a repeat collapses",
+                    bool(rows) and rows[0]["n"] == 2,
                 )
             )
         finally:

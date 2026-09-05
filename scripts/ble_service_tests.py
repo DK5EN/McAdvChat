@@ -1212,6 +1212,48 @@ async def _test_hello_settle_delay_ordering(record: Any) -> None:
         _restore_state(snapshot)
 
 
+async def _test_post_connect_burst_opts_into_ack_attribution(record: Any) -> None:
+    """`query_extended_registers()` -- the post-connect command burst both
+    init paths run -- must send `ACK_ATTRIBUTION_COMMAND` (`--ackinfo on`)
+    and send it FIRST. The flag is volatile on the node (reset on
+    disconnect), so every connect has to re-assert it, and it has to precede
+    the register queries so acks for anything sent during the burst are
+    already ungated. Drives the real adapter method with only `write` and
+    `is_connected` overridden; the assertion is on the exact ordered command
+    list, so reordering or dropping the flag changes it.
+    """
+    sent: list[str] = []
+
+    class _RecordingAdapter(BLEAdapter):
+        @property
+        def is_connected(self) -> bool:
+            return True
+
+        async def write(self, data: bytes) -> bool:
+            # `_frame()` = [len][type][payload]; the payload is the command text.
+            sent.append(data[2:].decode("utf-8"))
+            return True
+
+    adapter = _RecordingAdapter.__new__(_RecordingAdapter)
+    original_sleep = ble_adapter.asyncio.sleep
+
+    async def _fake_sleep(delay: float) -> None:
+        return None
+
+    ble_adapter.asyncio.sleep = _fake_sleep  # type: ignore[assignment]
+    try:
+        await adapter.query_extended_registers()
+    finally:
+        ble_adapter.asyncio.sleep = original_sleep
+
+    record(
+        "post-connect burst: `--ackinfo on` is sent first, then the register queries "
+        f"-- observed: {sent}",
+        sent == [ble_adapter.ACK_ATTRIBUTION_COMMAND, "--io", "--tel"]
+        and ble_adapter.ACK_ATTRIBUTION_COMMAND == "--ackinfo on",
+    )
+
+
 def _load_state_safe() -> tuple[str | None, str | None]:
     """Call `_load_ble_state()`, capturing rather than propagating a raise —
     the thing under test IS whether it raises, so the test needs to observe
@@ -5750,6 +5792,7 @@ async def run_ble_service_tests() -> bool:
         _test_register_cache_receives_salvaged_partial_frame,
         _test_register_cache_cleared_on_target_change,
         _test_hello_settle_delay_ordering,
+        _test_post_connect_burst_opts_into_ack_attribution,
     ):
         await case(_record)
     _test_ble_state_missing_corrupt_and_nondict(_record)

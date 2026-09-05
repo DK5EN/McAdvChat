@@ -15,6 +15,7 @@ from collections.abc import Callable
 from pathlib import Path
 from typing import Any, cast
 
+from .ble_protocol import ACK_KIND_BY_TYPE, ack_type_text, normalise_ack_callsign
 from .commands.parsing import strip_relay_path
 from .logging_setup import get_logger
 from .runtime_state import save_runtime_state
@@ -264,6 +265,54 @@ def try_repair_json(text: str) -> dict[str, Any]:
             return {"raw_text": text, "error": "invalid_json_not_an_object"}
     logger.debug("JSON repair gave up after %d attempts", MAX_JSON_REPAIR_ATTEMPTS)
     return {"raw_text": text, "error": "invalid_json_repair_failed"}
+
+
+_EXTUDP_ACK_MSG_ID_LEN = 8  # firmware msg_id on the wire: 8 hex digits
+_EXTUDP_ACK_VIA = frozenset({"lora", "udp"})
+
+
+def normalize_extudp_ack(message: dict[str, Any]) -> dict[str, Any] | None:
+    """Turn the proposed extUDP delivery-status datagram into the ingest ACK shape.
+
+    Wire (firmware proposal `docs/ack-wer-hat-quittiert.md` §6.3):
+    `{"type": "ack", "msg_id": "1A2B3C4D", "status": 1, "from": "OE1XYZ-12",
+    "via": "lora"}` — `status` uses the firmware's BLE status byte values
+    (0 Node ACK / heard, 1 Gateway ACK, 2 Peer ACK), `from`/`via` optional.
+
+    Returns the SAME dict shape `ble_protocol.transform_ack` produces for the
+    BLE binary frame (`type`, `msg_id`, `ack_type`, `ack_type_text`, optional
+    `ack_from`/`ack_via`), so `storage/ingest.py::_handle_ack` has one input
+    contract. `None` when `msg_id` or `status` is unusable — an ACK that cannot
+    be correlated is noise, not data. A bad `from`/`via` only drops that field
+    (attribution is extra, the ACK itself must survive — proposal §5.2).
+    """
+    msg_id = message.get("msg_id")
+    if not isinstance(msg_id, str):
+        return None
+    msg_id = msg_id.strip().upper()
+    if len(msg_id) != _EXTUDP_ACK_MSG_ID_LEN:
+        return None
+    try:
+        int(msg_id, 16)
+    except ValueError:
+        return None
+    status = message.get("status")
+    if isinstance(status, bool) or not isinstance(status, int) or status not in ACK_KIND_BY_TYPE:
+        return None
+    result: dict[str, Any] = {
+        "type": "ack",
+        "src_type": "udp",
+        "msg_id": msg_id,
+        "ack_type": status,
+        "ack_type_text": ack_type_text(status),
+    }
+    ack_from = normalise_ack_callsign(message.get("from"))
+    if ack_from is not None:
+        result["ack_from"] = ack_from
+    via = message.get("via")
+    if isinstance(via, str) and via.lower() in _EXTUDP_ACK_VIA:
+        result["ack_via"] = via.lower()
+    return result
 
 
 def _log_non_chat_frame(message: dict[str, Any]) -> None:
@@ -564,7 +613,7 @@ class UDPHandler:
                 if self.message_router:
                     await self.message_router.publish("udp", "mesh_message", message)
                 return
-            _log_non_chat_frame(message)
+            await self._handle_non_chat_frame(message)
             return
 
         message["timestamp"] = now_ms()
@@ -582,6 +631,24 @@ class UDPHandler:
                 message.get("src_type", "<MISSING>"),
                 list(message.keys()),
             )
+
+    async def _handle_non_chat_frame(self, message: dict[str, Any]) -> None:
+        """A datagram without `msg` that is not telemetry: either the delivery-
+        status datagram (attribution proposal §6.3, `{"type": "ack", ...}`) or
+        something to log and drop. The ack must be claimed here — before this
+        branch existed every such frame fell into `_log_non_chat_frame`'s
+        DEBUG line and vanished, which is exactly the hole the proposal's §6.2
+        describes from the firmware side."""
+        if message.get("type") != "ack":
+            _log_non_chat_frame(message)
+            return
+        ack = normalize_extudp_ack(message)
+        if ack is None:
+            logger.debug("Dropped unusable extUDP ack datagram: %s", message)
+            return
+        ack["timestamp"] = now_ms()
+        if self.message_router:
+            await self.message_router.publish("udp", "mesh_message", ack)
 
     def _reject_non_scalar_fields(self, message: dict[str, Any], ip_str: str) -> None:
         """Apply `_strip_non_scalar_fields` and make the drop diagnosable.

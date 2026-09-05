@@ -122,6 +122,16 @@ KEEPALIVE_INTERVAL_S = 300
 DST_CHECK_INTERVAL_S = 3600
 POST_PAIR_SETTLE_S = 2
 REGISTER_QUERY_DELAY_S = 0.8
+
+# ACK attribution opt-in (firmware proposal docs/ack-wer-hat-quittiert.md
+# §5.5): the node's "first ACK only" gate falls only while this session flag
+# is set. It is VOLATILE on the node -- reset on BLE disconnect -- so the
+# official phone app, which never sends it, keeps the legacy one-frame
+# behaviour on the same node. McApp is idempotent for repeated ACK frames
+# (storage/ingest.py `_record_message_ack`), so it opts in on every connect.
+# Pre-attribution firmware answers `--wrong command --ackinfo on` on the
+# command-back channel, which is logged and otherwise harmless.
+ACK_ATTRIBUTION_COMMAND = "--ackinfo on"
 MESHCOM_NAME_PREFIX = "MC-"  # not shared with src/mcapp — ble_service is a separate process
 
 logger = logging.getLogger(__name__)
@@ -1646,12 +1656,18 @@ class BLEAdapter:
 
         The device auto-sends: I, SN, G, SA, SE+S1, SW+S2, W, AN
         This only queries: IO (GPIO status) and TM (telemetry config).
+
+        The same burst carries the one per-session setting McApp needs on
+        the node: `ACK_ATTRIBUTION_COMMAND`, sent FIRST so that every ACK
+        frame of this session -- including the acks for messages sent while
+        the register replies are still arriving -- is already ungated.
         """
         if not self.is_connected:
             logger.warning("Cannot query registers: not connected")
             return
 
         commands = [
+            (ACK_ATTRIBUTION_COMMAND, REGISTER_QUERY_DELAY_S),  # session flag, see constant
             ("--io", REGISTER_QUERY_DELAY_S),  # TYP: IO (GPIO status)
             ("--tel", REGISTER_QUERY_DELAY_S),  # TYP: TM (telemetry config)
         ]

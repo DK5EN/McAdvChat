@@ -21,6 +21,7 @@ from .ble_protocol import (
     calc_fcs,
     decode_binary_message,
     dispatcher,
+    parse_ack_appendix,
     parse_aprs_position,
     timestamp_from_date_time,
     transform_mh,
@@ -344,6 +345,23 @@ def _build_ack_frame(msg_id: int, ack_type: int) -> bytes:
         + struct.pack("<I", msg_id)
         + bytes([ack_type])
         + b"\x00"
+        + struct.pack("<I", 0)
+    )
+
+
+def _build_attributed_ack_frame(
+    msg_id: int, ack_type: int, callsign: bytes, *, length_byte: int | None = None
+) -> bytes:
+    """ACK frame with the attribution appendix (proposal §4.2 as amended by the
+    MCProxy plan): byte 7 = appendix length, callsign bytes, then the timestamp.
+    `length_byte` overrides the declared length to build deliberately broken
+    frames (declared longer than the bytes present, etc.)."""
+    n = len(callsign) if length_byte is None else length_byte
+    return (
+        bytes([FRAME_PREFIX, ACK_TYPE_BYTE])
+        + struct.pack("<I", msg_id)
+        + bytes([ack_type, n])
+        + callsign
         + struct.pack("<I", 0)
     )
 
@@ -1151,6 +1169,80 @@ def _test_i_register_fwdate_passthrough(results: list[tuple[str, bool]]) -> None
     )
 
 
+def _test_ack_appendix(results: list[tuple[str, bool]]) -> None:
+    """The attribution appendix (firmware proposal docs/ack-wer-hat-quittiert.md
+    §4.2, amended: byte 7 is a LENGTH, 0 = legacy). Every legacy frame decodes
+    unchanged; a valid appendix yields `ack_from`; every malformed appendix is
+    dropped while the ACK itself still decodes (proposal §5.2: attribution
+    must never cost an ACK)."""
+    legacy = decode_binary_message(_build_ack_frame(ACK_MSG_ID, ACK_TYPE_GATEWAY))
+    _check(
+        results,
+        "ACK appendix: legacy 12-byte frame (byte 7 == 0) carries no ack_from",
+        legacy is not None and "ack_from" not in legacy,
+    )
+    wire = decode_binary_message(PEER_ACK_WIRE_FRAME)
+    _check(
+        results,
+        "ACK appendix: real 13-byte wire frame (trailing pad) carries no ack_from",
+        wire is not None and "ack_from" not in wire,
+    )
+
+    six = decode_binary_message(
+        _build_attributed_ack_frame(ACK_MSG_ID, ACK_TYPE_GATEWAY, b"OE1XYZ")
+    )
+    _check(
+        results,
+        "ACK appendix: n=6 -> ack_from 'OE1XYZ', ack_type untouched",
+        six is not None and six.get("ack_from") == "OE1XYZ" and six["ack_type"] == ACK_TYPE_GATEWAY,
+    )
+    ten = decode_binary_message(
+        _build_attributed_ack_frame(ACK_MSG_ID, ACK_TYPE_NODE, b"DL3NCU-100")
+    )
+    _check(
+        results,
+        "ACK appendix: n=10 (the cap) -> ack_from 'DL3NCU-100'",
+        ten is not None and ten.get("ack_from") == "DL3NCU-100",
+    )
+    lower = decode_binary_message(
+        _build_attributed_ack_frame(ACK_MSG_ID, ACK_TYPE_PEER, b"dk5en-98")
+    )
+    _check(
+        results,
+        "ACK appendix: lower-case callsign is upper-cased",
+        lower is not None and lower.get("ack_from") == "DK5EN-98",
+    )
+
+    eleven = decode_binary_message(
+        _build_attributed_ack_frame(ACK_MSG_ID, ACK_TYPE_GATEWAY, b"DL3NCU-1000")
+    )
+    _check(
+        results,
+        "ACK appendix: n=11 exceeds the cap -> appendix dropped, ACK kept",
+        eleven is not None and "ack_from" not in eleven and eleven["msg_id"] == ACK_MSG_ID,
+    )
+    junk = decode_binary_message(
+        _build_attributed_ack_frame(ACK_MSG_ID, ACK_TYPE_GATEWAY, b"OE1 XYZ")
+    )
+    _check(
+        results,
+        "ACK appendix: byte outside [A-Z0-9-] -> appendix dropped, ACK kept",
+        junk is not None and "ack_from" not in junk and junk["ack_type"] == ACK_TYPE_GATEWAY,
+    )
+    short = _build_attributed_ack_frame(ACK_MSG_ID, ACK_TYPE_GATEWAY, b"OE1XYZ", length_byte=9)
+    short_decoded = decode_binary_message(short)
+    _check(
+        results,
+        "ACK appendix: declared length overruns the frame -> dropped, ACK kept",
+        short_decoded is not None and "ack_from" not in short_decoded,
+    )
+    _check(
+        results,
+        "ACK appendix: parse_ack_appendix never claims a callsign on a 7-byte stub",
+        parse_ack_appendix(bytes([FRAME_PREFIX, ACK_TYPE_BYTE]) + b"\x00" * 5) is None,
+    )
+
+
 def run_ble_protocol_tests() -> bool:
     """Run all ble_protocol golden-frame tests. Returns True iff all pass."""
     results: list[tuple[str, bool]] = []
@@ -1160,6 +1252,7 @@ def run_ble_protocol_tests() -> bool:
     _test_decode_malformed(results)
     _test_fcs(results)
     _test_ack(results)
+    _test_ack_appendix(results)
     _test_aprs_position(results)
     _test_aprs_comment_injection(results)
     _test_aprs_symbol_table_ids(results)

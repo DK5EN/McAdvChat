@@ -17,6 +17,7 @@ from statistics import mean
 from typing import Any
 
 from .. import linkcheck
+from ..ble_protocol import normalise_ack_callsign
 from ..logging_setup import get_logger
 from ..util import (
     ACK_SUFFIX_RE,
@@ -110,6 +111,25 @@ _WEATHER_BEACON_FIELDS = ("temp1", "temp2", "hum", "hum2", "qfe", "qnh", "gas", 
 _APRS_ESCAPE_BACKFILL_MARKER = "aprs_escape_backfill_done:v1"
 
 logger = get_logger(__name__)
+
+
+_ACK_VIA_VALUES = frozenset({"lora", "udp"})
+
+
+def _coerce_ack_via(value: Any) -> str | None:
+    """`ack_via` is a closed vocabulary (proposal §6.3); anything else is dropped."""
+    return value if isinstance(value, str) and value in _ACK_VIA_VALUES else None
+
+
+def _ack_attribution_fields(ack_from: str | None, ack_via: str | None) -> dict[str, str]:
+    """The optional `from`/`via` keys of a `msg_status` event — present only when
+    known, so legacy-firmware payloads are unchanged (pinned by ack_status_tests)."""
+    fields: dict[str, str] = {}
+    if ack_from is not None:
+        fields["from"] = ack_from
+    if ack_via is not None:
+        fields["via"] = ack_via
+    return fields
 
 
 class IngestMixin(StorageBase):
@@ -740,10 +760,25 @@ class IngestMixin(StorageBase):
         logger.info("APRS escape backfill complete: %s", summary)
         return summary
 
-    async def _handle_ack(
-        self, ack_for_msg_id: str, ack_type: Any, ack_type_text: str, timestamp: int
+    async def _handle_ack(  # noqa: PLR0913 - one call site, every argument is a decoded frame field
+        self,
+        ack_for_msg_id: str,
+        ack_type: Any,
+        ack_type_text: str,
+        timestamp: int,
+        *,
+        ack_from: str | None = None,
+        ack_via: str | None = None,
     ) -> None:
         """Binary ACK → set send_success on the original message, no row of its own.
+
+        `ack_from`/`ack_via` are the optional attribution carried by
+        attribution-capable firmware (BLE appendix, `ble_protocol.parse_ack_appendix`)
+        or the extUDP ack datagram (`udp_handler.normalize_extudp_ack`). When the
+        original row matched they are recorded in `message_acks` (one row per
+        msg_id/kind/station, repeats collapse) and echoed on the `msg_status`
+        event as `from`/`via` — ONLY when known, so the pinned legacy payloads
+        for pre-appendix firmware stay byte-identical.
 
         Firmware sends 7-byte ACKs to BLE: msg_id = ID of the original message being
         acknowledged, ack_type = 0x00 (Node ACK), 0x01 (Gateway ACK), or 0x02 (Peer
@@ -805,6 +840,8 @@ class IngestMixin(StorageBase):
             # Publish only on an actual match, exactly like the inline path — an
             # ack for a msg_id we never sent must never claim a delivery. Never let
             # a publish failure break ingestion (hot path).
+            if acked_rows:
+                await self._record_message_ack(ack_for_msg_id, "peer", ack_from, ack_via, timestamp)
             if acked_rows and self._message_router:
                 try:
                     await self._message_router.publish(
@@ -814,6 +851,7 @@ class IngestMixin(StorageBase):
                             "msg_id": ack_for_msg_id,
                             "acked": True,
                             "ack_kind": "peer",
+                            **_ack_attribution_fields(ack_from, ack_via),
                         },
                     )
                 except Exception:
@@ -836,6 +874,8 @@ class IngestMixin(StorageBase):
             ack_kind = "gateway"
         else:
             ack_kind = f"unknown({ack_type!r})"
+        if rows and ack_kind in ("node", "gateway"):
+            await self._record_message_ack(ack_for_msg_id, ack_kind, ack_from, ack_via, timestamp)
         if self._message_router:
             await self._message_router.publish(
                 "storage",
@@ -844,8 +884,34 @@ class IngestMixin(StorageBase):
                     "msg_id": ack_for_msg_id,
                     "sent": True,
                     "ack_kind": ack_kind,
+                    **_ack_attribution_fields(ack_from, ack_via),
                 },
             )
+
+    async def _record_message_ack(
+        self,
+        msg_id: str,
+        kind: str,
+        ack_from: str | None,
+        ack_via: str | None,
+        timestamp: int,
+    ) -> None:
+        """Append one row to the attribution ledger (schema v29), idempotently.
+
+        `INSERT OR IGNORE` on the (msg_id, kind, from_call) key: once firmware
+        stops gating "only the first ACK reaches the app" (proposal §3), the same
+        station's repeat is a no-op and an unattributed repeat ('' placeholder)
+        collapses into the one row per kind that is already there. Never raises
+        into the ingest hot path.
+        """
+        try:
+            await self._mutate(
+                "INSERT OR IGNORE INTO message_acks (msg_id, kind, from_call, via, timestamp)"
+                " VALUES (?, ?, ?, ?, ?)",
+                (msg_id, kind, ack_from or "", ack_via, timestamp),
+            )
+        except sqlite3.Error:
+            logger.exception("Failed to record %s ack for msg_id=%s", kind, msg_id)
 
     async def _store_position(
         self, callsign: str, message: dict[str, Any], raw: str, relay_via: str
@@ -1071,6 +1137,8 @@ class IngestMixin(StorageBase):
                     message.get("ack_type"),
                     message.get("ack_type_text", "Unknown"),
                     timestamp,
+                    ack_from=normalise_ack_callsign(message.get("ack_from")),
+                    ack_via=_coerce_ack_via(message.get("ack_via")),
                 )
             return  # Don't store ACK as a separate row
 

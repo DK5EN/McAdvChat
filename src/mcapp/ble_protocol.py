@@ -33,7 +33,77 @@ PAYLOAD_TYPE_ACK = 65  # acknowledgement frame
 # call site in `transform_mh`.
 _MH_PAYLOAD_TYPE_HEY = 0x40  # '@'
 
+# --- ACK attribution appendix (firmware proposal `docs/ack-wer-hat-quittiert.md`) ---
+#
+# The BLE ACK frame gains an optional callsign appendix naming the station that
+# acknowledged: on the GATT frame, byte 7 (the proposal's "byte 6", counted
+# without the leading '@') switches from a fixed 0x00 terminator to the LENGTH of
+# the appendix, and the callsign follows at bytes 8..8+n. Old firmware always
+# sends 0x00 there, so `n == 0` is the legacy frame and decodes exactly as before.
+# Mirrors the wire-side rule in proposal §4.1 byte 11 — one rule for both.
+#
+# The appendix is attribution only: a bad appendix (length out of range, bytes
+# outside the callsign charset, or a frame too short to hold `n` bytes plus the
+# 4-byte timestamp) is DROPPED and the frame is processed as a plain ACK. It
+# must never cost an ACK (proposal §5.2).
+_ACK_APPENDIX_OFFSET = 8  # GATT index of the first callsign byte
+_ACK_APPENDIX_MAX_LEN = 10  # proposal §4.1: n <= 10
+_ACK_TIMESTAMP_LEN = 4  # firmware appends 4 bytes of unix time after the payload
+_ACK_CALLSIGN_RE = re.compile(r"^[A-Z0-9][A-Z0-9-]{0,9}$")
+
+# ack_type (firmware status byte) -> the `ack_kind` vocabulary shared with the
+# webapp and mc-chat on the `msg_status` SSE event. "node" is the proposal's
+# "heard" (a neighbour repeated our frame), "gateway" its "server reached",
+# "peer" the addressee's own matched reply. Single source for both ingest paths
+# (BLE binary frame and the extUDP `{"type": "ack"}` datagram).
+ACK_KIND_BY_TYPE: dict[int, str] = {0x00: "node", 0x01: "gateway", 0x02: "peer"}
+ACK_TEXT_BY_TYPE: dict[int, str] = {0x00: "Node ACK", 0x01: "Gateway ACK", 0x02: "Peer ACK"}
+
 logger = logging.getLogger(__name__)
+
+
+def ack_type_text(ack_type: int) -> str:
+    """Human-readable label for a firmware ACK status byte."""
+    return ACK_TEXT_BY_TYPE.get(ack_type, f"Unknown ({ack_type})")
+
+
+def normalise_ack_callsign(value: Any) -> str | None:
+    """Validate an acknowledging station's callsign from an untrusted source.
+
+    Accepts `str` or `bytes` (the BLE appendix), upper-cases, and returns `None`
+    for anything outside the proposal's `[A-Z0-9-]`, 1..10-char grammar. Used by
+    both the BLE appendix parser and the extUDP `from` field so the two ingest
+    paths cannot drift on what counts as a callsign.
+    """
+    if isinstance(value, bytes | bytearray):
+        try:
+            value = bytes(value).decode("ascii")
+        except UnicodeDecodeError:
+            return None
+    if not isinstance(value, str):
+        return None
+    candidate = value.strip().upper()
+    if not candidate or len(candidate) > _ACK_APPENDIX_MAX_LEN:
+        return None
+    return candidate if _ACK_CALLSIGN_RE.match(candidate) else None
+
+
+def parse_ack_appendix(byte_msg: bytes) -> str | None:
+    """Extract the optional acknowledging-station callsign from a GATT ACK frame.
+
+    Layout (GATT indices): [0]'@' [1]0x41 [2..5]msg_id [6]ack_type [7]n
+    [8..8+n]callsign [..]timestamp x4. `n == 0` is the legacy frame. Any
+    violation returns `None` — never raises, never rejects the frame.
+    """
+    if len(byte_msg) <= _ACK_APPENDIX_OFFSET - 1:
+        return None
+    n = byte_msg[_ACK_APPENDIX_OFFSET - 1]
+    if n == 0 or n > _ACK_APPENDIX_MAX_LEN:
+        return None
+    end = _ACK_APPENDIX_OFFSET + n
+    if end + _ACK_TIMESTAMP_LEN > len(byte_msg):
+        return None
+    return normalise_ack_callsign(byte_msg[_ACK_APPENDIX_OFFSET:end])
 
 
 def calc_fcs(msg: bytes) -> int:
@@ -101,26 +171,24 @@ def _decode_ack_frame(
                node originated — lora_functions.cpp:857-896, the strongest ack the
                firmware emits: `L1`, MCProxy wire-protocol audit 2026-08-21)
 
-    Bytes 7+ are terminator (0x00) + 4-byte unix timestamp appended by firmware.
+    Byte 7 is 0x00 on legacy firmware; on attribution-capable firmware it is
+    the length of a callsign appendix (see `parse_ack_appendix`). The 4-byte
+    unix timestamp the firmware appends is never read — `transform_ack` stamps
+    arrival time — so a longer frame decodes identically to a 12-byte one.
     """
     logger.debug("ACK raw hex: %s (len=%d)", byte_msg.hex(), len(byte_msg))
 
     ack_type = max_hop_raw  # byte 6 is ack_type in ACK frames
-    if ack_type == 0x00:
-        ack_type_text = "Node ACK"
-    elif ack_type == 0x01:
-        ack_type_text = "Gateway ACK"
-    elif ack_type == 0x02:  # noqa: PLR2004 - firmware wire constant, named in the docstring above
-        ack_type_text = "Peer ACK"
-    else:
-        ack_type_text = f"Unknown ({ack_type})"
-
-    return {
+    result: dict[str, Any] = {
         "payload_type": payload_type,
         "msg_id": msg_id,
         "ack_type": ack_type,
-        "ack_type_text": ack_type_text,
+        "ack_type_text": ack_type_text(ack_type),
     }
+    ack_from = parse_ack_appendix(byte_msg)
+    if ack_from is not None:
+        result["ack_from"] = ack_from
+    return result
 
 
 def _decode_data_frame(  # noqa: PLR0913 - all fields are needed from the shared header/fcs computation

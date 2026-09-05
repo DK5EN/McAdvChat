@@ -80,6 +80,7 @@ try:
     from fastapi.middleware.cors import CORSMiddleware
     from starlette.routing import Route
 
+    from .sse_routes.acks import build_acks_router
     from .sse_routes.classifier import build_classifier_router
     from .sse_routes.deploy import build_deploy_router
     from .sse_routes.linkcheck import build_linkcheck_router
@@ -458,6 +459,7 @@ class SSEManager:
         app.include_router(build_push_router(self))
         app.include_router(build_linkcheck_router(self))
         app.include_router(build_uptime_router(self))
+        app.include_router(build_acks_router(self))
 
         return app
 
