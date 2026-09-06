@@ -1,5 +1,70 @@
 # Release History
 
+## v2.0.3 (2026-09-06)
+
+Patch release. Adds **ACK attribution**: the chat view can now show _who_ acknowledged a message,
+not just that it was acknowledged. Also opens UDP/443 for HTTP/3 so LAN clients stop falling back
+to TCP, and updates dependencies. Schema **v28 → v29**.
+
+**Requires firmware
+[v4.35s.09.06](https://github.com/DK5EN/MeshCom-Firmware/releases/tag/v4.35s.09.06) or later** on
+the node to see attributed acks — older firmware keeps working exactly as before, it just answers
+"wrong command" to the new `--ackinfo` request (harmless) and the app falls back to its old,
+unattributed wording.
+
+### Highlights
+
+- **Who acknowledged a message is now visible, not just that it was.** Until now a double
+  check-mark meant only "some ACK arrived" — the firmware's binary node/gateway ACK and a peer's
+  inline `:ackNNN` reply were both folded into one flag. The proxy now attributes each ACK to the
+  station that sent it (node, gateway, or peer) whenever the frame carries that information, and
+  the webapp shows it two ways: the check-mark tooltip names the strongest attribution, and the
+  message's details popover lists every ACK received.
+
+  Two examples from the field: a directed message acknowledged by the addressee (peer ACK, with a
+  second, unattributed ACK from a station whose reply lacked the callsign appendix), and a group
+  message showing both the gateway that relayed it and a station that merely heard it.
+
+- **Fully backwards compatible.** Attribution is additive — it only appears on frames that carry
+  it. A node running older firmware answers "wrong command" to the new post-connect `--ackinfo`
+  request and otherwise behaves exactly as before; the webapp's older, unattributed ack wording is
+  unchanged for those stations.
+
+### Backend (MCProxy)
+
+- **[feat]** ACK attribution (schema **v29**): `message_acks` ledger keyed by
+  `(msg_id, kind, from_call)`, `''` for an unattributed row so repeated frames collapse. Node/
+  gateway ACKs are parsed from a length-prefixed callsign appendix on the BLE ACK frame (byte 7 =
+  length, `0` = legacy — a bad appendix drops only the appendix, never the ACK); the proposed
+  extUDP `{"type": "ack"}` datagram is now recognised (it has no `msg` key and used to vanish into
+  the DEBUG-only non-chat log). New `GET /api/messages/{msg_id}/acks` endpoint backs the webapp's
+  details popover. `ble_service` requests attribution with `--ackinfo on`, sent once per connection
+  as a volatile node flag (reset on disconnect).
+- **[fix]** Opened `udp/443` for Caddy's HTTP/3 (QUIC) and bumped `SYSTEM_EPOCH` to **2** so
+  already-installed boxes converge to the new firewall rule. LAN clients speaking HTTP/3 were being
+  silently dropped and falling back to TCP.
+- **[chore]** Dependency refresh (anyio, sse-starlette, ruff) and a regenerated standalone
+  `ble_service` lock.
+
+### Frontend (webapp)
+
+- **[feat]** ACK attribution UI: the check-mark tooltip names the strongest attributed station
+  (peer > gateway > node), and the message details popover lists every ack, fetching the backend
+  ledger lazily on first open. Wording for old-firmware traffic (nothing attributed) is unchanged.
+- **[fix]** The popover no longer double-lists an unattributed gateway ack — the backend serialises
+  it as `null`, the live `msg:status` path as `undefined`, and the two were rendering as separate
+  entries. Now merged, and labelled "Other GW ACKed" to describe what it actually is: another
+  gateway's 12-byte LoRa ACK without the hash appendix.
+
+### Upgrade notes
+
+- Schema migrates automatically on first start (v28 → v29); no manual step.
+- `SYSTEM_EPOCH` 1 → 2: an already-installed box picks up the UDP/443 firewall rule on its next
+  `--converge` pass (every update-runner cycle already does this).
+- To see attributed acks in the field, update the node's firmware to
+  [v4.35s.09.06](https://github.com/DK5EN/MeshCom-Firmware/releases/tag/v4.35s.09.06) or later.
+  Nothing needs to change on older firmware — it is simply not attributed.
+
 ## v2.0.2 (2026-09-01)
 
 Patch release. Three field-reported defects and their causes: the **Gateway Availability** card had

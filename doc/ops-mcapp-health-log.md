@@ -1,10 +1,12 @@
 # McApp production health log — mcapp.local
 
-> **Status:** Current — newest section: §6 (2026-08-22, fable review of the release tooling and
-> its fixes). Newest sweep: §4 (2026-08-22 17:53 CEST) — verdict **all green**, zero findings.
-> Open watch points: **W1** (swap), **W2** (live `config.json` stays `0640` by decision), **W3**
-> (Caddy 12 h certs), **W6** and **W7** (§6, accepted residual risks). **W4** (§3) and **W5** (§5)
-> are resolved.
+> **Status:** Current — newest section: §7 (2026-09-01, v2.0.2 promoted to production).
+> Newest sweep: §7 (2026-09-01 15:45 CEST) — box **all green**. Its one finding (**F13**, a 6.07 h
+> `{CET}` uplink outage) was upstream and **resolved the same evening at 18:38 CEST**, which also
+> verified the v2.0.2 gap-close path and re-confirmed the 606.8 s cadence.
+> Open watch points: **W1** (zram swap, 59 MB out — improving), **W2** (live `config.json` stays
+> `0640` by decision), **W3** (Caddy 12 h certs), **W6** and **W7** (§6, accepted residual risks).
+> **W4** (§3), **W5** (§5) and **W8** (§7) are resolved.
 >
 > **Kind:** Recurring ops review; one dated section per run, appended, never edited in place.
 > **Produced by:** the `ai-ops` skill (`.claude/skills/ai-ops/SKILL.md`).
@@ -466,3 +468,159 @@ the case where it was wrong.
   `/var/www/html` is not writable by any non-root account.
 - `src/**/*_vectors.json` failing to match files directly under `src/` — `**` matches zero
   directories in gitignore semantics; verified with prettier.
+
+## 7. 2026-09-01 15:45 CEST — v2.0.2 promoted to production
+
+Post-release sweep after promoting `v2.0.2-dev.9` to **v2.0.2** and deploying it. Verdict: **all
+green on the box, one live finding that is not ours** — the `{CET}` uplink has been down since
+12:34 CEST, three hours before the deploy, while RF traffic is completely normal. That is the exact
+situation the Gateway Availability feature was built to make visible, and it is reporting it
+correctly.
+
+### Deploy
+
+| Check                  | Result                                                                |
+| ---------------------- | --------------------------------------------------------------------- |
+| `/api/status` version  | `v2.0.2`                                                              |
+| `/webapp/version.html` | `v2.0.2`                                                              |
+| Active slot            | **slot-1**, deployed 2026-09-01 13:39:30 UTC (rollback target slot-0) |
+| Services               | `mcapp`, `mcapp-ble`, `caddy`, `lighttpd` — all `active`              |
+| `NRestarts`            | **0**                                                                 |
+| Schema (active slot)   | `LATEST_SCHEMA_VERSION = 28`; DB reports **28** — they agree          |
+| System epoch           | installed **1** / required **1**                                      |
+| Disk                   | 4.1 G used of 59 G (8 %)                                              |
+| Memory                 | 269 MB used of 415 MB, 145 MB available                               |
+| Journal warnings, 24 h | **0**                                                                 |
+
+### The webapp tree-replace fix, measured
+
+The reason §6 shipped `install_webapp_tree`. Right after v2.0.1 the serve directory held 868 files
+and 26 MB for a release containing 70, plus 133 AppleDouble `._*` sidecars. After this deploy:
+
+| Signal                          | After v2.0.1 | After v2.0.2 |
+| ------------------------------- | ------------ | ------------ |
+| Files in `/var/www/html/webapp` | 868          | **70**       |
+| AppleDouble `._*` sidecars      | 133          | **0**        |
+
+Exactly the release contents, nothing carried over. The fix works in production, not only in its
+suite.
+
+### Migrations v26 / v27 / v28, verified against live data
+
+All three touch existing rows, so each was checked for its intended effect rather than for a clean
+exit code:
+
+- **v26** — placeholder callsigns: **0** rows remain matching `XX0XXX*` / `DK0XXX*` / `DX0XXX*`
+  across `station_positions`.
+- **v27** — `lora_mod` is now `None` (307) or `8` (27), nothing above the low nibble. The old bug
+  stored the packed byte, so a country-8 node read **131**; that value no longer exists in the
+  table. `station_positions.gw` reads 215 `NULL` / 83 `0` / 36 `1` — the zeros are **re-learned**
+  since v27 nulled them, which is the intended steady state (a `0` from a HEY frame is an
+  authoritative "not a gateway").
+- **v28** — the uptime ledger is repaired **and correctly bounded**. Only **3** gap segments survive
+  after the 2026-08-27 07:45:59 cutoff: 19.3 min, 22.9 h and 20.2 min — all genuine outages, all
+  well past the new 12 min tolerance. The 31 remaining sub-12-min gaps are all _before_ the cutoff
+  and were kept on purpose, because the cadence still alternated there. The 210 spurious ones are
+  gone.
+
+Retuned thresholds confirmed live in the active slot: `GAP_TOLERANCE_MS = 720_000`,
+`SILENT_MS = 720_000`, `OFF_MS = 1_800_000`.
+
+### F13 — the `{CET}` uplink is genuinely down (upstream, not ours)
+
+`/api/uptime?range=24h` at 15:48 CEST:
+
+```
+state             off
+uptime_pct        81.39
+coverage_pct      100.0
+last_beacon_ms    2026-09-01 12:34:34 CEST
+longest_outage    11_253_037 ms  (3.13 h, still open)
+```
+
+**This is not a release regression and not a threshold problem.** Three independent facts separate
+the two cases, and this is why the check is worth writing down:
+
+1. The gap opened at **12:34**, three hours _before_ the 15:39 deploy. The old build recorded its
+   start; the new one continues the same open segment.
+2. **Zero** `{CET}` matches in six hours of journal. CLAUDE.md's symptom rule — "uptime near zero
+   while beacons are visibly arriving means `GAP_TOLERANCE_MS` is under the cadence" — needs
+   beacons to be arriving. They are not. This is the opposite case.
+3. **RF is completely healthy.** ~100 messages/h steady across all six hours, 29 stations in the
+   last 60 min, 12 in the last 15, and ingest continued across the restart (rows at 15:40–15:42 on
+   the new build).
+
+A busy mesh with a silent server uplink is precisely the state no surface could distinguish before
+v2.0.1, and `state: "off"` with `coverage_pct: 100` says it exactly: we were watching the whole
+time, and there was nothing to hear.
+
+**Action: none on our side.** `{CET}` originates at the MeshCom server. Watch for the beacon to
+return and the ledger to close the segment; if it stays dark for many hours, it is an upstream
+report, not a local fix.
+
+#### F13 resolved, 18:38 CEST — and it verified the shipped recorder
+
+The beacon returned at **18:38:32** after a **6.07 h** outage (12:34:34 → 18:38:32). The ledger
+closed the gap at exactly that timestamp and opened an `up` run; `state` went `off` → `active`.
+Confirmed upstream, not a defect in anything we ship.
+
+Two things worth keeping:
+
+- **This is the one v2.0.2 code path the promotion sweep could not exercise.** The retuned
+  thresholds and migration v28 were verified against stored history, but a gap being _closed_ by
+  a returning beacon needed a returning beacon. It behaved correctly on the new build.
+- **Cadence re-measured: 606.8 s (10.11 min)**, from 18:38:32 → 18:48:39. Unchanged from the
+  documented 606.5 s, so `GAP_TOLERANCE_MS` at 12 min keeps its intended 1.19x margin — **no
+  retune needed.** Re-measuring here was the point: the cadence is set upstream by the MeshCom
+  server and has already moved once, and a long outage is exactly the occasion on which it might
+  have moved again.
+
+The 24 h uptime reads **73.3 %** while the outage is still inside the window; it climbs out over
+the following day. Coverage stayed **100 %** throughout — the proxy was watching the whole time.
+
+### Rate baseline — re-measured
+
+| Signal                     | Baseline (§1)     | This run                | Verdict                    |
+| -------------------------- | ----------------- | ----------------------- | -------------------------- |
+| `messages` type `msg`      | 11 / h            | **8 / h**               | within factor 2            |
+| `messages` type `pos`      | 87 / h            | **96 / h**              | steady                     |
+| `signal_log`               | 347 / h           | **440 / h**             | within factor 2            |
+| journal warnings           | 0 / 24 h          | **0 / 24 h**            | unchanged                  |
+| unclassified `msg`         | 0                 | **0**                   | classifier keeping up      |
+| `{CET}` rows in `messages` | 0                 | **0**                   | dropped at ingest, correct |
+| `{CET}` cadence            | 606.5 s (retuned) | **no beacon — see F13** | upstream outage            |
+
+Structural: schema **28** (was 25 — this release), system epoch **1**, classifier version **3** with
+**38** rules, 20 398 messages in a 37 MB database.
+
+### Secret hygiene
+
+| File                                    | Mode    | Note                                                                           |
+| --------------------------------------- | ------- | ------------------------------------------------------------------------------ |
+| `/var/lib/mcapp/vapid.json`             | **600** | raw VAPID private scalar — correct                                             |
+| `/etc/systemd/system/mcapp-ble.service` | **600** | **§6 finding 5 is closed on the box** (was 644 with a cleartext `BLE_API_KEY`) |
+| `/etc/mcapp/config.json`                | 640     | **W2** — unchanged by decision; moves on `--reconfigure`                       |
+
+### Watch points
+
+- **W8 — opened and closed within this section.** The `{CET}` uplink outage above: down 12:34:34,
+  back 18:38:32, 6.07 h, upstream. Kept on the record so a future run reading a depressed 24 h
+  uptime figure finds the cause here instead of re-diagnosing it as a threshold problem. The
+  cadence was re-measured on recovery and is unchanged at 606.8 s.
+- **W1 — swap. Carried, and improved again.** **59 MB** swapped out under zram (from 94 in §4,
+  142 in §2), 355 MB SwapFree, 135 MB RAM available. Still a WATCH, not a finding; it becomes one
+  if SwapFree trends toward zero.
+- **W2 — `config.json` is `0640` on the live box.** Confirmed again. The decided state until
+  someone runs `--reconfigure`; **do not report it as a regression.**
+- **W3 — Caddy cert always looks near-expiry.** Confirmed healthy: issuer
+  `CN=Caddy Local Authority - ECC Intermediate`, `notBefore Sep 1 12:38:16 GMT →
+notAfter Sep 2 00:38:16 GMT`, read at 17:06 GMT = mid-life on a 12 h leaf.
+- **W6, W7** carry forward unchanged (§6, accepted residual risks).
+- **W5 is closed.** webapp `main` no longer runs ahead of its own `development`: `release.sh` now
+  tags, bumps and **pushes** both repos, and both read `behind_main: 0` after this release.
+
+> **Correction to an earlier draft of this section.** A first pass of these notes closed **W1**
+> and credited it to the tree-replace measurement. That was wrong on both halves: W1 is **memory
+> swap under zram**, and the directory-swap window in `install_webapp_tree` is **W6**, which is an
+> accepted residual risk and stays open. Swap is measured above and carries forward. The
+> `mcapp-ble.service` `0600` change closes **§6 finding 5**, not W5.

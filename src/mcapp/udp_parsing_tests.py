@@ -48,6 +48,7 @@ from .udp_handler import (
     _strip_non_scalar_fields,
     _undouble_aprs_symbol_escapes,
     _unescape_firmware_msg_body,
+    normalize_extudp_ack,
     strip_invalid_utf8,
     try_repair_json,
 )
@@ -701,6 +702,114 @@ def _test_strip_non_scalar_fields() -> list[tuple[str, bool]]:
     return results
 
 
+def _test_normalize_extudp_ack() -> list[tuple[str, bool]]:
+    """Unit cases for the proposed extUDP delivery-status datagram (firmware
+    proposal docs/ack-wer-hat-quittiert.md §6.3). The output must be the ingest
+    ACK shape `ble_protocol.transform_ack` produces, and attribution must never
+    decide whether the ACK survives."""
+    results: list[tuple[str, bool]] = []
+
+    full = normalize_extudp_ack(
+        {"type": "ack", "msg_id": "1a2b3c4d", "status": 1, "from": "oe1xyz-12", "via": "LoRa"}
+    )
+    results.append(
+        (
+            "extUDP ack: full datagram -> ingest shape (upper-cased id, kind, from, via)",
+            full
+            == {
+                "type": "ack",
+                "src_type": "udp",
+                "msg_id": "1A2B3C4D",
+                "ack_type": 1,
+                "ack_type_text": "Gateway ACK",
+                "ack_from": "OE1XYZ-12",
+                "ack_via": "lora",
+            },
+        )
+    )
+    bare = normalize_extudp_ack({"type": "ack", "msg_id": "1A2B3C4D", "status": 0})
+    results.append(
+        (
+            "extUDP ack: from/via absent -> keys absent, not None",
+            bare is not None and "ack_from" not in bare and "ack_via" not in bare,
+        )
+    )
+    bad_from = normalize_extudp_ack(
+        {"type": "ack", "msg_id": "1A2B3C4D", "status": 2, "from": "not a call", "via": "carrier"}
+    )
+    results.append(
+        (
+            "extUDP ack: bad from/via drops the fields, keeps the ACK",
+            bad_from is not None
+            and bad_from["ack_type"] == 2
+            and "ack_from" not in bad_from
+            and "ack_via" not in bad_from,
+        )
+    )
+    results.append(
+        (
+            "extUDP ack: unusable msg_id (not 8 hex) -> None",
+            normalize_extudp_ack({"type": "ack", "msg_id": "12345", "status": 1}) is None
+            and normalize_extudp_ack({"type": "ack", "msg_id": "GGGGGGGG", "status": 1}) is None
+            and normalize_extudp_ack({"type": "ack", "msg_id": 0x1A2B3C4D, "status": 1}) is None,
+        )
+    )
+    results.append(
+        (
+            "extUDP ack: status outside 0..2, bool, or absent -> None",
+            normalize_extudp_ack({"type": "ack", "msg_id": "1A2B3C4D", "status": 7}) is None
+            and normalize_extudp_ack({"type": "ack", "msg_id": "1A2B3C4D", "status": True}) is None
+            and normalize_extudp_ack({"type": "ack", "msg_id": "1A2B3C4D"}) is None,
+        )
+    )
+    return results
+
+
+async def _test_extudp_ack_end_to_end() -> list[tuple[str, bool]]:
+    """The datagram has no `msg`, so before the dedicated branch it fell into the
+    DEBUG-only non-chat fallthrough and never reached the router. This drives
+    the real ingress and asserts on what the router received."""
+    results: list[tuple[str, bool]] = []
+    datagram = json.dumps(
+        {"type": "ack", "msg_id": "1A2B3C4D", "status": 1, "from": "OE1XYZ-12", "via": "lora"}
+    ).encode()
+    unusable = json.dumps({"type": "ack", "msg_id": "nope", "status": 1}).encode()
+
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        router = _CaptureRouter()
+        handler = UDPHandler(
+            listen_port=0,
+            target_host="127.0.0.1",
+            target_port=0,
+            message_router=router,
+            runtime_state_path=Path(tmp_dir) / "runtime.json",
+        )
+        try:
+            await handler._process_received_message(datagram, (_CAPTURE_SENDER_IP, _SENDER_PORT))
+            published = router.calls[-1][2] if router.calls else {}
+            n_before = len(router.calls)
+            await handler._process_received_message(unusable, (_CAPTURE_SENDER_IP, _SENDER_PORT))
+            n_after = len(router.calls)
+        finally:
+            handler.send_socket.close()
+
+    results.append(
+        (
+            "extUDP ack e2e: reaches the router as a mesh_message of type ack with attribution",
+            bool(router.calls)
+            and router.calls[0][1] == "mesh_message"
+            and published.get("type") == "ack"
+            and published.get("msg_id") == "1A2B3C4D"
+            and published.get("ack_type") == 1
+            and published.get("ack_from") == "OE1XYZ-12"
+            and published.get("ack_via") == "lora"
+            and isinstance(published.get("timestamp"), int),
+        )
+    )
+    results.append(("extUDP ack e2e: an unusable ack datagram is dropped", n_after == n_before))
+    return results
+
+
 async def _test_non_scalar_end_to_end() -> list[tuple[str, bool]]:
     """The guard must be CALLED at the ingress, above every publish branch.
 
@@ -1119,6 +1228,8 @@ async def run_udp_parsing_tests() -> bool:
     results.extend(await _test_msg_escape_end_to_end())
     results.extend(_test_strip_non_scalar_fields())
     results.extend(await _test_non_scalar_end_to_end())
+    results.extend(_test_normalize_extudp_ack())
+    results.extend(await _test_extudp_ack_end_to_end())
     results.extend(await _test_pseudo_callsign())
     results.extend(await _test_send_message_wire_frame_guard())
 

@@ -574,10 +574,39 @@ class MigrationsMixin(StorageBase):
                         current_version,
                         cur.rowcount if cur is not None else 0,
                     )
+                    _set_schema_version(conn, 28)
+
+                if current_version < 29:  # noqa: PLR2004 - schema migration step
+                    # ACK attribution ledger ("who acknowledged?", firmware proposal
+                    # docs/ack-wer-hat-quittiert.md). `messages.send_success` and
+                    # `messages.acked` stay the single-flag answers the bubble
+                    # renders from; this table holds the per-station detail behind
+                    # them: one row per (msg_id, kind, station). `from_call` is ''
+                    # (never NULL — NULL would defeat the UNIQUE constraint and let
+                    # every unattributed repeat insert a new row) when the frame
+                    # carried no callsign, which is every frame from firmware
+                    # without the appendix, so those collapse into one row per kind.
+                    conn.executescript("""
+                        CREATE TABLE IF NOT EXISTS message_acks (
+                            msg_id    TEXT    NOT NULL,
+                            kind      TEXT    NOT NULL,
+                            from_call TEXT    NOT NULL DEFAULT '',
+                            via       TEXT,
+                            timestamp INTEGER NOT NULL,
+                            PRIMARY KEY (msg_id, kind, from_call)
+                        ) WITHOUT ROWID;
+                        CREATE INDEX IF NOT EXISTS idx_message_acks_timestamp
+                            ON message_acks(timestamp);
+                    """)
+                    logger.info(
+                        "Migration v%d → v29: created message_acks (ACK attribution"
+                        " ledger, empty until the first acknowledged outbound message)",
+                        current_version,
+                    )
                     # Adding a step after this one? Bump LATEST_SCHEMA_VERSION in
                     # storage/constants.py in the same commit — the startup suite
                     # asserts every migration chain terminates there.
-                    _set_schema_version(conn, 28)
+                    _set_schema_version(conn, 29)
 
         await asyncio.to_thread(_init_db)
 

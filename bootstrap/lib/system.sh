@@ -350,6 +350,12 @@ configure_nftables() {
       needs_update=true
     fi
 
+    # Update if UDP 443 (QUIC/HTTP3 for Caddy) is missing.
+    if ! grep -q "udp dport 443" "$nft_conf" 2>/dev/null; then
+      log_info "  Updating nftables rules (adding Caddy QUIC/HTTP3 UDP port 443)..."
+      needs_update=true
+    fi
+
     if [[ "$needs_update" == "false" ]]; then
       log_info "  nftables rules already configured"
       return 0
@@ -372,6 +378,7 @@ configure_nftables() {
 #   5353/udp - mDNS (avahi for .local resolution)
 #   2985/tcp - Update runner SSE stream
 #   19532/tcp - AIOps journal cross-shipping (Pi↔Pi, LAN only)
+#   443/udp  - QUIC/HTTP3 for Caddy (optional; TCP/443 already covers HTTP/2 fallback)
 #
 # Internal only (not exposed):
 #   2981/tcp - FastAPI SSE/REST (proxied via Caddy→lighttpd)
@@ -403,6 +410,9 @@ table inet filter {
 
     # HTTPS (Caddy HTTPS front door — Wave 0; LAN/iPhone clients hit :443)
     tcp dport 443 accept
+
+    # QUIC/HTTP3 for Caddy (optional latency win on LAN; TCP/443 already covers fallback)
+    udp dport 443 accept
 
     # Update runner SSE stream (frontend-triggered updates)
     tcp dport 2985 accept

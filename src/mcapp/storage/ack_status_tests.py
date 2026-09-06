@@ -69,7 +69,7 @@ class _RecordingRouter:
         self.published.append((source, message_type, data))
 
 
-async def run_ack_status_tests() -> bool:  # noqa: PLR0915 - six independent ACK-shape cases, each needs its own assertions
+async def run_ack_status_tests() -> bool:  # noqa: PLR0915 - seven independent ACK-shape cases, each needs its own assertions
     """Run the msg_status ACK-reporting regression suite. Returns True iff all pass."""
     results: list[tuple[str, bool]] = []
 
@@ -353,6 +353,138 @@ async def run_ack_status_tests() -> bool:  # noqa: PLR0915 - six independent ACK
                     and unk_events[0].get("msg_id") == "UNKN0001"
                     and unk_events[0].get("sent") is True
                     and unk_events[0].get("ack_kind") not in ("node", "gateway"),
+                )
+            )
+
+            # 7. Attribution (firmware proposal docs/ack-wer-hat-quittiert.md):
+            #    an attributed Gateway ACK carries from/via on the event AND lands
+            #    in message_acks; the SAME station's repeat is a no-op row-wise
+            #    (the firmware will stop gating "first ACK only"); an unattributed
+            #    repeat of the same kind collapses into one '' row; the peer ack is
+            #    recorded under kind "peer"; get_message_acks maps '' -> None.
+            router.published.clear()
+            outbound_attr = {
+                "msg_id": "ATTR0001",
+                "src": "DK5EN-98",
+                "dst": "DL3NCU-1",
+                "msg": "who acked this",
+                "type": "msg",
+                "src_type": "ble",
+                "timestamp": _BASE_TS + 10,
+            }
+            await storage.store_message(outbound_attr, "{}")
+            gw_ack = {
+                "type": "ack",
+                "msg_id": "ATTR0001",
+                "ack_type": 0x01,
+                "ack_type_text": "Gateway ACK",
+                "ack_from": "OE1XYZ-12",
+                "ack_via": "lora",
+                "timestamp": _BASE_TS + 11,
+            }
+            await storage.store_message(gw_ack, "{}")
+            await storage.store_message({**gw_ack, "timestamp": _BASE_TS + 12}, "{}")
+            await storage.store_message(
+                {
+                    "type": "ack",
+                    "msg_id": "ATTR0001",
+                    "ack_type": 0x00,
+                    "ack_type_text": "Node ACK",
+                    "timestamp": _BASE_TS + 13,
+                },
+                "{}",
+            )
+            await storage.store_message(
+                {
+                    "type": "ack",
+                    "msg_id": "ATTR0001",
+                    "ack_type": 0x00,
+                    "ack_type_text": "Node ACK",
+                    "timestamp": _BASE_TS + 14,
+                },
+                "{}",
+            )
+            await storage.store_message(
+                {
+                    "type": "ack",
+                    "msg_id": "ATTR0001",
+                    "ack_type": 0x02,
+                    "ack_type_text": "Peer ACK",
+                    "ack_from": "DL3NCU-1",
+                    "ack_via": "udp",
+                    "timestamp": _BASE_TS + 15,
+                },
+                "{}",
+            )
+            attr_events = _msg_status_events()
+            results.append(
+                (
+                    'attributed Gateway ACK: event carries "from"/"via" beside sent/ack_kind',
+                    len(attr_events) >= 1
+                    and attr_events[0]
+                    == {
+                        "msg_id": "ATTR0001",
+                        "sent": True,
+                        "ack_kind": "gateway",
+                        "from": "OE1XYZ-12",
+                        "via": "lora",
+                    },
+                )
+            )
+            results.append(
+                (
+                    'unattributed Node ACK: event has NO "from"/"via" keys (legacy shape intact)',
+                    len(attr_events) >= 3
+                    and attr_events[2] == {"msg_id": "ATTR0001", "sent": True, "ack_kind": "node"},
+                )
+            )
+            results.append(
+                (
+                    'attributed Peer ACK: event is the acked/peer shape plus "from"/"via"',
+                    attr_events[-1]
+                    == {
+                        "msg_id": "ATTR0001",
+                        "acked": True,
+                        "ack_kind": "peer",
+                        "from": "DL3NCU-1",
+                        "via": "udp",
+                    },
+                )
+            )
+            acks = await storage.get_message_acks("ATTR0001")
+            results.append(
+                (
+                    "message_acks: one row per (kind, station) — repeats collapse, '' -> None",
+                    [(a["kind"], a["from"], a["via"]) for a in acks]
+                    == [
+                        ("gateway", "OE1XYZ-12", "lora"),
+                        ("node", None, None),
+                        ("peer", "DL3NCU-1", "udp"),
+                    ],
+                )
+            )
+            results.append(
+                (
+                    "message_acks: timestamps are the FIRST observation, oldest first",
+                    [a["timestamp"] for a in acks] == [_BASE_TS + 11, _BASE_TS + 13, _BASE_TS + 15],
+                )
+            )
+            # An ack for a msg_id we never sent must not populate the ledger.
+            await storage.store_message(
+                {
+                    "type": "ack",
+                    "msg_id": "NEVER001",
+                    "ack_type": 0x01,
+                    "ack_type_text": "Gateway ACK",
+                    "ack_from": "OE1XYZ-12",
+                    "timestamp": _BASE_TS + 16,
+                },
+                "{}",
+            )
+            results.append(
+                (
+                    "message_acks: an ack for an unknown msg_id records nothing",
+                    await storage.get_message_acks("NEVER001") == [],
                 )
             )
         finally:

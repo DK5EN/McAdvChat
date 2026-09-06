@@ -128,6 +128,13 @@ class QueryMixin(StorageBase):
             "DELETE FROM messages WHERE type = 'ack' AND timestamp < ?",
             (cutoff_ack_ms,),
         )
+        # The attribution ledger follows the ACK retention, not the chat one: an
+        # ack list is only meaningful next to a bubble, and 8 days covers every
+        # bubble anyone opens the details popover on.
+        await self._mutate(
+            "DELETE FROM message_acks WHERE timestamp < ?",
+            (cutoff_ack_ms,),
+        )
         # Catch-all for any other types: use the shortest retention
         min_cutoff_ms = max(cutoff_pos_ms, cutoff_ack_ms)
         await self._mutate(
@@ -1227,3 +1234,26 @@ class QueryMixin(StorageBase):
             """,  # noqa: S608 - identifiers from fixed set; values parameterized
             (cutoff,),
         )
+
+    async def get_message_acks(self, msg_id: str) -> list[dict[str, Any]]:
+        """Every acknowledgement recorded for one outbound message, oldest first.
+
+        Rows come from `message_acks` (schema v29). `from_call` is exposed as
+        `from` and mapped to `None` when the ledger holds the '' placeholder —
+        the storage-side sentinel is an implementation detail of the UNIQUE
+        constraint and must not leak to the API.
+        """
+        rows = await self._query(
+            "SELECT kind, from_call, via, timestamp FROM message_acks"
+            " WHERE msg_id = ? ORDER BY timestamp ASC",
+            (msg_id,),
+        )
+        return [
+            {
+                "kind": row["kind"],
+                "from": row["from_call"] or None,
+                "via": row["via"],
+                "timestamp": row["timestamp"],
+            }
+            for row in rows
+        ]
