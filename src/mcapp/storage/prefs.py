@@ -135,8 +135,21 @@ class PrefsMixin(StorageBase):
         if await self.get_meta("read_cursors_seeded"):
             return 0
 
-        counts = await self.get_read_counts()
         my_base = my_callsign.split("-", maxsplit=1)[0].upper()
+        if not my_base:
+            # An empty callsign degenerates every non-verbatim key below to
+            # '<>DK3PB' (my_base missing entirely), which is wrong forever —
+            # but setting the marker anyway would mean a LATER boot with the
+            # real callsign configured writes 0 (the marker already claims
+            # "seeded"). Skip the whole pass and leave the marker unset so the
+            # next boot retries once the callsign is configured.
+            logger.warning(
+                "seed_read_cursors_from_counts: empty my_callsign, skipping seed"
+                " without setting the marker — will retry on next boot"
+            )
+            return 0
+
+        counts = await self.get_read_counts()
         written = 0
 
         for sidebar_key, count in counts.items():
@@ -260,7 +273,14 @@ class PrefsMixin(StorageBase):
                         " AND type IN ('msg', 'ack')"
                         " AND msg LIKE '{CET}%'"
                     )
-                    cursor_key: str | None = "*"
+                    # The Time chat's rows live under conversation_key '*' (they
+                    # are split out of the broadcast on read, see the delete
+                    # comment above), but the CLIENT stores its read cursor
+                    # under the key 'Time' — no message row is ever keyed 'Time'
+                    # itself. Using '*' here would delete the broadcast
+                    # cursor's ~2.8k-row-deep mark on mcapp.local production
+                    # every time someone cleared the Time chat.
+                    cursor_key: str | None = "Time"
                 elif dst == "*":
                     cursor = conn.execute(
                         "DELETE FROM messages WHERE conversation_key = '*'"

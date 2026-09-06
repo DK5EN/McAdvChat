@@ -524,7 +524,10 @@ class QueryMixin(StorageBase):
         same blocklist re-bucketing (a quarantined group post is counted under
         SPAM_GROUP, matching where the message itself now shows up) — see that
         method's docstring for why this must run on the way OUT of storage to
-        be retroactive.
+        be retroactive. Unlike that method, `unread` for a rebucketed row is
+        NOT best-effort here: a second LEFT JOIN (`rc2`) resolves the SPAM_GROUP
+        cursor and the row counts as unread only past MAX(original cursor,
+        SPAM_GROUP cursor), so marking 9999 read actually clears the badge.
 
         `key` narrows the scan to one conversation (the per-POST refresh in
         `/api/read_cursor`, which has to hand the client a fresh `unread` for
@@ -538,7 +541,9 @@ class QueryMixin(StorageBase):
         window_cutoff_ms = now_ms() - LONG_RETENTION_DAYS * SECONDS_PER_DAY * 1000
         my_base = my_callsign.split("-", maxsplit=1)[0].upper()
         key_clause = "" if key is None else " AND COALESCE(m.conversation_key, m.dst) = ?"
-        params: tuple[Any, ...] = (window_cutoff_ms,) if key is None else (window_cutoff_ms, key)
+        params: tuple[Any, ...] = (
+            (SPAM_GROUP, window_cutoff_ms) if key is None else (SPAM_GROUP, window_cutoff_ms, key)
+        )
 
         def _run() -> dict[str, dict[str, int]]:
             with db_read(self.db_path) as conn:
@@ -549,12 +554,25 @@ class QueryMixin(StorageBase):
                     "SELECT COALESCE(m.conversation_key, m.dst) AS key, m.src, m.dst,"  # noqa: S608 - key_clause is a fixed literal; values parameterized
                     " COUNT(*) AS cnt, MAX(m.timestamp) AS last_ts,"
                     " SUM(CASE WHEN m.timestamp > COALESCE(rc.ts, 0) THEN 1 ELSE 0 END)"
-                    "   AS newer"
+                    "   AS newer,"
+                    " SUM(CASE WHEN m.timestamp >"
+                    "   MAX(COALESCE(rc.ts, 0), COALESCE(rc2.ts, 0))"
+                    "   THEN 1 ELSE 0 END) AS newer_spam"
                     " FROM messages m"
                     " LEFT JOIN read_cursors rc"
                     "   ON rc.key = COALESCE(m.conversation_key, m.dst)"
+                    " LEFT JOIN read_cursors rc2"
+                    "   ON rc2.key = ?"
                     " WHERE m.type = 'msg' AND m.msg NOT GLOB '*:ack[0-9]*'"
-                    " AND m.timestamp >= ?" + key_clause + " GROUP BY key, m.src, m.dst",
+                    " AND m.timestamp >= ?"
+                    + key_clause
+                    # Positional GROUP BY, not "GROUP BY key": with the second
+                    # read_cursors join (rc2) below, a bare "key" is ambiguous
+                    # between the SELECT alias and rc.key/rc2.key (both actual
+                    # columns named "key" in the joined tables) and SQLite
+                    # rejects the query outright with
+                    # "ambiguous column name: key".
+                    + " GROUP BY 1, m.src, m.dst",
                     params,
                 ).fetchall()
 
@@ -565,19 +583,22 @@ class QueryMixin(StorageBase):
                         continue
                     src = row["src"] or ""
                     dst = row["dst"] or ""
+                    rebucketed = False
                     if blocklist_filter is not None:
                         kept = blocklist_filter({"src": src, "dst": dst})
                         if kept is None:
                             continue  # dropped outright
                         if kept.get("dst") == SPAM_GROUP:
                             # Rebucketed to the quarantine group, matching where
-                            # the message itself now shows up. The read_cursors
-                            # JOIN above stays keyed on the ORIGINAL key — the
-                            # spam bucket's cursor is therefore best-effort
-                            # (accepted): re-joining against SPAM_GROUP would
-                            # mean every quarantined group shares ONE cursor,
-                            # which is no more correct and adds a second query.
+                            # the message itself now shows up. Every quarantined
+                            # group shares ONE cursor (rc2, keyed on SPAM_GROUP
+                            # itself): a row only counts as unread when it is
+                            # newer than BOTH the original key's cursor and the
+                            # SPAM_GROUP cursor (MAX semantics), so marking 9999
+                            # read actually clears the badge instead of it
+                            # re-lighting from the untouched original cursor.
                             key = SPAM_GROUP
+                            rebucketed = True
 
                     entry = summary.setdefault(key, {"count": 0, "last_ts": 0, "unread": 0})
                     entry["count"] += row["cnt"]
@@ -585,7 +606,7 @@ class QueryMixin(StorageBase):
 
                     sender_base = src.split(",", maxsplit=1)[0].split("-", maxsplit=1)[0].upper()
                     if sender_base != my_base:
-                        entry["unread"] += row["newer"] or 0
+                        entry["unread"] += (row["newer_spam"] if rebucketed else row["newer"]) or 0
 
                 return summary
 

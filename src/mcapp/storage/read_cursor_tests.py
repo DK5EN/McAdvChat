@@ -29,12 +29,19 @@ Coverage:
      skipped outright, and the whole pass being idempotent (a second call
      writes nothing).
   7. The blocklist branch rebuckets a quarantined group post's count/last_ts/
-     unread under `SPAM_GROUP`, exactly like `get_smart_initial_with_summary`.
+     unread under `SPAM_GROUP`, exactly like `get_smart_initial_with_summary`
+     — including Finding 2 of unread-cursor-verdict.md: a cursor on EITHER
+     the SPAM_GROUP key or the original key clears the rebucketed unread
+     count (MAX semantics against both), so the 9999 badge actually clears.
 
   Also (out of the plan's numbered list, but this suite's own file set):
   `delete_messages_by_dst` removes the matching `read_cursors` row so a
   deleted conversation cannot leave behind a stale cursor for whatever
-  reoccupies that key.
+  reoccupies that key — including Finding 4: 'Time' and '*' are distinct
+  cursor keys, and deleting one must never remove the other's cursor.
+  Finding 6: seeding with an empty `my_callsign` writes nothing and leaves
+  the `read_cursors_seeded` marker unset, so a later boot with the real
+  callsign configured retries instead of silently writing 0 forever.
 
 All timestamps are milliseconds (project-wide DB convention).
 """
@@ -284,9 +291,65 @@ async def _test_seed_translation(results: list[tuple[str, bool]]) -> None:
             await storage.close()
 
 
+async def _test_seed_empty_callsign(results: list[tuple[str, bool]]) -> None:
+    """Finding 6: seeding with an empty my_callsign must write nothing AND
+    must NOT set the 'read_cursors_seeded' marker — otherwise a later boot
+    with the real callsign configured finds the marker already set and
+    silently writes 0 forever.
+    """
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        db_path = Path(tmp_dir) / "read_cursor_seed_empty_callsign_test.db"
+        storage = await create_sqlite_storage(db_path)
+        try:
+            group_key = "888"
+            t0 = now_ms() - 500_000
+            await _store_msg(storage, "OE1ABC-1", group_key, "g1", t0)
+            await storage.set_read_count(group_key, 1)
+
+            written = await storage.seed_read_cursors_from_counts("")
+            results.append(
+                (
+                    "Finding 6: seeding with an empty callsign writes 0 cursors",
+                    written == 0,
+                )
+            )
+            marker = await storage.get_meta("read_cursors_seeded")
+            results.append(
+                (
+                    (
+                        "Finding 6: an empty-callsign seed leaves the"
+                        " 'read_cursors_seeded' marker unset"
+                    ),
+                    not marker,
+                )
+            )
+
+            written_real = await storage.seed_read_cursors_from_counts(MY_CALLSIGN)
+            results.append(
+                (
+                    "Finding 6: a following call with a real callsign seeds normally",
+                    written_real == 1,
+                )
+            )
+            cursors = await storage.get_read_cursors()
+            results.append(
+                (
+                    "Finding 6: the real-callsign seed actually wrote the group cursor",
+                    cursors.get(group_key) == t0,
+                )
+            )
+        finally:
+            await storage.close()
+
+
 async def _test_blocklist_rebucket(results: list[tuple[str, bool]]) -> None:
     """Case 7: a quarantined group post is rebucketed under SPAM_GROUP for
     count, last_ts AND unread alike — matching get_smart_initial_with_summary.
+
+    Also covers Finding 2 (verdict): the SPAM_GROUP badge must actually clear.
+    A cursor on SPAM_GROUP alone clears it; a cursor on the ORIGINAL key alone
+    also clears it (MAX semantics against either), and clearing SPAM_GROUP
+    must NOT affect the original group's own (non-quarantined) unread count.
     """
     with tempfile.TemporaryDirectory() as tmp_dir:
         db_path = Path(tmp_dir) / "read_cursor_blocklist_test.db"
@@ -322,8 +385,62 @@ async def _test_blocklist_rebucket(results: list[tuple[str, bool]]) -> None:
                     group_entry.get("count") == 1 and group_entry.get("last_ts") == t0 + 10,
                 )
             )
+
+            # Finding 2: marking SPAM_GROUP read (cursor on SPAM_GROUP itself)
+            # must clear its own badge, while the original group's own entry
+            # (the non-quarantined row) stays unaffected.
+            await storage.set_read_cursor(SPAM_GROUP, now_ms())
+            summary_after_spam_cursor = await storage.get_conversation_summary(
+                MY_CALLSIGN, filter_fn
+            )
+            results.append(
+                (
+                    "Finding 2: a cursor on SPAM_GROUP itself clears the SPAM_GROUP badge",
+                    summary_after_spam_cursor.get(SPAM_GROUP, {}).get("unread") == 0,
+                )
+            )
+            results.append(
+                (
+                    (
+                        "Finding 2: clearing SPAM_GROUP leaves the original group's own"
+                        " unread count untouched (real, non-quarantined traffic)"
+                    ),
+                    summary_after_spam_cursor.get(group_key, {}).get("unread") == 1,
+                )
+            )
         finally:
             await storage.close()
+
+        # Separate DB: a cursor on the ORIGINAL key alone (never touching
+        # SPAM_GROUP) must ALSO clear the rebucketed row's unread — MAX
+        # semantics against either cursor, per the verdict's fix.
+        db_path2 = Path(tmp_dir) / "read_cursor_blocklist_original_key_test.db"
+        storage2 = await create_sqlite_storage(db_path2)
+        try:
+            group_key2 = "666"
+            t1 = now_ms() - 100_000
+            spam_src2 = "SPAMMER-2"
+            await _store_msg(storage2, spam_src2, group_key2, "buy now", t1)
+
+            def _filter2(data: dict[str, Any]) -> dict[str, Any] | None:
+                if data.get("src") == spam_src2:
+                    return {"dst": SPAM_GROUP}
+                return data
+
+            filter_fn2: HistoryFilter = _filter2
+            await storage2.set_read_cursor(group_key2, now_ms())
+            summary2 = await storage2.get_conversation_summary(MY_CALLSIGN, filter_fn2)
+            results.append(
+                (
+                    (
+                        "Finding 2: a cursor on the ORIGINAL key alone also clears the"
+                        " rebucketed SPAM_GROUP unread (MAX against either cursor)"
+                    ),
+                    summary2.get(SPAM_GROUP, {}).get("unread") == 0,
+                )
+            )
+        finally:
+            await storage2.close()
 
 
 async def _test_delete_removes_cursor(results: list[tuple[str, bool]]) -> None:
@@ -362,6 +479,32 @@ async def _test_delete_removes_cursor(results: list[tuple[str, bool]]) -> None:
                     group_dst not in cursors,
                 )
             )
+
+            # -- Finding 4 regression: 'Time' and '*' are DISTINCT cursor
+            # keys (the client stores the Time-chat cursor under 'Time', not
+            # '*' — no message row is ever keyed 'Time' itself). Deleting one
+            # must not touch the other.
+            await storage.set_read_cursor("Time", t0)
+            await storage.set_read_cursor("*", t0)
+            await storage.delete_messages_by_dst("Time")
+            cursors = await storage.get_read_cursors()
+            results.append(
+                (
+                    (
+                        "Finding 4: delete_messages_by_dst('Time') removes only the"
+                        " 'Time' cursor, leaving '*' untouched"
+                    ),
+                    "Time" not in cursors and cursors.get("*") == t0,
+                )
+            )
+            await storage.delete_messages_by_dst("*")
+            cursors = await storage.get_read_cursors()
+            results.append(
+                (
+                    ("Finding 4: delete_messages_by_dst('*') removes only the '*' cursor"),
+                    "*" not in cursors,
+                )
+            )
         finally:
             await storage.close()
 
@@ -374,6 +517,7 @@ async def run_read_cursor_tests() -> bool:
     await _test_cursor_semantics(results)
     await _test_max_semantics(results)
     await _test_seed_translation(results)
+    await _test_seed_empty_callsign(results)
     await _test_blocklist_rebucket(results)
     await _test_delete_removes_cursor(results)
 
