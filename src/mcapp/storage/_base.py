@@ -99,6 +99,15 @@ class StorageBase(Protocol):
     async def get_read_counts(self) -> dict[str, int]:
         raise NotImplementedError
 
+    async def get_read_cursors(self) -> dict[str, int]:
+        raise NotImplementedError
+
+    async def set_read_cursor(self, key: str, ts: int) -> int:
+        raise NotImplementedError
+
+    async def seed_read_cursors_from_counts(self, my_callsign: str) -> int:
+        raise NotImplementedError
+
     async def get_blocked_texts(self) -> list[str]:
         raise NotImplementedError
 

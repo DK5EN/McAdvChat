@@ -198,6 +198,13 @@ class ReadCountRequest(BaseModel):
     count: int
 
 
+class ReadCursorRequest(BaseModel):
+    """POST /api/read_cursor"""
+
+    key: str = Field(min_length=1)
+    ts: int = Field(ge=0)
+
+
 class HiddenDestinationsRequest(BaseModel):
     """POST /api/hidden_destinations — bulk update hidden destinations."""
 

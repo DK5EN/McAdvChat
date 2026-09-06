@@ -31,7 +31,7 @@ from .classifier import Classifier
 from .commands.parsing import SPAM_GROUP
 from .linkcheck import is_link_check_payload
 from .logging_setup import get_logger
-from .schemas import DeleteMessagesRequest
+from .schemas import DeleteMessagesRequest, ReadCursorRequest
 from .sqlite_storage import SQLiteStorage, create_sqlite_storage
 from .storage.constants import db_write
 from .system_converge import (
@@ -290,6 +290,21 @@ class SSEManager:
                 },
                 SSEManager._RESPONSE_EVENT_MAP["summary"],
             )
+            my_callsign = (self.message_router.my_callsign or "") if self.message_router else ""
+            conversations = await storage.get_conversation_summary(
+                my_callsign,
+                blocklist_filter=(
+                    self.message_router.filter_history_row if self.message_router else None
+                ),
+            )
+            yield self.format_sse_event(
+                {
+                    "type": "response",
+                    "msg": "conversations",
+                    "data": conversations,
+                },
+                SSEManager._RESPONSE_EVENT_MAP["conversations"],
+            )
             # Send persisted read counts for unread badge sync
             read_counts = await storage.get_read_counts()
             if read_counts:
@@ -301,6 +316,19 @@ class SSEManager:
                     },
                     SSEManager._RESPONSE_EVENT_MAP["read_counts"],
                 )
+            # Read cursors: ALWAYS emitted, including `{}` when empty — same
+            # rationale as blocked_callsigns above. The client max-merges
+            # cursor values, so an empty burst is safe and a gated one would
+            # leave a client that reconnected after every cursor was cleared
+            # stuck with stale local cursors forever.
+            yield self.format_sse_event(
+                {
+                    "type": "response",
+                    "msg": "read_cursors",
+                    "data": await storage.get_read_cursors(),
+                },
+                SSEManager._RESPONSE_EVENT_MAP["read_cursors"],
+            )
             hidden_dsts = await storage.get_hidden_destinations()
             if hidden_dsts:
                 yield self.format_sse_event(
@@ -589,6 +617,8 @@ class SSEManager:
         "smart_initial": "proxy:initial",
         "summary": "proxy:summary",
         "read_counts": "proxy:read_counts",
+        "conversations": "proxy:conversations",
+        "read_cursors": "proxy:read_cursors",
         "hidden_destinations": "proxy:hidden_destinations",
         "blocked_texts": "proxy:blocked_texts",
         "blocked_callsigns": "proxy:blocked_callsigns",
@@ -834,7 +864,7 @@ def create_sse_manager(
     return SSEManager(host, port, message_router, weather_service)
 
 
-async def run_startup_tests() -> bool:  # noqa: PLR0915 - regression suite kept as one flat sequence
+async def run_startup_tests() -> bool:  # noqa: PLR0912, PLR0915 - regression suite kept as one flat sequence
     """SSE-layer regression suite.
 
     1. UDP 2.0 Track U (U3): UDP-lora signal reaches SSE clients live.
@@ -868,6 +898,14 @@ async def run_startup_tests() -> bool:  # noqa: PLR0915 - regression suite kept 
        `SSEManager.broadcast_event()` must not be blocked/raise when one
        client's queue is full — it disconnects the slow client and still
        delivers to healthy clients.
+    5. Unread-cursor plan §7 case 5: the `initial_events()` burst order is
+       load-bearing — `proxy:blocked_callsigns` < `proxy:initial` <
+       `proxy:conversations` < `proxy:read_cursors` — against a real ephemeral
+       SQLite storage.
+    6. Unread-cursor plan §7 case 6: a POST to `/api/read_cursor` reaches every
+       connected client as `proxy:read_cursor` carrying `{key, ts}`, and a
+       second POST with a lower `ts` echoes back the already-stored higher
+       value (MAX semantics surfaced through the broadcast/response).
     """
     results: list[tuple[str, bool]] = []
 
@@ -1467,6 +1505,114 @@ async def run_startup_tests() -> bool:  # noqa: PLR0915 - regression suite kept 
                 "event: test:overflow" in delivered,
             )
         )
+
+    # 5. Unread-cursor plan §7 case 5: initial_events() burst order.
+    class _InitialEventsRouter:
+        """Minimal MessageRouter stand-in for initial_events(): storage +
+        callsign, no BLE/commands wiring (get_protocol always returns None,
+        no blocklist filter)."""
+
+        def __init__(self, storage: SQLiteStorage, callsign: str) -> None:
+            self.storage_handler = storage
+            self.my_callsign = callsign
+            self.filter_history_row = None
+
+        def subscribe(self, _topic: str, _handler: Any) -> None:
+            return
+
+        def get_protocol(self, _name: str) -> Any:
+            return None
+
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        storage = await create_sqlite_storage(pathlib.Path(tmp_dir) / "sse_initial_events_test.db")
+        try:
+            order_manager = SSEManager(
+                host="127.0.0.1", port=0, message_router=_InitialEventsRouter(storage, "DK5EN")
+            )
+            chunks = [chunk async for chunk in order_manager.initial_events("order-client")]
+            full_text = "".join(chunks)
+            positions = {
+                name: full_text.find(f"event: {name}")
+                for name in (
+                    "proxy:blocked_callsigns",
+                    "proxy:initial",
+                    "proxy:conversations",
+                    "proxy:read_cursors",
+                )
+            }
+            order_label = (
+                "initial_events burst order: blocked_callsigns < initial"
+                " < conversations < read_cursors"
+            )
+            results.append(
+                (
+                    order_label,
+                    -1 not in positions.values()
+                    and positions["proxy:blocked_callsigns"]
+                    < positions["proxy:initial"]
+                    < positions["proxy:conversations"]
+                    < positions["proxy:read_cursors"],
+                )
+            )
+        finally:
+            await storage.close()
+
+    # 6. Unread-cursor plan §7 case 6: POST /api/read_cursor fans out to every
+    # connected client, and a lower ts echoes the already-stored higher value.
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        storage = await create_sqlite_storage(pathlib.Path(tmp_dir) / "sse_read_cursor_test.db")
+        try:
+            cursor_manager = SSEManager(
+                host="127.0.0.1", port=0, message_router=_InitialEventsRouter(storage, "DK5EN")
+            )
+            client_a = SSEClient("cursor-client-a")
+            client_b = SSEClient("cursor-client-b")
+            cursor_manager.clients[client_a.client_id] = client_a
+            cursor_manager.clients[client_b.client_id] = client_b
+            cursor_router = build_prefs_router(cursor_manager)
+            set_cursor_endpoint = next(
+                route.endpoint
+                for route in cursor_router.routes
+                if isinstance(route, Route) and route.path == "/api/read_cursor"
+            )
+            high_ts = 1_770_000_000_000
+            low_ts = 1_000_000_000_000
+
+            first = await set_cursor_endpoint(ReadCursorRequest(key="DK3PB<>DK5EN", ts=high_ts))
+            results.append(
+                ("POST /api/read_cursor stores and echoes the ts", first.get("ts") == high_ts)
+            )
+
+            def _last_read_cursor_event(client: SSEClient) -> dict[str, Any] | None:
+                payload = None
+                while not client.queue.empty():
+                    chunk = client.queue.get_nowait()
+                    lines = chunk.strip("\n").split("\n")
+                    event_line = next((line for line in lines if line.startswith("event: ")), "")
+                    if event_line.removeprefix("event: ") == "proxy:read_cursor":
+                        data_line = next((line for line in lines if line.startswith("data: ")), "")
+                        payload = json.loads(data_line.removeprefix("data: "))
+                return payload
+
+            event_a = _last_read_cursor_event(client_a)
+            event_b = _last_read_cursor_event(client_b)
+            expected_event = {"key": "DK3PB<>DK5EN", "ts": high_ts, "unread": 0}
+            results.append(
+                (
+                    "proxy:read_cursor reaches both connected clients with {key, ts, unread}",
+                    event_a == expected_event and event_b == expected_event,
+                )
+            )
+
+            second = await set_cursor_endpoint(ReadCursorRequest(key="DK3PB<>DK5EN", ts=low_ts))
+            results.append(
+                (
+                    "a lower ts POST echoes the already-stored higher value (MAX semantics)",
+                    second.get("ts") == high_ts,
+                )
+            )
+        finally:
+            await storage.close()
 
     # reachable_runner_host: the update-runner stream URL must use the host the
     # CLIENT reached us on, never the loopback bind address (regression: a

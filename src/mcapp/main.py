@@ -784,6 +784,15 @@ class MessageRouter:
         }
         await self._send_response(websocket, summary_payload, client_id)
 
+        conversations_payload = {
+            "type": "response",
+            "msg": "conversations",
+            "data": await self.storage_handler.get_conversation_summary(
+                self.my_callsign or "", blocklist_filter=self.filter_history_row
+            ),
+        }
+        await self._send_response(websocket, conversations_payload, client_id)
+
         # Send persisted read counts for unread badge sync
         read_counts = await self.storage_handler.get_read_counts()
         if read_counts:
@@ -793,6 +802,16 @@ class MessageRouter:
                 "data": read_counts,
             }
             await self._send_response(websocket, rc_payload, client_id)
+
+        # Read cursors: ALWAYS sent, including `{}` when empty — same
+        # rationale as blocked_callsigns/read_cursors in sse_handler.py's
+        # initial_events (client max-merges cursor values).
+        rcur_payload = {
+            "type": "response",
+            "msg": "read_cursors",
+            "data": await self.storage_handler.get_read_cursors(),
+        }
+        await self._send_response(websocket, rcur_payload, client_id)
 
         # Send persisted hidden destinations for group visibility sync
         hidden_dsts = await self.storage_handler.get_hidden_destinations()
@@ -2446,7 +2465,7 @@ def _wire_node_identity_detection(message_router: MessageRouter) -> None:
     message_router.subscribe("ble_notification", _detect_node_identity)
 
 
-async def build_app(cfg: Config) -> AppContext:  # noqa: PLR0915 - sequential wiring steps kept together (CO-04)
+async def build_app(cfg: Config) -> AppContext:  # noqa: PLR0912, PLR0915 - sequential wiring steps kept together (CO-04)
     """Wire up storage, classifier, message router, and the command/UDP/SSE/BLE
     handlers. Extracted from main() (CO-04); returns everything main() needs to
     log startup info, start background tasks, and drive the shutdown sequence.
@@ -2485,6 +2504,19 @@ async def build_app(cfg: Config) -> AppContext:  # noqa: PLR0915 - sequential wi
     message_router = MessageRouter(storage_handler)
     message_router.set_callsign(cfg.call_sign)
     storage_handler.set_message_router(message_router)
+    # One-shot, idempotent read-cursor seed (unread-cursor plan §3): must run
+    # after storage init and after the callsign is known (both true above),
+    # and before the SSE server starts accepting clients (below) so the very
+    # first connect burst already reflects seeded cursors. Never allowed to
+    # block startup — this is a resilient always-on proxy.
+    try:
+        seeded = await storage_handler.seed_read_cursors_from_counts(
+            message_router.my_callsign or ""
+        )
+        if seeded > 0:
+            logger.info("Seeded %d read cursor(s) from legacy read counts", seeded)
+    except Exception:
+        logger.warning("seed_read_cursors_from_counts failed", exc_info=True)
     message_router.cached_gps = None  # {lat, lon} — set when BLE device sends TYP="G"
     message_router.cached_ble_registers = {}  # {TYP: dict} — cached on ble_notification
     _wire_ble_caches(message_router)

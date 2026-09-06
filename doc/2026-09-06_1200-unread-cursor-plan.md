@@ -76,18 +76,18 @@ SSE burst (order is load-bearing, unchanged prefix):
 `blocked_callsigns` → `smart_initial` → `summary` (legacy) → **`conversations`** →
 `read_counts` (legacy) → **`read_cursors`** → `hidden_destinations` → ...
 
-| Event                 | Envelope | Payload                                                 |
-| --------------------- | -------- | ------------------------------------------------------- |
-| `proxy:conversations` | yes      | `{ key: { count, last_ts, unread } }`                   |
-| `proxy:read_cursors`  | yes      | `{ key: ts }` (always emitted, `{}` when empty)         |
-| `proxy:read_cursor`   | no       | `{ key, ts }` broadcast to every client after each POST |
+| Event                 | Envelope | Payload                                                                                                                                                                        |
+| --------------------- | -------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `proxy:conversations` | yes      | `{ key: { count, last_ts, unread } }`                                                                                                                                          |
+| `proxy:read_cursors`  | yes      | `{ key: ts }` (always emitted, `{}` when empty)                                                                                                                                |
+| `proxy:read_cursor`   | no       | `{ key, ts, unread }` broadcast to every client after each POST; `unread` is the fresh server count for that key, because the client's capped local window cannot recompute it |
 
 REST:
 
-| Method | Path                | Body / Response                                                       |
-| ------ | ------------------- | --------------------------------------------------------------------- |
-| GET    | `/api/read_cursors` | `{ key: ts }`                                                         |
-| POST   | `/api/read_cursor`  | `{ key, ts }` → `{ status: "ok", ts }` where `ts` is the stored value |
+| Method | Path                | Body / Response                                                               |
+| ------ | ------------------- | ----------------------------------------------------------------------------- |
+| GET    | `/api/read_cursors` | `{ key: ts }`                                                                 |
+| POST   | `/api/read_cursor`  | `{ key, ts }` → `{ status: "ok", ts, unread }` where `ts` is the stored value |
 
 The WebSocket twin in `main.py` emits the same three snapshots.
 
