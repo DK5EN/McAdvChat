@@ -1,6 +1,6 @@
 # `tests/`
 
-Destination for the pytest migration — decision D1 in `implementation-pytest.md`
+Destination for the pytest migration — decision D1 in `doc/implementation-pytest.md`
 ("Top-level `tests/` mirroring the package tree; `src/` stays clean of test code").
 
 **The migration has not started.** Today the canonical, authoritative runner is still:
@@ -11,7 +11,7 @@ uv run python scripts/run_startup_tests.py    # exit 0 = all suites passed
 
 Suites currently live next to the code they test, as `src/mcapp/**/*_tests.py` (plus
 `src/mcapp/commands/tests.py`), and are registered in that script's `main()`. A suite
-not wired into that `main()` is gated by nothing. See `implementation-pytest.md` §3
+not wired into that `main()` is gated by nothing. See `doc/implementation-pytest.md` §3
 for the target tree and the wave plan that moves them here.
 
 ## `fixtures/`

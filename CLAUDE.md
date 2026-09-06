@@ -241,6 +241,51 @@ firmware side: `MeshCom-Firmware-DEV-Main/docs/ack-wer-hat-quittiert.md`.
 - **The extUDP `{"type":"ack"}` datagram has no `msg` key** and must be claimed in
   `_handle_non_chat_frame` before the DEBUG-only non-chat log, which is where it used to vanish.
 
+## Unread Cursors (`read_cursors`, sidebar badges)
+
+Server-authoritative "what has the operator seen" state behind the webapp's sidebar badges and
+the PWA app-icon badge. Plan and the field evidence: `doc/2026-09-06_1200-unread-cursor-plan.md`.
+
+- **A cursor is a timestamp, never a count.** `read_cursors(key, ts)` holds the ingest `timestamp`
+  of the newest message seen; `unread = COUNT(timestamp > cursor AND base(src) != base(me))`.
+  The previous scheme (`read_counts`, v7: "the total was N when I looked") broke every time the
+  count shrank under retention, the blocklist filter or the webapp's 2000-row cap, and was stale
+  on every device except the one that did the reading. `read_counts` is still emitted and served
+  for one release (v2.0.4) and is dead weight after that.
+- **Keys are `conversation_key`, on both ends of the wire.** DMs are `A<>B` (sorted base
+  callsigns), groups/hashtags/`*` verbatim. The webapp translates to its sidebar key at exactly
+  one boundary (`translateServerSummaryKey` / `serverKeyForSidebarKey`). `read_counts.dst` stored
+  whatever the client sent, which is why the one-shot seed at startup
+  (`seed_read_cursors_from_counts`) has to translate `A~B` pairs and bare partner calls itself.
+- **Writes are `MAX(existing, incoming)`, and the write returns the stored value.** A second
+  device or a delayed retry must never move the mark backwards. `POST /api/read_cursor` answers
+  `{ts, unread}` and broadcasts `proxy:read_cursor {key, ts, unread}` to every client: the
+  `unread` rides along because the webapp's local window is capped and cannot recompute it once
+  the cursor moves.
+- **Own traffic is excluded by BASE callsign**, not exact SSID: `DK5EN-98` and `DK5EN-14` are
+  both the operator. A message you send from another node must not light a badge here.
+- **`proxy:read_cursors` is emitted unconditionally, `{}` included**, for the same reason as
+  `blocked_callsigns`: the client max-merges, so an empty burst is harmless and a gated one leaves
+  a reconnecting client stuck with stale local cursors.
+- **The webapp marks read on render while the tab is visible, in every mode.** The old scheme
+  marked on conversation switch only, so "All / No Filter" never marked anything and badges grew
+  while the messages were on screen.
+- **Unread is counted per DISTINCT message, judged by its EARLIEST stored copy.** The same
+  message lands as two `messages` rows with the same `msg_id` about 100 ms apart (UDP datagram
+  plus the BLE copy; the v3 migration dropped the `msg_id` UNIQUE constraint on purpose), while
+  the webapp dedups to the first copy and marks read with that copy's timestamp. A per-row count
+  leaves the later sibling "newer than the cursor" forever: on mcapp.local every conversation
+  whose newest message arrived over two transports sat at **+1** with nothing a client could do
+  (v2.0.4-dev.1). `get_conversation_summary` therefore groups by `msg_id` (rowid fallback for
+  id-less rows) and takes `MIN(timestamp)` before joining the cursors. Symptom → cause: a badge
+  stuck at exactly 1 per conversation means a query is counting transport copies, not messages.
+  The pairs themselves were an ingest RACE, fixed the same day: the dedup gate was a
+  check-then-insert against `messages` with classification and the SQLite write between the
+  two awaits, and the two copies arrive as separate router tasks 40-170 ms apart. 984 pairs in
+  one week, none slower than 172 ms. `_claim_recent_ingest` now claims `(sender, msg_id)` in
+  memory synchronously before the first await; the DB lookup stays as the restart backstop.
+  Rows written before v2.0.4-dev.3 still hold the pairs, so the per-message aggregation stays.
+
 ## Blocklist (`sperrliste.json`)
 
 The curated global blocklist, maintained in this repo and fetched by every node from

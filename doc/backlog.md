@@ -34,3 +34,20 @@ re-diverge the two sides. Wanted is one design pass that decides the state model
   glyphs.
 - `msg_www` gets its name back: internet-sourced duplicates only.
 - mc-chat parity: `msg_status` is a shared wire shape, so any new field is a contract change.
+
+## B3 — show release notes on the Update page (webapp-only, no due date)
+
+**Problem:** the System Update confirm dialog names version numbers and nothing else — an operator
+deciding whether to promote has no way to see what a release actually changed without leaving the
+app to read the GitHub release page by hand.
+
+**Why it's tracked here too:** `doc/release-history.md` in this repo is the source of the release
+body text (`release.sh` publishes it verbatim via `gh release create --notes-file`), so anyone
+touching the notes format should know the webapp is meant to start rendering them. The fix itself
+is entirely webapp-side — the GitHub releases API response the webapp already fetches
+(`useVersionCheck.ts`'s `fetchReleases()`) carries the release `body`; it's just discarded today.
+No MCProxy change, no new endpoint, no contract.
+
+**Tracked as B5 in the webapp repo:** `webapp/docs/backlog.md`, full design brief in
+`webapp/docs/change-log-update-disp.md` (shared-modal vs. page-card tradeoff, markdown-safety,
+rate-limit and long-body constraints, what's out of scope).

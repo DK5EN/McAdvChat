@@ -64,6 +64,7 @@ async def run_migration_chain_tests() -> bool:
     await _test_v27_gw_lora_mod_scrub(results)
     await _test_v28_uptime_gap_scrub(results)
     await _test_v29_message_acks_table(results)
+    await _test_v30_read_cursors_table(results)
 
     for label, ok in results:
         print(f"    {'✅ PASS' if ok else '❌ FAIL'} | {label}")
@@ -999,6 +1000,70 @@ async def _test_v29_message_acks_table(results: list[tuple[str, bool]]) -> None:
                 (
                     "v29 message_acks: (msg_id, kind, from_call) is the key — a repeat collapses",
                     bool(rows) and rows[0]["n"] == 2,
+                )
+            )
+        finally:
+            await storage.close()
+
+
+async def _test_v30_read_cursors_table(results: list[tuple[str, bool]]) -> None:
+    """Seed a v29 fixture and assert the v30 step stands up `read_cursors` with
+    its (key) primary key and NOT NULL ts — the table
+    `PrefsMixin.get_read_cursors`/`set_read_cursor` (doc/2026-09-06_1200-
+    unread-cursor-plan.md) read and write."""
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        db_path = Path(tmp_dir) / "migration_chain_v30.db"
+
+        def _create_v29_db() -> None:
+            with db_write(db_path) as conn:
+                conn.executescript(CREATE_SCHEMA_SQL)
+                conn.executescript(CREATE_SCHEMA_V2_SQL)
+                conn.execute("DELETE FROM schema_version")
+                conn.execute("INSERT INTO schema_version (version) VALUES (29)")
+                conn.commit()
+
+        await asyncio.to_thread(_create_v29_db)
+
+        try:
+            storage = await create_sqlite_storage(db_path)
+        except Exception:
+            logger.exception("v30 read_cursors migration raised")
+            results.append(("v30 read_cursors: migrator runs v29→HEAD without error", False))
+            return
+
+        results.append(("v30 read_cursors: migrator runs v29→HEAD without error", True))
+        try:
+            version = await _schema_version(storage)
+            results.append(
+                (
+                    f"v30 read_cursors: final schema_version marker is {FINAL_SCHEMA_VERSION}",
+                    version == FINAL_SCHEMA_VERSION,
+                )
+            )
+            await storage._mutate(
+                "INSERT INTO read_cursors (key, ts) VALUES (?, ?)",
+                ("232", 1000),
+            )
+            # A repeat insert of the same key must collide on the PRIMARY KEY.
+            collided = False
+            try:
+                await storage._mutate(
+                    "INSERT INTO read_cursors (key, ts) VALUES (?, ?)",
+                    ("232", 2000),
+                )
+            except Exception:
+                collided = True
+            results.append(
+                (
+                    "v30 read_cursors: key is the PRIMARY KEY — a repeat insert collides",
+                    collided,
+                )
+            )
+            rows = await storage._query("SELECT COUNT(*) AS n FROM read_cursors", ())
+            results.append(
+                (
+                    "v30 read_cursors: exactly one row survives the collision attempt",
+                    bool(rows) and rows[0]["n"] == 1,
                 )
             )
         finally:

@@ -1,5 +1,79 @@
 # Release History
 
+## v2.0.4 (2026-09-06)
+
+Patch release. Replaces the unread-badge bookkeeping with **server-side read cursors**, so the
+sidebar badges and the PWA app-icon badge finally agree across devices and stop drifting, and
+closes an **ingest race** that had been storing most mesh messages twice. Also refreshes
+dependencies. Schema **v29 → v30**.
+
+### Highlights
+
+- **Unread badges are now a server fact, not a per-browser guess.** Until now each client
+  remembered "the conversation had N messages when I last looked" and showed the difference. That
+  number broke every time the total shrank (retention, the blocklist, the webapp's 2000-row cap)
+  and was stale on every device except the one that did the reading, so badges lit up on a phone
+  for messages already read on the desktop. The proxy now stores one **read cursor** per
+  conversation (the timestamp of the newest message the operator has seen), counts unread against
+  it, and broadcasts every change to all connected clients. Writes are monotonic (a second device
+  or a delayed retry can never move the mark backwards), and own traffic is excluded by base
+  callsign, so a message sent from another of your nodes does not light a badge here.
+
+- **Badges clear when you actually see the messages.** The old scheme marked a conversation read
+  only when you switched to it, so in "All / No Filter" mode nothing was ever marked and the counts
+  grew while the messages sat on screen. The webapp now marks read when a message bubble is
+  rendered in a visible tab, in every filter mode.
+
+- **The same message was landing twice, about 100 ms apart.** One frame reaches the proxy as a UDP
+  datagram and again as the BLE copy, as two separate router tasks 40-170 ms apart. The dedup gate
+  was a check-then-insert with the classifier and the SQLite write between the two awaits, so the
+  second copy's lookup ran before the first copy's insert had landed: **984 duplicate pairs in one
+  week** on mcapp.local, none slower than 172 ms. The claim is now taken in memory, synchronously,
+  before the first await. Rows written before this release still hold the pairs, and the unread
+  query is written to tolerate them (see below).
+
+### Backend (MCProxy)
+
+- **[feat]** Read cursors (schema **v30**): new `read_cursors` table keyed by `conversation_key`
+  with MAX-semantics upsert, a one-shot seed from the legacy `read_counts` at first start, and a
+  per-conversation summary (`count`, `last_ts`, `unread`) that excludes own traffic by base
+  callsign. Wire: `proxy:conversations` and `proxy:read_cursors` in the connect burst,
+  `GET /api/read_cursors`, and `POST /api/read_cursor`, which answers `{ts, unread}` and broadcasts
+  `proxy:read_cursor {key, ts, unread}` to every client.
+- **[fix]** Unread is counted per **distinct message**, judged by its earliest stored copy. A
+  per-row count left the later transport sibling "newer than the cursor" forever: in v2.0.4-dev.1
+  every conversation whose newest message arrived over two transports sat at **+1** with nothing a
+  client could do.
+- **[fix]** Ingest dedup claims `(sender, msg_id)` in memory before the first await; the DB lookup
+  stays as the restart backstop. New `ingest_dedup` suite replays the concurrent pair and fails on
+  the old gate.
+- **[fix]** Marking the spam group (9999) read now actually clears its badge; deleting the Time
+  chat removes only the `Time` cursor, not the broadcast one; seeding with an empty callsign no
+  longer sets the one-shot marker.
+- **[chore]** Regenerated standalone `ble_service` lock.
+
+### Frontend (webapp)
+
+- **[feat]** Sidebar and app-icon badges driven by the server read cursors: snapshot on connect,
+  live `proxy:read_cursor` echo carrying the server's fresh unread count, and a debounced
+  `POST /api/read_cursor`. Conversations are marked read on render in a visible tab
+  (IntersectionObserver), in every filter mode, which also removes the badge flash on reload.
+- **[fix]** Cursors that are locally ahead of the server snapshot are re-POSTed on connect, so a
+  debounced write lost to a reconnect or reload no longer leaves a badge stuck. A stale echo (older
+  than the local cursor) is ignored; deleting a conversation cancels its pending POST; the read
+  marker drops non-finite timestamps and re-observes a bubble whose conversation key was patched
+  in place.
+- **[chore]** Dependency refresh (`npm update`).
+
+### Upgrade notes
+
+- Schema migrates automatically on first start (v29 → v30); no manual step. The legacy
+  `read_counts` are seeded into cursors once and are still emitted and served for this release
+  only and are scheduled for removal afterwards.
+- Existing duplicate message rows from before this release are not scrubbed. The unread query
+  tolerates them; the message list already deduplicated them client-side.
+- No firmware change required.
+
 ## v2.0.3 (2026-09-06)
 
 Patch release. Adds **ACK attribution**: the chat view can now show _who_ acknowledged a message,

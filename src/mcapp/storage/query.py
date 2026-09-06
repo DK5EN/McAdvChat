@@ -498,6 +498,138 @@ class QueryMixin(StorageBase):
         _, summary = await self.get_smart_initial_with_summary()
         return summary
 
+    async def get_conversation_summary(
+        self,
+        my_callsign: str,
+        blocklist_filter: HistoryFilter | None = None,
+        key: str | None = None,
+    ) -> dict[str, dict[str, int]]:
+        """Per-conversation count/last_ts/unread, joined against read_cursors.
+
+        Unread-cursor rework (doc/2026-09-06_1200-unread-cursor-plan.md §3/§4):
+        added BESIDE `get_smart_initial_with_summary` (which stays byte-
+        identical) rather than replacing it, so the legacy `summary`/
+        `read_counts` wire keeps working for one release (D6) while the new
+        `conversations`/`read_cursors` events are introduced alongside it.
+
+        `unread(key) = COUNT(rows WHERE timestamp > cursor AND sender != me)`
+        — a missing cursor (LEFT JOIN, `COALESCE(rc.ts, 0)`) reads as "0",
+        i.e. every row counts, never as "all read". `last_ts` is MAX(timestamp)
+        over ALL rows of the key, own messages included — it answers "when did
+        this conversation last see any traffic", not "when did I last hear
+        from someone else".
+
+        Same window cutoff and the same `type='msg' AND msg NOT GLOB
+        '*:ack[0-9]*'` predicate as `get_smart_initial_with_summary`, and the
+        same blocklist re-bucketing (a quarantined group post is counted under
+        SPAM_GROUP, matching where the message itself now shows up) — see that
+        method's docstring for why this must run on the way OUT of storage to
+        be retroactive. Unlike that method, `unread` for a rebucketed row is
+        NOT best-effort here: a second LEFT JOIN (`rc2`) resolves the SPAM_GROUP
+        cursor and the row counts as unread only past MAX(original cursor,
+        SPAM_GROUP cursor), so marking 9999 read actually clears the badge.
+
+        `key` narrows the scan to one conversation (the per-POST refresh in
+        `/api/read_cursor`, which has to hand the client a fresh `unread` for
+        the key it just advanced — the client's local window is capped and
+        cannot recompute it). SPAM_GROUP is deliberately NOT narrowable: its
+        rows live under their ORIGINAL keys and only land in the bucket via the
+        blocklist rebucketing below, so a `key = SPAM_GROUP` predicate would
+        match nothing — callers pass `key=None` for it and read the bucket out
+        of the full scan.
+        """
+        window_cutoff_ms = now_ms() - LONG_RETENTION_DAYS * SECONDS_PER_DAY * 1000
+        my_base = my_callsign.split("-", maxsplit=1)[0].upper()
+        key_clause = "" if key is None else " AND COALESCE(m.conversation_key, m.dst) = ?"
+        params: tuple[Any, ...] = (
+            (window_cutoff_ms, SPAM_GROUP) if key is None else (window_cutoff_ms, key, SPAM_GROUP)
+        )
+
+        def _run() -> dict[str, dict[str, int]]:
+            with db_read(self.db_path) as conn:
+                conn.row_factory = sqlite3.Row
+                conn.execute("PRAGMA journal_mode=WAL")
+                conn.execute("PRAGMA query_only=ON")
+                # One row per DISTINCT message first (subquery `d`), then per
+                # conversation. The same message is stored once per transport
+                # it arrived over — the UDP datagram and the BLE copy land as two
+                # rows with the same msg_id ~100 ms apart (the v3 migration
+                # dropped the msg_id UNIQUE constraint on purpose) — while the
+                # webapp dedups to the FIRST copy and marks read with that copy's
+                # timestamp. Counting rows instead of messages left the later
+                # sibling "newer than the cursor" forever: on mcapp.local every
+                # conversation whose newest message came in over two transports
+                # sat at +1 with nothing a client could do about it
+                # (v2.0.4-dev.1, 2026-09-06). A message is therefore judged by
+                # its EARLIEST copy, which is the one the client holds. Rows
+                # without a msg_id never collapse into each other (rowid
+                # fallback). src/dst are taken from the earliest copy too: the
+                # relay-path prefix can differ between copies, but the resolved
+                # sender (first comma component) is the same.
+                rows = conn.execute(
+                    "SELECT COALESCE(d.conversation_key, d.dst) AS key, d.src, d.dst,"  # noqa: S608 - key_clause is a fixed literal; values parameterized
+                    " COUNT(*) AS cnt, MAX(d.ts) AS last_ts,"
+                    " SUM(CASE WHEN d.ts > COALESCE(rc.ts, 0) THEN 1 ELSE 0 END)"
+                    "   AS newer,"
+                    " SUM(CASE WHEN d.ts >"
+                    "   MAX(COALESCE(rc.ts, 0), COALESCE(rc2.ts, 0))"
+                    "   THEN 1 ELSE 0 END) AS newer_spam"
+                    " FROM ("
+                    "   SELECT MIN(m.timestamp) AS ts, m.src, m.dst, m.conversation_key"
+                    "   FROM messages m"
+                    "   WHERE m.type = 'msg' AND m.msg NOT GLOB '*:ack[0-9]*'"
+                    "   AND m.timestamp >= ?"
+                    + key_clause
+                    + "   GROUP BY COALESCE(NULLIF(m.msg_id, ''), 'row:' || m.rowid)"
+                    " ) d"
+                    " LEFT JOIN read_cursors rc"
+                    "   ON rc.key = COALESCE(d.conversation_key, d.dst)"
+                    " LEFT JOIN read_cursors rc2"
+                    "   ON rc2.key = ?"
+                    # Positional GROUP BY, not "GROUP BY key": with the two
+                    # read_cursors joins a bare "key" is ambiguous between the
+                    # SELECT alias and rc.key/rc2.key and SQLite rejects the
+                    # query outright with "ambiguous column name: key".
+                    " GROUP BY 1, d.src, d.dst",
+                    params,
+                ).fetchall()
+
+                summary: dict[str, dict[str, int]] = {}
+                for row in rows:
+                    key = row["key"]
+                    if not key:
+                        continue
+                    src = row["src"] or ""
+                    dst = row["dst"] or ""
+                    rebucketed = False
+                    if blocklist_filter is not None:
+                        kept = blocklist_filter({"src": src, "dst": dst})
+                        if kept is None:
+                            continue  # dropped outright
+                        if kept.get("dst") == SPAM_GROUP:
+                            # Rebucketed to the quarantine group, matching where
+                            # the message itself now shows up. Every quarantined
+                            # group shares ONE cursor (rc2, keyed on SPAM_GROUP
+                            # itself): a row only counts as unread when it is
+                            # newer than BOTH the original key's cursor and the
+                            # SPAM_GROUP cursor (MAX semantics), so marking 9999
+                            # read actually clears the badge instead of it
+                            # re-lighting from the untouched original cursor.
+                            key = SPAM_GROUP
+                            rebucketed = True
+
+                    entry = summary.setdefault(key, {"count": 0, "last_ts": 0, "unread": 0})
+                    entry["count"] += row["cnt"]
+                    entry["last_ts"] = max(entry["last_ts"], row["last_ts"] or 0)
+
+                    sender_base = src.split(",", maxsplit=1)[0].split("-", maxsplit=1)[0].upper()
+                    if sender_base != my_base:
+                        entry["unread"] += (row["newer_spam"] if rebucketed else row["newer"]) or 0
+
+                return summary
+
+        return await asyncio.to_thread(_run)
+
     async def get_messages_page(
         self,
         dst: str,

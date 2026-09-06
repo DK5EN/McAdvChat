@@ -11,8 +11,15 @@ from typing import Any, cast
 
 from ..commands.parsing import is_group, is_hashtag
 from ..logging_setup import get_logger
+from ..util import now_ms
 from ._base import StorageBase
-from .constants import compute_conversation_key, db_write, escape_like
+from .constants import (
+    LONG_RETENTION_DAYS,
+    SECONDS_PER_DAY,
+    compute_conversation_key,
+    db_write,
+    escape_like,
+)
 
 logger = get_logger(__name__)
 
@@ -38,6 +45,137 @@ class PrefsMixin(StorageBase):
             "   updated_at = excluded.updated_at",
             (dst, count),
         )
+
+    async def get_read_cursors(self) -> dict[str, int]:
+        """Get every read cursor: conversation_key -> newest-seen timestamp (ms).
+
+        Unread-cursor rework (doc/2026-09-06_1200-unread-cursor-plan.md §3/§4),
+        replacing the client-count-comparison scheme (`read_counts` above,
+        which stays for one release per D6). A missing key here reads as "0" —
+        everything in that conversation is unread — never as "all read".
+        """
+        rows = await self._query("SELECT key, ts FROM read_cursors")
+        return {row["key"]: row["ts"] for row in rows}
+
+    async def set_read_cursor(self, key: str, ts: int) -> int:
+        """Upsert a read cursor with MAX semantics — a cursor NEVER regresses,
+        because a client can only advance based on what IT has rendered, and
+        an out-of-order POST (a second device, a delayed retry) must never
+        move the server's mark backwards and re-surface something already
+        read elsewhere. Returns the value actually stored (the max of the
+        existing and incoming ts), read back in the same write transaction so
+        the caller's `{status: "ok", ts}` response is never stale.
+        """
+
+        def _run() -> int:
+            with db_write(self.db_path) as conn:
+                conn.execute(
+                    "INSERT INTO read_cursors (key, ts, updated_at)"
+                    " VALUES (?, ?, CURRENT_TIMESTAMP)"
+                    " ON CONFLICT(key) DO UPDATE SET"
+                    "   ts = MAX(read_cursors.ts, excluded.ts),"
+                    "   updated_at = CURRENT_TIMESTAMP",
+                    (key, ts),
+                )
+                row = conn.execute("SELECT ts FROM read_cursors WHERE key = ?", (key,)).fetchone()
+                conn.commit()
+                return int(row[0])
+
+        return await asyncio.to_thread(_run)
+
+    async def _nth_oldest_message_ts(self, key: str, n: int) -> int:
+        """The timestamp of the N-th oldest (1-indexed) non-ack 'msg' row under
+        `key`, within the same retention window `get_smart_initial_with_summary`
+        bounds its scan by. Fewer than N such rows exist -> now() (everything
+        that legacy count represented is already covered; nothing to seed).
+        """
+        window_cutoff_ms = now_ms() - LONG_RETENTION_DAYS * SECONDS_PER_DAY * 1000
+        rows = await self._query(
+            "SELECT timestamp FROM messages"
+            " WHERE type = 'msg' AND msg NOT GLOB '*:ack[0-9]*'"
+            " AND COALESCE(conversation_key, dst) = ? AND timestamp >= ?"
+            " ORDER BY timestamp ASC LIMIT 1 OFFSET ?",
+            (key, window_cutoff_ms, n - 1),
+        )
+        if not rows:
+            return now_ms()
+        return int(rows[0]["timestamp"])
+
+    async def seed_read_cursors_from_counts(self, my_callsign: str) -> int:
+        """One-shot, idempotent seed of `read_cursors` translated from the
+        legacy `read_counts` rows (doc/2026-09-06_1200-unread-cursor-plan.md
+        §3 "Seed"). Without this, every conversation's badge lights up once
+        after the schema switches from count-comparison to cursors, since a
+        brand-new `read_cursors` table has no rows at all (== "everything
+        unread" per get_read_cursors' own contract).
+
+        Guarded by the `classifier_meta` marker 'read_cursors_seeded'
+        (`get_meta`/`set_meta`, ClassifierApiMixin) so a restart never re-runs
+        this — set_read_cursor's MAX semantics would protect an already-
+        advanced cursor from regressing anyway, but skipping the whole pass
+        avoids re-scanning every read_counts row (and re-querying `messages`
+        once per row) on every startup after the first.
+
+        Sidebar-key -> conversation_key translation (three shapes, in order):
+          * 'A~B' (third-party pair)                 -> sorted([A, B]) '<>'-joined
+          * group / hashtag / '*' / 'Time' (verbatim) -> unchanged
+          * anything else: a partner BASE callsign    -> sorted([my_base, base])
+                                                          '<>'-joined
+
+        For each translated key the cursor is the timestamp of the N-th oldest
+        message under that key (N = the legacy read_counts value) — see
+        `_nth_oldest_message_ts`. `N <= 0` is skipped outright (nothing was
+        ever read). The cursor is written through the same MAX-semantics
+        upsert as a live POST, so a seed can never regress a cursor that
+        somehow already advanced past it.
+
+        Returns the number of cursors actually written (0 on every repeat
+        call, once the marker is set).
+        """
+        if await self.get_meta("read_cursors_seeded"):
+            return 0
+
+        my_base = my_callsign.split("-", maxsplit=1)[0].upper()
+        if not my_base:
+            # An empty callsign degenerates every non-verbatim key below to
+            # '<>DK3PB' (my_base missing entirely), which is wrong forever —
+            # but setting the marker anyway would mean a LATER boot with the
+            # real callsign configured writes 0 (the marker already claims
+            # "seeded"). Skip the whole pass and leave the marker unset so the
+            # next boot retries once the callsign is configured.
+            logger.warning(
+                "seed_read_cursors_from_counts: empty my_callsign, skipping seed"
+                " without setting the marker — will retry on next boot"
+            )
+            return 0
+
+        counts = await self.get_read_counts()
+        written = 0
+
+        for sidebar_key, count in counts.items():
+            if count <= 0:
+                continue
+            if "~" in sidebar_key:
+                partner_a, partner_b = sidebar_key.split("~", maxsplit=1)
+                key = "<>".join(sorted([partner_a, partner_b]))
+            elif is_group(sidebar_key) or is_hashtag(sidebar_key) or sidebar_key in ("*", "Time"):
+                key = sidebar_key
+            else:
+                partner_base = sidebar_key.split("-", maxsplit=1)[0].upper()
+                key = "<>".join(sorted([my_base, partner_base]))
+
+            cursor_ts = await self._nth_oldest_message_ts(key, count)
+            await self.set_read_cursor(key, cursor_ts)
+            written += 1
+
+        await self.set_meta("read_cursors_seeded", "1")
+        logger.info(
+            "seed_read_cursors_from_counts: wrote %d cursor(s) translated from"
+            " legacy read_counts (my_callsign=%s)",
+            written,
+            my_callsign,
+        )
+        return written
 
     @staticmethod
     def _zero_match_siblings(conn: sqlite3.Connection, dst: str) -> list[str]:
@@ -135,12 +273,21 @@ class PrefsMixin(StorageBase):
                         " AND type IN ('msg', 'ack')"
                         " AND msg LIKE '{CET}%'"
                     )
+                    # The Time chat's rows live under conversation_key '*' (they
+                    # are split out of the broadcast on read, see the delete
+                    # comment above), but the CLIENT stores its read cursor
+                    # under the key 'Time' — no message row is ever keyed 'Time'
+                    # itself. Using '*' here would delete the broadcast
+                    # cursor's ~2.8k-row-deep mark on mcapp.local production
+                    # every time someone cleared the Time chat.
+                    cursor_key: str | None = "Time"
                 elif dst == "*":
                     cursor = conn.execute(
                         "DELETE FROM messages WHERE conversation_key = '*'"
                         " AND type IN ('msg', 'ack')"
                         " AND (msg IS NULL OR msg NOT LIKE '{CET}%')"
                     )
+                    cursor_key = "*"
                 elif is_group(dst) or is_hashtag(dst):
                     # Unified predicates (group_dst_vectors.json,
                     # hashtag_dst_vectors.json). An out-of-range digit dst
@@ -155,6 +302,7 @@ class PrefsMixin(StorageBase):
                         " AND type IN ('msg', 'ack')",
                         (dst,),
                     )
+                    cursor_key = dst
                 else:
                     personal = True
                     if not own_call:
@@ -173,9 +321,18 @@ class PrefsMixin(StorageBase):
                         " AND type IN ('msg', 'ack')",
                         (conv_key,),
                     )
+                    cursor_key = conv_key
                 deleted = cursor.rowcount
                 # Clean up read_counts for this destination
                 conn.execute("DELETE FROM read_counts WHERE dst = ?", (read_key or dst,))
+                # Clean up the matching read_cursors row (unread-cursor rework,
+                # doc/2026-09-06_1200-unread-cursor-plan.md) — keyed by the SAME
+                # conversation_key the delete above just matched on, not by
+                # read_key/dst like read_counts: a deleted conversation must not
+                # leave behind a cursor that silently marks a future, unrelated
+                # reoccupant of that key as already read.
+                if cursor_key:
+                    conn.execute("DELETE FROM read_cursors WHERE key = ?", (cursor_key,))
                 siblings = self._zero_match_siblings(conn, dst) if personal and not deleted else []
                 conn.commit()
                 return deleted, personal, siblings

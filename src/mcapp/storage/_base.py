@@ -28,6 +28,7 @@ class StorageBase(Protocol):
     db_path: Path
     _initialized: bool
     _bucket_accumulators: dict[tuple[str, int], dict[str, list[float | int]]]
+    _recent_ingest: dict[tuple[str, str], int]
     _message_router: Any
     _classifier: Any
     MAX_DB_SIZE_MB: int
@@ -97,6 +98,15 @@ class StorageBase(Protocol):
 
     # ── PrefsMixin → called across mixin boundaries ─────────────────────────
     async def get_read_counts(self) -> dict[str, int]:
+        raise NotImplementedError
+
+    async def get_read_cursors(self) -> dict[str, int]:
+        raise NotImplementedError
+
+    async def set_read_cursor(self, key: str, ts: int) -> int:
+        raise NotImplementedError
+
+    async def seed_read_cursors_from_counts(self, my_callsign: str) -> int:
         raise NotImplementedError
 
     async def get_blocked_texts(self) -> list[str]:

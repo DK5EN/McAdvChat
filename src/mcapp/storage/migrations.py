@@ -603,10 +603,39 @@ class MigrationsMixin(StorageBase):
                         " ledger, empty until the first acknowledged outbound message)",
                         current_version,
                     )
+                    _set_schema_version(conn, 29)
+
+                if current_version < 30:  # noqa: PLR2004 - schema migration step
+                    # Unread-cursor rework (doc/2026-09-06_1200-unread-cursor-
+                    # plan.md §3): one server-authoritative high-water-mark row
+                    # per conversation, replacing the client-count-comparison
+                    # scheme (`read_counts`, v7) whose two independent
+                    # weaknesses — a per-browser mark going stale whenever the
+                    # same conversation was read on another device, and every
+                    # server-side count shrink (retention window, blocklist)
+                    # pushing the mark above the count and clamping to 0 —
+                    # together produced the reload flash and permanently-stuck
+                    # badges the plan documents. Writes are MAX(existing,
+                    # incoming) (see PrefsMixin.set_read_cursor), so a cursor
+                    # never regresses; empty until the first read-cursor write
+                    # (POST or the one-shot seed from read_counts).
+                    conn.execute("""
+                        CREATE TABLE IF NOT EXISTS read_cursors (
+                            key TEXT PRIMARY KEY,
+                            ts INTEGER NOT NULL,
+                            updated_at TEXT DEFAULT CURRENT_TIMESTAMP
+                        );
+                    """)
+                    logger.info(
+                        "Migration v%d → v30: created read_cursors table"
+                        " (unread-cursor rework, empty until the first"
+                        " read-cursor write)",
+                        current_version,
+                    )
                     # Adding a step after this one? Bump LATEST_SCHEMA_VERSION in
                     # storage/constants.py in the same commit — the startup suite
                     # asserts every migration chain terminates there.
-                    _set_schema_version(conn, 29)
+                    _set_schema_version(conn, 30)
 
         await asyncio.to_thread(_init_db)
 

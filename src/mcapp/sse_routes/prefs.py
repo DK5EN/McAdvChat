@@ -13,11 +13,13 @@ from typing import TYPE_CHECKING, Any
 
 from fastapi import APIRouter
 
+from ..commands.parsing import SPAM_GROUP
 from ..schemas import (
     BlockedTextRequest,
     DeleteMessagesRequest,
     HiddenDestinationsRequest,
     ReadCountRequest,
+    ReadCursorRequest,
     SidebarStateRequest,
 )
 
@@ -25,7 +27,7 @@ if TYPE_CHECKING:
     from ..sse_handler import SSEManager
 
 
-def build_prefs_router(manager: SSEManager) -> APIRouter:
+def build_prefs_router(manager: SSEManager) -> APIRouter:  # noqa: PLR0915 - one router per concern (SSE-01), several endpoints kept together
     """Build the read-counts/hidden-destinations/blocked-texts/sidebar/filter-prefs router."""
     router = APIRouter()
 
@@ -42,6 +44,40 @@ def build_prefs_router(manager: SSEManager) -> APIRouter:
         storage = manager.require_storage()
         await storage.set_read_count(body.dst, body.count)
         return {"status": "ok"}
+
+    # Read cursors endpoints (server-authoritative unread cursor, MAX semantics)
+    @router.get("/api/read_cursors")
+    async def get_read_cursors() -> Any:
+        """Get persisted read cursors ({key: ts}) for unread-badge sync."""
+        storage = manager.require_storage()
+        return await storage.get_read_cursors()
+
+    @router.post("/api/read_cursor")
+    async def set_read_cursor(body: ReadCursorRequest) -> dict[str, int | str]:
+        """Persist a read cursor for a conversation key (MAX semantics) and
+        broadcast the stored value to every connected client — see
+        sse_handler.py's _linkcheck_handler for the same bare-payload
+        broadcast_event precedent (not the {type,msg,data} response envelope).
+        """
+        storage = manager.require_storage()
+        stored = await storage.set_read_cursor(body.key, body.ts)
+        # Fresh `unread` for the advanced key rides along on both the response
+        # and the broadcast: the webapp's local window is capped (and offline
+        # boot may hold none of the rows), so it cannot recompute the badge
+        # itself once the cursor moves — the server is the only party that can.
+        router_ = manager.message_router
+        my_callsign = (router_.my_callsign or "") if router_ else ""
+        summary = await storage.get_conversation_summary(
+            my_callsign,
+            blocklist_filter=router_.filter_history_row if router_ else None,
+            key=None if body.key == SPAM_GROUP else body.key,
+        )
+        unread = summary.get(body.key, {}).get("unread", 0)
+        await manager.broadcast_event(
+            "proxy:read_cursor",
+            {"key": body.key, "ts": stored, "unread": unread},
+        )
+        return {"status": "ok", "ts": stored, "unread": unread}
 
     # Hidden destinations endpoints (persist hidden groups)
     @router.get("/api/hidden_destinations")

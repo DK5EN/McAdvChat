@@ -100,6 +100,11 @@ _QNH_PLAUSIBLE_HPA_RANGE = (850, 1100)
 # on beacons that may carry nothing else, and a shorter list silently ignored those.
 _WEATHER_BEACON_FIELDS = ("temp1", "temp2", "hum", "hum2", "qfe", "qnh", "gas", "co2")
 
+# Size at which `_claim_recent_ingest` sweeps entries older than DEDUP_WINDOW_MS
+# out of the in-memory (sender, msg_id) set. ~3k messages/week on mcapp.local,
+# so the set never reaches this in normal operation; it is a bound, not a tuning.
+_RECENT_INGEST_PRUNE_AT = 4096
+
 # --- APRS symbol double-escape (firmware bug, see backfill_aprs_symbol_escapes) --
 # `FIRMWARE_DOUBLED_BACKSLASH` (TWO 0x5C characters, what the firmware sends),
 # `APRS_ALTERNATE_TABLE` (ONE, the real symbol table id) and the normalizer that
@@ -133,6 +138,28 @@ def _ack_attribution_fields(ack_from: str | None, ack_via: str | None) -> dict[s
 
 
 class IngestMixin(StorageBase):
+    def _claim_recent_ingest(self, callsign: str, msg_id: str, timestamp: int) -> bool:
+        """Race-free half of the message dedup gate. Returns True when this
+        (sender, msg_id) is new within DEDUP_WINDOW_MS and records it; False when
+        a copy was already claimed. Deliberately synchronous — no await between
+        the lookup and the record — so two concurrently ingesting copies of one
+        frame cannot both pass, which the DB lookup in store_message cannot
+        guarantee (see the comment at its call site). Keyed by the resolved
+        sender exactly like that lookup: msg_id is a node-local 32-bit counter,
+        so two stations collide regularly inside one window and must never
+        suppress each other.
+        """
+        key = (callsign.strip().upper(), msg_id)
+        seen = self._recent_ingest.get(key)
+        if seen is not None and timestamp - seen <= DEDUP_WINDOW_MS:
+            return False
+        if len(self._recent_ingest) >= _RECENT_INGEST_PRUNE_AT:
+            cutoff = timestamp - DEDUP_WINDOW_MS
+            for k in [k for k, ts in self._recent_ingest.items() if ts <= cutoff]:
+                del self._recent_ingest[k]
+        self._recent_ingest[key] = timestamp
+        return True
+
     async def _init_bucket_accumulators(self) -> None:
         """Load current partial buckets from signal_log into memory."""
         bucket_ms = BUCKET_SECONDS * 1000
@@ -1227,15 +1254,32 @@ class IngestMixin(StorageBase):
         # (`node_press`, `extudp_functions.cpp:459`) — see verdict V4/V4a.)
         # Salvaging telemetry here is safe against a genuine double-delivered datagram:
         # `store_telemetry` has its own 60 s window that merges rather than duplicates.
+        #
+        # Two halves, and the ORDER is the fix (2026-09-06): the in-memory claim
+        # runs synchronously before this method's first await on the chat path,
+        # so it cannot race; the DB lookup is only the backstop across a restart
+        # (the in-memory set is empty after one). The DB check alone was a
+        # check-then-insert with classification and the SQLite write between
+        # the two: the UDP datagram and the BLE copy of the same frame arrive as
+        # separate router tasks 40-170 ms apart, the second copy's SELECT ran
+        # before the first copy's INSERT had landed, and BOTH rows were stored —
+        # 984 such pairs in one week on mcapp.local (a third of all message
+        # rows), every one under 172 ms apart, none slower, which is the
+        # signature of a timing window rather than a matching rule. Every slow
+        # duplicate (a LoRa relay copy seconds later) was caught by the SELECT.
+        # storage/ingest_dedup_tests.py replays both shapes.
         if msg_id is not None:
-            existing = await self._query(
-                "SELECT 1 FROM messages WHERE msg_id = ? AND timestamp > ?"
-                " AND UPPER(TRIM(CASE WHEN instr(src, ',') > 0"
-                "   THEN substr(src, 1, instr(src, ',') - 1) ELSE src END)) = ?"
-                " LIMIT 1",
-                (msg_id, timestamp - DEDUP_WINDOW_MS, callsign.upper()),
-            )
-            if existing:
+            duplicate = not self._claim_recent_ingest(callsign, str(msg_id), timestamp)
+            if not duplicate:
+                existing = await self._query(
+                    "SELECT 1 FROM messages WHERE msg_id = ? AND timestamp > ?"
+                    " AND UPPER(TRIM(CASE WHEN instr(src, ',') > 0"
+                    "   THEN substr(src, 1, instr(src, ',') - 1) ELSE src END)) = ?"
+                    " LIMIT 1",
+                    (msg_id, timestamp - DEDUP_WINDOW_MS, callsign.upper()),
+                )
+                duplicate = bool(existing)
+            if duplicate:
                 # Presence, not truthiness — see the identical note in
                 # `_store_position`; a genuine all-zero beacon must still reach
                 # `store_telemetry`'s own transport-aware sentinel decoding.
