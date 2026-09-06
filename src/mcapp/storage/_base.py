@@ -28,6 +28,7 @@ class StorageBase(Protocol):
     db_path: Path
     _initialized: bool
     _bucket_accumulators: dict[tuple[str, int], dict[str, list[float | int]]]
+    _recent_ingest: dict[tuple[str, str], int]
     _message_router: Any
     _classifier: Any
     MAX_DB_SIZE_MB: int

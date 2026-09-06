@@ -279,6 +279,12 @@ the PWA app-icon badge. Plan and the field evidence: `doc/2026-09-06_1200-unread
   (v2.0.4-dev.1). `get_conversation_summary` therefore groups by `msg_id` (rowid fallback for
   id-less rows) and takes `MIN(timestamp)` before joining the cursors. Symptom → cause: a badge
   stuck at exactly 1 per conversation means a query is counting transport copies, not messages.
+  The pairs themselves were an ingest RACE, fixed the same day: the dedup gate was a
+  check-then-insert against `messages` with classification and the SQLite write between the
+  two awaits, and the two copies arrive as separate router tasks 40-170 ms apart. 984 pairs in
+  one week, none slower than 172 ms. `_claim_recent_ingest` now claims `(sender, msg_id)` in
+  memory synchronously before the first await; the DB lookup stays as the restart backstop.
+  Rows written before v2.0.4-dev.3 still hold the pairs, so the per-message aggregation stays.
 
 ## Blocklist (`sperrliste.json`)
 

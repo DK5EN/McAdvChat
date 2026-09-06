@@ -58,6 +58,7 @@ from mcapp.sse_handler import run_startup_tests as run_sse_tests
 from mcapp.storage.ack_status_tests import run_ack_status_tests
 from mcapp.storage.connection_lifecycle_tests import run_connection_lifecycle_tests
 from mcapp.storage.conversation_key_tests import run_conversation_key_tests
+from mcapp.storage.ingest_dedup_tests import run_ingest_dedup_tests
 from mcapp.storage.linkcheck_ingest_tests import run_linkcheck_ingest_tests
 from mcapp.storage.mheard_attribution_tests import run_mheard_attribution_tests
 from mcapp.storage.migration_chain_tests import run_migration_chain_tests
@@ -166,6 +167,9 @@ async def main() -> int:  # noqa: PLR0915 - flat suite registry; one visible lin
     read_cursor_ok = await run_read_cursor_tests()
     print(f"read_cursor: {'PASS' if read_cursor_ok else 'FAIL'}")
 
+    ingest_dedup_ok = await run_ingest_dedup_tests()
+    print(f"ingest_dedup: {'PASS' if ingest_dedup_ok else 'FAIL'}")
+
     meteo_ok = run_meteo_tests()
     print(f"meteo: {'PASS' if meteo_ok else 'FAIL'}")
 
@@ -250,6 +254,7 @@ async def main() -> int:  # noqa: PLR0915 - flat suite registry; one visible lin
         and connection_lifecycle_ok
         and uptime_ok
         and read_cursor_ok
+        and ingest_dedup_ok
         and meteo_ok
         and push_ok
         and blocklist_history_ok

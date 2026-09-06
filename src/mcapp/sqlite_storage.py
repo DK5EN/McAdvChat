@@ -69,6 +69,13 @@ class SQLiteStorage(
         # In-memory bucket accumulators: {(callsign, bucket_start_ms): {"rssi": [], "snr": []}}
         self._bucket_accumulators: dict[tuple[str, int], dict[str, list[float | int]]] = {}
 
+        # Race-free half of the message dedup gate: {(SENDER, msg_id): first ts}.
+        # Claimed synchronously in store_message BEFORE its first await — the DB
+        # lookup that follows is an await, and two transport copies of one frame
+        # (UDP datagram + BLE copy, ~40-170 ms apart) arrive as separate router
+        # tasks that interleave there. See IngestMixin._claim_recent_ingest.
+        self._recent_ingest: dict[tuple[str, str], int] = {}
+
         # Reference to message router (set via set_message_router after construction)
         self._message_router = None
 
