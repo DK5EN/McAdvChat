@@ -542,7 +542,7 @@ class QueryMixin(StorageBase):
         my_base = my_callsign.split("-", maxsplit=1)[0].upper()
         key_clause = "" if key is None else " AND COALESCE(m.conversation_key, m.dst) = ?"
         params: tuple[Any, ...] = (
-            (SPAM_GROUP, window_cutoff_ms) if key is None else (SPAM_GROUP, window_cutoff_ms, key)
+            (window_cutoff_ms, SPAM_GROUP) if key is None else (window_cutoff_ms, key, SPAM_GROUP)
         )
 
         def _run() -> dict[str, dict[str, int]]:
@@ -550,29 +550,47 @@ class QueryMixin(StorageBase):
                 conn.row_factory = sqlite3.Row
                 conn.execute("PRAGMA journal_mode=WAL")
                 conn.execute("PRAGMA query_only=ON")
+                # One row per DISTINCT message first (subquery `d`), then per
+                # conversation. The same message is stored once per transport
+                # it arrived over — the UDP datagram and the BLE copy land as two
+                # rows with the same msg_id ~100 ms apart (the v3 migration
+                # dropped the msg_id UNIQUE constraint on purpose) — while the
+                # webapp dedups to the FIRST copy and marks read with that copy's
+                # timestamp. Counting rows instead of messages left the later
+                # sibling "newer than the cursor" forever: on mcapp.local every
+                # conversation whose newest message came in over two transports
+                # sat at +1 with nothing a client could do about it
+                # (v2.0.4-dev.1, 2026-09-06). A message is therefore judged by
+                # its EARLIEST copy, which is the one the client holds. Rows
+                # without a msg_id never collapse into each other (rowid
+                # fallback). src/dst are taken from the earliest copy too: the
+                # relay-path prefix can differ between copies, but the resolved
+                # sender (first comma component) is the same.
                 rows = conn.execute(
-                    "SELECT COALESCE(m.conversation_key, m.dst) AS key, m.src, m.dst,"  # noqa: S608 - key_clause is a fixed literal; values parameterized
-                    " COUNT(*) AS cnt, MAX(m.timestamp) AS last_ts,"
-                    " SUM(CASE WHEN m.timestamp > COALESCE(rc.ts, 0) THEN 1 ELSE 0 END)"
+                    "SELECT COALESCE(d.conversation_key, d.dst) AS key, d.src, d.dst,"  # noqa: S608 - key_clause is a fixed literal; values parameterized
+                    " COUNT(*) AS cnt, MAX(d.ts) AS last_ts,"
+                    " SUM(CASE WHEN d.ts > COALESCE(rc.ts, 0) THEN 1 ELSE 0 END)"
                     "   AS newer,"
-                    " SUM(CASE WHEN m.timestamp >"
+                    " SUM(CASE WHEN d.ts >"
                     "   MAX(COALESCE(rc.ts, 0), COALESCE(rc2.ts, 0))"
                     "   THEN 1 ELSE 0 END) AS newer_spam"
-                    " FROM messages m"
+                    " FROM ("
+                    "   SELECT MIN(m.timestamp) AS ts, m.src, m.dst, m.conversation_key"
+                    "   FROM messages m"
+                    "   WHERE m.type = 'msg' AND m.msg NOT GLOB '*:ack[0-9]*'"
+                    "   AND m.timestamp >= ?"
+                    + key_clause
+                    + "   GROUP BY COALESCE(NULLIF(m.msg_id, ''), 'row:' || m.rowid)"
+                    " ) d"
                     " LEFT JOIN read_cursors rc"
-                    "   ON rc.key = COALESCE(m.conversation_key, m.dst)"
+                    "   ON rc.key = COALESCE(d.conversation_key, d.dst)"
                     " LEFT JOIN read_cursors rc2"
                     "   ON rc2.key = ?"
-                    " WHERE m.type = 'msg' AND m.msg NOT GLOB '*:ack[0-9]*'"
-                    " AND m.timestamp >= ?"
-                    + key_clause
-                    # Positional GROUP BY, not "GROUP BY key": with the second
-                    # read_cursors join (rc2) below, a bare "key" is ambiguous
-                    # between the SELECT alias and rc.key/rc2.key (both actual
-                    # columns named "key" in the joined tables) and SQLite
-                    # rejects the query outright with
-                    # "ambiguous column name: key".
-                    + " GROUP BY 1, m.src, m.dst",
+                    # Positional GROUP BY, not "GROUP BY key": with the two
+                    # read_cursors joins a bare "key" is ambiguous between the
+                    # SELECT alias and rc.key/rc2.key and SQLite rejects the
+                    # query outright with "ambiguous column name: key".
+                    " GROUP BY 1, d.src, d.dst",
                     params,
                 ).fetchall()
 

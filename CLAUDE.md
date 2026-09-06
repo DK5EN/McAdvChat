@@ -270,6 +270,15 @@ the PWA app-icon badge. Plan and the field evidence: `doc/2026-09-06_1200-unread
 - **The webapp marks read on render while the tab is visible, in every mode.** The old scheme
   marked on conversation switch only, so "All / No Filter" never marked anything and badges grew
   while the messages were on screen.
+- **Unread is counted per DISTINCT message, judged by its EARLIEST stored copy.** The same
+  message lands as two `messages` rows with the same `msg_id` about 100 ms apart (UDP datagram
+  plus the BLE copy; the v3 migration dropped the `msg_id` UNIQUE constraint on purpose), while
+  the webapp dedups to the first copy and marks read with that copy's timestamp. A per-row count
+  leaves the later sibling "newer than the cursor" forever: on mcapp.local every conversation
+  whose newest message arrived over two transports sat at **+1** with nothing a client could do
+  (v2.0.4-dev.1). `get_conversation_summary` therefore groups by `msg_id` (rowid fallback for
+  id-less rows) and takes `MIN(timestamp)` before joining the cursors. Symptom → cause: a badge
+  stuck at exactly 1 per conversation means a query is counting transport copies, not messages.
 
 ## Blocklist (`sperrliste.json`)
 

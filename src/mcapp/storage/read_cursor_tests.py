@@ -509,10 +509,77 @@ async def _test_delete_removes_cursor(results: list[tuple[str, bool]]) -> None:
             await storage.close()
 
 
+async def _test_transport_duplicates(results: list[tuple[str, bool]]) -> None:
+    """Field regression (mcapp.local, v2.0.4-dev.1, 2026-09-06): the same message
+    reaches the proxy twice — once over UDP, once as the BLE copy — and both are
+    stored as separate rows with the SAME msg_id ~100 ms apart (the v3 migration
+    dropped the msg_id UNIQUE constraint on purpose). The webapp dedups to the
+    first copy and marks read with THAT copy's timestamp, so a per-row count
+    left the sibling copy "newer than the cursor" forever: every conversation
+    whose newest message arrived over two transports stuck at +1. Unread and
+    count must therefore be per DISTINCT message, judged by its earliest copy.
+    """
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        db_path = Path(tmp_dir) / "read_cursor_dup_test.db"
+        storage = await create_sqlite_storage(db_path)
+        try:
+            t0 = now_ms() - 100_000
+            base = {"src": "DK1TCP-77", "dst": "*", "msg": "--- TST 18 msg", "type": "msg"}
+            await storage.store_message(
+                {**base, "msg_id": "E686400E", "timestamp": t0, "src_type": "udp"}, raw=""
+            )
+            # The sibling copy is inserted directly: store_message's in-process
+            # duplicate suppression catches a back-to-back replay in a test, but
+            # production demonstrably holds both rows (msg_id E686400E, udp
+            # 13:11:59.249 and ble_remote 13:11:59.356 on mcapp.local), and the
+            # summary has to be correct for the rows that exist, however they
+            # got there.
+            await storage._mutate(  # white-box: mirror the production row pair
+                "INSERT INTO messages (msg_id, src, dst, msg, type, timestamp, src_type,"
+                " conversation_key)"
+                " SELECT msg_id, src, dst, msg, type, ?, 'ble_remote', conversation_key"
+                " FROM messages WHERE msg_id = 'E686400E'",
+                (t0 + 107,),
+            )
+            stored = await storage._query(  # white-box: prove both copies exist
+                "SELECT COUNT(*) AS n FROM messages WHERE msg_id = 'E686400E'"
+            )
+            results.append(("fixture: both transport copies are stored", stored[0]["n"] == 2))
+
+            summary = await storage.get_conversation_summary(MY_CALLSIGN)
+            results.append(
+                (
+                    "transport duplicates: count is per distinct message, not per row",
+                    summary["*"]["count"] == 1,
+                )
+            )
+            results.append(
+                (
+                    "transport duplicates: missing cursor counts the message once",
+                    summary["*"]["unread"] == 1,
+                )
+            )
+
+            await storage.set_read_cursor("*", t0)  # the copy the client rendered
+            summary = await storage.get_conversation_summary(MY_CALLSIGN)
+            results.append(
+                (
+                    (
+                        "transport duplicates: cursor at the FIRST copy clears the message"
+                        " (the later sibling copy must not keep it unread)"
+                    ),
+                    summary["*"]["unread"] == 0,
+                )
+            )
+        finally:
+            await storage.close()
+
+
 async def run_read_cursor_tests() -> bool:
     """Run the unread-cursor regression suite. Returns True iff every case passes."""
     results: list[tuple[str, bool]] = []
 
+    await _test_transport_duplicates(results)
     await _test_own_message_exclusion(results)
     await _test_cursor_semantics(results)
     await _test_max_semantics(results)
